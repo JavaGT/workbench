@@ -90,9 +90,11 @@ opt-out-implicitly:
 - **Route gate** — a request must be authenticated to reach a handler.
 - **Row gate** — the per-entity grant runs on every row.
 
-One auth concept, `requireAuth`, covers both transports: `docs.use(requireAuth)`
-on HTTP and `app.room(..., { require: requireAuth })` on WebSockets. `req.user`
-is hydrated from the session; the app never writes a manual `loadUser`.
+One auth concept, `requireUser`, covers both transports: HTTP route gates and the
+WebSocket live-delivery seam use the same principal and authorization engine.
+Entities declare their route gate and are exposed with `app.mount(path, Entity)`;
+the framework's `/events` live endpoint re-authorizes delivery. `req.user` is
+hydrated from the session; the app never writes a manual `loadUser`.
 
 ---
 
@@ -101,7 +103,7 @@ is hydrated from the session; the app never writes a manual `loadUser`.
 Verbs are methods, handlers are varargs:
 
 ```js
-users.get('/', requireAuth, userList)
+users.get('/', requireUser, userList)
 ```
 
 `router()` builds mini-apps mounted bare with `app.use(path, router)`. Subtrees
@@ -110,11 +112,12 @@ one obvious way to wire a route.
 
 ---
 
-## 5. Documents — `app.doc(name, schema)`
+## 5. Documents — `entity()` + `app.mount()`
 
-`app.doc` declares a durable entity and auto-generates its REST CRUD, its version
-history, and its CRDT collaboration room. You declare the shape; the framework
-owns persistence, sync, and event emission.
+`entity(name, declaration)` declares a durable entity. `app.mount(path, Entity)`
+exposes its generated REST CRUD and declared routes; the framework owns
+persistence, sync, and event emission. Live collaboration uses the separate
+LiveChannel/live-delivery seam rather than an entity-specific room API.
 
 ### 5.1 Field types are an open registry (ADR #9)
 
@@ -366,10 +369,11 @@ An action's class — durable, ephemeral, volatile — is **emergent from which 
 it engages**, never a label it carries. Engage the persistence seam and the
 action is durable (events get a sequence number and replay). Don't, and it is
 ephemeral (presence heartbeats) or volatile (coalesced typing indicators, no
-events). `app.doc` is the durable class; `app.room`'s presence/chat is the
-ephemeral/volatile class — one action primitive with engaged seams, not three
-mechanisms. The engaged seam does the work itself (the field-type plugin owns the
-persistence strategy); there is no inert marker that flips a gate.
+events). An entity declaration that engages the persistence seam is durable; live
+delivery can also carry ephemeral/volatile field events. These are one action
+primitive with engaged seams, not separate mechanisms. The engaged seam does the
+work itself (the field-type plugin owns the persistence strategy); there is no
+inert marker that flips a gate.
 
 ### 7.3 Undo is preimage-restore plus inverse events
 
@@ -639,16 +643,20 @@ read** (compilability ≠ read intent — the ADR #2 leak guard).
 
 A realtime-collaborative feature page is 30–80 lines, none of it event handling
 (the DX ceiling `scope` proves reachable — `SCOPE-FINDINGS.md` §3). The page
-constructs a store from the declared doc/room name (the framework derives the
-endpoint URLs — the page does not hand-pass URL strings) and calls
-`dispatch(type, payload)`. **Dispatch does not throw**; it returns one
+constructs a `LiveChannel` for the server's live-delivery URL and a
+`createLiveStore({ baseUrl, name, path, channel })` for an entity mounted at its
+CRUD path, then calls `dispatch(type, payload)`. `LiveChannel` multiplexes
+entity/id subscriptions over WebSocket and `LiveList` bootstraps from the REST
+snapshot before subscribing. The page does not use an entity-specific room API.
+**Dispatch does not throw**; it returns one
 framework-owned result shape decoded through one shared decoder (two call sites
 cannot drift). The principal is built **server-side from the session**; the
 client-supplied id is a transport correlation id only — the client cannot supply
 its own identity.
 
-`package.json` declares `workbench`, `type: module`,
-`main: src/index.mjs`.
+`package.json` declares `workbench`, `type: module`, with the package entry point
+at `build/index.mjs`; the browser client is `workbench/client` and the server-only
+surface is `workbench/server`.
 
 ---
 

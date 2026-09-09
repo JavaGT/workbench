@@ -28,7 +28,7 @@ grammar:
 ```ts
 const Transcript = entity('Transcript', {
   project: ref('Project'),
-  owner: ref('User'),
+  owner: ref('User', { role: 'owner' }),
   body: annotatedText({
     project: 'project',
     owner: 'owner',

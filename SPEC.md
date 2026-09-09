@@ -636,14 +636,14 @@ read** (compilability ≠ read intent — the ADR #2 leak guard).
 
 `public/workbench-client.mjs` keeps the page declarative:
 
-The annotated-text field's declaration, editing, recipient projection, and
-confidentiality contract is documented in
-[`docs/annotated-text.md`](docs/annotated-text.md).
-
 - **`LiveChannel`** — subscribes over WebSocket, auto-reconnects, dispatches
   events.
 - **`LiveList`** — boots from a JSON snapshot, applies deltas, calls a render
   callback. Enforces the bootstrap ordering of §7.1.
+
+The annotated-text field's declaration, editing, recipient projection, and
+confidentiality contract is documented in
+[`docs/annotated-text.md`](docs/annotated-text.md).
 
 A realtime-collaborative feature page is 30–80 lines, none of it event handling
 (the DX ceiling `scope` proves reachable — `SCOPE-FINDINGS.md` §3). The page

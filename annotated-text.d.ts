@@ -8,7 +8,7 @@
 //   src/annotated-text-recipient-projection.ts canonical -> recipient projection
 // The canonical document is {kind:'workbench.annotatedText.canonical', version:1,
 // text, annotations, ranges, measurements, capabilityHints, orphans?}; the
-// recipient projection is {kind:'workbench.annotatedText.recipient', version:2
+// recipient projection is {kind:'workbench.annotatedText.recipient', version:3
 // (fully-visible, anchored ranges) or version:1 (redacted/restricted, offset
 // ranges), text, ranges, annotations, measurements, capabilityHints}. The block-era
 // shapes and family shims below are marked `@deprecated`.

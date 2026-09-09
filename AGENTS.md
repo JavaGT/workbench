@@ -14,6 +14,10 @@ Issues and specs live in this repository's GitHub Issues and are managed with `g
 
 Use the canonical Matt Pocock skill labels: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, and `wontfix`. See `docs/agents/triage-labels.md`.
 
+### Pain journal
+
+While working, append one-line friction notes to `~/.config/opencode/pain-journals/workbench.md` when you encounter them: slow checks, misleading names, missing types, docs that lied, or context you had to reconstruct. Use `- YYYY-MM-DD area one line`; never stop task work to write these, and never record credentials, private payloads, transcripts, or full logs.
+
 ### Domain docs
 
 This is a single-context repository. Read `CONTEXT.md` and relevant records under `docs/adr/`. See `docs/agents/domain.md`.

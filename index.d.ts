@@ -1114,7 +1114,7 @@ export interface AnnotatedTextRecipientRedaction {
 }
 export interface AnnotatedTextRecipientDocument {
   readonly kind: 'workbench.annotatedText.recipient';
-  readonly version: 1 | 2;
+  readonly version: 1 | 2 | 3;
   readonly text: string;
   readonly ranges: readonly AnnotatedTextRecipientRange[];
   readonly annotations: readonly AnnotatedTextAnnotation[];

@@ -22,7 +22,7 @@ import { createRequire } from 'node:module';
 import { createDurableHistoryRuntime } from './durable-history.ts';
 import { decideReplay } from './replay-decision.ts';
 import { getLog } from './log.ts';
-import { failure, failureFromError, failureOutcome } from './outcome.ts';
+import { failure, failureFromError, failureOutcome, forbidden } from './outcome.ts';
 import { principalKeyOf } from './principal.ts';
 import { applyErasureDirective, isErasureDirective, isErasureDirectivePreparation, prepareErasureDirective } from './erasure-directive.ts';
 import { declarePostCommitEffectsInTxn } from './post-commit-effects.ts';
@@ -131,7 +131,7 @@ export function noBlobAdapter() {
 }
 
 function requireAdmission(granted: unknown) {
-  if (!granted) throw Object.assign(new Error('forbidden'), { status: 403 });
+  if (!granted) throw forbidden();
 }
 
 function effectEventsFor(registry: unknown, executeEffectsForEvent: unknown) {
@@ -1022,17 +1022,13 @@ async function commitEvents(db: any, events: any, {
           for (const action of payload) {
             const result = await authorize({ type: action.type, payload: action.payload, principal });
             if (!result) {
-              const err = new Error('forbidden');
-              (err as any).status = 403;
-              throw err;
+              throw forbidden();
             }
           }
         } else {
           const result = await authorize({ type, payload, principal });
           if (!result) {
-            const err = new Error('forbidden');
-            (err as any).status = 403;
-            throw err;
+            throw forbidden();
           }
         }
       }

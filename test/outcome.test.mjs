@@ -5,6 +5,7 @@ import {
   FAILURE_CATEGORIES,
   failure,
   failureOutcome,
+  forbidden,
   isWorkbenchFailure,
   sanitizeUnexpectedFailure,
 } from '../build/index.mjs';
@@ -69,6 +70,18 @@ test('failureOutcome creates the exact public failure result', () => {
     ok: false,
     failure: { category: 'denied', message: 'Forbidden.' },
   });
+});
+
+test('forbidden creates one typed 403 error for direct and HTTP callers', () => {
+  const error = forbidden();
+  assert.equal(error.message, 'forbidden');
+  assert.equal(error.status, 403);
+  assert.deepEqual(error.failure, { category: 'denied', message: 'forbidden' });
+
+  const historyError = forbidden('history.forbidden', 'history.forbidden');
+  assert.equal(historyError.status, 403);
+  assert.equal(historyError.code, 'history.forbidden');
+  assert.deepEqual(failureFromError(historyError), { category: 'denied', message: 'history.forbidden' });
 });
 
 test('isWorkbenchFailure recognizes only complete canonical failures', () => {

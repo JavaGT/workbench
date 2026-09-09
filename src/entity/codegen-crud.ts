@@ -39,6 +39,7 @@ import { write } from '../grant.ts';
 import { admitRowTransition } from '../field-admission.ts';
 import type { AuthorizationAdapter } from '../authorization-adapter.ts';
 import { materializeCreateDefaults, resolveGeneratedEventScope } from './crud.ts';
+import { forbidden } from '../outcome.ts';
 
 /** The `action(type)` handle shape (pipeline.ts — structural, the module exports no types). */
 interface ActionDeclaration {
@@ -328,10 +329,6 @@ export function codegenOwnerField(entity: CodegenEntity): string | null {
     if (descriptor.type === 'ref' && descriptor.role && descriptor.readonly) return fieldName;
   }
   return null;
-}
-
-function forbidden(): Error {
-  return Object.assign(new Error('forbidden'), { status: 403 });
 }
 
 /**

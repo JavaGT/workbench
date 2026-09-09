@@ -18,13 +18,7 @@
 
 import { tryParseScopeKey } from './scope-handle.ts';
 import type { DbHandle } from './driver.ts';
-
-function forbidden(): Error & { code: string; status: number } {
-  const error = new Error('history.forbidden') as Error & { code: string; status: number };
-  error.code = 'history.forbidden';
-  error.status = 403;
-  return error;
-}
+import { forbidden } from './outcome.ts';
 
 function parseJson(value: unknown, fallback: unknown): unknown {
   if (value == null) return fallback;
@@ -52,7 +46,7 @@ export function assertLegacyAnnotatedHistoryReadable(
   privateHistoryScopes: ReadonlySet<string>,
 ): void {
   const handle = tryParseScopeKey(scope);
-  if (handle && privateHistoryScopes.has(handle.entity)) throw forbidden();
+  if (handle && privateHistoryScopes.has(handle.entity)) throw forbidden('history.forbidden', 'history.forbidden');
 
   // Legacy receipt scanning: a receipt is annotated when it is a native
   // annotated action, a batch containing one, or its event refs reference an
@@ -61,7 +55,7 @@ export function assertLegacyAnnotatedHistoryReadable(
     'SELECT scope, actionType, actionData, eventRefs FROM _ActionReceipt WHERE scope = :scope',
   ).all({ scope }) as ReceiptRowLike[];
   for (const receipt of receipts) {
-    if (receiptIsAnnotated(receipt, privateHistoryScopes)) throw forbidden();
+    if (receiptIsAnnotated(receipt, privateHistoryScopes)) throw forbidden('history.forbidden', 'history.forbidden');
   }
 }
 

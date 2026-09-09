@@ -5,6 +5,7 @@ import { txn, upsert, type DbHandle } from './driver.ts';
 import { tryParseScopeKey } from './scope-handle.ts';
 import { applicationPrivateFactView, parseCompoundContributionFact, compoundKindOf } from './compound-contribution-fact.ts';
 import type { HistoryContributionPolicy, HistoryContributionPolicyRegistry } from './history-contribution-policy.ts';
+import { forbidden } from './outcome.ts';
 
 const HISTORY_DESCRIPTOR: unique symbol = Symbol('workbench.durable-history');
 
@@ -132,10 +133,6 @@ interface UndoToPointArgs extends IdentityArgs {
   actionId?: unknown;
   revision?: unknown;
   seq?: unknown;
-}
-
-function forbidden(): Error {
-  return Object.assign(new Error('forbidden'), { status: 403 });
 }
 
 function conflict(message: string): Error {

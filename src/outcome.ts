@@ -28,6 +28,25 @@ export interface FailureOutcome {
   readonly failure: WorkbenchFailure;
 }
 
+/**
+ * A deliberate authorization denial at an internal seam. The status and
+ * optional code preserve the direct-caller contract; `failure` lets every
+ * transport normalize the same denial through the shared outcome grammar.
+ */
+export interface ForbiddenError extends Error {
+  readonly status: 403;
+  readonly code?: string;
+  readonly failure: WorkbenchFailure;
+}
+
+export function forbidden(message = 'forbidden', code?: string): ForbiddenError {
+  const error = new Error(message) as ForbiddenError;
+  Object.defineProperty(error, 'status', { value: 403, enumerable: true });
+  if (code !== undefined) Object.defineProperty(error, 'code', { value: code, enumerable: true });
+  Object.defineProperty(error, 'failure', { value: failure('denied', message), enumerable: true });
+  return error;
+}
+
 const failureCategories = new Set<FailureCategory>(FAILURE_CATEGORIES);
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {

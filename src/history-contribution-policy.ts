@@ -29,10 +29,7 @@ import type { DbHandle } from './driver.ts';
 import type { CompoundContributionEnvelope } from './compound-contribution-fact.ts';
 import { canonicalJsonEqual, parseCompoundContributionFact } from './compound-contribution-fact.ts';
 import { assertV9AnnotatedTextOffsetEditPayload } from './entity/crud.ts';
-
-function forbidden(): Error & { status: number } {
-  return Object.assign(new Error('forbidden'), { status: 403 });
-}
+import { forbidden } from './outcome.ts';
 
 export type ContributionPolicyFilter = 'eligible' | 'barrier' | 'excluded';
 

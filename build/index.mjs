@@ -29,6 +29,7 @@ export {
   FAILURE_CATEGORIES,
   failure,
   failureOutcome,
+  forbidden,
   isWorkbenchFailure,
   sanitizeUnexpectedFailure,
 } from './outcome.mjs';

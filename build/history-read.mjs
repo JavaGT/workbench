@@ -8,6 +8,7 @@ import { publicEvent } from './event-delivery.mjs';
 // ONLY here (the history actions()/events() read boundary) and used ONLY from
 // the authorize step. Movement code must not import it.
 import { assertLegacyAnnotatedHistoryReadable } from './legacy-annotated-history-read-privacy.mjs';
+import { forbidden } from './outcome.mjs';
 
 
 
@@ -67,13 +68,6 @@ import { assertLegacyAnnotatedHistoryReadable } from './legacy-annotated-history
 
 
 
-
-function forbidden()                                           {
-  const error = new Error('history.forbidden')                                            ;
-  error.code = 'history.forbidden';
-  error.status = 403;
-  return error;
-}
 
 function reauthFor(
   entityRec                     ,
@@ -128,20 +122,20 @@ export function createHistoryReader({
     // has no eligibility/barrier/target/retry/compensation role.
     assertLegacyAnnotatedHistoryReadable(database, scope, denyScopes);
     const handle = tryParseScopeKey(scope);
-    if (!handle) throw forbidden();
+    if (!handle) throw forbidden('history.forbidden', 'history.forbidden');
     const entityRec = resolveEntity(handle.entity);
-    if (!entityRec) throw forbidden();
+    if (!entityRec) throw forbidden('history.forbidden', 'history.forbidden');
     const auth = reauthFor(entityRec, principal, handle, database, scopeVisible);
-    if (!auth) throw forbidden();
+    if (!auth) throw forbidden('history.forbidden', 'history.forbidden');
     if (!(await mayRow(entityRec, 'subscribe', auth.row, principal, authorizeVerb))) {
-      throw forbidden();
+      throw forbidden('history.forbidden', 'history.forbidden');
     }
     return { entityRec, row: auth.row };
   }
 
   async function readCommittedHistory({ scope, principal, sinceSeq = 0, limit = 100 }                     = {})                             {
     if (typeof scope !== 'string' || scope.length === 0) throw new TypeError('scope is required');
-    if (!principal || principal.id == null) throw forbidden();
+    if (!principal || principal.id == null) throw forbidden('history.forbidden', 'history.forbidden');
     if (!Number.isSafeInteger(sinceSeq) || sinceSeq < 0) throw new TypeError('sinceSeq must be a non-negative integer');
     if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw new TypeError('limit must be an integer from 1 to 1000');
     // Receipt reads need no projector; history reads do. Require it here so a
@@ -182,7 +176,7 @@ export function createHistoryReader({
   async function readReceipt({ scope, actionId, principal }                       )                                 {
     if (typeof scope !== 'string' || scope.length === 0) throw new TypeError('scope is required');
     if (typeof actionId !== 'string' || actionId.length === 0) throw new TypeError('actionId is required');
-    if (!principal || principal.id == null) throw forbidden();
+    if (!principal || principal.id == null) throw forbidden('history.forbidden', 'history.forbidden');
 
     await authorize(scope, principal);
 

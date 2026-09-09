@@ -5,6 +5,7 @@ import { txn, upsert,               } from './driver.mjs';
 import { tryParseScopeKey } from './scope-handle.mjs';
 import { applicationPrivateFactView, parseCompoundContributionFact, compoundKindOf } from './compound-contribution-fact.mjs';
 
+import { forbidden } from './outcome.mjs';
 
 const HISTORY_DESCRIPTOR                = Symbol('workbench.durable-history');
 
@@ -133,10 +134,6 @@ const HISTORY_DESCRIPTOR                = Symbol('workbench.durable-history');
 
 
 
-
-function forbidden()        {
-  return Object.assign(new Error('forbidden'), { status: 403 });
-}
 
 function conflict(message        )        {
   return Object.assign(new Error(message), { status: 409 });

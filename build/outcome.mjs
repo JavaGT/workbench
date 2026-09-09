@@ -28,6 +28,25 @@ export const FAILURE_CATEGORIES = Object.freeze([
 
 
 
+/**
+ * A deliberate authorization denial at an internal seam. The status and
+ * optional code preserve the direct-caller contract; `failure` lets every
+ * transport normalize the same denial through the shared outcome grammar.
+ */
+
+
+
+
+
+
+export function forbidden(message = 'forbidden', code         )                 {
+  const error = new Error(message)                  ;
+  Object.defineProperty(error, 'status', { value: 403, enumerable: true });
+  if (code !== undefined) Object.defineProperty(error, 'code', { value: code, enumerable: true });
+  Object.defineProperty(error, 'failure', { value: failure('denied', message), enumerable: true });
+  return error;
+}
+
 const failureCategories = new Set                 (FAILURE_CATEGORIES);
 
 function isPlainRecord(value         )                                   {

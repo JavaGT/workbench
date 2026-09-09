@@ -78,12 +78,19 @@ export interface FailureOutcome {
   readonly failure: WorkbenchFailure;
 }
 
+export interface ForbiddenError extends Error {
+  readonly status: 403;
+  readonly code?: string;
+  readonly failure: WorkbenchFailure;
+}
+
 export function failure(
   category: FailureCategory,
   message: string,
   details?: Readonly<Record<string, unknown>>,
 ): WorkbenchFailure;
 export function failureOutcome(workbenchFailure: WorkbenchFailure): FailureOutcome;
+export function forbidden(message?: string, code?: string): ForbiddenError;
 export function isWorkbenchFailure(value: unknown): value is WorkbenchFailure;
 export function sanitizeUnexpectedFailure(value?: unknown): WorkbenchFailure;
 export function statusForFailure(failure: WorkbenchFailure): 400 | 403 | 404 | 409 | 500;

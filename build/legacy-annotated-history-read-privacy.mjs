@@ -18,13 +18,7 @@
 
 import { tryParseScopeKey } from './scope-handle.mjs';
 
-
-function forbidden()                                           {
-  const error = new Error('history.forbidden')                                            ;
-  error.code = 'history.forbidden';
-  error.status = 403;
-  return error;
-}
+import { forbidden } from './outcome.mjs';
 
 function parseJson(value         , fallback         )          {
   if (value == null) return fallback;
@@ -52,7 +46,7 @@ export function assertLegacyAnnotatedHistoryReadable(
   privateHistoryScopes                     ,
 )       {
   const handle = tryParseScopeKey(scope);
-  if (handle && privateHistoryScopes.has(handle.entity)) throw forbidden();
+  if (handle && privateHistoryScopes.has(handle.entity)) throw forbidden('history.forbidden', 'history.forbidden');
 
   // Legacy receipt scanning: a receipt is annotated when it is a native
   // annotated action, a batch containing one, or its event refs reference an
@@ -61,7 +55,7 @@ export function assertLegacyAnnotatedHistoryReadable(
     'SELECT scope, actionType, actionData, eventRefs FROM _ActionReceipt WHERE scope = :scope',
   ).all({ scope })                    ;
   for (const receipt of receipts) {
-    if (receiptIsAnnotated(receipt, privateHistoryScopes)) throw forbidden();
+    if (receiptIsAnnotated(receipt, privateHistoryScopes)) throw forbidden('history.forbidden', 'history.forbidden');
   }
 }
 

@@ -22,7 +22,7 @@ import { createRequire } from 'node:module';
 import { createDurableHistoryRuntime } from './durable-history.mjs';
 import { decideReplay } from './replay-decision.mjs';
 import { getLog } from './log.mjs';
-import { failure, failureFromError, failureOutcome } from './outcome.mjs';
+import { failure, failureFromError, failureOutcome, forbidden } from './outcome.mjs';
 import { principalKeyOf } from './principal.mjs';
 import { applyErasureDirective, isErasureDirective, isErasureDirectivePreparation, prepareErasureDirective } from './erasure-directive.mjs';
 import { declarePostCommitEffectsInTxn } from './post-commit-effects.mjs';
@@ -131,7 +131,7 @@ export function noBlobAdapter() {
 }
 
 function requireAdmission(granted         ) {
-  if (!granted) throw Object.assign(new Error('forbidden'), { status: 403 });
+  if (!granted) throw forbidden();
 }
 
 function effectEventsFor(registry         , executeEffectsForEvent         ) {
@@ -1022,17 +1022,13 @@ async function commitEvents(db     , events     , {
           for (const action of payload) {
             const result = await authorize({ type: action.type, payload: action.payload, principal });
             if (!result) {
-              const err = new Error('forbidden');
-              (err       ).status = 403;
-              throw err;
+              throw forbidden();
             }
           }
         } else {
           const result = await authorize({ type, payload, principal });
           if (!result) {
-            const err = new Error('forbidden');
-            (err       ).status = 403;
-            throw err;
+            throw forbidden();
           }
         }
       }

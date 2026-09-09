@@ -29,10 +29,7 @@
 
 import { canonicalJsonEqual, parseCompoundContributionFact } from './compound-contribution-fact.mjs';
 import { assertV9AnnotatedTextOffsetEditPayload } from './entity/crud.mjs';
-
-function forbidden()                             {
-  return Object.assign(new Error('forbidden'), { status: 403 });
-}
+import { forbidden } from './outcome.mjs';
 
 
 

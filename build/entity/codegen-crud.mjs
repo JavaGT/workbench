@@ -39,6 +39,7 @@ import { write } from '../grant.mjs';
 import { admitRowTransition } from '../field-admission.mjs';
 
 import { materializeCreateDefaults, resolveGeneratedEventScope } from './crud.mjs';
+import { forbidden } from '../outcome.mjs';
 
 /** The `action(type)` handle shape (pipeline.ts — structural, the module exports no types). */
 
@@ -328,10 +329,6 @@ export function codegenOwnerField(entity               )                {
     if (descriptor.type === 'ref' && descriptor.role && descriptor.readonly) return fieldName;
   }
   return null;
-}
-
-function forbidden()        {
-  return Object.assign(new Error('forbidden'), { status: 403 });
 }
 
 /**

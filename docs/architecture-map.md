@@ -111,6 +111,7 @@ authorization (`authz.mjs`, `scope-sql`, `row-grant`) stays outside this folder.
 
 ## Annotated text (field kind across loops)
 
+Product-facing contract: [`annotated-text.md`](./annotated-text.md).
 Public wire vs internal durable versions:
 [`annotated-text-public-v9-operated-lattice.md`](./annotated-text-public-v9-operated-lattice.md).
 RGA grammar: [`adr/0005-annotated-text-kernel.md`](./adr/0005-annotated-text-kernel.md).

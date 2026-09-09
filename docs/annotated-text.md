@@ -37,7 +37,7 @@ const Transcript = entity('Transcript', {
       protectingAnnotation('private', {
         protects: 'comment',
         placeholder: '[Restricted]',
-        access: ({ principal }) => canReadPrivate(principal),
+        access: async ({ is }) => (await is.owner()) ? grant(read) : grant(),
       }),
     ],
     measurements: [measurement('words')],
@@ -73,13 +73,21 @@ through the document session rather than dispatching raw events.
 
 Each accepted edit is authorized against the current document and project,
 committed once, and eventually confirmed by authoritative delivery. The
-session may show an optimistic pending state, reported by `pendingCount()`;
-the delivered fold or snapshot is what settles it. A retry uses the same
-operation identity and does not create a second contribution.
+session's `status`, `ready`, document updates, and recovery behavior provide
+its lifecycle signal.
+The delivered fold or snapshot is what settles an optimistic edit. Callers
+that need a retry to reuse the same semantic operation must supply the same
+`mutationId`; when it is omitted, the client mints a new one.
 
 ## What recipients receive
 
-The recipient document is a versioned, immutable value with this public shape:
+There are two deliberately different recipient shapes. The server projection
+is the wire envelope; the browser materializer turns that envelope into the
+client document view. They must not be treated as one merged object.
+
+### Wire recipient projection
+
+The package-owned wire envelope contains the recipient projection:
 
 ```ts
 {
@@ -89,24 +97,45 @@ The recipient document is a versioned, immutable value with this public shape:
   ranges,
   annotations,
   measurements,
-  orphans,
-  capabilities,
   capabilityHints,
+  orphans,
+  // only when at least one range was redacted:
   redactions,
 }
 ```
 
-The current model is blockless: `text` is one string and `ranges` use
-document-absolute offsets. Annotation records contain only the fields allowed
-to that recipient. An emptied annotation may be retained as an `orphan` with
-its saved quote when the declaration's orphan policy calls for retention.
-Measurement payloads are validated by their declared extension before they are
-published.
+`capabilityHints` is the server-side, recipient-specific list of granted
+capability names. It is not the client document's `capabilities` property.
+`redactions` is omitted when empty. A whole-document denial instead produces a
+restricted wire projection with `restricted: true`, empty text and
+collections, and no authoring hints; it does not disclose a redaction's
+content or shape.
 
-Recipients must treat `version` and field presence as a schema boundary and
-use the package materializer/typed client types rather than guessing a wire
-shape. Public snapshot and coordinate helpers are exported from the annotated
-text package; internal checkpoints are not application input.
+The current model is blockless: `text` is one string and offset-form `ranges`
+use document-absolute UTF-16 offsets. Annotation records contain only the
+fields allowed to that recipient. An emptied annotation may be retained as an
+`orphan` with its saved quote when the declaration's orphan policy calls for
+retention. Measurement payloads are validated by their declared extension
+before they are published.
+
+Fully visible, anchored wire projections may use version 3 and include
+`points` and `frontiers`, which intern the structural range endpoints. These
+are package-owned wire/recovery fields consumed by the materializer, not
+application-authored operation data or a second public state model. Offset or
+redacted projections use the applicable non-anchored wire version. Treat
+`version` and field presence as a schema boundary; do not guess a wire shape or
+construct these fields yourself.
+
+### Client materialized document
+
+`materializeAnnotatedTextSnapshot` converts wire `capabilityHints` into the
+client-facing `capabilities` array. The materialized document therefore has
+`capabilities: string[]` for an ordinary recipient, or `capabilities: null`
+when `restricted: true`. It carries `restricted` only for that restricted
+view, and carries `redactions` only when the wire projection has non-empty
+redactions. The materialized client view does not expose wire
+`capabilityHints`, `points`, or `frontiers`; applications should use this
+typed view and its coordinate helpers rather than the wire envelope.
 
 ## Confidential ranges
 
@@ -151,7 +180,9 @@ the declaration makes an operation eligible. These are durable compensating
 actions against the original contribution, not restoration of an old whole
 document. They preserve unrelated concurrent work and never reveal protected
 text. The general history contract is
-[durable-history-contract.md](./durable-history-contract.md).
+[durable-history-contract.md](./durable-history-contract.md). Its
+compensation and one-reconciliation rules are grounded in
+[semantic-operations.md](./semantic-operations.md).
 
 Initial load, reconnect, cursor gaps, stale authoring positions, and
 non-foldable changes recover through an authorized recipient snapshot. During

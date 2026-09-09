@@ -636,6 +636,10 @@ read** (compilability ≠ read intent — the ADR #2 leak guard).
 
 `public/workbench-client.mjs` keeps the page declarative:
 
+The annotated-text field's declaration, editing, recipient projection, and
+confidentiality contract is documented in
+[`docs/annotated-text.md`](docs/annotated-text.md).
+
 - **`LiveChannel`** — subscribes over WebSocket, auto-reconnects, dispatches
   events.
 - **`LiveList`** — boots from a JSON snapshot, applies deltas, calls a render

@@ -24,19 +24,41 @@ named per-kind fact (whole-value replace), never as the default. See #180.
 
 Opt-in, live/no-history tier only: `expectedRevision` vs `_LiveRevision`,
 mismatch → 409 `conflict` (`src/live-revision.ts`). History tier has no
-per-field OCC. #183 must decide whether queued live actions carry (possibly
-stale) revisions or rebase before resend.
+per-field OCC. Queued live actions carry the revision captured when they were
+created; a stale resend fails closed with 409 `conflict` and its optimistic
+placeholder is rolled back. The history tier does not add per-field OCC.
 
-## Offline resend rule (binds #183)
+## Offline resend rule (#183, current)
 
 - Same `actionId` resend: safe — pipeline dedupes the whole `(scope, actionId)`
   against receipts before field logic (`src/pipeline.ts` dedupe checks).
 - Fresh `actionId` resend: a NEW mutation re-entering the table above.
   The outbox must never mint fresh actionIds for retries.
 
-## What #182 / #183 must obey
+The current outbox behavior is covered by [local-outbox.test.mjs](../test/local-outbox.test.mjs):
+value replacement, map merge, ordered coexistence, stale live revision rejection,
+and the separation between CRUD outbox entries and native CRDT text operations.
 
-- #182 codegen: parity test per kind; kinds whose outcome is merge/stub cannot
-  be covered by whole-value assignment codegen.
-- #183 outbox: conflict behavior tested per kind (CRDT coexist, map merge,
-  ordered-insert coexist, value replace, live 409), not single-writer only.
+## CRUD codegen boundary (#182, current)
+
+`src/entity/codegen-crud.ts` is opt-in. The normal `src/entity/compile.ts`
+compiler and `src/entity/crud.ts` handlers remain the canonical/default CRUD
+implementation. Codegen derives actions, lifecycle events, handlers, and
+inverses over the same pipeline; it does not introduce a second mutation or
+write authority.
+
+The currently admitted assignment-shaped kinds are `value`, `hash`, `state`,
+and `struct` (`state` still enforces its transition graph, and `struct` keeps
+per-cell replacement). `annotatedText`, `crdt`, `store` (including map/log),
+and `ordered` (including list) remain hand-written because their merge or
+coexistence semantics are not assignment-shaped. `computed`, `projected`, and
+`ephemeral` are framework-owned and reject client payloads. Unknown kinds fail
+closed as hand-written. A CRUD payload touching a refused kind is rejected
+before any event is emitted; it is not partially applied.
+
+Codegen also refuses lifecycle cases it does not derive: `onRemove` cascades
+keep removal hand-written, and live or conditional-history entities keep their
+hand-written lifecycle actions. The parity kill switch is
+[entity-codegen-crud-parity.test.mjs](../test/entity-codegen-crud-parity.test.mjs),
+which covers byte-identical lifecycle events, access denial with zero events,
+and the merge/stub refusal boundary.

@@ -15,10 +15,18 @@ do not exist.
 
 Declaration → compiled Entity (handlers, DDL, auth, effects, schedules, routes).
 
+The normal `src/entity/compile.ts` compiler is the canonical/default Entity
+path, including its built-in CRUD handlers. `src/entity/codegen-crud.ts` is an
+opt-in CRUD-only alternative for applications that explicitly register its
+surface; it composes the same action, authorization, commit, and projection
+pipeline and is not a second write authority. Its coverage and byte-level
+parity contract are pinned by [entity-codegen-crud-parity.test.mjs](../test/entity-codegen-crud-parity.test.mjs).
+
 | Module | Role |
 | --- | --- |
 | `entity/compile.mjs` | Orchestrates compile |
 | `entity/crud.mjs` | Lifecycle action handlers |
+| `entity/codegen-crud.mjs` | Opt-in CRUD-only action/event/handler derivation; assignment-covered kinds only |
 | `entity/projection.mjs` | Entity-as-projection consumer |
 | `entity/query.mjs` | Ambient find/query surface |
 | `field.mjs` | Field constructors |

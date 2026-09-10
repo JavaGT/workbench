@@ -4,8 +4,8 @@
 // a directory plus a logical name (or a memory database) — never from a
 // physical filename (src/db-adapter.ts). `openSqliteAdapter(config)` owns the
 // directory: restrictive layout, an OS-backed ownership lock, the centralized
-// PRAGMA layer, a fail-closed quick_check at open, and checkpoint-then-close
-// shutdown. `openMemoryAdapter()` preserves the same surface and lifecycle
+// PRAGMA layer, a fail-closed quick_check at open, a periodic WAL
+// checkpoint-starvation guard, and checkpoint-then-close shutdown. `openMemoryAdapter()` preserves the same surface and lifecycle
 // ordering for `:memory:` without a directory or lock.
 //
 // The physical db filename is DERIVED here and never exposed to the app. The
@@ -15,13 +15,15 @@
 // backups/, quarantine/, and recycle/ are owned by S1/A3/A4/A6 and survive.
 
 import { backup, DatabaseSync } from 'node:sqlite';
-import { chmodSync, mkdirSync, realpathSync, rmSync } from 'node:fs';
+import { chmodSync, mkdirSync, realpathSync, rmSync, statSync } from 'node:fs';
 import path from 'node:path';
 import {
   applyConnectionPragmas,
   attachDriverHelpers,
+  walCheckpointRestart,
 
 } from './driver.mjs';
+import { getLog } from './log.mjs';
 import {
   capabilitiesOf,
 
@@ -58,6 +60,16 @@ const TEARDOWN_FILENAMES = Object.freeze([
   'data.sqlite-shm',
   'lock.sqlite',
 ]);
+
+// WAL checkpoint-starvation guard (scope#2727). With a second long-lived READ
+// handle on the same file (the app's read mirror), SQLite's automatic
+// checkpointing can be starved: the WAL then grows without bound while reads
+// never stop (better-sqlite3 performance.md — poll the -wal sidecar and run
+// wal_checkpoint(RESTART) once it outgrows a budget). File-mode adapters poll
+// at WAL_GUARD_INTERVAL_MS and checkpoint when the sidecar exceeds
+// WAL_GUARD_SIZE_THRESHOLD_BYTES.
+export const WAL_GUARD_INTERVAL_MS = 60_000;
+export const WAL_GUARD_SIZE_THRESHOLD_BYTES = 8 * 1024 * 1024;
 
 // Options for the online-backup hook (S1/A3). Mirrors node:sqlite's BackupOptions:
 // `source`/`target` name ATTACHed databases; `rate` is pages per step.
@@ -236,6 +248,31 @@ function quickCheck(db              )       {
   }
 }
 
+// One starvation-guard tick (scope#2727): checkpoint(RESTART) when the -wal
+// sidecar has outgrown WAL_GUARD_SIZE_THRESHOLD_BYTES. A missing sidecar
+// (nothing written since the last checkpoint) and a busy result (a reader is
+// still pinning the WAL) are both no-ops — the next tick re-checks; there is
+// no retry loop. The checkpoint runs with busy_timeout 0 so a pinned WAL can
+// never stall the shared connection's event loop (driver.ts). Best-effort by
+// design: a guard tick must never crash its host.
+function walGuardTick(db              , walFile        )       {
+  let walBytes        ;
+  try {
+    walBytes = statSync(walFile).size;
+  } catch {
+    return; // no -wal sidecar yet — nothing to checkpoint
+  }
+  if (walBytes <= WAL_GUARD_SIZE_THRESHOLD_BYTES) return;
+  try {
+    const row = walCheckpointRestart(db);
+    if (row?.busy) {
+      getLog().debug('system', 'wal checkpoint guard: WAL pinned by a reader; deferring to the next tick', { walBytes });
+    }
+  } catch (err) {
+    getLog().debug('system', 'wal checkpoint guard tick failed', { err, walBytes });
+  }
+}
+
 // Real-path containment for the managed-path predicate. realpath fails on a
 // non-existent leaf, so the parent chain is realpath'd and the leaf re-joined:
 // a non-existent path under a managed directory still resolves as managed,
@@ -295,6 +332,22 @@ function makeOpenedSqliteDatabase(
   const backupTo = (destPath        , options                      )                  =>
     options === undefined ? backup(db, destPath) : backup(db, destPath, options);
 
+  // Starvation-guard wiring (scope#2727): one interval, file mode only (memory
+  // has no -wal sidecar). unref'd so a maintenance timer never holds the
+  // process open; cleared on the close path below.
+  const walGuard =
+    mode === 'file' && root
+      ? setInterval(() => {
+          if (closed) return;
+          try {
+            walGuardTick(db, path.join(root, SQLITE_DATA_FILENAME) + '-wal');
+          } catch (err) {
+            getLog().debug('system', 'wal checkpoint guard tick failed', { err });
+          }
+        }, WAL_GUARD_INTERVAL_MS)
+      : undefined;
+  walGuard?.unref();
+
   // Checkpoint-then-close: clean shutdown truncates the WAL into the main db
   // file before the handle (and then the ownership lock) goes away. Idempotent.
   // Failures are NOT swallowed: an explicit close() propagates a failed
@@ -303,6 +356,7 @@ function makeOpenedSqliteDatabase(
   const close = ()       => {
     if (closed) return;
     closed = true;
+    clearInterval(walGuard);
     let failure          = null;
     if (mode === 'file') {
       try {

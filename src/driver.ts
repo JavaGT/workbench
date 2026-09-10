@@ -255,6 +255,25 @@ export function applyConnectionPragmas(db: { exec(sql: string): unknown }): void
   for (const sql of CONNECTION_PRAGMA_SQL) db.exec(sql);
 }
 
+// The WAL starvation-guard checkpoint (scope#2727): wal_checkpoint(RESTART) run
+// with busy_timeout 0 — saved and restored — so a reader pinning the WAL
+// answers busy immediately instead of stalling the shared connection's event
+// loop for the connection's full busy_timeout. Returns the checkpoint row;
+// busy=1 means a reader still pins the WAL and the caller defers to its next
+// poll. Lives here because the PRAGMA layer has exactly one declaring module.
+export function walCheckpointRestart(db: {
+  prepare(sql: string): { get(): unknown };
+  exec(sql: string): unknown;
+}): { busy?: number } | undefined {
+  const { timeout } = db.prepare('PRAGMA busy_timeout').get() as { timeout: number };
+  db.exec('PRAGMA busy_timeout = 0');
+  try {
+    return db.prepare('PRAGMA wal_checkpoint(RESTART)').get() as { busy?: number } | undefined;
+  } finally {
+    db.exec(`PRAGMA busy_timeout = ${timeout}`);
+  }
+}
+
 // ---- attachDriverHelpers: attach the SQLite default txn/upsert surface ----
 // The adapter needs the driver contract helpers WITHOUT wrapDriver's PRAGMA
 // bootstrap (it runs the centralized layer itself, fail-closed). `this` inside

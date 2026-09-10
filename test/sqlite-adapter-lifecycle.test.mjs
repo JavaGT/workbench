@@ -1,9 +1,10 @@
 // sqlite-adapter-lifecycle.test.mjs — S1/A2 lifecycle: owned-directory layout
 // + permissions, the centralized PRAGMA layer, fail-closed quick_check at open,
-// checkpoint/close ordering, and the teardown guard (db file + -wal/-shm + lock
-// sidecar removed, backups/quarantine/recycle untouched).
+// checkpoint/close ordering, the periodic WAL checkpoint-starvation guard, and
+// the teardown guard (db file + -wal/-shm + lock sidecar removed,
+// backups/quarantine/recycle untouched).
 
-import { test } from 'node:test';
+import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   mkdtempSync,
@@ -25,6 +26,8 @@ import {
   SQLITE_DATA_FILENAME,
   SQLITE_LOCK_FILENAME,
   MANAGED_SUBDIRECTORIES,
+  WAL_GUARD_INTERVAL_MS,
+  WAL_GUARD_SIZE_THRESHOLD_BYTES,
 } from '../build/sqlite-adapter.mjs';
 
 const EXPECTED_CAPABILITIES = {
@@ -323,6 +326,76 @@ test('the owned directory reflects a sensible derived physical layout', () => {
       opened.close();
     }
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('the WAL starvation guard checkpoints an oversized WAL, tolerates a busy reader, and its timer dies with close()', () => {
+  const root = tempRoot();
+  const dir = path.join(root, 'owned');
+  mock.timers.enable({ apis: ['setInterval'] });
+  let prevClearInterval = null;
+  try {
+    const opened = openSqliteAdapter({ directory: dir, name: 'app' });
+    const walFile = path.join(dir, SQLITE_DATA_FILENAME + '-wal');
+    const dbFile = path.join(dir, SQLITE_DATA_FILENAME);
+    opened.handle.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)');
+
+    // Under the threshold a tick must not checkpoint: the main db file is
+    // untouched while the small write sits in the WAL.
+    opened.handle.exec("INSERT INTO t (v) VALUES ('small')");
+    const dbBytesBefore = statSync(dbFile).size;
+    mock.timers.tick(WAL_GUARD_INTERVAL_MS);
+    assert.equal(statSync(dbFile).size, dbBytesBefore, 'tick under the threshold is a no-op');
+
+    // Starve the WAL the way the read mirror does: a reader holding an old
+    // snapshot while the WAL outgrows the guard threshold.
+    const reader = new DatabaseSync(dbFile, { readOnly: true });
+    reader.exec('BEGIN');
+    reader.prepare('SELECT count(*) FROM t').get();
+    const payload = 'x'.repeat(64 * 1024);
+    const insert = opened.handle.prepare('INSERT INTO t (v) VALUES (?)');
+    opened.handle.exec('BEGIN');
+    for (let i = 0; i < Math.ceil((WAL_GUARD_SIZE_THRESHOLD_BYTES * 1.25) / payload.length); i++) {
+      insert.run(payload);
+    }
+    opened.handle.exec('COMMIT');
+    assert.ok(statSync(walFile).size > WAL_GUARD_SIZE_THRESHOLD_BYTES, '-wal outgrew the threshold');
+
+    // Busy tick: the pinned reader must be swallowed without throwing, without
+    // stalling (the guard checkpoints with busy_timeout 0), and without
+    // draining the WAL into the main db.
+    const busyTickStarted = Date.now();
+    assert.doesNotThrow(() => mock.timers.tick(WAL_GUARD_INTERVAL_MS), 'busy tick does not throw');
+    assert.ok(Date.now() - busyTickStarted < 2000, 'busy tick does not honor the 5s busy_timeout');
+    assert.ok(statSync(dbFile).size < WAL_GUARD_SIZE_THRESHOLD_BYTES, 'busy tick did not drain the WAL');
+    reader.exec('COMMIT');
+    reader.close();
+
+    // Success tick: with the reader gone, the guard's checkpoint drains the
+    // WAL into the main db and a probe RESTART reports the WAL un-pinned.
+    mock.timers.tick(WAL_GUARD_INTERVAL_MS);
+    assert.ok(statSync(dbFile).size > WAL_GUARD_SIZE_THRESHOLD_BYTES, 'guard checkpoint drained the WAL');
+    opened.handle.exec('PRAGMA busy_timeout = 0');
+    const probe = opened.handle.prepare('PRAGMA wal_checkpoint(RESTART)').get();
+    opened.handle.exec('PRAGMA busy_timeout = 5000');
+    assert.equal(probe.busy, 0, 'WAL is no longer pinned after the guard checkpoint');
+
+    // The guard timer is cleared on close and never fires against a closed db.
+    prevClearInterval = globalThis.clearInterval;
+    let cleared = false;
+    globalThis.clearInterval = (...args) => {
+      cleared = true;
+      return prevClearInterval(...args);
+    };
+    opened.close();
+    globalThis.clearInterval = prevClearInterval;
+    prevClearInterval = null;
+    assert.ok(cleared, 'close() cleared the guard interval');
+    assert.doesNotThrow(() => mock.timers.tick(WAL_GUARD_INTERVAL_MS), 'no guard tick after close');
+  } finally {
+    if (prevClearInterval) globalThis.clearInterval = prevClearInterval;
+    mock.timers.reset();
     rmSync(root, { recursive: true, force: true });
   }
 });

@@ -56,6 +56,47 @@ export { canUndoField, undoableFieldKinds } from './field-laws.mjs';
 export { startSimulation } from './simulate.mjs';
 export { generateTypes } from './generate-types.mjs';
 export { parsePrincipalSnapshotScope } from './principal-snapshot-scope.mjs';
+export {
+  compileQueryContract,
+  executeQueryPage,
+  acceptQueryPage,
+  overlayOptimisticQueryPage,
+  readCommittedRevision,
+  createQueryInvalidationHub,
+  createQueryInvalidationConsumer,
+  QueryScopedReadError,
+  QueryContentionError,
+  queryAuthorizationFields,
+  compileFilterPredicate,
+  keysetSql,
+  selectAuthorizedPage,
+  withRevisionFence,
+  asSafeRevision,
+  QUERY_OPERATORS,
+  OPERATORS_BY_FIELD_TYPE,
+  QUERY_PAGE_SIZE_MIN,
+  QUERY_PAGE_SIZE_MAX,
+  QUERY_REGISTRATION_MAX,
+
+
+
+
+
+
+
+} from './query-scoped-read.mjs';
+export {
+  compileQueryFamily,
+  executeQueryFamily,
+  createQueryFamilyRegistry,
+  queryFamilyDependencies,
+  registerQueryFamilyInvalidation,
+  queryFamilyChangedSince,
+  DYNAMIC_VALUE_TYPES,
+
+
+
+} from './query-family.mjs';
 export { createPrincipalSnapshotTransaction } from './principal-snapshot-transaction.mjs';
 export { WORKBENCH_MIGRATIONS, ensureWorkbenchMigrationTable, appliedWorkbenchVersion, runWorkbenchMigrations } from './workbench-migrations.mjs';
 export {

@@ -69,6 +69,8 @@ Post-commit → re-auth → wire → client Replay decision → fold.
 
 | Module | Role |
 | --- | --- |
+| `query-scoped-read.mjs` | Authorized query pages over compiled grants (`scopeFilter` + keyset) with `_CommittedRevision` tokens and invalidation/refetch signals — not a second auth or write path (ADR-0009, #225) |
+| `query-family.mjs` | Registered query families over host + typed value catalog/elements; clients name a family and pass a validated field id (ADR-0009 phase 2) |
 | `live-delivery.mjs` | Framework WebSocket seam `createWebSocketLiveDelivery` → `{ count, close, createConsumer, wake }` (stateful delta/reducer envelopes) |
 | `live-delivery-public.mjs` | Transport-neutral committed seam `createOwnedLiveDelivery` (public `createLiveDelivery` via `./server`) — stateless recipient envelopes |
 | `live-connection.mjs` / `live-admission.mjs` / `live-fanout.mjs` | Private impl of the seam (conn / subscribe auth / fan-out) |

@@ -56,6 +56,47 @@ export { canUndoField, undoableFieldKinds } from './field-laws.ts';
 export { startSimulation } from './simulate.ts';
 export { generateTypes } from './generate-types.ts';
 export { parsePrincipalSnapshotScope } from './principal-snapshot-scope.ts';
+export {
+  compileQueryContract,
+  executeQueryPage,
+  acceptQueryPage,
+  overlayOptimisticQueryPage,
+  readCommittedRevision,
+  createQueryInvalidationHub,
+  createQueryInvalidationConsumer,
+  QueryScopedReadError,
+  QueryContentionError,
+  queryAuthorizationFields,
+  compileFilterPredicate,
+  keysetSql,
+  selectAuthorizedPage,
+  withRevisionFence,
+  asSafeRevision,
+  QUERY_OPERATORS,
+  OPERATORS_BY_FIELD_TYPE,
+  QUERY_PAGE_SIZE_MIN,
+  QUERY_PAGE_SIZE_MAX,
+  QUERY_REGISTRATION_MAX,
+  type QueryContract,
+  type QueryCursor,
+  type CompiledQuery,
+  type QueryPage,
+  type QueryInvalidationSignal,
+  type QueryDependency,
+  type PendingQueryWrite,
+} from './query-scoped-read.ts';
+export {
+  compileQueryFamily,
+  executeQueryFamily,
+  createQueryFamilyRegistry,
+  queryFamilyDependencies,
+  registerQueryFamilyInvalidation,
+  queryFamilyChangedSince,
+  DYNAMIC_VALUE_TYPES,
+  type QueryFamilyDeclaration,
+  type CompiledQueryFamily,
+  type QueryFamilyRequest,
+} from './query-family.ts';
 export { createPrincipalSnapshotTransaction } from './principal-snapshot-transaction.ts';
 export { WORKBENCH_MIGRATIONS, ensureWorkbenchMigrationTable, appliedWorkbenchVersion, runWorkbenchMigrations } from './workbench-migrations.ts';
 export {

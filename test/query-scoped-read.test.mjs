@@ -481,13 +481,33 @@ test('a fetch that predates registration resyncs; stale notices do not rewind', 
 });
 
 test('an unsafe committed revision fails closed', () => {
-  const { db } = setup();
-  try {
-    db.prepare("UPDATE _CommittedRevision SET revision = 9007199254740992 WHERE name = 'actions'").run();
-    assert.throws(() => readCommittedRevision(db), QueryScopedReadError);
-  } finally {
-    db.close();
-  }
+  const db = {
+    prepare: () => ({
+      get: () => ({ revision: 2 ** 53 }),
+      all: () => [],
+    }),
+  };
+  assert.throws(() => readCommittedRevision(db), /exceeds safe range/);
+});
+
+test('scopeAst harvests authorization fields that are not owner or projectId', () => {
+  const Doc = entity('Doc', {
+    body: text(),
+    status: text(),
+    teamId: text(),
+    grant: () => [
+      scope(({ fields }) => fields.teamId.is('acme')).can(() => grant(read, subscribe)),
+    ],
+  });
+  const compiled = compileQueryContract({
+    entity: 'Doc',
+    filters: [{ field: 'status', op: 'eq', value: 'open' }],
+    sort: { field: 'id', direction: 'asc' },
+    pageSize: 10,
+  }, Doc);
+  assert.ok(compiled.dependencyFields.includes('teamId'), 'grant AST field must be a dependency');
+  assert.ok(!compiled.dependencyFields.includes('body'));
+  assert.ok(!('owner' in Doc.fields) && !('projectId' in Doc.fields), 'this case is not the role/name shortcut');
 });
 
 test('optimistic overlay previews safe fields and flags membership-uncertain writes', () => {

@@ -284,10 +284,13 @@ export function compileQueryContract(input         , entity             )       
 }
 
 function asSafeRevision(value         , label        )         {
-  if (typeof value === 'number' && Number.isSafeInteger(value)) return value;
+  if (typeof value === 'number') {
+    if (Number.isSafeInteger(value)) return value;
+    fail(`${label} exceeds safe range.`);
+  }
   if (typeof value === 'bigint') {
     const converted = Number(value);
-    if (!Number.isSafeInteger(converted)) fail(`${label} exceeds a safe integer.`);
+    if (!Number.isSafeInteger(converted)) fail(`${label} exceeds safe range.`);
     return converted;
   }
   fail(`${label} is missing.`);

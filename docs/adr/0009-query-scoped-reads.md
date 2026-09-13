@@ -83,7 +83,12 @@ that notices must match. After commit, a post-commit consumer notices matching
 events (create/remove always; update when a dependency *or authorization* field
 is touched) and records `max(existing, notice)` — a stale/out-of-order notice
 is ignored. Events without a matching `scope` do not signal (no cross-project
-timing leak).
+timing leak). A row-scoped event (`Note:id`) matches the registered project
+only when `event.data[scopeField]` is present and equals the scope id; omitting
+that cell does **not** signal. That is a stale client (the page may be wrong
+until the next matching notice or resync), not a cross-project leak. An
+explicit `scopeField` that is empty or not a declared field fails closed at
+registration (`QueryScopedReadError`); it must not skip the scope predicate.
 
 The client-facing seam returns a **signal**, never a row patch:
 

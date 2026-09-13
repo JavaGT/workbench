@@ -16,6 +16,7 @@ import {
   compileQueryFamily,
   createQueryFamilyRegistry,
   executeQueryFamily,
+  queryFamilyDependencies,
   registerQueryFamilyInvalidation,
   queryFamilyChangedSince,
 } from '../build/query-family.mjs';
@@ -343,6 +344,89 @@ test('a foreign principal cannot read another principal\'s family field', () => 
     );
     const own = run(registry, db, bob, { fieldId: 'f-bob', op: 'contains', value: 'hidden' });
     assert.deepEqual(own.rows.map((row) => row.id), ['a4']);
+  } finally {
+    db.close();
+  }
+});
+
+test('family invalidation harvests grant fields from scopeAst', () => {
+  const Host = entity('FamAstHost', {
+    title: text(),
+    teamId: text(),
+    projectId: text(),
+    grant: () => [scope(({ fields }) => fields.teamId.is('acme')).can(() => grant(read, subscribe))],
+  });
+  const slice = makeSlice();
+  const family = compileQueryFamily({
+    name: 'astHost',
+    host: Host,
+    catalog: slice.ValueSet,
+    elements: slice.ValueElement,
+    hostKey: 'hostId',
+    fieldKey: 'fieldId',
+    typeField: 'valueType',
+    valueColumns: {
+      text: 'textValue',
+      number: 'numberValue',
+      epoch: 'epochValue',
+      boolean: 'booleanValue',
+      option: 'optionValue',
+    },
+  });
+  const hostDep = queryFamilyDependencies(family, 'Project:p1').find((dep) => dep.entity === 'FamAstHost');
+  assert.ok(hostDep.fields.includes('teamId'), 'scopeAst grant field must invalidate the family');
+});
+
+test('a family grant-field change invalidates', () => {
+  const { db, Artefact, ValueSet, ValueElement } = setup();
+  try {
+    const family = familyOf({ Artefact, ValueSet, ValueElement });
+    const hub = createQueryInvalidationHub();
+    const revision = readCommittedRevision(db);
+    registerQueryFamilyInvalidation(hub, {
+      id: 'grant-field',
+      family,
+      principal: alice,
+      db,
+      revision,
+      scope: 'Project:p1',
+    });
+    hub.notice([{
+      type: fieldSet('Artefact', 'owner').type,
+      handle: fieldSet('Artefact', 'owner'),
+      scope: 'Artefact:a1',
+      data: { id: 'a1', owner: 'bob', projectId: 'p1' },
+      committedAt: 't',
+    }], revision + 1);
+    assert.equal(queryFamilyChangedSince(hub, {
+      id: 'grant-field',
+      family,
+      principal: alice,
+      sinceRevision: revision,
+      revision: revision + 1,
+    }).kind, 'changed');
+  } finally {
+    db.close();
+  }
+});
+
+test('family invalidation registration is atomic against the slot cap', () => {
+  const { db, Artefact, ValueSet, ValueElement } = setup();
+  try {
+    const family = familyOf({ Artefact, ValueSet, ValueElement });
+    const hub = createQueryInvalidationHub({ maxRegistrations: 2 });
+    assert.throws(
+      () => registerQueryFamilyInvalidation(hub, {
+        id: 'overflow',
+        family,
+        principal: alice,
+        db,
+        revision: readCommittedRevision(db),
+        scope: 'Project:p1',
+      }),
+      /at most 2 query registrations/,
+    );
+    assert.equal(hub.size, 0, 'overflow must not leave a partial family registration');
   } finally {
     db.close();
   }

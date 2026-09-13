@@ -190,9 +190,12 @@ dynamic predicate.
    gate.)
 5. **Change delivery.** Bounded refetch. Row-level patches only if later
    measurements justify them.
-6. **Invalidation registration cap.** 32 per client (one hub per client
-   connection), failing closed — confirmed. Author-declared query families are
-   a small compile-time set and are not that cap.
+6. **Invalidation registration cap.** 32 slots per client (one hub per client
+   connection), failing closed — confirmed. A live family subscription occupies
+   **three** slots (host, catalog, elements) and is registered atomically: if
+   those three would exceed the cap, none are stored. Author-declared family
+   *definitions* (the compile-time registry) are a small set and are not this
+   cap.
 
 ## Deferred (not owner-blocking)
 

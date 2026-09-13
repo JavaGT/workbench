@@ -66,6 +66,7 @@ export {
   createQueryInvalidationConsumer,
   QueryScopedReadError,
   QueryContentionError,
+  queryAuthorizationFields,
   compileFilterPredicate,
   keysetSql,
   selectAuthorizedPage,

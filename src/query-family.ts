@@ -8,6 +8,7 @@
 import { canonicalStringify } from './canonical-json.ts';
 import {
   compileFilterPredicate,
+  queryAuthorizationFields,
   QueryScopedReadError,
   QUERY_OPERATORS,
   namespaceSqlParams,
@@ -246,16 +247,17 @@ export function queryFamilyDependencies(
   scope: string,
   scopeField?: string,
 ): readonly QueryDependency[] {
-  const hostFields = Object.freeze(['owner', 'projectId'].filter((name) => Boolean(family.host.fields[name])));
-  const elementFields = Object.freeze([
-    family.hostKey,
-    family.fieldKey,
-    ...DYNAMIC_VALUE_TYPES.map((type) => family.valueColumns[type]),
-  ]);
+  const extra = (entity: QueryEntity, more: readonly string[]) =>
+    Object.freeze([...new Set([...queryAuthorizationFields(entity), ...more])]);
   return Object.freeze([
-    Object.freeze({ entity: family.host.name, fields: hostFields, scope, ...(scopeField ? { scopeField } : {}) }),
-    Object.freeze({ entity: family.catalog.name, fields: Object.freeze([family.typeField]), scope, ...(scopeField ? { scopeField } : {}) }),
-    Object.freeze({ entity: family.elements.name, fields: elementFields, scope, ...(scopeField ? { scopeField } : {}) }),
+    Object.freeze({ entity: family.host.name, fields: extra(family.host, []), scope, ...(scopeField ? { scopeField } : {}) }),
+    Object.freeze({ entity: family.catalog.name, fields: extra(family.catalog, [family.typeField]), scope, ...(scopeField ? { scopeField } : {}) }),
+    Object.freeze({
+      entity: family.elements.name,
+      fields: extra(family.elements, [family.hostKey, family.fieldKey, ...DYNAMIC_VALUE_TYPES.map((type) => family.valueColumns[type])]),
+      scope,
+      ...(scopeField ? { scopeField } : {}),
+    }),
   ]);
 }
 
@@ -276,16 +278,14 @@ export function registerQueryFamilyInvalidation(
     [input.family.catalog.name]: input.family.catalog,
     [input.family.elements.name]: input.family.elements,
   };
-  for (const dependency of queryFamilyDependencies(input.family, input.scope, input.scopeField)) {
-    hub.register({
-      id: `${input.id}:${dependency.entity}`,
-      dependency,
-      principal: input.principal,
-      entity: entities[dependency.entity]!,
-      db: input.db,
-      revision: input.revision,
-    });
-  }
+  hub.registerMany(queryFamilyDependencies(input.family, input.scope, input.scopeField).map((dependency) => ({
+    id: `${input.id}:${dependency.entity}`,
+    dependency,
+    principal: input.principal,
+    entity: entities[dependency.entity]!,
+    db: input.db,
+    revision: input.revision,
+  })));
 }
 
 export function queryFamilyChangedSince(

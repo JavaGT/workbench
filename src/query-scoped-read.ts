@@ -208,7 +208,7 @@ function collectAstFields(ast: unknown, result: Set<string>, seen = new Set<obje
   }
 }
 
-function authorizationFields(entity: QueryEntity): string[] {
+export function queryAuthorizationFields(entity: QueryEntity): string[] {
   const out = new Set<string>();
   if (entity.scopeAst) collectAstFields(entity.scopeAst, out);
   for (const [name, descriptor] of Object.entries(entity.fields ?? {})) {
@@ -366,7 +366,7 @@ export function compileQueryContract(input: unknown, entity: QueryEntity): Compi
     pageSize,
   });
   const dependencyFields = Object.freeze([
-    ...new Set([...filters.map((filter) => filter.field), sortField, ...authorizationFields(entity)]),
+    ...new Set([...filters.map((filter) => filter.field), sortField, ...queryAuthorizationFields(entity)]),
   ]);
   return Object.freeze({
     entity: entity.name,
@@ -733,14 +733,14 @@ export function createQueryInvalidationHub(options: { maxRegistrations?: number 
     return `${principalKey}\n${id}`;
   }
 
-  function register(input: {
+  function prepare(input: {
     id: string;
     dependency: QueryDependency;
     principal: unknown;
     entity: QueryEntity;
     db: QueryDb;
     revision: number;
-  }): void {
+  }): { key: string; record: QueryRegistration } {
     if (typeof input.id !== 'string' || input.id.length === 0) fail('registration id is required.');
     if (!Number.isSafeInteger(input.revision)) fail('registration revision must be a safe integer.');
     const principalKey = queryPrincipalKey(input.principal);
@@ -752,21 +752,50 @@ export function createQueryInvalidationHub(options: { maxRegistrations?: number 
     if (!tryParseScopeKey(input.dependency.scope)) fail('dependency scope must be a Scope handle.');
     const scopeField = resolveScopeField(input.entity, input.dependency.scope, input.dependency.scopeField);
     assertVisibleInScope(input.db, input.entity, input.principal, input.dependency.scope, scopeField);
-    const key = slot(principalKey, input.id);
-    if (!registrations.has(key) && registrations.size >= maxRegistrations) {
+    return {
+      key: slot(principalKey, input.id),
+      record: {
+        id: input.id,
+        entityName: input.dependency.entity,
+        fields: new Set(input.dependency.fields),
+        scope: input.dependency.scope,
+        scopeField,
+        principalKey,
+        compiledEntity: input.entity,
+        lastInvalidatedRevision: null,
+        registeredAtRevision: input.revision,
+      },
+    };
+  }
+
+  function commitPrepared(prepared: readonly { key: string; record: QueryRegistration }[]): void {
+    const newKeys = new Set(prepared.filter((entry) => !registrations.has(entry.key)).map((entry) => entry.key));
+    if (registrations.size + newKeys.size > maxRegistrations) {
       fail(`at most ${maxRegistrations} query registrations may be active.`);
     }
-    registrations.set(key, {
-      id: input.id,
-      entityName: input.dependency.entity,
-      fields: new Set(input.dependency.fields),
-      scope: input.dependency.scope,
-      scopeField,
-      principalKey,
-      compiledEntity: input.entity,
-      lastInvalidatedRevision: null,
-      registeredAtRevision: input.revision,
-    });
+    for (const entry of prepared) registrations.set(entry.key, entry.record);
+  }
+
+  function register(input: {
+    id: string;
+    dependency: QueryDependency;
+    principal: unknown;
+    entity: QueryEntity;
+    db: QueryDb;
+    revision: number;
+  }): void {
+    commitPrepared([prepare(input)]);
+  }
+
+  function registerMany(inputs: ReadonlyArray<{
+    id: string;
+    dependency: QueryDependency;
+    principal: unknown;
+    entity: QueryEntity;
+    db: QueryDb;
+    revision: number;
+  }>): void {
+    commitPrepared(inputs.map(prepare));
   }
 
   function unregister(id: string, principal: unknown): void {
@@ -821,6 +850,7 @@ export function createQueryInvalidationHub(options: { maxRegistrations?: number 
 
   return {
     register,
+    registerMany,
     unregister,
     notice,
     changedSince,

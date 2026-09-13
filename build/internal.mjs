@@ -67,6 +67,10 @@ export {
   QueryScopedReadError,
   QueryContentionError,
   compileFilterPredicate,
+  keysetSql,
+  selectAuthorizedPage,
+  withRevisionFence,
+  asSafeRevision,
   QUERY_OPERATORS,
   OPERATORS_BY_FIELD_TYPE,
   QUERY_PAGE_SIZE_MIN,
@@ -84,6 +88,9 @@ export {
   compileQueryFamily,
   executeQueryFamily,
   createQueryFamilyRegistry,
+  queryFamilyDependencies,
+  registerQueryFamilyInvalidation,
+  queryFamilyChangedSince,
   DYNAMIC_VALUE_TYPES,
 
 

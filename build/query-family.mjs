@@ -8,13 +8,13 @@
 import { canonicalStringify } from './canonical-json.mjs';
 import {
   compileFilterPredicate,
-  compileQueryContract,
-  QueryContentionError,
   QueryScopedReadError,
   QUERY_OPERATORS,
-  QUERY_PAGE_SIZE_MIN,
-  QUERY_PAGE_SIZE_MAX,
-  readCommittedRevision,
+  selectAuthorizedPage,
+  withRevisionFence,
+
+
+
 
 
 
@@ -78,9 +78,25 @@ function identifier(name        , label        )         {
 
 
 
-function requireColumn(entity             , field        , label        )         {
+const VALUE_COLUMN_TYPES                                                        = Object.freeze({
+  text: Object.freeze(['text']),
+  number: Object.freeze(['number']),
+  epoch: Object.freeze(['number', 'date']),
+  boolean: Object.freeze(['boolean']),
+  option: Object.freeze(['text', 'ref']),
+});
+
+function requireColumn(entity             , field        , label        , allowedTypes                    )         {
   identifier(field, label);
-  if (field !== 'id' && !entity.fields[field]) fail(`${label} '${field}' is not a declared field on ${entity.name}.`);
+  if (field === 'id') {
+    if (allowedTypes && !allowedTypes.includes('text')) fail(`${label} 'id' is not a ${allowedTypes.join('/')} field.`);
+    return field;
+  }
+  const descriptor = entity.fields[field];
+  if (!descriptor) fail(`${label} '${field}' is not a declared field on ${entity.name}.`);
+  if (allowedTypes && !allowedTypes.includes(descriptor.type ?? '')) {
+    fail(`${label} '${field}' must be a ${allowedTypes.join('/')} field.`);
+  }
   return field;
 }
 
@@ -97,15 +113,15 @@ export function compileQueryFamily(input         )                      {
   identifier(declaration.host.name, 'host entity');
   identifier(declaration.catalog.name, 'catalog entity');
   identifier(declaration.elements.name, 'elements entity');
-  const hostKey = requireColumn(declaration.elements, declaration.hostKey, 'hostKey');
-  const fieldKey = requireColumn(declaration.elements, declaration.fieldKey, 'fieldKey');
-  const typeField = requireColumn(declaration.catalog, declaration.typeField, 'typeField');
+  const hostKey = requireColumn(declaration.elements, declaration.hostKey, 'hostKey', ['text', 'ref']);
+  const fieldKey = requireColumn(declaration.elements, declaration.fieldKey, 'fieldKey', ['text', 'ref']);
+  const typeField = requireColumn(declaration.catalog, declaration.typeField, 'typeField', ['text']);
   if (!declaration.valueColumns || typeof declaration.valueColumns !== 'object') fail('valueColumns is required.');
   const valueColumns = {}                                    ;
   for (const type of DYNAMIC_VALUE_TYPES) {
     const column = declaration.valueColumns[type];
     if (typeof column !== 'string') fail(`valueColumns.${type} is required.`);
-    valueColumns[type] = requireColumn(declaration.elements, column, `valueColumns.${type}`);
+    valueColumns[type] = requireColumn(declaration.elements, column, `valueColumns.${type}`, VALUE_COLUMN_TYPES[type]);
   }
   return Object.freeze({
     name: declaration.name,
@@ -137,17 +153,33 @@ function readCatalogType(
   return valueType                    ;
 }
 
+function elementGrantSql(
+  family                     ,
+  principal         ,
+  params                         ,
+)         {
+  if (typeof family.elements.scopeFilter !== 'function') fail('elements entity has no compiled grant filter.');
+  const grant = family.elements.scopeFilter(principal);
+  Object.assign(params, grant.params);
+  const table = identifier(family.elements.name, 'elements entity');
+  // Re-authorize in a subquery whose only alias is t0 so compiled grants
+  // (bare `owner` or `t0.owner`) cannot bind to the outer host row.
+  return `e.id IN (SELECT t0.id FROM ${table} AS t0 WHERE (${grant.sql}))`;
+}
+
 function elementMatchSql(
   family                     ,
   fieldType                  ,
   op               ,
   value         ,
+  principal         ,
   params                         ,
 )         {
   const valueColumn = `e.${identifier(family.valueColumns[fieldType], 'value column')}`;
   const fieldColumn = `e.${identifier(family.fieldKey, 'fieldKey')}`;
   const hostRef = `e.${identifier(family.hostKey, 'hostKey')}`;
   const table = identifier(family.elements.name, 'elements entity');
+  const visible = elementGrantSql(family, principal, params);
   if (op === 'isEmpty') {
     const nonEmpty = compileFilterPredicate({
       column: valueColumn,
@@ -157,7 +189,7 @@ function elementMatchSql(
       params,
       index: 0,
     });
-    return `NOT EXISTS (SELECT 1 FROM ${table} AS e WHERE ${hostRef} = t0.id AND ${fieldColumn} = :query_field_id AND ${nonEmpty})`;
+    return `NOT EXISTS (SELECT 1 FROM ${table} AS e WHERE ${hostRef} = t0.id AND ${fieldColumn} = :query_field_id AND ${nonEmpty} AND ${visible})`;
   }
   const predicate = compileFilterPredicate({
     column: valueColumn,
@@ -167,7 +199,7 @@ function elementMatchSql(
     params,
     index: 0,
   });
-  return `EXISTS (SELECT 1 FROM ${table} AS e WHERE ${hostRef} = t0.id AND ${fieldColumn} = :query_field_id AND ${predicate})`;
+  return `EXISTS (SELECT 1 FROM ${table} AS e WHERE ${hostRef} = t0.id AND ${fieldColumn} = :query_field_id AND ${predicate} AND ${visible})`;
 }
 
 export function executeQueryFamily(
@@ -181,22 +213,6 @@ export function executeQueryFamily(
   const input = request                      ;
   if (typeof input.fieldId !== 'string' || input.fieldId.length === 0) fail('fieldId is required.');
   if (!(QUERY_OPERATORS                     ).includes(input.op)) fail('a filter uses an unsupported operator.');
-  const fieldType = readCatalogType(db, family, principal, input.fieldId);
-
-  const params                          = { query_field_id: input.fieldId };
-  const match = elementMatchSql(family, fieldType, input.op, input.value, params);
-
-  const compiled = compileQueryContract({
-    entity: family.host.name,
-    filters: [],
-    sort: input.sort,
-    pageSize: input.pageSize,
-  }, family.host);
-
-  if (!Number.isSafeInteger(input.pageSize) || input.pageSize < QUERY_PAGE_SIZE_MIN || input.pageSize > QUERY_PAGE_SIZE_MAX) {
-    fail(`pageSize must be an integer from ${QUERY_PAGE_SIZE_MIN} through ${QUERY_PAGE_SIZE_MAX}.`);
-  }
-
   const identity = canonicalStringify({
     family: family.name,
     fieldId: input.fieldId,
@@ -205,71 +221,97 @@ export function executeQueryFamily(
     sort: input.sort,
     pageSize: input.pageSize,
   });
-
   if (input.cursor && input.cursor.queryIdentity !== identity) fail('page token does not match this query.');
+  return withRevisionFence(db, () => {
+    const fieldType = readCatalogType(db, family, principal, input.fieldId);
+    const extraParams                          = { query_field_id: input.fieldId };
+    const extraWhere = elementMatchSql(family, fieldType, input.op, input.value, principal, extraParams);
+    return selectAuthorizedPage(db, family.host, principal, {
+      identity,
+      extraWhere,
+      extraParams,
+      sort: input.sort,
+      pageSize: input.pageSize,
+      cursor: input.cursor,
+      includeCount: input.includeCount === true,
+    });
+  });
+}
 
-  const includeCount = input.includeCount === true;
-  let lastError               = null;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    const before = readCommittedRevision(db);
-    if (typeof family.host.scopeFilter !== 'function') fail('host entity has no compiled grant filter.');
-    const grant = family.host.scopeFilter(principal);
-    const runParams = { ...grant.params, ...params };
-    const sortField = input.sort?.field;
-    if (typeof sortField !== 'string') fail('sort is required.');
-    const direction = input.sort.direction === 'desc' ? 'DESC' : 'ASC';
-    const sortColumn = `t0.${identifier(sortField, 'sort field')}`;
-    const parts = [`(${grant.sql})`, `(${match})`];
-    if (input.cursor) {
-      if (typeof input.cursor.id !== 'string' || input.cursor.id.length === 0) fail('page token id is required.');
-      runParams.query_cursor_sort = input.cursor.sortValue;
-      runParams.query_cursor_id = input.cursor.id;
-      if (direction === 'ASC') {
-        parts.push(`(
-          (:query_cursor_sort IS NULL AND ${sortColumn} IS NULL AND t0.id > :query_cursor_id)
-          OR (:query_cursor_sort IS NULL AND ${sortColumn} IS NOT NULL)
-          OR (:query_cursor_sort IS NOT NULL AND ${sortColumn} > :query_cursor_sort)
-          OR (:query_cursor_sort IS NOT NULL AND ${sortColumn} = :query_cursor_sort AND t0.id > :query_cursor_id)
-        )`);
-      } else {
-        parts.push(`(
-          (:query_cursor_sort IS NULL AND ${sortColumn} IS NULL AND t0.id > :query_cursor_id)
-          OR (:query_cursor_sort IS NOT NULL AND ${sortColumn} < :query_cursor_sort)
-          OR (:query_cursor_sort IS NOT NULL AND ${sortColumn} = :query_cursor_sort AND t0.id > :query_cursor_id)
-          OR (:query_cursor_sort IS NOT NULL AND ${sortColumn} IS NULL)
-        )`);
-      }
-    }
-    const where = parts.join(' AND ');
-    runParams.query_limit = compiled.pageSize + 1;
-    const sql = `SELECT * FROM ${identifier(family.host.name, 'host entity')} AS t0 WHERE ${where} ORDER BY ${sortColumn} ${direction}, t0.id ASC LIMIT :query_limit`;
-    const fetched = db.prepare(sql).all(runParams).map((row) => Object.freeze({ ...row }));
-    const hasMore = fetched.length > compiled.pageSize;
-    const rows = hasMore ? fetched.slice(0, compiled.pageSize) : fetched;
-    const last = rows.at(-1);
-    const nextCursor = hasMore && last
-      ? Object.freeze({ queryIdentity: identity, sortValue: last[sortField], id: String(last.id) })
-      : null;
-    let count                    ;
-    if (includeCount) {
-      const countParams = { ...grant.params, ...params };
-      const countRow = db.prepare(`SELECT COUNT(*) AS n FROM ${identifier(family.host.name, 'host entity')} AS t0 WHERE (${grant.sql}) AND (${match})`).get(countParams);
-      const n = countRow?.n;
-      count = typeof n === 'bigint' ? Number(n) : Number(n ?? 0);
-    }
-    const after = readCommittedRevision(db);
-    if (before === after) {
-      return Object.freeze({
-        rows: Object.freeze(rows),
-        revision: after,
-        nextCursor,
-        queryIdentity: identity,
-        ...(includeCount ? { count } : {}),
-      });
-    }
-    lastError = new QueryContentionError();
+export function queryFamilyDependencies(
+  family                     ,
+  scope        ,
+  scopeField         ,
+)                             {
+  const hostFields = Object.freeze(['owner', 'projectId'].filter((name) => Boolean(family.host.fields[name])));
+  const elementFields = Object.freeze([
+    family.hostKey,
+    family.fieldKey,
+    ...DYNAMIC_VALUE_TYPES.map((type) => family.valueColumns[type]),
+  ]);
+  return Object.freeze([
+    Object.freeze({ entity: family.host.name, fields: hostFields, scope, ...(scopeField ? { scopeField } : {}) }),
+    Object.freeze({ entity: family.catalog.name, fields: Object.freeze([family.typeField]), scope, ...(scopeField ? { scopeField } : {}) }),
+    Object.freeze({ entity: family.elements.name, fields: elementFields, scope, ...(scopeField ? { scopeField } : {}) }),
+  ]);
+}
+
+export function registerQueryFamilyInvalidation(
+  hub                      ,
+  input
+
+
+
+
+
+
+
+   ,
+)       {
+  const entities                              = {
+    [input.family.host.name]: input.family.host,
+    [input.family.catalog.name]: input.family.catalog,
+    [input.family.elements.name]: input.family.elements,
+  };
+  for (const dependency of queryFamilyDependencies(input.family, input.scope, input.scopeField)) {
+    hub.register({
+      id: `${input.id}:${dependency.entity}`,
+      dependency,
+      principal: input.principal,
+      entity: entities[dependency.entity] ,
+      db: input.db,
+      revision: input.revision,
+    });
   }
-  throw lastError ?? new QueryContentionError();
+}
+
+export function queryFamilyChangedSince(
+  hub                      ,
+  input
+
+
+
+
+
+   ,
+)                          {
+  const names = [input.family.host.name, input.family.catalog.name, input.family.elements.name];
+  const signals = names.map((entity) => hub.changedSince({
+    id: `${input.id}:${entity}`,
+    principal: input.principal,
+    sinceRevision: input.sinceRevision,
+    revision: input.revision,
+  }));
+  if (signals.some((signal) => signal.kind === 'denied')) {
+    return Object.freeze({ kind: 'denied', revision: input.revision });
+  }
+  if (signals.some((signal) => signal.kind === 'resync')) {
+    return Object.freeze({ kind: 'resync', revision: input.revision });
+  }
+  if (signals.some((signal) => signal.kind === 'changed')) {
+    return Object.freeze({ kind: 'changed', revision: input.revision });
+  }
+  return Object.freeze({ kind: 'unchanged', revision: input.revision });
 }
 
 export function createQueryFamilyRegistry() {

@@ -58,8 +58,13 @@ rejected. Page tokens are never authorization.
 **Null and empty:** `eq` / range / `in` / `contains` reject `null` at compile.
 `isEmpty` / `isNotEmpty` are the empty operators and do not take a value. On a
 declared column, empty means SQL NULL (and, for text, `''`). On a dynamic
-field (query family), empty means no non-empty element row. Stored NULL sort
-keys still traverse (SQLite orders NULLs first in ASC, last in DESC).
+field (query family), empty means no non-empty **authorized** element row.
+Stored NULL sort keys still traverse (SQLite orders NULLs first in ASC, last
+in DESC).
+
+**Date predicates:** `date()` fields are stored as INTEGER epoch millis. A
+filter value may be a finite number (millis) or an ISO-8601 string, which is
+converted to millis before binding. Invalid strings fail closed.
 
 Historical pagination (a page at a past revision) is out of scope: SQLite cannot
 reconstruct old rows from a revision token. Every page is read at the current
@@ -185,7 +190,9 @@ dynamic predicate.
    gate.)
 5. **Change delivery.** Bounded refetch. Row-level patches only if later
    measurements justify them.
-6. **Registration cap.** 32 per hub, failing closed — confirmed.
+6. **Invalidation registration cap.** 32 per client (one hub per client
+   connection), failing closed — confirmed. Author-declared query families are
+   a small compile-time set and are not that cap.
 
 ## Deferred (not owner-blocking)
 
@@ -200,5 +207,7 @@ dynamic predicate.
 - Scope integration (pin bump, surface migration) is a later phase; this ADR
   does not change Scope.
 - Invalidation storms, unindexed dynamic queries, and cache growth remain
-  tracked risks; page size, operator set, family registration, and refetch
-  stay bounded rather than introducing incremental result maintenance.
+  tracked risks; page size, operator set, per-client invalidation cap, and
+  refetch stay bounded rather than introducing incremental result maintenance.
+  Element rows in a family join are re-authorized with the element's compiled
+  grant so a foreign-owned value cannot change another principal's membership.

@@ -15,10 +15,13 @@ import {
 import {
   compileQueryFamily,
   createQueryFamilyRegistry,
+  registerQueryFamilyInvalidation,
+  queryFamilyChangedSince,
 } from '../build/query-family.mjs';
 import { fieldSet } from '../build/event-handle.mjs';
 
 const alice = principal({ type: 'user', id: 'alice' });
+const bob = principal({ type: 'user', id: 'bob' });
 const ownerGrant = () => [scope(({ is }) => is.owner()).can(() => grant(read, subscribe))];
 
 function makeSlice() {
@@ -80,6 +83,7 @@ function seed(db, { Artefact, ValueSet, ValueElement }) {
   el.run('e10', 'a1', 'f-opt', null, null, null, null, 'photo', 'p1', 'alice');
   el.run('e11', 'a2', 'f-opt', null, null, null, null, 'clip', 'p1', 'alice');
   el.run('e12', 'a4', 'f-bob', 'hidden', null, null, null, null, 'p2', 'bob');
+  el.run('e-leak', 'a1', 'f-text', 'banana', null, null, null, null, 'p1', 'bob');
 }
 
 function familyOf(slice) {
@@ -219,18 +223,19 @@ test('pagination boundaries and count on a dynamic filter', () => {
 });
 
 test('a membership-changing element edit invalidates and refetches', () => {
-  const { db, registry, ValueElement } = setup();
+  const { db, registry, Artefact, ValueSet, ValueElement } = setup();
   try {
     const before = run(registry, db, alice, { fieldId: 'f-text', op: 'contains', value: 'apple', includeCount: true });
     assert.equal(before.count, 1);
     const hub = createQueryInvalidationHub();
-    hub.register({
+    const family = familyOf({ Artefact, ValueSet, ValueElement });
+    registerQueryFamilyInvalidation(hub, {
       id: 'by-label',
-      dependency: { entity: 'ValueElement', fields: ['textValue', 'fieldId'], scope: 'Project:p1' },
+      family,
       principal: alice,
-      entity: ValueElement,
       db,
       revision: before.revision,
+      scope: 'Project:p1',
     });
     db.prepare("UPDATE ValueElement SET textValue = 'red plum' WHERE id = 'e1'").run();
     db.prepare("UPDATE _CommittedRevision SET revision = revision + 1 WHERE name = 'actions'").run();
@@ -242,8 +247,9 @@ test('a membership-changing element edit invalidates and refetches', () => {
       data: { id: 'e1', textValue: 'red plum', projectId: 'p1' },
       committedAt: 't',
     }], revision);
-    assert.equal(hub.changedSince({
+    assert.equal(queryFamilyChangedSince(hub, {
       id: 'by-label',
+      family,
       principal: alice,
       sinceRevision: before.revision,
       revision,
@@ -254,4 +260,51 @@ test('a membership-changing element edit invalidates and refetches', () => {
   } finally {
     db.close();
   }
+});
+
+test('a foreign-owned element on an owned host does not match', () => {
+  const { db, registry } = setup();
+  try {
+    const page = run(registry, db, alice, { fieldId: 'f-text', op: 'contains', value: 'banana' });
+    assert.deepEqual(page.rows, [], 'element grant filters bob-owned values off alice hosts');
+  } finally {
+    db.close();
+  }
+});
+
+test('a foreign principal cannot read another principal\'s family field', () => {
+  const { db, registry } = setup();
+  try {
+    assert.throws(
+      () => run(registry, db, bob, { fieldId: 'f-text', op: 'contains', value: 'apple' }),
+      /unknown field/,
+    );
+    const own = run(registry, db, bob, { fieldId: 'f-bob', op: 'contains', value: 'hidden' });
+    assert.deepEqual(own.rows.map((row) => row.id), ['a4']);
+  } finally {
+    db.close();
+  }
+});
+
+test('family registration rejects a value column with the wrong declared type', () => {
+  const slice = makeSlice();
+  assert.throws(
+    () => compileQueryFamily({
+      name: 'badTypes',
+      host: slice.Artefact,
+      catalog: slice.ValueSet,
+      elements: slice.ValueElement,
+      hostKey: 'hostId',
+      fieldKey: 'fieldId',
+      typeField: 'valueType',
+      valueColumns: {
+        text: 'numberValue',
+        number: 'numberValue',
+        epoch: 'epochValue',
+        boolean: 'booleanValue',
+        option: 'optionValue',
+      },
+    }),
+    /valueColumns.text 'numberValue' must be a text field/,
+  );
 });

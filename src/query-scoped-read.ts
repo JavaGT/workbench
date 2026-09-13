@@ -231,17 +231,38 @@ function operatorsFor(fieldType: string): readonly QueryOperator[] {
   return allowed;
 }
 
+function bindDateValue(value: unknown, label: string): number {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string') {
+    const ms = Date.parse(value);
+    if (!Number.isFinite(ms)) fail(`${label} must be a finite number or ISO date string.`);
+    return ms;
+  }
+  fail(`${label} must be a finite number or ISO date string.`);
+}
+
 function assertTypedValue(fieldType: string, value: unknown, label: string): void {
   assertSqlValue(value, label);
   if (fieldType === 'boolean') {
     if (typeof value !== 'boolean') fail(`${label} must be a boolean.`);
     return;
   }
-  if (fieldType === 'number' || fieldType === 'date' || fieldType === 'epoch') {
+  if (fieldType === 'date') {
+    bindDateValue(value, label);
+    return;
+  }
+  if (fieldType === 'number' || fieldType === 'epoch') {
     if (typeof value !== 'number' || !Number.isFinite(value)) fail(`${label} must be a finite number.`);
     return;
   }
   if (typeof value !== 'string') fail(`${label} must be a string.`);
+}
+
+function bindTypedValue(fieldType: string, value: unknown, label: string): unknown {
+  if (fieldType === 'date') return bindDateValue(value, label);
+  assertTypedValue(fieldType, value, label);
+  if (fieldType === 'boolean') return value ? 1 : 0;
+  return value;
 }
 
 function escapeLike(value: string): string {
@@ -272,9 +293,8 @@ export function compileFilterPredicate(input: {
       fail('in requires 1 through 100 values.');
     }
     const names = input.value.map((item, itemIndex) => {
-      assertTypedValue(input.fieldType, item, 'in value');
       const name = `query_f${input.index}_${itemIndex}`;
-      input.params[name] = item;
+      input.params[name] = bindTypedValue(input.fieldType, item, 'in value');
       return `:${name}`;
     });
     return `${column} IN (${names.join(', ')})`;
@@ -285,9 +305,8 @@ export function compileFilterPredicate(input: {
     input.params[name] = escapeLike(input.value);
     return `${column} LIKE '%' || :${name} || '%' ESCAPE '\\'`;
   }
-  assertTypedValue(input.fieldType, input.value, 'filter value');
   const name = `query_f${input.index}`;
-  input.params[name] = input.fieldType === 'boolean' ? (input.value ? 1 : 0) : input.value;
+  input.params[name] = bindTypedValue(input.fieldType, input.value, 'filter value');
   const operator = ({ eq: '=', gt: '>', gte: '>=', lt: '<', lte: '<=' } as const)[input.op];
   return `${column} ${operator} :${name}`;
 }
@@ -359,7 +378,7 @@ export function compileQueryContract(input: unknown, entity: QueryEntity): Compi
   });
 }
 
-function asSafeRevision(value: unknown, label: string): number {
+export function asSafeRevision(value: unknown, label: string): number {
   if (typeof value === 'number') {
     if (Number.isSafeInteger(value)) return value;
     fail(`${label} exceeds safe range.`);
@@ -436,7 +455,7 @@ function filterSql(compiled: CompiledQuery, entity: QueryEntity, params: Record<
   return compiled.filters.map((filter, index) => compileFilter(filter, declared, entity, params, index).sql).join(' AND ');
 }
 
-function keysetSql(sortColumn: string, direction: 'asc' | 'desc', cursor: QueryCursor, params: Record<string, unknown>): string {
+export function keysetSql(sortColumn: string, direction: 'asc' | 'desc', cursor: QueryCursor, params: Record<string, unknown>): string {
   params.query_cursor_sort = cursor.sortValue;
   params.query_cursor_id = cursor.id;
   const sort = sortColumn;
@@ -456,25 +475,84 @@ function keysetSql(sortColumn: string, direction: 'asc' | 'desc', cursor: QueryC
   )`;
 }
 
-function whereSql(
-  compiled: CompiledQuery,
+export function selectAuthorizedPage(
+  db: QueryDb,
   entity: QueryEntity,
   principal: unknown,
-  cursor: QueryCursor | null | undefined,
-  params: Record<string, unknown>,
-): string {
+  input: {
+    identity: string;
+    extraWhere?: string | null;
+    extraParams?: Record<string, unknown>;
+    sort: QuerySort;
+    pageSize: number;
+    cursor?: QueryCursor | null;
+    includeCount?: boolean;
+  },
+): Omit<QueryPage, 'revision'> {
+  identifier(entity.name, 'entity name');
+  const sortField = input.sort?.field;
+  if (typeof sortField !== 'string') fail('sort is required.');
+  assertScalarField(entity, sortField, 'sort field');
+  if (input.sort.direction !== 'asc' && input.sort.direction !== 'desc') fail('sort direction must be asc or desc.');
+  if (!Number.isSafeInteger(input.pageSize) || input.pageSize < QUERY_PAGE_SIZE_MIN || input.pageSize > QUERY_PAGE_SIZE_MAX) {
+    fail(`pageSize must be an integer from ${QUERY_PAGE_SIZE_MIN} through ${QUERY_PAGE_SIZE_MAX}.`);
+  }
+  if (input.cursor) {
+    if (input.cursor.queryIdentity !== input.identity) fail('page token does not match this query.');
+    if (typeof input.cursor.id !== 'string' || input.cursor.id.length === 0) fail('page token id is required.');
+  }
+  const params: Record<string, unknown> = { ...(input.extraParams ?? {}) };
   const grant = grantFilter(entity, principal);
   Object.assign(params, grant.params);
   const parts = [grant.sql];
-  const extra = filterSql(compiled, entity, params);
-  if (extra) parts.push(extra);
-  if (cursor) {
-    if (cursor.queryIdentity !== compiled.identity) fail('page token does not match this query.');
-    if (typeof cursor.id !== 'string' || cursor.id.length === 0) fail('page token id is required.');
-    const sortColumn = `t0.${identifier(compiled.sort.field, 'sort field')}`;
-    parts.push(keysetSql(sortColumn, compiled.sort.direction, cursor, params));
+  if (input.extraWhere) parts.push(input.extraWhere);
+  if (input.cursor) {
+    const sortColumn = `t0.${identifier(sortField, 'sort field')}`;
+    parts.push(keysetSql(sortColumn, input.sort.direction, input.cursor, params));
   }
-  return parts.map((part) => `(${part})`).join(' AND ');
+  const where = parts.map((part) => `(${part})`).join(' AND ');
+  const sortColumn = `t0.${identifier(sortField, 'sort field')}`;
+  const direction = input.sort.direction === 'desc' ? 'DESC' : 'ASC';
+  params.query_limit = input.pageSize + 1;
+  const sql = `SELECT * FROM ${identifier(entity.name, 'entity name')} AS t0 WHERE ${where} ORDER BY ${sortColumn} ${direction}, t0.id ASC LIMIT :query_limit`;
+  const fetched = db.prepare(sql).all(params).map(detached);
+  const hasMore = fetched.length > input.pageSize;
+  const rows = hasMore ? fetched.slice(0, input.pageSize) : fetched;
+  const last = rows.at(-1);
+  const nextCursor = hasMore && last
+    ? Object.freeze({
+      queryIdentity: input.identity,
+      sortValue: last[sortField],
+      id: String(last.id),
+    })
+    : null;
+  let count: number | undefined;
+  if (input.includeCount === true) {
+    const countParams: Record<string, unknown> = { ...(input.extraParams ?? {}), ...grant.params };
+    const countParts = [grant.sql];
+    if (input.extraWhere) countParts.push(input.extraWhere);
+    const countWhere = countParts.map((part) => `(${part})`).join(' AND ');
+    const countRow = db.prepare(`SELECT COUNT(*) AS n FROM ${identifier(entity.name, 'entity name')} AS t0 WHERE ${countWhere}`).get(countParams);
+    count = asSafeRevision(countRow?.n ?? 0, 'count');
+  }
+  return {
+    rows: Object.freeze(rows),
+    nextCursor,
+    queryIdentity: input.identity,
+    ...(input.includeCount === true ? { count } : {}),
+  };
+}
+
+export function withRevisionFence(db: QueryDb, run: () => Omit<QueryPage, 'revision'>): QueryPage {
+  let lastContention: QueryContentionError | null = null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const before = readCommittedRevision(db);
+    const page = run();
+    const after = readCommittedRevision(db);
+    if (before === after) return Object.freeze({ ...page, revision: after });
+    lastContention = new QueryContentionError();
+  }
+  throw lastContention ?? new QueryContentionError();
 }
 
 function runPage(
@@ -485,38 +563,17 @@ function runPage(
   cursor: QueryCursor | null | undefined,
   includeCount: boolean,
 ): Omit<QueryPage, 'revision'> {
-  identifier(entity.name, 'entity name');
-  const params: Record<string, unknown> = {};
-  const where = whereSql(compiled, entity, principal, cursor, params);
-  const sortColumn = `t0.${identifier(compiled.sort.field, 'sort field')}`;
-  const direction = compiled.sort.direction === 'desc' ? 'DESC' : 'ASC';
-  const limit = compiled.pageSize + 1;
-  params.query_limit = limit;
-  const sql = `SELECT * FROM ${identifier(entity.name, 'entity name')} AS t0 WHERE ${where} ORDER BY ${sortColumn} ${direction}, t0.id ASC LIMIT :query_limit`;
-  const fetched = db.prepare(sql).all(params).map(detached);
-  const hasMore = fetched.length > compiled.pageSize;
-  const rows = hasMore ? fetched.slice(0, compiled.pageSize) : fetched;
-  const last = rows.at(-1);
-  const nextCursor = hasMore && last
-    ? Object.freeze({
-      queryIdentity: compiled.identity,
-      sortValue: last[compiled.sort.field],
-      id: String(last.id),
-    })
-    : null;
-  let count: number | undefined;
-  if (includeCount) {
-    const countParams: Record<string, unknown> = {};
-    const countWhere = whereSql(compiled, entity, principal, null, countParams);
-    const countRow = db.prepare(`SELECT COUNT(*) AS n FROM ${identifier(entity.name, 'entity name')} AS t0 WHERE ${countWhere}`).get(countParams);
-    count = asSafeRevision(countRow?.n ?? 0, 'count');
-  }
-  return {
-    rows: Object.freeze(rows),
-    nextCursor,
-    queryIdentity: compiled.identity,
-    ...(includeCount ? { count } : {}),
-  };
+  const extraParams: Record<string, unknown> = {};
+  const extra = filterSql(compiled, entity, extraParams);
+  return selectAuthorizedPage(db, entity, principal, {
+    identity: compiled.identity,
+    extraWhere: extra || null,
+    extraParams,
+    sort: compiled.sort,
+    pageSize: compiled.pageSize,
+    cursor,
+    includeCount,
+  });
 }
 
 export function executeQueryPage(
@@ -527,18 +584,7 @@ export function executeQueryPage(
   options: { cursor?: QueryCursor | null; includeCount?: boolean } = {},
 ): QueryPage {
   if (compiled.entity !== entity.name) fail('compiled query does not match the entity.');
-  const includeCount = options.includeCount === true;
-  let lastContention: QueryContentionError | null = null;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    const before = readCommittedRevision(db);
-    const page = runPage(db, entity, principal, compiled, options.cursor, includeCount);
-    const after = readCommittedRevision(db);
-    if (before === after) {
-      return Object.freeze({ ...page, revision: after });
-    }
-    lastContention = new QueryContentionError();
-  }
-  throw lastContention ?? new QueryContentionError();
+  return withRevisionFence(db, () => runPage(db, entity, principal, compiled, options.cursor, options.includeCount === true));
 }
 
 export function acceptQueryPage(heldRevision: number, incomingRevision: number): QueryPageDecision {

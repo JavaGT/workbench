@@ -1,7 +1,7 @@
 // Query-scoped reads (#225, ADR-0009): authorized pages with a revision token,
 // keyset pagination, invalidation + bounded refetch, and stale-response rejection.
 
-import { text, ref, number, grant, read, subscribe, scope } from '../build/index.mjs';
+import { text, ref, number, date, grant, read, subscribe, scope } from '../build/index.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
@@ -327,6 +327,48 @@ test('per-type operators accept valid cases and reject the rest', () => {
       pageSize: 10,
     }, Note);
     assert.ok(executeQueryPage(db, Note, alice, filled).rows.every((row) => row.id !== 'n4'));
+  } finally {
+    db.close();
+  }
+});
+
+test('date predicates accept ISO strings and finite numbers', () => {
+  const Dated = entity('Dated', {
+    title: text(),
+    startsAt: date(),
+    owner: ref('User', { role: 'owner', readonly: true }),
+    grant: () => [scope(({ is }) => is.owner()).can(() => grant(read, subscribe))],
+  });
+  const db = new DatabaseSync(':memory:');
+  try {
+    for (const sql of generateFrameworkDDL()) db.exec(sql);
+    for (const sql of generateDDL(Dated)) db.exec(sql);
+    const ms = Date.parse('2026-09-13T00:00:00.000Z');
+    db.prepare('INSERT INTO Dated (id, title, startsAt, owner) VALUES (?, ?, ?, ?)').run('e1', 'one', ms, 'alice');
+    db.prepare('INSERT INTO Dated (id, title, startsAt, owner) VALUES (?, ?, ?, ?)').run('e2', 'two', ms + 86_400_000, 'alice');
+    const byIso = compileQueryContract({
+      entity: 'Dated',
+      filters: [{ field: 'startsAt', op: 'eq', value: '2026-09-13T00:00:00.000Z' }],
+      sort: { field: 'id', direction: 'asc' },
+      pageSize: 10,
+    }, Dated);
+    assert.deepEqual(executeQueryPage(db, Dated, alice, byIso).rows.map((row) => row.id), ['e1']);
+    const byNumber = compileQueryContract({
+      entity: 'Dated',
+      filters: [{ field: 'startsAt', op: 'gt', value: ms }],
+      sort: { field: 'id', direction: 'asc' },
+      pageSize: 10,
+    }, Dated);
+    assert.deepEqual(executeQueryPage(db, Dated, alice, byNumber).rows.map((row) => row.id), ['e2']);
+    assert.throws(
+      () => compileQueryContract({
+        entity: 'Dated',
+        filters: [{ field: 'startsAt', op: 'eq', value: 'not-a-date' }],
+        sort: { field: 'id', direction: 'asc' },
+        pageSize: 10,
+      }, Dated),
+      /ISO date string/,
+    );
   } finally {
     db.close();
   }

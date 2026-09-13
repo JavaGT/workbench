@@ -79,6 +79,18 @@ _Avoid_: Effect, projection, queue message when meaning leased worker work
 The deliver-loop seam that re-authorizes and pushes committed events to subscribed clients.
 _Avoid_: WebSocket server, pub/sub, broadcast when meaning the framework delivery contract
 
+**Query-scoped read**:
+A bounded, authorized page of Entity rows selected by a typed query contract (allowlisted filters, single-key sort, keyset cursor), stamped with a revision token from the commit lifecycle.
+_Avoid_: Snapshot when meaning a filtered list page; collection subscription when meaning row-level patches; ad-hoc SQL
+
+**Revision token**:
+The `_CommittedRevision.actions` value captured with a query page, proving the page was read at that commit point.
+_Avoid_: Seq cursor (per-scope live position); page token as authorization
+
+**Query invalidation**:
+A post-commit "changed since revision R" signal for registered query dependencies; the client refetches a bounded page rather than applying row patches.
+_Avoid_: Row-level result patch; full snapshot replace
+
 **Kernel**:
 The framework's durable mutation-dispatch core: admit, handle, append to the committed log, project rows, and register engaged post-commit consumers.
 _Avoid_: Server, router, application container

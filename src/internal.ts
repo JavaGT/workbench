@@ -56,6 +56,27 @@ export { canUndoField, undoableFieldKinds } from './field-laws.ts';
 export { startSimulation } from './simulate.ts';
 export { generateTypes } from './generate-types.ts';
 export { parsePrincipalSnapshotScope } from './principal-snapshot-scope.ts';
+export {
+  compileQueryContract,
+  executeQueryPage,
+  acceptQueryPage,
+  overlayOptimisticQueryPage,
+  readCommittedRevision,
+  createQueryInvalidationHub,
+  createQueryInvalidationConsumer,
+  QueryScopedReadError,
+  QueryContentionError,
+  QUERY_OPERATORS,
+  QUERY_PAGE_SIZE_MIN,
+  QUERY_PAGE_SIZE_MAX,
+  type QueryContract,
+  type QueryCursor,
+  type CompiledQuery,
+  type QueryPage,
+  type QueryInvalidationSignal,
+  type QueryDependency,
+  type PendingQueryWrite,
+} from './query-scoped-read.ts';
 export { createPrincipalSnapshotTransaction } from './principal-snapshot-transaction.ts';
 export { WORKBENCH_MIGRATIONS, ensureWorkbenchMigrationTable, appliedWorkbenchVersion, runWorkbenchMigrations } from './workbench-migrations.ts';
 export {

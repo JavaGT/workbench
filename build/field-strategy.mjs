@@ -40,6 +40,7 @@ import { tryBetterAuthHash } from './hash-compat.mjs';
 
 
 
+
 // A typed failure for the validate stage. Stage 1 throws this and NOTHING
 // downstream runs (no apply, no persist, no emit) — a bad payload never proceeds
 // (SPEC §7 stage 1, fail closed). The message names the field path + reason.
@@ -165,6 +166,10 @@ export const STRATEGIES                                          = Object.freeze
   value: Object.freeze({
     laws: Object.freeze({ invertible: true, coalescible: true, idempotent: false, commutativeMerge: false }),
     validate(value         , descriptor                  ) {
+      // An optional field's stored absence is null (import normalization and
+      // the read side both represent it that way), so null validates for an
+      // optional descriptor; null still fails for required/nullable-only kinds.
+      if (value === null && descriptor?.optional === true) return true;
       switch (descriptor?.type) {
         case 'text':
           if (!isTextValue(value)) return 'expected a text value';

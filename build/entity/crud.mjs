@@ -875,7 +875,10 @@ function assertAnnotatedTextImportPayload(name        , fieldName        , descr
       } else if (fieldDescriptor.default !== undefined) {
         fieldValue = materializeDefault(fieldDescriptor.default);
       } else if (fieldDescriptor.nullable || fieldDescriptor.optional) {
-        fieldValue = null;
+        // Same absent-field normalization as the ranges loop: import as null,
+        // skip value validation (scope#3000).
+        fields[declaredName] = null;
+        continue;
       } else {
         throw new ValidationError(`${name}.${fieldName} annotated-text import blocks[${i}].fields is missing required field '${declaredName}'`);
       }
@@ -984,7 +987,13 @@ function assertAnnotatedTextImportPayload(name        , fieldName        , descr
         } else if (fieldDescriptor.default !== undefined) {
           fieldValue = materializeDefault(fieldDescriptor.default);
         } else if (fieldDescriptor.nullable || fieldDescriptor.optional) {
-          fieldValue = null;
+          // An absent nullable/optional field imports as null and skips value
+          // validation: null is how the read side and the derived-annotation
+          // path normalize absence, and a non-nullable kind's validator (e.g.
+          // boolean) rejects null, which would make an optional field
+          // impossible to omit (scope#3000).
+          rangeFields[fieldName] = null;
+          continue;
         } else {
           throw new ValidationError(`${name}.${fieldName} annotated-text import ranges[${i}].fields is missing required field '${fieldName}'`);
         }

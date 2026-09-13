@@ -27,6 +27,7 @@ export interface FieldDescriptor {
   readonly canonicalize?: ((value: unknown) => unknown) | undefined;
   readonly required?: boolean | undefined;
   readonly nullable?: boolean | undefined;
+  readonly optional?: boolean | undefined;
   readonly readonly?: boolean | undefined;
   readonly touch?: boolean | undefined;
   readonly dimensions?: number | undefined;
@@ -165,6 +166,10 @@ export const STRATEGIES: Readonly<Record<string, FieldStrategy>> = Object.freeze
   value: Object.freeze({
     laws: Object.freeze({ invertible: true, coalescible: true, idempotent: false, commutativeMerge: false }),
     validate(value: unknown, descriptor?: FieldDescriptor) {
+      // An optional field's stored absence is null (import normalization and
+      // the read side both represent it that way), so null validates for an
+      // optional descriptor; null still fails for required/nullable-only kinds.
+      if (value === null && descriptor?.optional === true) return true;
       switch (descriptor?.type) {
         case 'text':
           if (!isTextValue(value)) return 'expected a text value';

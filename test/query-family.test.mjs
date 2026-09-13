@@ -15,6 +15,7 @@ import {
 import {
   compileQueryFamily,
   createQueryFamilyRegistry,
+  executeQueryFamily,
   registerQueryFamilyInvalidation,
   queryFamilyChangedSince,
 } from '../build/query-family.mjs';
@@ -267,6 +268,67 @@ test('a foreign-owned element on an owned host does not match', () => {
   try {
     const page = run(registry, db, alice, { fieldId: 'f-text', op: 'contains', value: 'banana' });
     assert.deepEqual(page.rows, [], 'element grant filters bob-owned values off alice hosts');
+  } finally {
+    db.close();
+  }
+});
+
+test('host grant params cannot overwrite element grant params', () => {
+  const Host = entity('HostPA', {
+    title: text(),
+    projectId: text(),
+    grant: () => [scope(({ fields }) => fields.projectId.is('PA')).can(() => grant(read, subscribe))],
+  });
+  const Catalog = entity('CatPA', {
+    name: text(),
+    valueType: text(),
+    projectId: text(),
+    grant: () => [scope(({ fields }) => fields.projectId.is('PA')).can(() => grant(read, subscribe))],
+  });
+  const Element = entity('ElPB', {
+    hostId: text(),
+    fieldId: text(),
+    textValue: text(),
+    numberValue: number(),
+    epochValue: number(),
+    booleanValue: boolean(),
+    optionValue: text(),
+    projectId: text(),
+    grant: () => [scope(({ fields }) => fields.projectId.is('PB')).can(() => grant(read, subscribe))],
+  });
+  const db = new DatabaseSync(':memory:');
+  try {
+    for (const sql of generateFrameworkDDL()) db.exec(sql);
+    for (const sql of generateDDL(Host)) db.exec(sql);
+    for (const sql of generateDDL(Catalog)) db.exec(sql);
+    for (const sql of generateDDL(Element)) db.exec(sql);
+    db.prepare("INSERT INTO HostPA (id, title, projectId) VALUES ('h1', 'visible-host', 'PA')").run();
+    db.prepare("INSERT INTO CatPA (id, name, valueType, projectId) VALUES ('f1', 'label', 'text', 'PA')").run();
+    db.prepare("INSERT INTO ElPB (id, hostId, fieldId, textValue, numberValue, epochValue, booleanValue, optionValue, projectId) VALUES ('el1', 'h1', 'f1', 'secret', null, null, null, null, 'PA')").run();
+    const family = compileQueryFamily({
+      name: 'collide',
+      host: Host,
+      catalog: Catalog,
+      elements: Element,
+      hostKey: 'hostId',
+      fieldKey: 'fieldId',
+      typeField: 'valueType',
+      valueColumns: {
+        text: 'textValue',
+        number: 'numberValue',
+        epoch: 'epochValue',
+        boolean: 'booleanValue',
+        option: 'optionValue',
+      },
+    });
+    const page = executeQueryFamily(db, family, alice, {
+      fieldId: 'f1',
+      op: 'contains',
+      value: 'secret',
+      sort: { field: 'id', direction: 'asc' },
+      pageSize: 10,
+    });
+    assert.deepEqual(page.rows, [], 'element grant PB must not bind the host grant PA literal');
   } finally {
     db.close();
   }

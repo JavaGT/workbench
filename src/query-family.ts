@@ -10,6 +10,7 @@ import {
   compileFilterPredicate,
   QueryScopedReadError,
   QUERY_OPERATORS,
+  namespaceSqlParams,
   selectAuthorizedPage,
   withRevisionFence,
   type QueryDb,
@@ -142,7 +143,8 @@ function readCatalogType(
   fieldId: string,
 ): DynamicValueType {
   if (typeof family.catalog.scopeFilter !== 'function') fail('catalog entity has no compiled grant filter.');
-  const grant = family.catalog.scopeFilter(principal);
+  const rawCatalog = family.catalog.scopeFilter(principal);
+  const grant = namespaceSqlParams(rawCatalog.sql, rawCatalog.params, 'qcat');
   const params = { ...grant.params, query_field_id: fieldId };
   const sql = `SELECT t0.${identifier(family.typeField, 'typeField')} AS valueType FROM ${identifier(family.catalog.name, 'catalog entity')} AS t0 WHERE (${grant.sql}) AND t0.id = :query_field_id LIMIT 1`;
   const row = db.prepare(sql).get(params);
@@ -159,7 +161,8 @@ function elementGrantSql(
   params: Record<string, unknown>,
 ): string {
   if (typeof family.elements.scopeFilter !== 'function') fail('elements entity has no compiled grant filter.');
-  const grant = family.elements.scopeFilter(principal);
+  const raw = family.elements.scopeFilter(principal);
+  const grant = namespaceSqlParams(raw.sql, raw.params, 'qelem');
   Object.assign(params, grant.params);
   const table = identifier(family.elements.name, 'elements entity');
   // Re-authorize in a subquery whose only alias is t0 so compiled grants

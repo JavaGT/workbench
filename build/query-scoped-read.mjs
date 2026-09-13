@@ -413,6 +413,24 @@ function grantFilter(entity             , principal         )                   
   return { sql: filter.sql, params: { ...filter.params } };
 }
 
+/** Rewrite `:name` placeholders so two compiled grants cannot share a bind key. */
+export function namespaceSqlParams(
+  sql        ,
+  params                         ,
+  prefix        ,
+)                                                   {
+  if (!/^[A-Za-z][A-Za-z0-9]*$/.test(prefix)) fail('param namespace prefix must be an identifier.');
+  const namespaced                          = {};
+  let rewritten = sql;
+  for (const key of Object.keys(params).sort((a, b) => b.length - a.length)) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) fail(`grant param '${key}' is not a SQL identifier.`);
+    const next = `${prefix}_${key}`;
+    namespaced[next] = params[key];
+    rewritten = rewritten.replace(new RegExp(`:${key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![A-Za-z0-9_])`, 'g'), `:${next}`);
+  }
+  return { sql: rewritten, params: namespaced };
+}
+
 function isDeniedGrant(sql        )          {
   const compact = sql.replace(/\s+/g, '');
   return compact === '1=0' || compact === '(1=0)';
@@ -502,7 +520,8 @@ export function selectAuthorizedPage(
     if (typeof input.cursor.id !== 'string' || input.cursor.id.length === 0) fail('page token id is required.');
   }
   const params                          = { ...(input.extraParams ?? {}) };
-  const grant = grantFilter(entity, principal);
+  const rawGrant = grantFilter(entity, principal);
+  const grant = namespaceSqlParams(rawGrant.sql, rawGrant.params, 'qhost');
   Object.assign(params, grant.params);
   const parts = [grant.sql];
   if (input.extraWhere) parts.push(input.extraWhere);

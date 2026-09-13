@@ -269,11 +269,22 @@ function projectImportedRange(args: ImportedRangeProjectionArgs, index: number, 
     throw new Error(`${name}.${fieldName} created event imported range ${index} fields must be a non-array object`);
   }
   const suppliedNames = Object.keys(supplied).sort();
-  const declaredNames = fieldEntries.map(([fieldName]) => fieldName).sort();
-  if (JSON.stringify(suppliedNames) !== JSON.stringify(declaredNames)) {
-    throw new Error(`${name}.${fieldName} created event imported range ${index} fields disagree with declaration`);
+  // Absent optional/nullable fields are the optional contract — they store as
+  // SQL NULL below. Unknown supplied keys and missing required fields still
+  // fail closed (scope#3000: the exact-name equality rejected absent
+  // optional fields and broke every import that omitted them).
+  const unknownFields = suppliedNames.filter((key) => !fieldEntries.some(([fieldName]) => fieldName === key));
+  if (unknownFields.length > 0) {
+    throw new Error(`${name}.${fieldName} created event imported range ${index} fields has unknown field(s) '${unknownFields.join("', '")}'`);
+  }
+  const missingRequired = fieldEntries
+    .filter(([fieldName, field]) => !field.optional && field.nullable !== true && !Object.hasOwn(supplied, fieldName))
+    .map(([fieldName]) => fieldName);
+  if (missingRequired.length > 0) {
+    throw new Error(`${name}.${fieldName} created event imported range ${index} fields is missing required field(s) '${missingRequired.join("', '")}'`);
   }
   const storedFields = fieldEntries.map(([declaredName, field]) => {
+    if (!Object.hasOwn(supplied, declaredName)) return null;
     const value = supplied[declaredName];
     if (value === null && field.nullable === true) return null;
     const strategy = resolveStrategy(field.kind);

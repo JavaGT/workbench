@@ -875,6 +875,10 @@ function assertAnnotatedTextImportPayload(name        , fieldName        , descr
       } else if (fieldDescriptor.default !== undefined) {
         fieldValue = materializeDefault(fieldDescriptor.default);
       } else if (fieldDescriptor.nullable || fieldDescriptor.optional) {
+        // Absent optional: omit the key. Null is a NULLABLE value, not an
+        // absent one — materializing it here fails the value-type validate
+        // for every optional-but-not-nullable field (scope#3000).
+        if (fieldDescriptor.nullable !== true) continue;
         fieldValue = null;
       } else {
         throw new ValidationError(`${name}.${fieldName} annotated-text import blocks[${i}].fields is missing required field '${declaredName}'`);
@@ -983,11 +987,15 @@ function assertAnnotatedTextImportPayload(name        , fieldName        , descr
           fieldValue = range.fields[fieldName];
         } else if (fieldDescriptor.default !== undefined) {
           fieldValue = materializeDefault(fieldDescriptor.default);
-        } else if (fieldDescriptor.nullable || fieldDescriptor.optional) {
-          fieldValue = null;
-        } else {
-          throw new ValidationError(`${name}.${fieldName} annotated-text import ranges[${i}].fields is missing required field '${fieldName}'`);
-        }
+      } else if (fieldDescriptor.nullable || fieldDescriptor.optional) {
+        // Absent optional: omit the key. Null is a NULLABLE value, not an
+        // absent one — materializing it here fails the value-type validate
+        // for every optional-but-not-nullable field (scope#3000).
+        if (fieldDescriptor.nullable !== true) continue;
+        fieldValue = null;
+      } else {
+        throw new ValidationError(`${name}.${fieldName} annotated-text import ranges[${i}].fields is missing required field '${fieldName}'`);
+      }
         if (fieldValue === null && fieldDescriptor.nullable === true) {
           rangeFields[fieldName] = null;
           continue;

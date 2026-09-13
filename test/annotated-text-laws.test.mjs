@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import {
   applyTextOp, assertAnchor, assertFrontier, assertOpId, assertStructuralPoint,
   assertTextOp, assertUtf16Offset, assertUtf16Range, assertWellFormedText,
-  canonicalTextOp, compareInsertOrder, compareOpId, frontierDominates, scalarCount,
+  canonicalTextOp, compareInsertOrder, compareOpId, frontierDominates, frontierDominatesValidated, scalarCount,
   createTextState, materializeText, restoreTextCheckpoint, textCheckpoint,
 } from '../build/annotated-text.mjs';
 
@@ -26,6 +26,35 @@ test('frontiers are sorted, unique contiguous-counter summaries', () => {
   assert.throws(() => assertFrontier([[A, 0]]), /positive/);
   assert.equal(frontierDominates([[A, 2], [B, 1]], [[A, 1]]), true);
   assert.equal(frontierDominates([[A, 1]], [[A, 1], [B, 1]]), false);
+});
+
+test('indexed frontier dominance stays identical to the retired linear scan', () => {
+  // scope#3039: `frontierDominatesValidated` now indexes `left` once per call
+  // instead of running a `find` per `right` entry. Parity probe against the
+  // retired formula on valid (sorted, unique) frontiers.
+  const C = 'cccccccccccccccccccccccccccccccc';
+  const legacy = (left, right) => right.every(([actor, counter]) => {
+    const found = left.find(([candidate]) => candidate === actor);
+    return (found ? found[1] : 0) >= counter;
+  });
+  const cases = [
+    [[[A, 3], [B, 2]], [], true],
+    [[[A, 3], [B, 2]], [[A, 2]], true],
+    [[[A, 3], [B, 2]], [[A, 4]], false],
+    [[[A, 3], [B, 2]], [[A, 3], [B, 2]], true],
+    [[[A, 3], [B, 2]], [[A, 3], [B, 3]], false],
+    [[[A, 3], [B, 2]], [[C, 1]], false],
+    [[[A, 3], [B, 2], [C, 9]], [[A, 3], [B, 2], [C, 9]], true],
+    [[[A, 3], [B, 2], [C, 9]], [[A, 3], [B, 2], [C, 10]], false],
+  ];
+  for (const [left, right, expected] of cases) {
+    assert.equal(frontierDominatesValidated(left, right), expected, `expected ${expected} for right=${JSON.stringify(right)}`);
+    assert.equal(
+      frontierDominatesValidated(left, right),
+      legacy(left, right),
+      `parity with the retired scan for right=${JSON.stringify(right)}`,
+    );
+  }
 });
 
 test('UTF-16 accepts scalar edges and rejects only a surrogate-pair interior', () => {

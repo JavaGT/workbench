@@ -15,6 +15,7 @@ export const QUERY_OPERATORS = Object.freeze(['eq', 'in', 'gt', 'gte', 'lt', 'lt
 
 export const QUERY_PAGE_SIZE_MIN = 1;
 export const QUERY_PAGE_SIZE_MAX = 100;
+export const QUERY_REGISTRATION_MAX = 32;
 const IN_VALUES_MAX = 100;
 const FILTERS_MAX = 16;
 
@@ -33,6 +34,9 @@ export class QueryContentionError extends Error {
     this.name = 'QueryContentionError';
   }
 }
+
+
+
 
 
 
@@ -150,15 +154,26 @@ function assertScalarField(entity             , field        , label        )   
 }
 
 function assertSqlValue(value         , label        )       {
-  if (value === null || typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return;
+  if (value === null) fail(`${label} must not be null; IS NULL is not in the operator set.`);
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return;
   fail(`${label} must be a SQLite scalar value.`);
+}
+
+function freezeJsonValue(value         )          {
+  if (Array.isArray(value)) return Object.freeze(value.map((item) => freezeJsonValue(item)));
+  if (value && typeof value === 'object') {
+    const copy                          = {};
+    for (const [key, item] of Object.entries(value)) copy[key] = freezeJsonValue(item);
+    return Object.freeze(copy);
+  }
+  return value;
 }
 
 function detached(raw                         )                          {
   return Object.freeze({ ...raw });
 }
 
-function principalKeyOf(principal         )         {
+function queryPrincipalKey(principal         )         {
   if (!principal || typeof principal !== 'object') fail('principal is required.');
   const record = principal                                    ;
   if (typeof record.type !== 'string') fail('principal type is required.');
@@ -167,13 +182,38 @@ function principalKeyOf(principal         )         {
   return `${record.type}:${record.id}`;
 }
 
+function collectAstFields(ast         , result             , seen = new Set        ())       {
+  if (ast === null || typeof ast !== 'object' || seen.has(ast)) return;
+  seen.add(ast);
+  const record = ast                           ;
+  if (typeof record.field === 'string') result.add(record.field);
+  for (const value of Object.values(record)) {
+    if (typeof value === 'function') continue;
+    if (Array.isArray(value)) {
+      for (const entry of value) collectAstFields(entry, result, seen);
+    } else {
+      collectAstFields(value, result, seen);
+    }
+  }
+}
+
+function authorizationFields(entity             )           {
+  const out = new Set        ();
+  if (entity.scopeAst) collectAstFields(entity.scopeAst, out);
+  for (const [name, descriptor] of Object.entries(entity.fields ?? {})) {
+    if (descriptor?.role === 'owner' || name === 'owner' || name === 'projectId') out.add(name);
+  }
+  const declared = fieldsOf(entity);
+  return [...out].filter((field) => declared.has(field));
+}
+
 function compileFilter(
   filter         ,
   declared             ,
   entity             ,
   params                         ,
   index        ,
-)                                 {
+)                                                                    {
   if (!filter || typeof filter !== 'object' || Array.isArray(filter)) fail('filters must be objects.');
   assertKeys(filter, FILTER_KEYS, 'filter');
   const { field, op = 'eq', value } = filter               ;
@@ -191,13 +231,13 @@ function compileFilter(
       params[name] = item;
       return `:${name}`;
     });
-    return { sql: `${column} IN (${names.join(', ')})`, field };
+    return { sql: `${column} IN (${names.join(', ')})`, field, op, value: freezeJsonValue(value) };
   }
   assertSqlValue(value, 'filter value');
   const name = `query_f${index}`;
   params[name] = value;
   const operator = ({ eq: '=', gt: '>', gte: '>=', lt: '<', lte: '<=' }         )[op];
-  return { sql: `${column} ${operator} :${name}`, field };
+  return { sql: `${column} ${operator} :${name}`, field, op, value };
 }
 
 export function compileQueryContract(input         , entity             )                {
@@ -212,7 +252,7 @@ export function compileQueryContract(input         , entity             )       
   const params                          = {};
   const filters = (contract.filters ?? []).map((filter, index) => {
     const compiled = compileFilter(filter, declared, entity, params, index);
-    return Object.freeze({ field: compiled.field, op: (filter.op ?? 'eq')                 , value: filter.value });
+    return Object.freeze({ field: compiled.field, op: compiled.op, value: compiled.value });
   });
   if (!contract.sort || typeof contract.sort !== 'object' || Array.isArray(contract.sort)) fail('sort is required.');
   assertKeys(contract.sort, SORT_KEYS, 'sort');
@@ -228,8 +268,11 @@ export function compileQueryContract(input         , entity             )       
     entity: entity.name,
     filters: filters.map((filter) => ({ field: filter.field, op: filter.op, value: filter.value })),
     sort: { field: sortField, direction },
+    pageSize,
   });
-  const dependencyFields = Object.freeze([...new Set([...filters.map((filter) => filter.field), sortField])]);
+  const dependencyFields = Object.freeze([
+    ...new Set([...filters.map((filter) => filter.field), sortField, ...authorizationFields(entity)]),
+  ]);
   return Object.freeze({
     entity: entity.name,
     identity,
@@ -240,6 +283,16 @@ export function compileQueryContract(input         , entity             )       
   });
 }
 
+function asSafeRevision(value         , label        )         {
+  if (typeof value === 'number' && Number.isSafeInteger(value)) return value;
+  if (typeof value === 'bigint') {
+    const converted = Number(value);
+    if (!Number.isSafeInteger(converted)) fail(`${label} exceeds a safe integer.`);
+    return converted;
+  }
+  fail(`${label} is missing.`);
+}
+
 export function readCommittedRevision(db         )         {
   let row                                     ;
   try {
@@ -247,10 +300,12 @@ export function readCommittedRevision(db         )         {
   } catch (err) {
     throw new QueryScopedReadError(`committed revision is unavailable (${err instanceof Error ? err.message : String(err)}).`);
   }
-  const revision = row?.revision;
-  if (typeof revision === 'number' && Number.isSafeInteger(revision)) return revision;
-  if (typeof revision === 'bigint') return Number(revision);
-  fail('committed revision token is missing.');
+  try {
+    return asSafeRevision(row?.revision, 'committed revision token');
+  } catch (err) {
+    if (err instanceof QueryScopedReadError) throw err;
+    fail('committed revision token is missing.');
+  }
 }
 
 function grantFilter(entity             , principal         )                                                   {
@@ -258,6 +313,32 @@ function grantFilter(entity             , principal         )                   
   const filter = entity.scopeFilter(principal);
   if (!filter || typeof filter.sql !== 'string') fail('compiled grant filter is malformed.');
   return { sql: filter.sql, params: { ...filter.params } };
+}
+
+function isDeniedGrant(sql        )          {
+  const compact = sql.replace(/\s+/g, '');
+  return compact === '1=0' || compact === '(1=0)';
+}
+
+function assertAdmitted(entity             , principal         )                                                   {
+  const grant = grantFilter(entity, principal);
+  if (isDeniedGrant(grant.sql)) fail('principal is not admitted to this entity.');
+  return grant;
+}
+
+function principalStillAdmitted(entity             , principal         )          {
+  try {
+    const grant = grantFilter(entity, principal);
+    return !isDeniedGrant(grant.sql);
+  } catch {
+    return false;
+  }
+}
+
+function defaultScopeField(scope        )                {
+  const parsed = tryParseScopeKey(scope);
+  if (!parsed) return null;
+  return `${parsed.entity.charAt(0).toLowerCase()}${parsed.entity.slice(1)}Id`;
 }
 
 function filterSql(compiled               , entity             , params                         )         {
@@ -338,8 +419,7 @@ function runPage(
     const countParams                          = {};
     const countWhere = whereSql(compiled, entity, principal, null, countParams);
     const countRow = db.prepare(`SELECT COUNT(*) AS n FROM ${identifier(entity.name, 'entity name')} AS t0 WHERE ${countWhere}`).get(countParams);
-    const n = countRow?.n;
-    count = typeof n === 'bigint' ? Number(n) : Number(n ?? 0);
+    count = asSafeRevision(countRow?.n ?? 0, 'count');
   }
   return {
     rows: Object.freeze(rows),
@@ -417,6 +497,10 @@ export function overlayOptimisticQueryPage(
 
 
 
+
+
+
+
 function eventHandleOf(event         )                             {
   if (!event || typeof event !== 'object') return null;
   const value = event                                        ;
@@ -453,24 +537,88 @@ function eventTouches(event         , handle                            , fields
   return Object.keys(data).some((key) => key !== 'id' && fields.has(key));
 }
 
-export function createQueryInvalidationHub() {
+function eventScopeMatches(event         , registration                   )          {
+  if (!event || typeof event !== 'object') return false;
+  const raw = (event                       ).scope;
+  if (typeof raw !== 'string') return false;
+  if (raw === registration.scope) return true;
+  const wanted = tryParseScopeKey(registration.scope);
+  const got = tryParseScopeKey(raw);
+  if (!wanted || !got) return false;
+  if (got.key === wanted.key) return true;
+  if (got.entity !== registration.entityName || !registration.scopeField) return false;
+  const data = (event                      ).data;
+  if (!data || typeof data !== 'object') return false;
+  return (data                           )[registration.scopeField] === wanted.id;
+}
+
+function assertVisibleInScope(
+  db         ,
+  entity             ,
+  principal         ,
+  scope        ,
+  scopeField               ,
+)       {
+  const grant = assertAdmitted(entity, principal);
+  const params                          = { ...grant.params };
+  let sql = `SELECT 1 AS ok FROM ${identifier(entity.name, 'entity name')} AS t0 WHERE (${grant.sql})`;
+  const parsed = tryParseScopeKey(scope);
+  if (parsed && scopeField && (scopeField === 'id' || entity.fields[scopeField])) {
+    sql += ` AND t0.${identifier(scopeField, 'scope field')} = :query_scope_id`;
+    params.query_scope_id = parsed.id;
+  }
+  sql += ' LIMIT 1';
+  const row = db.prepare(sql).get(params);
+  if (!row) fail('principal cannot see this query scope.');
+}
+
+export function createQueryInvalidationHub(options                                = {}) {
+  const maxRegistrations = options.maxRegistrations ?? QUERY_REGISTRATION_MAX;
+  if (!Number.isSafeInteger(maxRegistrations) || maxRegistrations < 1) fail('maxRegistrations must be a positive integer.');
   const registrations = new Map                           ();
 
-  function register(input                                                                 )       {
+  function slot(principalKey        , id        )         {
+    return `${principalKey}\n${id}`;
+  }
+
+  function register(input
+
+
+
+
+
+
+   )       {
     if (typeof input.id !== 'string' || input.id.length === 0) fail('registration id is required.');
+    if (!Number.isSafeInteger(input.revision)) fail('registration revision must be a safe integer.');
+    const principalKey = queryPrincipalKey(input.principal);
+    if (!input.dependency || typeof input.dependency !== 'object') fail('dependency is required.');
     identifier(input.dependency.entity, 'dependency entity');
+    if (input.dependency.entity !== input.entity.name) fail('dependency entity does not match the compiled entity.');
     if (!Array.isArray(input.dependency.fields)) fail('dependency fields must be an array.');
-    registrations.set(input.id, {
+    if (typeof input.dependency.scope !== 'string' || input.dependency.scope.length === 0) fail('dependency scope is required.');
+    if (!tryParseScopeKey(input.dependency.scope)) fail('dependency scope must be a Scope handle.');
+    const scopeField = input.dependency.scopeField ?? defaultScopeField(input.dependency.scope);
+    assertVisibleInScope(input.db, input.entity, input.principal, input.dependency.scope, scopeField);
+    const key = slot(principalKey, input.id);
+    if (!registrations.has(key) && registrations.size >= maxRegistrations) {
+      fail(`at most ${maxRegistrations} query registrations may be active.`);
+    }
+    registrations.set(key, {
       id: input.id,
-      entity: input.dependency.entity,
+      entityName: input.dependency.entity,
       fields: new Set(input.dependency.fields),
-      principalKey: principalKeyOf(input.principal),
+      scope: input.dependency.scope,
+      scopeField,
+      principalKey,
+      compiledEntity: input.entity,
       lastInvalidatedRevision: null,
+      registeredAtRevision: input.revision,
     });
   }
 
-  function unregister(id        )       {
-    registrations.delete(id);
+  function unregister(id        , principal         )       {
+    registrations.delete(slot(queryPrincipalKey(principal), id));
   }
 
   function notice(events                    , revision        )       {
@@ -480,9 +628,12 @@ export function createQueryInvalidationHub() {
       const entity = eventEntityOf(event, handle);
       if (!entity) continue;
       for (const registration of registrations.values()) {
-        if (registration.entity !== entity) continue;
+        if (registration.entityName !== entity) continue;
+        if (!eventScopeMatches(event, registration)) continue;
         if (!eventTouches(event, handle, registration.fields)) continue;
-        registration.lastInvalidatedRevision = revision;
+        const previous = registration.lastInvalidatedRevision;
+        if (previous !== null && revision < previous) continue;
+        registration.lastInvalidatedRevision = previous === null ? revision : Math.max(previous, revision);
       }
     }
   }
@@ -493,17 +644,23 @@ export function createQueryInvalidationHub() {
 
 
    )                          {
-    const registration = registrations.get(input.id);
-    if (!registration) {
-      return Object.freeze({ kind: 'resync', revision: input.revision });
-    }
-    if (registration.principalKey !== principalKeyOf(input.principal)) {
-      return Object.freeze({ kind: 'denied', revision: input.revision });
-    }
+    const principalKey = queryPrincipalKey(input.principal);
     if (!Number.isSafeInteger(input.sinceRevision) || !Number.isSafeInteger(input.revision)) {
       fail('revision tokens must be safe integers.');
     }
     if (input.sinceRevision > input.revision) fail('sinceRevision is ahead of the commit lifecycle.');
+    const registration = registrations.get(slot(principalKey, input.id));
+    // Missing and foreign registrations share one signal so an id is not an
+    // existence oracle. Revocation of *this* principal's registration is denied.
+    if (!registration || registration.principalKey !== principalKey) {
+      return Object.freeze({ kind: 'resync', revision: input.revision });
+    }
+    if (!principalStillAdmitted(registration.compiledEntity, input.principal)) {
+      return Object.freeze({ kind: 'denied', revision: input.revision });
+    }
+    if (input.sinceRevision < registration.registeredAtRevision) {
+      return Object.freeze({ kind: 'resync', revision: input.revision });
+    }
     if (registration.lastInvalidatedRevision !== null && input.sinceRevision < registration.lastInvalidatedRevision) {
       return Object.freeze({ kind: 'changed', revision: input.revision });
     }
@@ -515,6 +672,7 @@ export function createQueryInvalidationHub() {
     unregister,
     notice,
     changedSince,
+    get size() { return registrations.size; },
   };
 }
 

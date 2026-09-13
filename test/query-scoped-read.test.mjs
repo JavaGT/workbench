@@ -42,7 +42,7 @@ function seed(db, Note) {
   const insert = db.prepare('INSERT INTO Note (id, body, status, rank, projectId, owner) VALUES (?, ?, ?, ?, ?, ?)');
   insert.run('n1', 'alpha', 'open', 1, 'p1', 'alice');
   insert.run('n2', 'beta', 'open', 2, 'p1', 'alice');
-  insert.run('n3', 'gamma', 'open', 2, 'p1', 'alice'); // same rank as n2 — id tie-break
+  insert.run('n3', 'gamma', 'open', 2, 'p1', 'alice');
   insert.run('n4', 'delta', 'closed', 3, 'p1', 'alice');
   insert.run('n5', 'echo', 'open', 1, 'p2', 'bob');
   insert.run('n6', 'foxtrot', 'open', 4, 'p1', 'alice');
@@ -62,6 +62,21 @@ function openPage(Note, pageSize = 2) {
     sort: { field: 'rank', direction: 'asc' },
     pageSize,
   }, Note);
+}
+
+function p1Dep(fields) {
+  return { entity: 'Note', fields, scope: 'Project:p1' };
+}
+
+function registerFor(hub, { db, Note, principal, id, fields, revision }) {
+  hub.register({
+    id,
+    dependency: p1Dep(fields),
+    principal,
+    entity: Note,
+    db,
+    revision: revision ?? readCommittedRevision(db),
+  });
 }
 
 test('authorization fails closed for the wrong principal', () => {
@@ -107,7 +122,6 @@ test('page boundaries hold with the unique id tie-break', () => {
     assert.equal(first.nextCursor.id, 'n2');
     assert.equal(first.nextCursor.sortValue, 2);
     const second = executeQueryPage(db, Note, alice, compiled, { cursor: first.nextCursor });
-    // n3 shares rank 2 with n2; id ASC places n3 after n2, then n6 (rank 4).
     assert.deepEqual(second.rows.map((row) => row.id), ['n3', 'n6']);
     assert.equal(second.nextCursor, null);
     const foreign = compileQueryContract({
@@ -125,7 +139,47 @@ test('page boundaries hold with the unique id tie-break', () => {
   }
 });
 
-test('a membership-changing edit invalidates and refetches correctly', () => {
+test('DESC sort pages with the id ASC tie-break', () => {
+  const { db, Note } = setup();
+  try {
+    const compiled = compileQueryContract({
+      entity: 'Note',
+      filters: [{ field: 'status', op: 'eq', value: 'open' }, { field: 'projectId', op: 'eq', value: 'p1' }],
+      sort: { field: 'rank', direction: 'desc' },
+      pageSize: 2,
+    }, Note);
+    const first = executeQueryPage(db, Note, alice, compiled);
+    assert.deepEqual(first.rows.map((row) => row.id), ['n6', 'n2']);
+    const second = executeQueryPage(db, Note, alice, compiled, { cursor: first.nextCursor });
+    assert.deepEqual(second.rows.map((row) => row.id), ['n3', 'n1']);
+    assert.equal(second.nextCursor, null);
+  } finally {
+    db.close();
+  }
+});
+
+test('NULL sort keys paginate without stalling the keyset', () => {
+  const { db, Note } = setup();
+  try {
+    db.prepare("INSERT INTO Note (id, body, status, rank, projectId, owner) VALUES ('n0', 'null-rank', 'open', NULL, 'p1', 'alice')").run();
+    const compiled = compileQueryContract({
+      entity: 'Note',
+      filters: [{ field: 'projectId', op: 'eq', value: 'p1' }],
+      sort: { field: 'rank', direction: 'asc' },
+      pageSize: 1,
+    }, Note);
+    const first = executeQueryPage(db, Note, alice, compiled);
+    assert.equal(first.rows[0].id, 'n0');
+    assert.equal(first.rows[0].rank, null);
+    const second = executeQueryPage(db, Note, alice, compiled, { cursor: first.nextCursor });
+    assert.equal(second.rows[0].id, 'n1');
+    assert.notEqual(second.rows[0].rank, null);
+  } finally {
+    db.close();
+  }
+});
+
+test('a membership-changing edit invalidates and refetches correctly', async () => {
   const { db, Note } = setup();
   try {
     const compiled = openPage(Note, 10);
@@ -134,17 +188,19 @@ test('a membership-changing edit invalidates and refetches correctly', () => {
     assert.ok(before.rows.some((row) => row.id === 'n2'));
 
     const hub = createQueryInvalidationHub();
-    hub.register({
-      id: 'alice-open-p1',
-      dependency: { entity: 'Note', fields: [...compiled.dependencyFields] },
-      principal: alice,
-    });
+    registerFor(hub, { db, Note, principal: alice, id: 'alice-open-p1', fields: [...compiled.dependencyFields] });
     const consumer = createQueryInvalidationConsumer(hub, db);
 
     db.prepare("UPDATE Note SET status = 'closed' WHERE id = 'n2'").run();
     db.prepare("UPDATE _CommittedRevision SET revision = revision + 1 WHERE name = 'actions'").run();
     const revision = readCommittedRevision(db);
-    consumer([{ type: updated('Note').type, handle: updated('Note'), data: { id: 'n2', status: 'closed' }, committedAt: '2026-09-13T00:00:00.000Z' }]);
+    await consumer([{
+      type: updated('Note').type,
+      handle: updated('Note'),
+      scope: 'Note:n2',
+      data: { id: 'n2', status: 'closed', projectId: 'p1' },
+      committedAt: '2026-09-13T00:00:00.000Z',
+    }]);
 
     const signal = hub.changedSince({
       id: 'alice-open-p1',
@@ -158,6 +214,26 @@ test('a membership-changing edit invalidates and refetches correctly', () => {
     assert.equal(after.count, 3);
     assert.deepEqual(after.rows.map((row) => row.id), ['n1', 'n3', 'n6']);
     assert.ok(after.revision > before.revision);
+  } finally {
+    db.close();
+  }
+});
+
+test('a grant-field transition invalidates membership', () => {
+  const { db, Note } = setup();
+  try {
+    const compiled = openPage(Note, 10);
+    const hub = createQueryInvalidationHub();
+    registerFor(hub, { db, Note, principal: alice, id: 'q', fields: [...compiled.dependencyFields] });
+    const at = readCommittedRevision(db);
+    hub.notice([{
+      type: fieldSet('Note', 'owner').type,
+      handle: fieldSet('Note', 'owner'),
+      scope: 'Note:n1',
+      data: { id: 'n1', owner: 'bob', projectId: 'p1' },
+      committedAt: 't',
+    }], at + 1);
+    assert.equal(hub.changedSince({ id: 'q', principal: alice, sinceRevision: at, revision: at + 1 }).kind, 'changed');
   } finally {
     db.close();
   }
@@ -202,7 +278,30 @@ test('count is the authorized matching set, not the page size', () => {
   }
 });
 
-test('unknown operators and fields fail closed at compile', () => {
+test('count retries when a concurrent write moves the revision fence', () => {
+  const { db, Note } = setup();
+  try {
+    const compiled = openPage(Note, 2);
+    let bumped = false;
+    const inner = db.prepare.bind(db);
+    db.prepare = (sql) => {
+      const statement = inner(sql);
+      if (typeof sql === 'string' && sql.includes('COUNT(*)') && !bumped) {
+        bumped = true;
+        inner("UPDATE _CommittedRevision SET revision = revision + 1 WHERE name = 'actions'").run();
+      }
+      return statement;
+    };
+    const page = executeQueryPage(db, Note, alice, compiled, { includeCount: true });
+    assert.equal(page.count, 4);
+    assert.equal(typeof page.revision, 'number');
+    assert.ok(bumped);
+  } finally {
+    db.close();
+  }
+});
+
+test('unknown operators, fields, and null filter values fail closed at compile', () => {
   const Note = makeNote();
   assert.throws(
     () => compileQueryContract({
@@ -222,44 +321,140 @@ test('unknown operators and fields fail closed at compile', () => {
     }, Note),
     QueryScopedReadError,
   );
+  assert.throws(
+    () => compileQueryContract({
+      entity: 'Note',
+      filters: [{ field: 'status', op: 'eq', value: null }],
+      sort: { field: 'rank', direction: 'asc' },
+      pageSize: 10,
+    }, Note),
+    /must not be null/,
+  );
+  assert.throws(
+    () => compileQueryContract({
+      entity: 'Note',
+      filters: [{ field: 'status', op: 'in', value: ['open', null] }],
+      sort: { field: 'rank', direction: 'asc' },
+      pageSize: 10,
+    }, Note),
+    /must not be null/,
+  );
 });
 
-test('delivery re-authorizes: a foreign principal cannot read another registration', () => {
-  const hub = createQueryInvalidationHub();
-  hub.register({
-    id: 'alice-open-p1',
-    dependency: { entity: 'Note', fields: ['status'] },
-    principal: alice,
-  });
-  const denied = hub.changedSince({
-    id: 'alice-open-p1',
-    principal: bob,
-    sinceRevision: 0,
-    revision: 1,
-  });
-  assert.equal(denied.kind, 'denied');
-  const resync = hub.changedSince({
-    id: 'unknown',
-    principal: alice,
-    sinceRevision: 0,
-    revision: 1,
-  });
-  assert.equal(resync.kind, 'resync');
+test('wrong-project registration is refused; own-project registration succeeds', () => {
+  const { db, Note } = setup();
+  try {
+    const hub = createQueryInvalidationHub();
+    registerFor(hub, { db, Note, principal: alice, id: 'alice-p1', fields: ['status'] });
+    assert.equal(hub.size, 1);
+    assert.throws(
+      () => registerFor(hub, { db, Note, principal: bob, id: 'bob-p1', fields: ['status'] }),
+      /cannot see this query scope/,
+    );
+  } finally {
+    db.close();
+  }
 });
 
-test('a field-set on a dependency invalidates; an unrelated field does not', () => {
-  const hub = createQueryInvalidationHub();
-  hub.register({
-    id: 'q',
-    dependency: { entity: 'Note', fields: ['status'] },
-    principal: alice,
-  });
-  hub.notice([{ type: fieldSet('Note', 'body').type, handle: fieldSet('Note', 'body'), data: { id: 'n1' }, committedAt: 't' }], 4);
-  assert.equal(hub.changedSince({ id: 'q', principal: alice, sinceRevision: 3, revision: 4 }).kind, 'unchanged');
-  hub.notice([{ type: fieldSet('Note', 'status').type, handle: fieldSet('Note', 'status'), data: { id: 'n1' }, committedAt: 't' }], 5);
-  assert.equal(hub.changedSince({ id: 'q', principal: alice, sinceRevision: 3, revision: 5 }).kind, 'changed');
-  hub.notice([{ type: created('Note').type, handle: created('Note'), data: { id: 'n9' }, committedAt: 't' }], 6);
-  assert.equal(hub.changedSince({ id: 'q', principal: alice, sinceRevision: 5, revision: 6 }).kind, 'changed');
+test('delivery after revocation is denied; foreign and unknown ids are not an existence oracle', () => {
+  const { db, Note } = setup();
+  try {
+    const hub = createQueryInvalidationHub();
+    registerFor(hub, { db, Note, principal: alice, id: 'alice-open-p1', fields: ['status'] });
+    const revision = readCommittedRevision(db);
+    const foreign = hub.changedSince({ id: 'alice-open-p1', principal: bob, sinceRevision: revision, revision });
+    const unknown = hub.changedSince({ id: 'no-such', principal: bob, sinceRevision: revision, revision });
+    assert.equal(foreign.kind, 'resync');
+    assert.equal(unknown.kind, 'resync');
+
+    Note.scopeFilter = () => ({ sql: '1 = 0', params: {} });
+    const revoked = hub.changedSince({ id: 'alice-open-p1', principal: alice, sinceRevision: revision, revision });
+    assert.equal(revoked.kind, 'denied');
+  } finally {
+    db.close();
+  }
+});
+
+test('a field-set on a dependency invalidates; an unrelated field or other project does not', () => {
+  const { db, Note } = setup();
+  try {
+    const hub = createQueryInvalidationHub();
+    const compiled = openPage(Note, 10);
+    registerFor(hub, { db, Note, principal: alice, id: 'q', fields: [...compiled.dependencyFields] });
+    const at = readCommittedRevision(db);
+    hub.notice([{
+      type: fieldSet('Note', 'body').type,
+      handle: fieldSet('Note', 'body'),
+      scope: 'Note:n1',
+      data: { id: 'n1', projectId: 'p1' },
+      committedAt: 't',
+    }], at + 1);
+    assert.equal(hub.changedSince({ id: 'q', principal: alice, sinceRevision: at, revision: at + 1 }).kind, 'unchanged');
+    hub.notice([{
+      type: fieldSet('Note', 'status').type,
+      handle: fieldSet('Note', 'status'),
+      scope: 'Note:n5',
+      data: { id: 'n5', projectId: 'p2' },
+      committedAt: 't',
+    }], at + 2);
+    assert.equal(hub.changedSince({ id: 'q', principal: alice, sinceRevision: at, revision: at + 2 }).kind, 'unchanged', 'other-project events do not signal');
+    hub.notice([{
+      type: fieldSet('Note', 'status').type,
+      handle: fieldSet('Note', 'status'),
+      scope: 'Note:n1',
+      data: { id: 'n1', projectId: 'p1' },
+      committedAt: 't',
+    }], at + 3);
+    assert.equal(hub.changedSince({ id: 'q', principal: alice, sinceRevision: at, revision: at + 3 }).kind, 'changed');
+    hub.notice([{
+      type: created('Note').type,
+      handle: created('Note'),
+      scope: 'Note:n9',
+      data: { id: 'n9', projectId: 'p1' },
+      committedAt: 't',
+    }], at + 4);
+    assert.equal(hub.changedSince({ id: 'q', principal: alice, sinceRevision: at + 3, revision: at + 4 }).kind, 'changed');
+  } finally {
+    db.close();
+  }
+});
+
+test('a fetch that predates registration resyncs; stale notices do not rewind', () => {
+  const { db, Note } = setup();
+  try {
+    const hub = createQueryInvalidationHub();
+    const at = readCommittedRevision(db);
+    registerFor(hub, { db, Note, principal: alice, id: 'q', fields: ['status'], revision: at + 2 });
+    assert.equal(hub.changedSince({ id: 'q', principal: alice, sinceRevision: at, revision: at + 2 }).kind, 'resync');
+    hub.notice([{
+      type: fieldSet('Note', 'status').type,
+      handle: fieldSet('Note', 'status'),
+      scope: 'Note:n1',
+      data: { id: 'n1', projectId: 'p1' },
+      committedAt: 't',
+    }], at + 5);
+    hub.notice([{
+      type: fieldSet('Note', 'status').type,
+      handle: fieldSet('Note', 'status'),
+      scope: 'Note:n1',
+      data: { id: 'n1', projectId: 'p1' },
+      committedAt: 't',
+    }], at + 4);
+    assert.equal(hub.changedSince({ id: 'q', principal: alice, sinceRevision: at + 2, revision: at + 5 }).kind, 'changed');
+    assert.equal(hub.changedSince({ id: 'q', principal: alice, sinceRevision: at + 5, revision: at + 5 }).kind, 'unchanged');
+  } finally {
+    db.close();
+  }
+});
+
+test('an unsafe committed revision fails closed', () => {
+  const { db } = setup();
+  try {
+    db.prepare("UPDATE _CommittedRevision SET revision = 9007199254740992 WHERE name = 'actions'").run();
+    assert.throws(() => readCommittedRevision(db), QueryScopedReadError);
+  } finally {
+    db.close();
+  }
 });
 
 test('optimistic overlay previews safe fields and flags membership-uncertain writes', () => {

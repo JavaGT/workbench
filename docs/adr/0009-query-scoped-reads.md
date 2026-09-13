@@ -47,12 +47,15 @@ scalar fields:
 Unknown operators, unknown fields, functions, and SQL fragments fail closed at
 compile. Filters AND together. Sort is **one declared field** plus a unique
 tie-break of `id ASC` (the existing `readRows` order). Page size is bounded
-(1–100). The page token is a **keyset cursor** `{ queryIdentity, sortValue, id }`
-bound to that contract's identity. A cursor from a different contract is
-rejected. Page tokens are never authorization.
+(1–100) and is part of the query identity. The page token is a **keyset cursor**
+`{ queryIdentity, sortValue, id }` bound to that contract's identity. A cursor
+from a different contract is rejected. Page tokens are never authorization.
 
-SQLite NULL ordering is used as-is (NULLs first in ASC, last in DESC). Keyset
-predicates are null-safe so a NULL sort value does not stall traversal.
+**Null in filters:** `eq` / range and `in` elements reject `null` at compile
+with a clear error. `IS NULL` is not in the operator set — a silent `col = NULL`
+would never match and would hide the mistake. Stored NULL sort keys still
+traverse (SQLite orders NULLs first in ASC, last in DESC); keyset predicates
+are null-safe so a NULL sort value does not stall pagination.
 
 Historical pagination (a page at a past revision) is out of scope: SQLite cannot
 reconstruct old rows from a revision token. Every page is read at the current
@@ -63,7 +66,9 @@ commit revision.
 Every response carries `revision`, read from `_CommittedRevision.actions` — the
 same counter the commit loop already bumps in the write transaction. Execution
 reads the token before and after the SELECT (the existing snapshot fence) and
-retries on contention so rows and revision come from one consistent read.
+retries on contention so rows and revision come from one consistent read. A
+bigint revision converts to number only when `Number.isSafeInteger` holds;
+otherwise the read fails closed.
 
 This token means **"this page was read consistently at revision R"**, not "every
 visible panel on the client represents R". Cross-panel atomic consistency is an
@@ -71,32 +76,48 @@ open owner question (below).
 
 ### 3. Invalidation subscriptions and bounded refetch
 
-A client registers a query's **declared dependencies** (entity + the filter and
-sort fields). After commit, a post-commit consumer notices matching events
-(create/remove always; update when a dependency field is touched) and records
-the new revision.
+A client registers a query's **declared dependencies**: entity, filter and sort
+fields, **authorization fields harvested from the compiled grant AST** (`scopeAst`)
+plus declared `owner` / `projectId` columns, and a **Scope handle** (project)
+that notices must match. After commit, a post-commit consumer notices matching
+events (create/remove always; update when a dependency *or authorization* field
+is touched) and records `max(existing, notice)` — a stale/out-of-order notice
+is ignored. Events without a matching `scope` do not signal (no cross-project
+timing leak).
 
 The client-facing seam returns a **signal**, never a row patch:
 
 - `unchanged` — still valid at revision R
 - `changed` — membership, order, or aggregate may have moved; **refetch the
   page**
-- `resync` — reconnect, unknown registration, or a gap the in-memory hub cannot
-  prove; refetch
-- `denied` — the registering principal no longer matches (revocation)
+- `resync` — reconnect, unknown-to-this-principal registration, a fetch that
+  predates registration (missed-change window), or a gap the in-memory hub
+  cannot prove; refetch
+- `denied` — this principal's registration is still held but the compiled grant
+  now refuses them (revocation)
+
+Registration is authorized through the compiled grant: `scopeFilter` must not
+be constant-false, and the principal must currently see at least one row in the
+registered scope. Delivery re-checks the grant. Registration ids are namespaced
+by principal so an unknown id is not an existence oracle (foreign and missing
+both return `resync`). Phase 1 caps in-process registrations at 32 per hub;
+excess `register()` fails closed. There is no LRU eviction — a silent drop
+would miss invalidations.
 
 Phase 1 notices are in-process. A process restart drops registrations, which is
 why reconnect is `resync`. A durable invalidation ledger is not introduced until
-reconnect-across-restart has a measured need.
+reconnect-across-restart has a measured need. Empty-scope subscribe (zero
+visible rows at register time) is out of phase 1.
 
 ### 4. Authorization
 
 Organisation membership never grants project data. Machine principals act
 through capabilities. Query execution applies the entity's compiled
 `scopeFilter` (the Grant row-scope half) on every page, including the page
-addressed by a cursor. Delivery of invalidation signals is bound to the
-registering principal. A stolen or reused page token does not admit another
-principal's rows.
+addressed by a cursor. Subscription registration and every `changedSince`
+delivery run that same grant: constant-false (`never()`) fails closed;
+revocation of an existing registration returns `denied`. A stolen or reused
+page token does not admit another principal's rows.
 
 Revocation stops future signals (`denied`) and the next execute returns only
 what the current grant allows (often empty). Runtime-held client cache clearing

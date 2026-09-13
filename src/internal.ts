@@ -66,7 +66,9 @@ export {
   createQueryInvalidationConsumer,
   QueryScopedReadError,
   QueryContentionError,
+  compileFilterPredicate,
   QUERY_OPERATORS,
+  OPERATORS_BY_FIELD_TYPE,
   QUERY_PAGE_SIZE_MIN,
   QUERY_PAGE_SIZE_MAX,
   QUERY_REGISTRATION_MAX,
@@ -78,6 +80,15 @@ export {
   type QueryDependency,
   type PendingQueryWrite,
 } from './query-scoped-read.ts';
+export {
+  compileQueryFamily,
+  executeQueryFamily,
+  createQueryFamilyRegistry,
+  DYNAMIC_VALUE_TYPES,
+  type QueryFamilyDeclaration,
+  type CompiledQueryFamily,
+  type QueryFamilyRequest,
+} from './query-family.ts';
 export { createPrincipalSnapshotTransaction } from './principal-snapshot-transaction.ts';
 export { WORKBENCH_MIGRATIONS, ensureWorkbenchMigrationTable, appliedWorkbenchVersion, runWorkbenchMigrations } from './workbench-migrations.ts';
 export {

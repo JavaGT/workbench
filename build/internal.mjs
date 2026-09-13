@@ -66,7 +66,9 @@ export {
   createQueryInvalidationConsumer,
   QueryScopedReadError,
   QueryContentionError,
+  compileFilterPredicate,
   QUERY_OPERATORS,
+  OPERATORS_BY_FIELD_TYPE,
   QUERY_PAGE_SIZE_MIN,
   QUERY_PAGE_SIZE_MAX,
   QUERY_REGISTRATION_MAX,
@@ -78,6 +80,15 @@ export {
 
 
 } from './query-scoped-read.mjs';
+export {
+  compileQueryFamily,
+  executeQueryFamily,
+  createQueryFamilyRegistry,
+  DYNAMIC_VALUE_TYPES,
+
+
+
+} from './query-family.mjs';
 export { createPrincipalSnapshotTransaction } from './principal-snapshot-transaction.mjs';
 export { WORKBENCH_MIGRATIONS, ensureWorkbenchMigrationTable, appliedWorkbenchVersion, runWorkbenchMigrations } from './workbench-migrations.mjs';
 export {

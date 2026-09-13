@@ -91,6 +91,10 @@ _Avoid_: Seq cursor (per-scope live position); page token as authorization
 A post-commit "changed since revision R" signal for registered query dependencies; the client refetches a bounded page rather than applying row patches.
 _Avoid_: Row-level result patch; full snapshot replace
 
+**Query family**:
+A registered, author-declared read shape over a host Entity and optional typed dynamic-field catalog/elements. Clients name the family and pass validated field references; they do not send query programs or SQL.
+_Avoid_: Ad-hoc SQL; free-form client query; collection subscription
+
 **Kernel**:
 The framework's durable mutation-dispatch core: admit, handle, append to the committed log, project rows, and register engaged post-commit consumers.
 _Avoid_: Server, router, application container

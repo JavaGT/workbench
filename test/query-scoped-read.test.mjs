@@ -301,6 +301,68 @@ test('count retries when a concurrent write moves the revision fence', () => {
   }
 });
 
+test('per-type operators accept valid cases and reject the rest', () => {
+  const { db, Note } = setup();
+  try {
+    const contains = compileQueryContract({
+      entity: 'Note',
+      filters: [{ field: 'status', op: 'contains', value: 'pe' }],
+      sort: { field: 'rank', direction: 'asc' },
+      pageSize: 10,
+    }, Note);
+    const page = executeQueryPage(db, Note, alice, contains);
+    assert.deepEqual(page.rows.map((row) => row.id).sort(), ['n1', 'n2', 'n3', 'n6']);
+    db.prepare("UPDATE Note SET body = NULL WHERE id = 'n4'").run();
+    const empty = compileQueryContract({
+      entity: 'Note',
+      filters: [{ field: 'body', op: 'isEmpty' }],
+      sort: { field: 'id', direction: 'asc' },
+      pageSize: 10,
+    }, Note);
+    assert.deepEqual(executeQueryPage(db, Note, alice, empty).rows.map((row) => row.id), ['n4']);
+    const filled = compileQueryContract({
+      entity: 'Note',
+      filters: [{ field: 'body', op: 'isNotEmpty' }, { field: 'projectId', op: 'eq', value: 'p1' }],
+      sort: { field: 'id', direction: 'asc' },
+      pageSize: 10,
+    }, Note);
+    assert.ok(executeQueryPage(db, Note, alice, filled).rows.every((row) => row.id !== 'n4'));
+  } finally {
+    db.close();
+  }
+});
+
+test('type-mismatched values and operators fail closed', () => {
+  const Note = makeNote();
+  assert.throws(
+    () => compileQueryContract({
+      entity: 'Note',
+      filters: [{ field: 'rank', op: 'eq', value: '2' }],
+      sort: { field: 'rank', direction: 'asc' },
+      pageSize: 10,
+    }, Note),
+    /must be a finite number/,
+  );
+  assert.throws(
+    () => compileQueryContract({
+      entity: 'Note',
+      filters: [{ field: 'rank', op: 'contains', value: '1' }],
+      sort: { field: 'rank', direction: 'asc' },
+      pageSize: 10,
+    }, Note),
+    /not supported on number/,
+  );
+  assert.throws(
+    () => compileQueryContract({
+      entity: 'Note',
+      filters: [{ field: 'status', op: 'isEmpty', value: true }],
+      sort: { field: 'rank', direction: 'asc' },
+      pageSize: 10,
+    }, Note),
+    /does not accept a value/,
+  );
+});
+
 test('unknown operators, fields, and null filter values fail closed at compile', () => {
   const Note = makeNote();
   assert.throws(

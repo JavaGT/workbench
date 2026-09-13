@@ -10,7 +10,18 @@ import { canonicalStringify } from './canonical-json.mjs';
 import { parseEventType, EventKind,                          } from './event-handle.mjs';
 import { tryParseScopeKey } from './scope-handle.mjs';
 
-export const QUERY_OPERATORS = Object.freeze(['eq', 'in', 'gt', 'gte', 'lt', 'lte']         );
+export const QUERY_OPERATORS = Object.freeze(['eq', 'in', 'gt', 'gte', 'lt', 'lte', 'contains', 'isEmpty', 'isNotEmpty']         );
+
+
+export const OPERATORS_BY_FIELD_TYPE = Object.freeze({
+  text: Object.freeze(['eq', 'in', 'contains', 'isEmpty', 'isNotEmpty']         ),
+  number: Object.freeze(['eq', 'in', 'gt', 'gte', 'lt', 'lte', 'isEmpty', 'isNotEmpty']         ),
+  date: Object.freeze(['eq', 'in', 'gt', 'gte', 'lt', 'lte', 'isEmpty', 'isNotEmpty']         ),
+  epoch: Object.freeze(['eq', 'in', 'gt', 'gte', 'lt', 'lte', 'isEmpty', 'isNotEmpty']         ),
+  boolean: Object.freeze(['eq', 'isEmpty', 'isNotEmpty']         ),
+  ref: Object.freeze(['eq', 'in', 'isEmpty', 'isNotEmpty']         ),
+  option: Object.freeze(['eq', 'in', 'isEmpty', 'isNotEmpty']         ),
+});
 
 
 export const QUERY_PAGE_SIZE_MIN = 1;
@@ -207,6 +218,80 @@ function authorizationFields(entity             )           {
   return [...out].filter((field) => declared.has(field));
 }
 
+function fieldTypeOf(entity             , field        )                 {
+  if (field === 'id') return 'text';
+  const type = entity.fields[field]?.type;
+  if (type && type in OPERATORS_BY_FIELD_TYPE) return type                  ;
+  fail(`field '${field}' has no queryable type.`);
+}
+
+function operatorsFor(fieldType        )                           {
+  const allowed = OPERATORS_BY_FIELD_TYPE[fieldType                  ];
+  if (!allowed) fail(`field type '${fieldType}' is not queryable.`);
+  return allowed;
+}
+
+function assertTypedValue(fieldType        , value         , label        )       {
+  assertSqlValue(value, label);
+  if (fieldType === 'boolean') {
+    if (typeof value !== 'boolean') fail(`${label} must be a boolean.`);
+    return;
+  }
+  if (fieldType === 'number' || fieldType === 'date' || fieldType === 'epoch') {
+    if (typeof value !== 'number' || !Number.isFinite(value)) fail(`${label} must be a finite number.`);
+    return;
+  }
+  if (typeof value !== 'string') fail(`${label} must be a string.`);
+}
+
+function escapeLike(value        )         {
+  return value.replaceAll('\\', '\\\\').replaceAll('%', '\\%').replaceAll('_', '\\_');
+}
+
+export function compileFilterPredicate(input
+
+
+
+
+
+
+ )         {
+  const allowed = operatorsFor(input.fieldType);
+  if (!(allowed                     ).includes(input.op)) fail(`operator '${input.op}' is not supported on ${input.fieldType} fields.`);
+  const column = input.column;
+  if (input.op === 'isEmpty') {
+    if (input.value !== undefined && input.value !== null) fail('isEmpty does not accept a value.');
+    return input.fieldType === 'text' ? `(${column} IS NULL OR ${column} = '')` : `${column} IS NULL`;
+  }
+  if (input.op === 'isNotEmpty') {
+    if (input.value !== undefined && input.value !== null) fail('isNotEmpty does not accept a value.');
+    return input.fieldType === 'text' ? `(${column} IS NOT NULL AND ${column} != '')` : `${column} IS NOT NULL`;
+  }
+  if (input.op === 'in') {
+    if (!Array.isArray(input.value) || input.value.length === 0 || input.value.length > IN_VALUES_MAX) {
+      fail('in requires 1 through 100 values.');
+    }
+    const names = input.value.map((item, itemIndex) => {
+      assertTypedValue(input.fieldType, item, 'in value');
+      const name = `query_f${input.index}_${itemIndex}`;
+      input.params[name] = item;
+      return `:${name}`;
+    });
+    return `${column} IN (${names.join(', ')})`;
+  }
+  if (input.op === 'contains') {
+    if (typeof input.value !== 'string' || input.value.length === 0) fail('contains requires a non-empty string.');
+    const name = `query_f${input.index}`;
+    input.params[name] = escapeLike(input.value);
+    return `${column} LIKE '%' || :${name} || '%' ESCAPE '\\'`;
+  }
+  assertTypedValue(input.fieldType, input.value, 'filter value');
+  const name = `query_f${input.index}`;
+  input.params[name] = input.fieldType === 'boolean' ? (input.value ? 1 : 0) : input.value;
+  const operator = ({ eq: '=', gt: '>', gte: '>=', lt: '<', lte: '<=' }         )[input.op];
+  return `${column} ${operator} :${name}`;
+}
+
 function compileFilter(
   filter         ,
   declared             ,
@@ -220,24 +305,11 @@ function compileFilter(
   if (typeof field !== 'string' || !declared.has(field)) fail('a filter references an unknown field.');
   assertScalarField(entity, field, 'filter field');
   if (!(QUERY_OPERATORS                     ).includes(op)) fail('a filter uses an unsupported operator.');
+  const fieldType = fieldTypeOf(entity, field);
   const column = `t0.${identifier(field, 'filter field')}`;
-  if (op === 'in') {
-    if (!Array.isArray(value) || value.length === 0 || value.length > IN_VALUES_MAX) {
-      fail('in requires 1 through 100 values.');
-    }
-    const names = value.map((item, itemIndex) => {
-      assertSqlValue(item, 'in value');
-      const name = `query_f${index}_${itemIndex}`;
-      params[name] = item;
-      return `:${name}`;
-    });
-    return { sql: `${column} IN (${names.join(', ')})`, field, op, value: freezeJsonValue(value) };
-  }
-  assertSqlValue(value, 'filter value');
-  const name = `query_f${index}`;
-  params[name] = value;
-  const operator = ({ eq: '=', gt: '>', gte: '>=', lt: '<', lte: '<=' }         )[op];
-  return { sql: `${column} ${operator} :${name}`, field, op, value };
+  const sql = compileFilterPredicate({ column, op, value, fieldType, params, index });
+  if (op === 'isEmpty' || op === 'isNotEmpty') return { sql, field, op, value: null };
+  return { sql, field, op, value: freezeJsonValue(value) };
 }
 
 export function compileQueryContract(input         , entity             )                {
@@ -266,7 +338,11 @@ export function compileQueryContract(input         , entity             )       
   }
   const identity = canonicalStringify({
     entity: entity.name,
-    filters: filters.map((filter) => ({ field: filter.field, op: filter.op, value: filter.value })),
+    filters: filters.map((filter) => (
+      filter.op === 'isEmpty' || filter.op === 'isNotEmpty'
+        ? { field: filter.field, op: filter.op }
+        : { field: filter.field, op: filter.op, value: filter.value }
+    )),
     sort: { field: sortField, direction },
     pageSize,
   });

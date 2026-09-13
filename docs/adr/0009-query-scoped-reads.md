@@ -1,6 +1,6 @@
 # Query-scoped reads are a Workbench-owned read contract
 
-Status: proposed (#225)
+Status: accepted (#225)
 
 Workbench serves filtered, sorted, paginated Entity pages to light clients
 through one typed query contract. Authorization, revision semantics, and
@@ -37,25 +37,29 @@ inspection (same ticket) pin the constraints:
 
 ### 1. Typed query contract
 
-A query names one compiled Entity and a closed operator set over declared
-scalar fields:
+A query names one compiled Entity and a **typed filter grammar** over declared
+fields. Operators are allowlisted **per field type**, not a global soup:
 
-- equality (`eq`)
-- set membership (`in`, 1–100 values)
-- range (`gt` / `gte` / `lt` / `lte`)
+| Type | Operators |
+| --- | --- |
+| text | `eq`, `in`, `contains`, `isEmpty`, `isNotEmpty` |
+| number, date, epoch | `eq`, `in`, `gt` / `gte` / `lt` / `lte`, `isEmpty`, `isNotEmpty` |
+| boolean | `eq`, `isEmpty`, `isNotEmpty` |
+| ref, option | `eq`, `in`, `isEmpty`, `isNotEmpty` |
 
-Unknown operators, unknown fields, functions, and SQL fragments fail closed at
-compile. Filters AND together. Sort is **one declared field** plus a unique
-tie-break of `id ASC` (the existing `readRows` order). Page size is bounded
-(1–100) and is part of the query identity. The page token is a **keyset cursor**
-`{ queryIdentity, sortValue, id }` bound to that contract's identity. A cursor
-from a different contract is rejected. Page tokens are never authorization.
+Unknown operators, unknown fields, type-mismatched values, functions, and SQL
+fragments fail closed at compile and at execution. Filters AND together. Sort
+is **one declared field** plus a unique tie-break of `id ASC` (the existing
+`readRows` order). Page size is bounded (1–100) and is part of the query
+identity. The page token is a **keyset cursor** `{ queryIdentity, sortValue, id }`
+bound to that contract's identity. A cursor from a different contract is
+rejected. Page tokens are never authorization.
 
-**Null in filters:** `eq` / range and `in` elements reject `null` at compile
-with a clear error. `IS NULL` is not in the operator set — a silent `col = NULL`
-would never match and would hide the mistake. Stored NULL sort keys still
-traverse (SQLite orders NULLs first in ASC, last in DESC); keyset predicates
-are null-safe so a NULL sort value does not stall pagination.
+**Null and empty:** `eq` / range / `in` / `contains` reject `null` at compile.
+`isEmpty` / `isNotEmpty` are the empty operators and do not take a value. On a
+declared column, empty means SQL NULL (and, for text, `''`). On a dynamic
+field (query family), empty means no non-empty element row. Stored NULL sort
+keys still traverse (SQLite orders NULLs first in ASC, last in DESC).
 
 Historical pagination (a page at a past revision) is out of scope: SQLite cannot
 reconstruct old rows from a revision token. Every page is read at the current
@@ -71,8 +75,9 @@ bigint revision converts to number only when `Number.isSafeInteger` holds;
 otherwise the read fails closed.
 
 This token means **"this page was read consistently at revision R"**, not "every
-visible panel on the client represents R". Cross-panel atomic consistency is an
-open owner question (below).
+visible panel on the client represents R". Cross-panel atomic consistency is
+**not required**: each result carries its own revision, and the client shows a
+visible updating state while a panel refetches.
 
 ### 3. Invalidation subscriptions and bounded refetch
 
@@ -154,27 +159,40 @@ write path or a second auth engine.
 `entity/query.ts` (`findAll`) remains the in-process ambient finder. Collection
 subscriptions remain the row-patch experiment. Neither is this contract.
 
-## Open questions (owner)
+`src/query-family.ts` — **registered query families** over a host entity plus a
+typed value catalog and element rows (Scope-style dynamic properties). Clients
+name a registered family and pass a validated field id + operator + value.
+There is no free-form client query program and no raw SQL. Execution reuses
+compiled host grants, the revision fence, keyset pagination, and invalidation
+signals. Dynamic sort-by-property-value and multi-field dynamic AND/OR in one
+request are deferred; phase 2 sorts declared host fields and applies one
+dynamic predicate.
 
-These are not silently decided. Phase 1 implements the **signal-and-refetch**
-side of each so work can proceed; the UI/product call stays with the owner.
+## Resolved decisions (owner, 2026-09-13)
 
-1. **Jump-on-edit versus signal-that-results-changed.** When a visible row's
-   sort key or filter field changes, should the list jump immediately, or stay
-   still and show that results changed? Phase 1 emits `changed` and leaves
-   placement to the client.
-2. **Cross-panel atomic consistency.** Must two panels (list + count, or two
-   lists) display exactly one shared revision, or is per-page provenance enough
-   with an explicit stale/loading state? Phase 1 stamps each page independently.
-3. **Dynamic / user-defined fields.** How are they stored and indexed today, and
-   which filter/sort combinations are actually used? Phase 1 only accepts
-   declared scalar fields on the compiled Entity.
-4. **Acceptance device and workflow.** Which phone/browser and which list
-   editing workflow is the regression gate? Not a protocol question, but it
-   gates later performance work.
-5. **When (if ever) to replace refetch with row-level patches.** Collection
-   subscriptions exist; adopting them for this contract needs evidence that
-   refetch is too expensive under the real subscription fan-out.
+1. **Live-list behaviour.** Workbench delivers `changed` signals and bounded
+   refetch. Jump-on-edit is a **client-contract** choice: reading lists
+   (library, quotes) stay and signal; small active contexts (Studio-style)
+   may jump. The server does not encode jump.
+2. **Cross-panel consistency.** Per-result consistency with a visible updating
+   state. No cross-panel one-revision atomicity.
+3. **Query vocabulary.** Typed filter grammar over declared fields, with
+   registered query families for dynamic field references (`eq`, `in`, range,
+   `contains`, `isEmpty` / `isNotEmpty`). No free-form client query programs.
+4. **Acceptance case.** iPhone-class WebKit and Pixel-class Chromium, artefacts
+   library browse/filter workflow; Playwright harness plus one real-device
+   check before release. (Measurement lives in Scope; this ADR records the
+   gate.)
+5. **Change delivery.** Bounded refetch. Row-level patches only if later
+   measurements justify them.
+6. **Registration cap.** 32 per hub, failing closed — confirmed.
+
+## Deferred (not owner-blocking)
+
+- Sorting a page by a dynamic property value (join order + keyset on the
+  element column).
+- Several dynamic predicates in one family request (AND/OR across properties).
+- Empty-scope subscribe (zero visible rows at register time).
 
 ## Consequences
 
@@ -182,5 +200,5 @@ side of each so work can proceed; the UI/product call stays with the owner.
 - Scope integration (pin bump, surface migration) is a later phase; this ADR
   does not change Scope.
 - Invalidation storms, unindexed dynamic queries, and cache growth remain
-  tracked risks; phase 1 bounds page size, operator set, and refetch rather
-  than introducing incremental result maintenance.
+  tracked risks; page size, operator set, family registration, and refetch
+  stay bounded rather than introducing incremental result maintenance.

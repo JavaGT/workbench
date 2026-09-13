@@ -341,6 +341,39 @@ test('unknown operators, fields, and null filter values fail closed at compile',
   );
 });
 
+test('an invalid explicit scopeField is refused', () => {
+  const { db, Note } = setup();
+  try {
+    const hub = createQueryInvalidationHub();
+    const revision = readCommittedRevision(db);
+    assert.throws(
+      () => hub.register({
+        id: 'bad-field',
+        dependency: { entity: 'Note', fields: ['status'], scope: 'Project:p1', scopeField: 'notAField' },
+        principal: alice,
+        entity: Note,
+        db,
+        revision,
+      }),
+      /scopeField 'notAField' is not a declared field/,
+    );
+    assert.throws(
+      () => hub.register({
+        id: 'empty-field',
+        dependency: { entity: 'Note', fields: ['status'], scope: 'Project:p1', scopeField: '' },
+        principal: alice,
+        entity: Note,
+        db,
+        revision,
+      }),
+      /scopeField must be a declared field name/,
+    );
+    assert.equal(hub.size, 0, 'a rejected scopeField must not register');
+  } finally {
+    db.close();
+  }
+});
+
 test('wrong-project registration is refused; own-project registration succeeds', () => {
   const { db, Note } = setup();
   try {

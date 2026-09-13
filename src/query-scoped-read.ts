@@ -335,10 +335,21 @@ function principalStillAdmitted(entity: QueryEntity, principal: unknown): boolea
   }
 }
 
-function defaultScopeField(scope: string): string | null {
+function defaultScopeField(scope: string, entityName: string): string | null {
   const parsed = tryParseScopeKey(scope);
   if (!parsed) return null;
+  if (parsed.entity === entityName) return 'id';
   return `${parsed.entity.charAt(0).toLowerCase()}${parsed.entity.slice(1)}Id`;
+}
+
+function resolveScopeField(entity: QueryEntity, scope: string, explicit: string | undefined): string {
+  if (explicit !== undefined) {
+    if (typeof explicit !== 'string' || explicit.length === 0) fail('scopeField must be a declared field name.');
+  }
+  const field = explicit ?? defaultScopeField(scope, entity.name);
+  if (typeof field !== 'string' || field.length === 0) fail('scopeField cannot be resolved on the entity.');
+  if (field !== 'id' && !entity.fields[field]) fail(`scopeField '${field}' is not a declared field.`);
+  return field;
 }
 
 function filterSql(compiled: CompiledQuery, entity: QueryEntity, params: Record<string, unknown>): string {
@@ -494,7 +505,7 @@ interface QueryRegistration {
   entityName: string;
   fields: ReadonlySet<string>;
   scope: string;
-  scopeField: string | null;
+  scopeField: string;
   principalKey: string;
   compiledEntity: QueryEntity;
   lastInvalidatedRevision: number | null;
@@ -557,17 +568,14 @@ function assertVisibleInScope(
   entity: QueryEntity,
   principal: unknown,
   scope: string,
-  scopeField: string | null,
+  scopeField: string,
 ): void {
   const grant = assertAdmitted(entity, principal);
-  const params: Record<string, unknown> = { ...grant.params };
-  let sql = `SELECT 1 AS ok FROM ${identifier(entity.name, 'entity name')} AS t0 WHERE (${grant.sql})`;
   const parsed = tryParseScopeKey(scope);
-  if (parsed && scopeField && (scopeField === 'id' || entity.fields[scopeField])) {
-    sql += ` AND t0.${identifier(scopeField, 'scope field')} = :query_scope_id`;
-    params.query_scope_id = parsed.id;
-  }
-  sql += ' LIMIT 1';
+  if (!parsed) fail('dependency scope must be a Scope handle.');
+  if (scopeField !== 'id' && !entity.fields[scopeField]) fail(`scopeField '${scopeField}' is not a declared field.`);
+  const params: Record<string, unknown> = { ...grant.params, query_scope_id: parsed.id };
+  const sql = `SELECT 1 AS ok FROM ${identifier(entity.name, 'entity name')} AS t0 WHERE (${grant.sql}) AND t0.${identifier(scopeField, 'scope field')} = :query_scope_id LIMIT 1`;
   const row = db.prepare(sql).get(params);
   if (!row) fail('principal cannot see this query scope.');
 }
@@ -598,7 +606,7 @@ export function createQueryInvalidationHub(options: { maxRegistrations?: number 
     if (!Array.isArray(input.dependency.fields)) fail('dependency fields must be an array.');
     if (typeof input.dependency.scope !== 'string' || input.dependency.scope.length === 0) fail('dependency scope is required.');
     if (!tryParseScopeKey(input.dependency.scope)) fail('dependency scope must be a Scope handle.');
-    const scopeField = input.dependency.scopeField ?? defaultScopeField(input.dependency.scope);
+    const scopeField = resolveScopeField(input.entity, input.dependency.scope, input.dependency.scopeField);
     assertVisibleInScope(input.db, input.entity, input.principal, input.dependency.scope, scopeField);
     const key = slot(principalKey, input.id);
     if (!registrations.has(key) && registrations.size >= maxRegistrations) {

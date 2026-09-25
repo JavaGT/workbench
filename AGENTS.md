@@ -26,7 +26,7 @@ Performance reference: read `docs/performance-results.md` for the latest recorde
 
 ## Development lanes
 
-All Workbench source, test, documentation, and workflow writes go through a managed lane. Create one with `pnpm lanes create <name> --owns <path>...` from the Workbench checkout; the canonical checkout is read-only for authoring. Lanes use literal path ownership, refuse overlaps, record milestones and expiry, and are closed with `pnpm lanes close <name> --reason "..."`. Never create ad-hoc worktrees or merge a lane silently. Read [`docs/agents/lane-delivery.md`](./docs/agents/lane-delivery.md) before dispatching or handing off work. Scope has a separate lane registry; a Scope lane never owns Workbench paths.
+All Workbench source, test, documentation, and workflow writes go through a managed lane. Create one with `pnpm lanes create <name> --owns <path>...` from the Workbench checkout; the canonical checkout is read-only for authoring. Lanes use literal path ownership, refuse overlaps, record milestones and expiry, enforce committed scope at close, and are closed with `pnpm lanes close <name> --reason "..."`. If ownership must grow, record it with `pnpm lanes extend <name> --owns <path>...` before closing. Never create ad-hoc worktrees or merge a lane silently. Read [`docs/agents/lane-delivery.md`](./docs/agents/lane-delivery.md) before dispatching or handing off work. Scope has a separate lane registry; a Scope lane never owns Workbench paths.
 
 ## Naming
 

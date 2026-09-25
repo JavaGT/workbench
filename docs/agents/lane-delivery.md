@@ -47,6 +47,16 @@ Run the full `pnpm test` only for a wave-close or release decision. A lane does 
 run shared development servers or paid hosted CI. Local checks and the commit SHA
 are the evidence for the handoff.
 
+## Extend ownership
+
+If the committed work legitimately needs another path, record the expansion before closing:
+
+```bash
+pnpm lanes extend <name> --owns <path>...
+```
+
+The command rejects globs, unknown paths, and overlaps with another active lane. `close` compares the lane's committed diff with its declared paths and refuses out-of-scope commits, so a receipt cannot hide scope creep.
+
 ## Integrate
 
 A lane branch is an integration queue item, not a silent merge:

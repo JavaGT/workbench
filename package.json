@@ -32,6 +32,7 @@
 		}
 	},
 	"scripts": {
+		"lanes": "node scripts/lane.mjs",
 		"check:heavy": "node scripts/heavy-command.mjs",
 		"emit:ts": "node --disable-warning=ExperimentalWarning scripts/emit-ts.mjs",
 		"build": "pnpm emit:ts",

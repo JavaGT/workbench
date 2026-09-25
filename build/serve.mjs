@@ -236,6 +236,126 @@ export function makeRequestHandler(source     , { principalOf = anonymousPrincip
     }
   }
 
+  // The ordered chain is stable for the lifetime of this server. Keep its
+  // match/handle functions out of the request path; request-local values are
+  // passed explicitly when the chain runs below.
+  const handlers = [
+    // /health — PUBLIC, anonymous, no auth (piece 1)
+    {
+      match: (req     , url     ) => isApp && req.method === 'GET' && url.pathname === '/health',
+      handle: (_req     , res     ) => { sendJson(res, 200, { status: 'ok', env }); return true; },
+    },
+    // /health/stats — includes uptime, RSS, request count
+    {
+      match: (req     , url     ) => isApp && req.method === 'GET' && url.pathname === '/health/stats',
+      handle: (_req     , res     ) => {
+        sendJson(res, 200, {
+          status: 'ok',
+          env,
+          uptimeMs: Math.round(process.uptime() * 1000),
+          rssBytes: process.memoryUsage().rss,
+          requestCount: requestCount.count,
+        });
+        return true;
+      },
+    },
+    // CORS preflight (piece 4 — opt-in): OPTIONS with allowed origin → 204
+    {
+      match: (req     , _url     ) => isApp && req.method === 'OPTIONS' && cors && cors.origins && Array.isArray(cors.origins),
+      handle: (req     , res     ) => {
+        const origin = req.headers.origin;
+        if (origin && cors.origins.includes(origin)) {
+          res.setHeader('access-control-allow-origin', origin);
+          res.setHeader('vary', 'Origin');
+          res.setHeader('access-control-allow-methods', 'GET, POST, PATCH, DELETE, OPTIONS');
+          res.setHeader('access-control-allow-headers', 'content-type');
+          res.writeHead(204);
+          res.end();
+          return true;
+        }
+        return false;
+      },
+    },
+    // Browser SDK: GET /workbench.mjs (intercepts before matchRoute)
+    {
+      match: (req     , _url     ) => isApp && req.method === 'GET',
+      handle: async (req     , res     ) => {
+        const handled = await handleClientSdkRoute(source, req, res);
+        return handled || responseHasStarted(res);
+      },
+    },
+    // Snapshot + resync: /snapshot/:entity/:id, /events-since/:entity/:id (spec #1, D6/D7)
+    {
+      match: (req     , _url     ) => isApp && req.method === 'GET',
+      handle: async (req     , res     ) => {
+        const handled = await handleResyncRoute(source, req, res, principalOfAdmitted(req));
+        return handled || responseHasStarted(res);
+      },
+    },
+    // Blob upload: POST /blobs (spec #2)
+    {
+      match: (req     , _url     ) => isApp && req.method === 'POST',
+      handle: async (req     , res     ) => {
+        const handled = await handleBlobUploadRoute(source, req, res, principalOfAdmitted(req));
+        return handled || responseHasStarted(res);
+      },
+    },
+    // Job-queue endpoints: /workers/register, /jobs/* (spec #5)
+    {
+      match: (req     , _url     ) => isApp && req.method === 'POST' && source.jobs,
+      handle: async (req     , res     ) => {
+        const handled = await handleJobRoute(source, req, res);
+        return handled || responseHasStarted(res);
+      },
+    },
+    // Generic registered-action transport. This is intentionally before
+    // application handlers so entity mutation authority stays in the
+    // package-owned registered-action kernel.
+    {
+      match: (_req     , _url     ) => isApp,
+      handle: async (req     , res     ) => handleApplicationActionHttp(source, req, res, actionPrincipalOf, sendJsonCompat),
+    },
+    // Application-integrated SSE delivery is package-owned: this mounted
+    // handler has no access to raw log rows or action callbacks.
+    {
+      match: (_req     , _url     ) => isApp && Boolean(source._applicationLiveDelivery),
+      handle: async (req     , res     ) => {
+        const handled = await source._applicationLiveDelivery.handler(req, res);
+        return handled || responseHasStarted(res);
+      },
+    },
+    // App-declared prefix-intercept handlers — app.use(prefix, fn)
+    {
+      match: (_req     , _url     ) => isApp && source._handlers?.length,
+      handle: async (req     , res     , url     ) => {
+        for (const { prefix, fn } of source._handlers) {
+          if (prefix !== '/' && url.pathname !== prefix && !url.pathname.startsWith(`${prefix}/`)) continue;
+          const rest = url.pathname.slice(prefix.length) || '/';
+          const ctxReq = {
+            body: undefined,
+            params: { path: rest.replace(/^\//, '') },
+            query: Object.fromEntries(url.searchParams),
+            principal: principalOfAdmitted(req),
+            raw: req,
+            headers: req.headers,
+            method: req.method,
+            url: req.url,
+          };
+          let handled = false;
+          const ctxRes = makeHandlerRes(res, () => { handled = true; });
+          try {
+            await fn(ctxReq, ctxRes, () => {});
+          } catch (err) {
+            renderError(res, err, { env });
+            return true;
+          }
+          if (handled || responseHasStarted(res)) return true;
+        }
+        return false;
+      },
+    },
+  ];
+
   async function handle(req     , res     ) {
     const startTime = Date.now();
     if (isApp) requestCount.count += 1;
@@ -307,132 +427,11 @@ export function makeRequestHandler(source     , { principalOf = anonymousPrincip
 
       const url = new URL(req.url, 'http://localhost');
 
-      // Ordered request handler chain: the first entry whose match() returns
-      // true gets to handle(). If handle() returns true (or the response has
-      // started), processing stops. If handle() returns false, the next
-      // matching entry is tried. At the end, the default route matching +
-      // dispatch runs.
-      const handlers = [
-        // /health — PUBLIC, anonymous, no auth (piece 1)
-        {
-          match: () => isApp && req.method === 'GET' && url.pathname === '/health',
-          handle: () => { sendJson(res, 200, { status: 'ok', env }); return true; },
-        },
-        // /health/stats — includes uptime, RSS, request count
-        {
-          match: () => isApp && req.method === 'GET' && url.pathname === '/health/stats',
-          handle: () => {
-            sendJson(res, 200, {
-              status: 'ok',
-              env,
-              uptimeMs: Math.round(process.uptime() * 1000),
-              rssBytes: process.memoryUsage().rss,
-              requestCount: requestCount.count,
-            });
-            return true;
-          },
-        },
-        // CORS preflight (piece 4 — opt-in): OPTIONS with allowed origin → 204
-        {
-          match: () => isApp && req.method === 'OPTIONS' && cors && cors.origins && Array.isArray(cors.origins),
-          handle: () => {
-            const origin = req.headers.origin;
-            if (origin && cors.origins.includes(origin)) {
-              res.setHeader('access-control-allow-origin', origin);
-              res.setHeader('vary', 'Origin');
-              res.setHeader('access-control-allow-methods', 'GET, POST, PATCH, DELETE, OPTIONS');
-              res.setHeader('access-control-allow-headers', 'content-type');
-              res.writeHead(204);
-              res.end();
-              return true;
-            }
-            return false;
-          },
-        },
-        // Browser SDK: GET /workbench.mjs (intercepts before matchRoute)
-        {
-          match: () => isApp && req.method === 'GET',
-          handle: async () => {
-            const handled = await handleClientSdkRoute(source, req, res);
-            return handled || responseHasStarted(res);
-          },
-        },
-        // Snapshot + resync: /snapshot/:entity/:id, /events-since/:entity/:id (spec #1, D6/D7)
-        {
-          match: () => isApp && req.method === 'GET',
-          handle: async () => {
-            const handled = await handleResyncRoute(source, req, res, principalOfAdmitted(req));
-            return handled || responseHasStarted(res);
-          },
-        },
-        // Blob upload: POST /blobs (spec #2)
-        {
-          match: () => isApp && req.method === 'POST',
-          handle: async () => {
-            const handled = await handleBlobUploadRoute(source, req, res, principalOfAdmitted(req));
-            return handled || responseHasStarted(res);
-          },
-        },
-        // Job-queue endpoints: /workers/register, /jobs/* (spec #5)
-        {
-          match: () => isApp && req.method === 'POST' && source.jobs,
-          handle: async () => {
-            const handled = await handleJobRoute(source, req, res);
-            return handled || responseHasStarted(res);
-          },
-        },
-        // Generic registered-action transport. This is intentionally before
-        // application handlers so entity mutation authority stays in the
-        // package-owned registered-action kernel.
-        {
-          match: () => isApp,
-          handle: async () => handleApplicationActionHttp(source, req, res, actionPrincipalOf, sendJsonCompat),
-        },
-        // Application-integrated SSE delivery is package-owned: this mounted
-        // handler has no access to raw log rows or action callbacks.
-        {
-          match: () => isApp && Boolean(source._applicationLiveDelivery),
-          handle: async () => {
-            const handled = await source._applicationLiveDelivery.handler(req, res);
-            return handled || responseHasStarted(res);
-          },
-        },
-        // App-declared prefix-intercept handlers — app.use(prefix, fn)
-        {
-          match: () => isApp && source._handlers?.length,
-          handle: async () => {
-            for (const { prefix, fn } of source._handlers) {
-              if (prefix !== '/' && url.pathname !== prefix && !url.pathname.startsWith(`${prefix}/`)) continue;
-              const rest = url.pathname.slice(prefix.length) || '/';
-              const ctxReq = {
-                body: undefined,
-                params: { path: rest.replace(/^\//, '') },
-                query: Object.fromEntries(url.searchParams),
-                principal: principalOfAdmitted(req),
-                raw: req,
-                headers: req.headers,
-                method: req.method,
-                url: req.url,
-              };
-              let handled = false;
-              const ctxRes = makeHandlerRes(res, () => { handled = true; });
-              try {
-                await fn(ctxReq, ctxRes, () => {});
-              } catch (err) {
-                renderError(res, err, { env });
-                return true;
-              }
-              if (handled || responseHasStarted(res)) return true;
-            }
-            return false;
-          },
-        },
-      ];
-
-      // Run the handler chain
+      // Run the stable handler chain. Request-local values are passed
+      // explicitly; the table itself is created once per server.
       for (const h of handlers) {
-        if (h.match()) {
-          const handled = await h.handle();
+        if (h.match(req, url)) {
+          const handled = await h.handle(req, res, url);
           if (handled || responseHasStarted(res)) return;
         }
       }

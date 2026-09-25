@@ -27,6 +27,20 @@ function makeEntity({ fields = {}, row = { id: 'd1', title: 'v1' } } = {}) {
   };
 }
 
+test('live fanout exits before hydration when the event scope has no subscribers', async () => {
+  let hydrations = 0;
+  const entity = makeEntity();
+  entity.findById = () => {
+    hydrations += 1;
+    return entity.fields;
+  };
+  const fanout = createLiveFanout({ mayVerb: async () => true });
+
+  await fanout.emit(entity, 'd1', undefined, { type: 'Doc.updated', seq: 1, data: { id: 'd1' } });
+
+  assert.equal(hydrations, 0);
+});
+
 test('live fanout stores subscriptions and removes them per connection', async () => {
   const fanout = createLiveFanout({ mayVerb: async () => true });
   const conn = makeConn('c1');

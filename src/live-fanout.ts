@@ -277,6 +277,7 @@ export function createLiveFanout({ mayVerb = null, authorization = null }: { may
   const byScope = new Map<string, Map<LiveConn, LiveSubscriptionSpec>>(); // Map<scopeKey, Map<conn, SubSpec>>
   const connSubs = new Map<LiveConn, Set<string>>();  // Map<conn, Set<scopeKey>>
   const paceBuffers = new Map<string, PaceBufferEntry>();
+  const annotatedTextByEntity = new WeakMap<object, boolean>();
   // One pending snapshot-control per (connection, document) per event-loop turn.
   // Later controls only raise the high-water sequence; the flush emits one message.
   const pendingSnapshotControls = new Map<string, {
@@ -368,8 +369,12 @@ export function createLiveFanout({ mayVerb = null, authorization = null }: { may
   }
 
   function addSubscriptionScope(scope: string, conn: LiveConn, fields: Record<string, true> | null = null, pace: PaceProfile | null = null, interest: Record<string, unknown> = {}): void {
-    if (!byScope.has(scope)) byScope.set(scope, new Map());
-    const previous = byScope.get(scope)!.get(conn);
+    let scopeSubs = byScope.get(scope);
+    if (!scopeSubs) {
+      scopeSubs = new Map();
+      byScope.set(scope, scopeSubs);
+    }
+    const previous = scopeSubs.get(conn);
     if (interest.rule && !previous?.interest?.rule && collectionSubscriptionCount(conn) >= 32) {
       throw new Error('Collection subscription limit exceeded.');
     }
@@ -377,7 +382,7 @@ export function createLiveFanout({ mayVerb = null, authorization = null }: { may
     const previousCarets = (previous?.interest?.carets as string[] | undefined) ?? [];
     const removedCarets = previousCarets.filter((field) => !nextCarets.includes(field));
     if (removedCarets.length > 0) onCaretInterestChange?.(conn, scope, removedCarets);
-    byScope.get(scope)!.set(conn, { fields, latch: true, pace, interest });
+    scopeSubs.set(conn, { fields, latch: true, pace, interest });
     // A late-joining caret subscriber must learn the CURRENT presence state for
     // the fields it now cares about; the caret module replays existing slots.
     const addedCarets = nextCarets.filter((field) => !previousCarets.includes(field));
@@ -562,19 +567,23 @@ export function createLiveFanout({ mayVerb = null, authorization = null }: { may
       } catch { return; }
     }
     const handle = committed.handle as EventIdentityHandle;
+    // Derive the anchor scope once. Besides avoiding duplicate Scope-handle
+    // construction, doing the registry lookup before row hydration/delta work
+    // makes an event with no subscribers a cheap no-op.
+    const directScope = scopeOf(name, id).key;
+    const eventScope = committed.scope ?? directScope;
+    const scopeSubs = byScope.get(eventScope);
+    if (!scopeSubs) return;
+
     // Scope-anchored case: a foreign-entity event (e.g. Job.updated) riding
     // the anchor row's own scope stream. The caller deliberately delivers it
     // here, authorized against the anchor row — not a per-entity mismatch.
     let scopeAnchored = false;
     if (handle.entity !== name) {
-      let anchorKey;
-      try { anchorKey = scopeOf(name, id).key; } catch { return; }
-      if (typeof committedEvent.scope !== 'string' || committedEvent.scope !== anchorKey) return;
+      if (typeof committed.scope !== 'string' || committed.scope !== directScope) return;
       scopeAnchored = true;
     }
 
-    const eventScope = committedEvent.scope ?? scopeOf(name, id).key;
-    const directScope = scopeOf(name, id).key;
     const removed = row === undefined;
 
     // Annotated-text operations have no recipient event grammar. Classify them
@@ -601,16 +610,18 @@ export function createLiveFanout({ mayVerb = null, authorization = null }: { may
         ephemeralField = handle.field;
       }
     }
-    const isAnnotatedTextEphemeral = ephemeralField !== null && hasAnnotatedText(entityRecord);
+    let annotatedText = annotatedTextByEntity.get(entityRecord);
+    if (annotatedText === undefined) {
+      annotatedText = hasAnnotatedText(entityRecord);
+      annotatedTextByEntity.set(entityRecord, annotatedText);
+    }
+    const isAnnotatedTextEphemeral = ephemeralField !== null && annotatedText;
 
     // Delta projection is per-entity state diffing; a scope-anchored foreign
     // event carries its own data and must not be fed to the anchor's projector.
     const delta = scopeAnchored || isAnnotatedTextOperation || isAnnotatedTextEphemeral
       ? undefined
       : deltaProjector.project(entityRecord as never, id, authzRow, committed as never);
-
-    const scopeSubs = byScope.get(eventScope);
-    if (!scopeSubs) return;
 
     for (const [conn, subSpec] of scopeSubs) {
       if (conn.closed) {
@@ -662,7 +673,7 @@ export function createLiveFanout({ mayVerb = null, authorization = null }: { may
           name,
           id,
           seq,
-          hasAnnotatedText(entityRecord) ? 'annotated-text-snapshot-required' : 'recipient-snapshot-required',
+          annotatedText ? 'annotated-text-snapshot-required' : 'recipient-snapshot-required',
         );
         continue;
       }

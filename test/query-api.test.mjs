@@ -89,6 +89,28 @@ test('Entity.getOrFail(id) returns the row; a missing id throws a 404-status err
   );
 });
 
+test('repeated entity queries reuse the prepared statement for the same SQL shape', () => {
+  const db = seedDb();
+  let prepareCount = 0;
+  const counted = new Proxy(db, {
+    get(target, property, receiver) {
+      if (property === 'prepare') {
+        return (sql) => {
+          prepareCount += 1;
+          return target.prepare(sql);
+        };
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  const User = bindUser(counted);
+  const before = prepareCount;
+  User.findOne(User.username.is('alice'));
+  User.findOne(User.username.is('alice'));
+  assert.equal(prepareCount - before, 1);
+});
+
 test('Entity.create(payload) inserts and returns the new row with its id', () => {
   const User = bindUser(seedDb());
   const created = User.create({ username: 'carol', password: 'pw-c' });

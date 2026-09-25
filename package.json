@@ -44,6 +44,7 @@
 		"bench:http": "node bench/hot-path.mjs --benchmarks http-crud",
 		"bench:commit": "node bench/hot-path.mjs --benchmarks commit",
 		"bench:live": "node bench/hot-path.mjs --benchmarks live-delivery",
+		"bench:live-delivery": "node bench/live-delivery.mjs",
 		"bench:text": "node bench/hot-path.mjs --benchmarks annotated-text",
 		"bench:profile": "node bench/hot-path.mjs --profile bench/workbench-performance.cpuprofile",
 		"bench:compare": "node bench/hot-path.mjs --compare bench/baseline.json",

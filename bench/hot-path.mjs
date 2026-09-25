@@ -942,18 +942,21 @@ async function runUnifiedAnnotatedTextSample(config) {
     });
 
     // Declaration action: timing.correct through the Commit loop against one
-    // stable authoring position frame.
+    // stable authoring position frame. Every dispatch runs inside the timed
+    // window so the metric is per-dispatch throughput, like the other phases.
     const binding = await unifiedAuthoringBinding(db, Doc);
     const correctOps = await timed(config.corrects, async () => {
-      const result = await app.dispatch({
-        actionId: `bench-correct-${Math.random().toString(36).slice(2)}`,
-        type: 'UnifiedDoc.body.timing.correct', scope: 'Project:p1', principal: me,
-        payload: {
-          version: 1, id: 'd1', basis: binding.documentPositionToken, mutationId: 'bench-correct',
-          from: 0, to: 5, values: { startMs: 0, durationMs: 10 },
-        },
-      });
-      if (!result?.ok) throw new Error(`unified correct failed: ${result?.failure?.message}`);
+      for (let index = 0; index < config.corrects; index += 1) {
+        const result = await app.dispatch({
+          actionId: `bench-correct-${Math.random().toString(36).slice(2)}`,
+          type: 'UnifiedDoc.body.timing.correct', scope: 'Project:p1', principal: me,
+          payload: {
+            version: 1, id: 'd1', basis: binding.documentPositionToken, mutationId: 'bench-correct',
+            from: 0, to: 5, values: { startMs: 0, durationMs: 10 },
+          },
+        });
+        if (!result?.ok) throw new Error(`unified correct failed: ${result?.failure?.message}`);
+      }
     });
 
     return {

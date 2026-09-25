@@ -81,10 +81,21 @@ test('create, status, overlap refusal, and close preserve a lane receipt', (t) =
     /owned paths overlap active lane/,
   );
 
+  const linkedLane = join(laneRoot, 'docs-refresh');
+  writeFileSync(join(linkedLane, 'docs', 'two.md'), 'changed\n');
+  git(linkedLane, ['add', '.']);
+  git(linkedLane, ['commit', '-m', 'outside owned path']);
+  assert.throws(
+    () => run(repo, ['close', 'docs-refresh', '--reason', 'should fail'], laneRoot),
+    /outside its owned paths/,
+  );
+  assert.match(run(repo, ['extend', 'docs-refresh', '--owns', 'docs'], laneRoot), /owns extended/);
+  const laneHead = git(linkedLane, ['rev-parse', 'HEAD']);
+
   const closed = run(repo, ['close', 'docs-refresh', '--reason', 'fixture lane complete'], laneRoot);
   assert.match(closed, /closed and archived at refs\/archive\/lane\/docs-refresh/);
   assert.equal(existsSync(join(laneRoot, 'docs-refresh')), false);
-  assert.equal(git(repo, ['rev-parse', 'refs/archive/lane/docs-refresh']), git(repo, ['rev-parse', 'HEAD']));
+  assert.equal(git(repo, ['rev-parse', 'refs/archive/lane/docs-refresh']), laneHead);
   assert.match(run(repo, ['status'], laneRoot), /docs-refresh\s+closed/);
 });
 

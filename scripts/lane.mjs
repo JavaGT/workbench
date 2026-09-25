@@ -216,6 +216,17 @@ function trackedPathExists(repo, ref, path) {
   return (gitOptional(repo, ['ls-tree', '-r', '--name-only', ref, '--', path]) ?? '') !== '';
 }
 
+function changedFiles(repo, lane) {
+  const base = lane.base ?? integrationRef(repo);
+  return git(repo, ['diff', '--name-only', `${base}..${lane.branch}`])
+    .split('\n')
+    .filter(Boolean);
+}
+
+function outsideOwnedFiles(lane, files) {
+  return files.filter((file) => !lane.owns.some((owned) => pathsOverlap(owned, file)));
+}
+
 function installLane(worktree) {
   const result = spawnSync('pnpm', ['install', '--frozen-lockfile', '--prefer-offline', '--silent'], {
     cwd: worktree,
@@ -366,6 +377,44 @@ function cmdStatus(repo, root) {
   }
 }
 
+function parseExtendOptions(args) {
+  const owns = [];
+  for (let index = 0; index < args.length; index += 1) {
+    if (args[index] !== '--owns' || !args[index + 1]) throw new UsageError('extend requires --owns <path>');
+    owns.push(args[index + 1]);
+    index += 1;
+  }
+  if (owns.length === 0) throw new UsageError('extend requires at least one --owns path');
+  return owns;
+}
+
+function cmdExtend(repo, root, name, additions) {
+  for (const addition of additions) {
+    if (!isValidOwnedPath(addition)) throw new UsageError(`owned path '${addition}' must be a literal repo-relative path`);
+  }
+  const lane = withManifestLock(root, () => {
+    const manifest = readManifest(root);
+    const current = manifest.lanes[name];
+    if (!current || current.status !== 'active') throw new Error(`active lane '${name}' not found`);
+    for (const addition of additions) {
+      if (!trackedPathExists(repo, current.base, addition)) {
+        throw new Error(`owned path '${addition}' matches no tracked files at the lane base`);
+      }
+      for (const other of Object.values(manifest.lanes)) {
+        if (other.name === name || other.status !== 'active') continue;
+        const overlap = findOverlap([addition], other.owns);
+        if (overlap) throw new Error(`extended path overlaps active lane '${other.name}': '${overlap.a}' vs '${overlap.b}'`);
+      }
+      if (!current.owns.includes(addition)) current.owns.push(addition);
+    }
+    writeMetadata(repo, name, current);
+    manifest.lanes[name] = current;
+    writeManifest(root, manifest);
+    return current;
+  });
+  console.log(`lane '${name}' owns extended: ${lane.owns.join(', ')}`);
+}
+
 function cmdClose(repo, root, name, reason) {
   if (!reason) throw new UsageError('close requires --reason "one-line receipt"');
   const archived = withManifestLock(root, () => {
@@ -377,6 +426,15 @@ function cmdClose(repo, root, name, reason) {
     if (!branchMissing && !worktreeMissing) {
       const dirty = git(repo, ['status', '--porcelain'], lane.worktree);
       if (dirty) throw new Error(`lane '${name}' is dirty; commit or park its work before closing`);
+    }
+    if (!branchMissing) {
+      const outside = outsideOwnedFiles(lane, changedFiles(repo, lane));
+      if (outside.length > 0) {
+        throw new Error(
+          `lane '${name}' commits touch files outside its owned paths: ${outside.join(', ')}. ` +
+          'Run `pnpm lanes extend ' + name + ' --owns <path>...` before closing.',
+        );
+      }
     }
     const head = branchMissing ? null : git(repo, ['rev-parse', lane.branch]);
     if (head) git(repo, ['update-ref', `refs/archive/lane/${name}`, head]);
@@ -431,12 +489,13 @@ function usage() {
   console.log(`Workbench lane workflow:
   pnpm lanes create <name> --owns <path>... [--base <ref>] [--no-install]
   pnpm lanes status
+  pnpm lanes extend <name> --owns <path>...
   pnpm lanes close <name> --reason "..."
   pnpm lanes reconcile
   pnpm lanes gc
 
 Lanes live under ~/Development/workbench-lanes by default. They own literal repo-relative
-paths, refuse overlaps, and never merge into the canonical checkout.`);
+paths, refuse overlaps, enforce committed scope at close, and never merge into the canonical checkout.`);
 }
 
 function main() {
@@ -456,6 +515,12 @@ function main() {
   if (command === 'status') {
     if (args.length) throw new UsageError('status takes no arguments');
     cmdStatus(repo, root);
+    return;
+  }
+  if (command === 'extend') {
+    const name = args.shift();
+    if (!name) throw new UsageError('extend requires a lane name');
+    cmdExtend(repo, root, name, parseExtendOptions(args));
     return;
   }
   if (command === 'close') {

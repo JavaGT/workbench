@@ -2,6 +2,8 @@
 
 Issues and specs for this repository live as GitHub issues. Use the `gh` CLI for all operations.
 
+Implementation work is authored in a Workbench lane. Read [`lane-delivery.md`](./lane-delivery.md) before creating a lane or handing off a branch.
+
 ## Conventions
 
 - **Create an issue**: `gh issue create --title "..." --body "..."`.

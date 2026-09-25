@@ -24,6 +24,10 @@ This is a single-context repository. Read `CONTEXT.md` and relevant records unde
 
 Performance reference: read `docs/performance-results.md` for the latest recorded benchmark parameters and expected runtimes. Treat results without a recorded Git commit as directional measurements from a dirty or otherwise unverified worktree.
 
+## Development lanes
+
+All Workbench source, test, documentation, and workflow writes go through a managed lane. Create one with `pnpm lanes create <name> --owns <path>...` from the Workbench checkout; the canonical checkout is read-only for authoring. Lanes use literal path ownership, refuse overlaps, record milestones and expiry, and are closed with `pnpm lanes close <name> --reason "..."`. Never create ad-hoc worktrees or merge a lane silently. Read [`docs/agents/lane-delivery.md`](./docs/agents/lane-delivery.md) before dispatching or handing off work. Scope has a separate lane registry; a Scope lane never owns Workbench paths.
+
 ## Naming
 
 - **Be specific.** A name should say what a thing IS, not a generic category it

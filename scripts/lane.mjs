@@ -96,7 +96,9 @@ function gitOptional(repo, args, cwd = repo) {
 function repoRoot() {
   if (process.env.WORKBENCH_REPO_ROOT) return resolve(process.env.WORKBENCH_REPO_ROOT);
   try {
-    return resolve(git(process.cwd(), ['rev-parse', '--show-toplevel'], process.cwd()));
+    const cwd = process.cwd();
+    const commonDir = resolve(cwd, git(cwd, ['rev-parse', '--git-common-dir'], cwd));
+    return commonDir.endsWith('/.git') ? dirname(commonDir) : git(cwd, ['rev-parse', '--show-toplevel'], cwd);
   } catch {
     return FALLBACK_REPO;
   }

@@ -3931,6 +3931,13 @@ export function createLiveDeliverySession({
 
   return {
     get snapshot() { return visibleSnapshot; },
+    // The pre-projection view: the last server-installed snapshot, with NO
+    // pending operation's optimistic reducer applied. `snapshot` above is the
+    // merged view (base + pending projections) and is what a UI renders from.
+    // A consumer that must know whether a row is CONFIRMED rather than merely
+    // projected reads this one; both views are already in memory, so this
+    // getter is free. Null exactly when `snapshot` is null.
+    get confirmedSnapshot() { return baseSnapshot; },
     get cursor() { return cursor; },
     get status() { return status; },
     // Capability negotiation state (#156): true only while a patch-capable

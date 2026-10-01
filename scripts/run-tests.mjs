@@ -33,7 +33,7 @@ const logDirectory = mkdtempSync(join(tmpdir(), 'workbench-test-'));
 const logPath = join(logDirectory, 'node-test.log');
 const output = openSync(logPath, 'w');
 const started = performance.now();
-const testFiles = globSync('test/**/*.test.mjs').filter((file) => !file.startsWith('test/browser/'));
+const testFiles = [...globSync('test/**/*.test.mjs'), ...globSync('scripts/**/*.test.mjs')].filter((file) => !file.startsWith('test/browser/'));
 
 function stop(child, signal) {
 	if (child.pid === undefined) return;
@@ -79,7 +79,7 @@ process.on('exit', () => {
 
 const child = spawn(
 	process.execPath,
-	['--test', '--test-force-exit', '--test-reporter=dot', '--test-timeout=30000', ...process.argv.slice(2), ...testFiles],
+	['--test', '--test-force-exit', ...(process.argv.slice(2).some((arg) => arg.startsWith('--test-reporter')) ? [] : ['--test-reporter=dot']), '--test-timeout=30000', ...process.argv.slice(2), ...testFiles],
 	{ cwd: process.cwd(), env: process.env, stdio: ['ignore', output, output], detached: process.platform !== 'win32' },
 );
 activeChild = child;

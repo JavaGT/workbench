@@ -86,12 +86,21 @@ function openRawWS(port) {
 
 // --- SSE frame reader over a fetch ReadableStream ---
 
+const sseBuffers = new WeakMap();
+
 async function nextSseFrame(reader, timeoutMs = 1500) {
   const decoder = new TextDecoder();
-  let text = '';
+  let text = sseBuffers.get(reader) ?? '';
   const start = Date.now();
   while (Date.now() - start <= timeoutMs) {
-    if (text.includes('\n\n')) break;
+    let separator;
+    while ((separator = text.indexOf('\n\n')) !== -1) {
+      const frame = text.slice(0, separator);
+      text = text.slice(separator + 2);
+      sseBuffers.set(reader, text);
+      const data = frame.split('\n').find((line) => line.startsWith('data: '));
+      if (data) return JSON.parse(data.slice('data: '.length));
+    }
     const remaining = timeoutMs - (Date.now() - start);
     if (remaining <= 0) break;
     const chunk = await Promise.race([
@@ -100,9 +109,9 @@ async function nextSseFrame(reader, timeoutMs = 1500) {
     ]);
     if (chunk.timedOut || chunk.done) break;
     text += decoder.decode(chunk.value, { stream: true });
+    sseBuffers.set(reader, text);
   }
-  const frame = text.split('\n\n').find((entry) => entry.startsWith('data: '));
-  return frame ? JSON.parse(frame.slice('data: '.length)) : null;
+  return null;
 }
 
 // --- shared fixtures ---
@@ -211,7 +220,7 @@ test('SSE and WebSocket deliver identical live `state` replacement envelopes (sh
     const sseResponse = await fetch(`${origin}/live-delivery/events?scope=Note%3An1&after=0`, { signal: sseController.signal });
     assert.equal(sseResponse.status, 200);
     sseReader = sseResponse.body.getReader();
-    await sseReader.read(); // `: connected` comment
+    // Preserve any baseline batched with the connection comment.
 
     ws = await openRawWS(server.address().port);
     ws.send(JSON.stringify({ type: 'subscribe', entity: 'Note', id: 'n1' }));
@@ -251,7 +260,7 @@ test('SSE and WebSocket deliver identical collection `state` and `state-invalida
     const sseResponse = await fetch(`${origin}/live-delivery/events?scope=Note&after=0&rule=${ruleParam}`, { signal: sseController.signal });
     assert.equal(sseResponse.status, 200);
     sseReader = sseResponse.body.getReader();
-    await sseReader.read(); // `: connected` comment
+    // Preserve any baseline batched with the connection comment.
 
     ws = await openRawWS(server.address().port);
     ws.send(JSON.stringify({ type: 'subscribe', scope: 'Note', rule: collectionRule }));
@@ -306,7 +315,7 @@ test('SSE and WebSocket deliver identical full-log `event` envelopes (shared cor
     const sseResponse = await fetch(`${origin}/live-delivery/events?scope=Project%3Ap1&after=1`, { signal: sseController.signal });
     assert.equal(sseResponse.status, 200);
     sseReader = sseResponse.body.getReader();
-    await sseReader.read(); // `: connected` comment
+    // Preserve any baseline batched with the connection comment.
 
     ws = await openRawWS(server.address().port);
     ws.send(JSON.stringify({ type: 'subscribe', entity: 'Project', id: 'p1' }));
@@ -545,7 +554,7 @@ function createRealClient() {
   const session = createLiveDeliverySession({
     bootstrap: async () => {
       bootstraps += 1;
-      return { kind: 'snapshot', snapshot: { id: 'n1', title: `snap-${bootstraps}` }, cursor: 0 };
+      return { kind: 'snapshot', snapshot: { id: 'n1', title: `snap-${bootstraps}` }, cursor: bootstraps === 1 ? 0 : 5 };
     },
     subscribe: async ({ deliver }) => { deliverBatch = deliver; return { close() {} }; },
     validateSnapshot: (snapshot) => snapshot,
@@ -584,7 +593,7 @@ test('a `state-invalidate` triggers a resnapshot through the shipped client', as
   await deliver([{ type: 'state-invalidate', entity: 'Note', id: 'n1', seq: 5, reason: 'bounded-overflow', rows: [{ id: 'n1', title: 'truncated' }] }]);
   assert.equal(bootstraps(), 2, 'a state-invalidate boundary forces a fresh replacement snapshot');
   assert.deepEqual(session.snapshot, { id: 'n1', title: 'snap-2' }, 'the resnapshot replaces the cached state');
-  assert.equal(session.cursor, 0, 'the invalidation itself never reconciles the cursor from invalidated content');
+  assert.equal(session.cursor, 5, 'the cursor comes from the authoritative replacement snapshot');
   session.close();
 });
 

@@ -101,7 +101,7 @@ function parseRelativeRange(value: unknown, label: string): Readonly<{ start: nu
   if (!isPlainObject(value) || !exactKeys(value, RANGE_KEYS)) failClosed(`${label} must be { start, end }`);
   const start = value.start;
   const end = value.end;
-  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || end <= start) {
+  if (typeof start !== 'number' || typeof end !== 'number' || !Number.isSafeInteger(start) || !Number.isSafeInteger(end) || end <= start) {
     failClosed(`${label} must be a forward integer range`);
   }
   return Object.freeze({ start, end });
@@ -112,7 +112,7 @@ function parseRanges(value: unknown, label: string): readonly Readonly<{ start: 
   return Object.freeze(value.map((entry, index) => parseRelativeRange(entry, `${label}[${index}]`)));
 }
 
-function parseCreateAnnotation(value: unknown): RegionEditTransition extends { kind: 'create' } ? RegionEditTransition['annotation'] : never {
+function parseCreateAnnotation(value: unknown): Extract<RegionEditTransition, { kind: 'create' }>['annotation'] {
   if (!isPlainObject(value) || !exactKeys(value, ANNOTATION_KEYS)) {
     failClosed('create.annotation must be { id, family, fields, protectedTargetIds }');
   }

@@ -59,7 +59,7 @@ export const PUBLIC_API = Object.freeze({
     named: Object.freeze([
        'annotatedText', 'annotation', 'protectingAnnotation', 'measurement',
        'annotationAction', 'annotationEntityAction', 'registerAnnotatedTextContract',
-        'registerAnnotatedTextStructuralExtension', 'annotatedTextAction', 'annotatedTextAnnotationAction', 'annotatedTextCreateAction', 'annotatedTextRetireAction', 'parseRegionEditDescriptor', 'isRegionEditDescriptor', 'exportAnnotatedText', 'readAnnotatedTextForRecipient',
+        'registerAnnotatedTextStructuralExtension', 'annotatedTextAction', 'annotatedTextAnnotationAction', 'annotatedTextCreateAction', 'annotatedTextRetireAction', 'parseRegionEditDescriptor', 'isRegionEditDescriptor', 'annotationEntityRemoveAction', 'annotatedTextOperation', 'exportAnnotatedText', 'readAnnotatedTextForRecipient',
     ]),
   }),
   'workbench/annotated-text-coords': Object.freeze({
@@ -76,7 +76,7 @@ export const PUBLIC_API = Object.freeze({
     exact: true,
     named: Object.freeze([
       'ensureStream', 'ensureLease', 'issueAuthoringSnapshot', 'buildAuthoringEnvelope',
-      'hashClientNonce', 'acknowledgeAndPruneSnapshot',
+      'hashClientNonce', 'acknowledgeAndPruneSnapshot', 'readAnnotatedTextFamilyCheckpoint', 'readProjectedCursorFence',
       'restoreTextFamilySerialized', 'textFamilyBasis', 'projectEndpointToOffset',
     ]),
   }),
@@ -143,7 +143,7 @@ test('the packed package exposes the supported runtime contract', () => {
         + `} finally { migrationDb.close(); }\n`
         + `const root = await import('workbench');\n`
         + `const annotatedText = await import('workbench/annotated-text');\n`
-        + `for (const symbol of ${JSON.stringify(['annotatedText', 'annotation', 'protectingAnnotation', 'measurement', 'annotationAction', 'registerAnnotatedTextContract', 'registerAnnotatedTextStructuralExtension', 'annotatedTextAction', 'annotatedTextCreateAction', 'annotatedTextRetireAction', 'parseRegionEditDescriptor', 'isRegionEditDescriptor', 'exportAnnotatedText', 'readAnnotatedTextForRecipient'])}) {\n`
+        + `for (const symbol of ${JSON.stringify(['annotatedText', 'annotation', 'protectingAnnotation', 'measurement', 'annotationAction', 'registerAnnotatedTextContract', 'registerAnnotatedTextStructuralExtension', 'annotatedTextAction', 'annotatedTextCreateAction', 'annotatedTextRetireAction', 'parseRegionEditDescriptor', 'isRegionEditDescriptor', 'annotationEntityRemoveAction', 'annotatedTextOperation', 'exportAnnotatedText', 'readAnnotatedTextForRecipient'])}) {\n`
         + `  if (root[symbol] !== annotatedText[symbol]) throw new Error('workbench/annotated-text must share root binding ' + symbol);\n`
         + `}\n`
         + `for (const entrypoint of ${JSON.stringify(PRIVATE_ENTRYPOINTS)}) {\n`

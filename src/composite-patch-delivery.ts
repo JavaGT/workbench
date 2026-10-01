@@ -297,10 +297,7 @@ export class CompositePatchDelivery {
 
 // One shared visibility walk (kept out of the projector's export surface to
 // avoid a public API beyond what tests consume; both call sites use this).
-import { deriveVisibility, deriveVisibilityExtended } from './composite-patch-projector.ts';
-function deriveVisibilityExport(plan: AnchorPatchPlan, projected: Record<string, unknown>): ReadonlyMap<string, ReadonlyMap<string, ReadonlySet<string>>> {
-  return deriveVisibility(plan, projected);
-}
+import { deriveVisibilityExtended } from './composite-patch-projector.ts';
 function deriveVisibilityExtendedExport(plan: AnchorPatchPlan, projected: Record<string, unknown>): { visible: Map<string, Map<string, Set<string>>>; addresses: Map<string, readonly string[]> } {
   return deriveVisibilityExtended(plan, projected);
 }

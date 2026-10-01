@@ -1,3 +1,4 @@
+import { databaseImage } from './helpers/database-image.mjs';
 // Create-source annotation ranges (issue #216): a diarized transcript imports
 // its text AND its speaker/annotation ranges atomically in the create action —
 // no post-create applies. Ranges use legacy document-absolute offsets over the
@@ -253,10 +254,10 @@ test('create with source.ranges stores ref annotation fields and null-nullable r
 
 test('create with source.ranges leaves the durable state empty when rejected', async () => {
   const { app, db } = await appFor();
-  const before = db.serialize();
+  const before = databaseImage(db);
   const result = await createWithRanges(app, 'd3', [{ annotationId: 'x', family: 'nope', start: 0, end: 5, fields: {} }]);
   assert.equal(result.ok, false);
-  assert.deepEqual(db.serialize(), before);
+  assert.deepEqual(databaseImage(db), before);
   await app.close?.();
 });
 
@@ -287,10 +288,10 @@ test('a transcript-sized import creates ordinary timing/confidence records in on
   // A malformed range anywhere in a transcript-sized batch rejects atomically.
   const badRanges = [...ranges];
   badRanges[60] = { ...badRanges[60], fields: { confidence: 2 } };
-  const before = db.serialize();
+  const before = databaseImage(db);
   const rejected = await createWithRanges(app, 'transcript-bad', badRanges, [{ text: words }]);
   assert.equal(rejected.ok, false);
-  assert.deepEqual(db.serialize(), before);
+  assert.deepEqual(databaseImage(db), before);
   await app.close?.();
 });
 

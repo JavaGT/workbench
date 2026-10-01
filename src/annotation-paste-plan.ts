@@ -13,11 +13,10 @@
 
 import {
   applyTextOperation,
-  resolveOffsetToEndpoint,
   type ContinuousTextFamily,
 } from './annotated-text-continuous.ts';
 import { constructV14OperatedEvent } from './annotated-text-operated-event.ts';
-import { planTextOffsetEdit, type EditOverlapBehavior } from './annotated-text-plan.ts';
+import { planTextOffsetEdit, planTextRangeApply, type EditOverlapBehavior } from './annotated-text-plan.ts';
 import type { AnnotationRange } from './annotated-text-ranges.ts';
 
 interface PasteAnnotation {
@@ -176,14 +175,23 @@ export function planAnnotationPaste({
   });
   const operation = base.operation as { kind: 'text.apply'; operation: unknown };
   const afterFamily = applyTextOperation(family, operation.operation);
-  const start = resolveOffsetToEndpoint(afterFamily, at.offset, afterFamily.checkpoint.frontier, 'right');
-  const end = resolveOffsetToEndpoint(afterFamily, at.offset + text.length, afterFamily.checkpoint.frontier, 'left');
-  const pastedRange: AnnotationRange = { annotationId: annotation.id, start, end };
   const emptied = base.facts.emptiedAnnotations as PasteEmptied[];
   const updates = base.facts.annotationUpdates as Array<{ annotationId: string; fields: Record<string, unknown> }>;
   const surviving = annotationsAfterDispositions(annotations, emptied, updates);
   const postimageAnnotations = [...surviving, annotation];
-  const postimageRanges = [...(base.facts.ranges as AnnotationRange[]), pastedRange];
+  const applied = planTextRangeApply({
+    documentId,
+    structureVersion: base.after.structuralRevision,
+    family: afterFamily,
+    annotation,
+    from: { offset: at.offset, affinity: 'right' },
+    to: { offset: at.offset + text.length, affinity: 'left' },
+    ranges: base.facts.ranges as AnnotationRange[],
+    actorId,
+    cardinality: annotation.cardinality ?? 'many',
+    sameFamilyAnnotationIds: new Set(surviving.filter((candidate) => candidate.family === annotation.family).map((candidate) => candidate.id)),
+  });
+  const postimageRanges = applied.facts.ranges as AnnotationRange[];
   return unifiedPlan({
     id: base.id,
     before: base.before,
@@ -192,7 +200,7 @@ export function planAnnotationPaste({
     family: base.facts.family,
     annotation,
     actorId,
-    selectedRange: { annotationId: annotation.id, start, end },
+    selectedRange: applied.facts.selectedRange,
     emptiedAnnotations: emptied,
     annotationUpdates: updates,
     ranges: Object.freeze(postimageRanges.map((entry) => deepFreeze({ annotationId: entry.annotationId, start: entry.start, end: entry.end }))),

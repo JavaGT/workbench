@@ -79,7 +79,7 @@ test('generateDDL includes main table and side tables in order', () => {
   const Note = entityWithOwner('Note', { body: text({ indexed: 'fts' }), title: text() });
   const ddl = generateDDL(Note);
   assert.ok(ddl.length >= 2, 'should have at least main table + fts table');
-  assert.match(ddl[0], /CREATE TABLE IF NOT EXISTS Note/);
+  assert.match(ddl[0], /CREATE TABLE IF NOT EXISTS "Note"/);
   assert.match(ddl[1], /CREATE VIRTUAL TABLE.*Note_body_fts/);
 });
 

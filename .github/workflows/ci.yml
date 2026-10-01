@@ -18,6 +18,13 @@ jobs:
       - run: npm ci
       - run: npm run emit:ts
       - run: node scripts/run-tests.mjs --test-reporter=spec --experimental-test-coverage --test-coverage-lines=85
+        env:
+          WORKBENCH_KEEP_TEST_LOGS: '1'
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: test-log
+          path: /tmp/workbench-test-*/node-test.log
 
   lint:
     runs-on: ubuntu-latest

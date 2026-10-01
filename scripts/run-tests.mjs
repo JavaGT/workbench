@@ -122,7 +122,7 @@ if (result.code === 0 && !result.error && !result.timedOut) {
 	if (result.error) console.error(result.error.message);
 
   const log = readFileSync(logPath, 'utf8');
-  const failureStart = log.search(/failed tests:/i);
+  const failureStart = log.search(/fail(?:ed|ing) tests:/i);
   const relevant = failureStart === -1 ? log : log.slice(failureStart);
   const excerpt = relevant.split('\n').slice(0, MAX_FAILURE_LINES).join('\n').slice(0, MAX_FAILURE_CHARS);
   if (excerpt) console.error(excerpt);

@@ -393,7 +393,8 @@ function resolveBlobDestinationDir(destBlobDir: string): string {
 
 // The identity (device + inode) of a file this invocation created: recorded at
 // publish time so rollback can prove the invocation still owns a final path
-// before ever removing it. POSIX reuses an inode only after it is freed, so a
+// before ever removing it. Keep the temp hard link until rollback completes
+// so the inode cannot be freed and reused by a replacement. With that pin, a
 // dev+ino match means the file AT the path is the exact file this invocation
 // wrote — never a winner's file that replaced it.
 type FileIdentity = Readonly<{ dev: number; ino: number }>;
@@ -659,15 +660,17 @@ function writeGenerationAtomically(
       writeFileSync(sidecarTmp, `${sha256hex(bytes)}\n`, { flag: 'wx', mode: 0o600 });
       sidecarCreated = true;
       byteFinalIdentity = publishNoClobber(byteTmp, byteFinal, `generation ${name}`);
-      unlinkSync(byteTmp);
       afterByteFinalPublish?.();
       sidecarFinalIdentity = publishNoClobber(sidecarTmp, sidecarFinal, `digest sidecar ${sidecarName}`);
-      unlinkSync(sidecarTmp);
     } catch (err) {
       // Ownership-aware rollback: remove only the files this invocation
       // created/published — its temps (unique to this invocation) and the
       // finals it published, and only while each final is still the exact
       // file it wrote — never another materializer's temp or final.
+      removeOwnedFile(byteFinal, byteFinalIdentity);
+      removeOwnedFile(sidecarFinal, sidecarFinalIdentity);
+      throw err;
+    } finally {
       for (const leftover of [
         byteCreated ? byteTmp : '',
         sidecarCreated ? sidecarTmp : '',
@@ -680,9 +683,6 @@ function writeGenerationAtomically(
           }
         }
       }
-      removeOwnedFile(byteFinal, byteFinalIdentity);
-      removeOwnedFile(sidecarFinal, sidecarFinalIdentity);
-      throw err;
     }
   } finally {
     releaseDestinationLock(lockSlots, destRealDir);

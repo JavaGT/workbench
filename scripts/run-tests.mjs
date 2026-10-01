@@ -79,7 +79,7 @@ process.on('exit', () => {
 
 const child = spawn(
 	process.execPath,
-	['--test', '--test-force-exit', ...(process.argv.slice(2).some((arg) => arg.startsWith('--test-reporter')) ? [] : ['--test-reporter=dot']), '--test-timeout=30000', ...process.argv.slice(2), ...testFiles],
+	['--expose-gc', '--test', '--test-force-exit', ...(process.argv.slice(2).some((arg) => arg.startsWith('--test-reporter')) ? [] : ['--test-reporter=dot']), '--test-timeout=30000', ...process.argv.slice(2), ...testFiles],
 	{ cwd: process.cwd(), env: process.env, stdio: ['ignore', output, output], detached: process.platform !== 'win32' },
 );
 activeChild = child;

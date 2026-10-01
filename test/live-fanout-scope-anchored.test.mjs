@@ -43,6 +43,7 @@ test('scope-anchored foreign event is delivered to scope subscriber', async () =
     { type: '_Job.updated', scope: 'Project:p1', seq: 1, data: { id: 'job1', status: 'completed' } },
   );
 
+  await new Promise((resolve) => setImmediate(resolve));
   const msgs = conn.drain();
   assert.equal(msgs.length, 1);
   assert.equal(msgs[0].entity, 'Project');
@@ -73,6 +74,7 @@ test('scope-anchored foreign event with an unreadable field resyncs instead of l
     { type: '_Job.updated', scope: 'Project:p1', seq: 1, data: { id: 'job1', status: 'completed' } },
   );
 
+  await new Promise((resolve) => setImmediate(resolve));
   const msgs = conn.drain();
   assert.equal(msgs.length, 1);
   assert.deepEqual(msgs[0], {
@@ -95,6 +97,7 @@ test('scope-anchored foreign event envelope carries no delta', async () => {
     { type: '_Job.created', scope: 'Project:p1', seq: 1, data: { id: 'job1' } },
   );
 
+  await new Promise((resolve) => setImmediate(resolve));
   const msgs = conn.drain();
   assert.equal(msgs.length, 1);
   assert.equal('delta' in msgs[0], false);
@@ -153,6 +156,7 @@ test('normal same-entity event still gets delta projection and delivery', async 
     { type: 'Doc.updated', scope: 'Doc:d1', seq: 2, data: { id: 'd1', title: 'v2' } },
   );
 
+  await new Promise((resolve) => setImmediate(resolve));
   const msgs = conn.drain();
   assert.equal(msgs.length, 1);
   assert.equal(msgs[0].event.type, 'Doc.updated');
@@ -176,6 +180,7 @@ test('same-entity and scope-anchored foreign events both deliver to same subscri
     { type: 'Project.updated', scope: 'Project:p1', seq: 2, data: { id: 'p1', title: 'updated' } },
   );
 
+  await new Promise((resolve) => setImmediate(resolve));
   const msgs = conn.drain();
   assert.equal(msgs.length, 2);
   assert.equal(msgs[0].event.type, '_Job.created');

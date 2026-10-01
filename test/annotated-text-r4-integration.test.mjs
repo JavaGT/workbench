@@ -1,3 +1,4 @@
+import { databaseImage, databaseFromImage } from './helpers/database-image.mjs';
 import assert from 'node:assert/strict';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { test } from 'node:test';
@@ -245,7 +246,7 @@ test('annotation.remove deletes the annotation and rejects a tampered event on r
     },
   })).ok, true);
   const next = await refreshBinding();
-  const preimage = db.serialize();
+  const preimage = databaseImage(db);
   const removed = await app.dispatch({
     actionId: 'r5-remove', type: 'R4Doc.body.operation', scope: 'Project:p1', principal: { id: 'u1' },
     payload: {
@@ -263,11 +264,14 @@ test('annotation.remove deletes the annotation and rejects a tampered event on r
 
   const tampered = structuredClone(removed.events[0].data);
   tampered.facts.removedAnnotationIds = ['forged-id'];
-  db.deserialize(preimage);
-  assert.throws(
-    () => app.entities.get('R4Doc').projection.apply({ handle: native('R4Doc', 'body', 'operated'), data: tampered }, db),
-  );
-  assert.deepEqual(db.serialize(), preimage);
+  const replay = databaseFromImage(preimage);
+  try {
+    const replayPreimage = databaseImage(replay.db);
+    assert.throws(
+      () => app.entities.get('R4Doc').projection.apply({ handle: native('R4Doc', 'body', 'operated'), data: tampered }, replay.db),
+    );
+    assert.deepEqual(databaseImage(replay.db), replayPreimage);
+  } finally { replay.close(); }
   await app.close?.();
 });
 
@@ -288,7 +292,7 @@ test('annotation.remove denies a non-writer before log or projection changes', a
     },
   })).ok, true);
   const next = await refreshBinding();
-  const preimage = db.serialize();
+  const preimage = databaseImage(db);
   const denied = await app.dispatch({
     actionId: 'r5-denied-remove', type: 'R4Doc.body.operation', scope: 'Project:p1', principal: { id: 'u2' },
     payload: {
@@ -301,7 +305,7 @@ test('annotation.remove denies a non-writer before log or projection changes', a
   assert.equal(denied.failure?.category, 'denied');
   // The denied operation must leave the ENTIRE durable state untouched
   // (annotation row, membership, orphan state, cursor, and log alike).
-  assert.deepEqual(db.serialize(), preimage);
+  assert.deepEqual(databaseImage(db), preimage);
   await app.close?.();
 });
 
@@ -433,7 +437,8 @@ test('HTTP snapshot serializes continuous text and never exposes basis', async (
   assert.equal(Object.hasOwn(body, 'blocks'), false);
   const serialized = JSON.stringify(body);
   assert.equal(serialized.includes('structuralRevision'), false);
-  assert.equal(serialized.includes('frontier'), false);
+  assert.equal(Object.hasOwn(body, 'frontier'), false);
+  assert.ok(Array.isArray(body.frontiers), 'authorized anchored ranges carry their deduplicated frontier table');
   assert.equal(serialized.includes('protectedTargetIds'), false);
   assert.equal(serialized.includes('last_memberships'), false);
   assert.equal(serialized.includes('family_checkpoint'), false);
@@ -835,7 +840,7 @@ test('snapshot redacts confidential spans for a non-owner without private fields
   })).ok, true);
 
   const ownerSerialized = await (await fetch(`http://127.0.0.1:${app.httpServer.address().port}/snapshot/R4Doc/d1`, { signal: AbortSignal.timeout(5_000) })).text();
-  assert.equal(serializedIncludesPrivateField(ownerSerialized, ['annotation_orphan_state', 'saved_quote', 'savedQuote', 'last_memberships', 'lastMemberships', 'structuralRevision', 'frontier']), false);
+  assert.equal(serializedIncludesPrivateField(ownerSerialized, ['annotation_orphan_state', 'saved_quote', 'savedQuote', 'last_memberships', 'lastMemberships', 'structuralRevision', '"frontier"']), false);
 
   principal = { id: 'u2' };
   const deniedResponse = await fetch(`http://127.0.0.1:${app.httpServer.address().port}/snapshot/R4Doc/d1`, { signal: AbortSignal.timeout(5_000) });
@@ -844,5 +849,5 @@ test('snapshot redacts confidential spans for a non-owner without private fields
   assert.equal('basis' in denied.snapshot.body, false);
   assert.equal(denied.snapshot.body.kind, 'workbench.annotatedText.recipient');
   assert.equal(JSON.stringify(denied.snapshot.body).includes('hello world'), false);
-  assert.equal(serializedIncludesPrivateField(JSON.stringify(denied.snapshot.body), ['annotation_orphan_state', 'saved_quote', 'savedQuote', 'last_memberships', 'lastMemberships', 'structuralRevision', 'frontier']), false);
+  assert.equal(serializedIncludesPrivateField(JSON.stringify(denied.snapshot.body), ['annotation_orphan_state', 'saved_quote', 'savedQuote', 'last_memberships', 'lastMemberships', 'structuralRevision', '"frontier"']), false);
 });

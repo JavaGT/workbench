@@ -116,7 +116,7 @@ export function mapMutationAction({ entityName, fieldName, operation, owner, mem
     throw new Error(`unknown map mutation operation '${String(operation)}'`);
   }
   const payload: MapMutationPayload = { owner: String(owner), member: String(member) };
-  if (operation !== 'remove') payload.role = role;
+  if (operation !== 'remove') payload.role = role ?? null;
   return Object.freeze({
     type: `${entityName}.${fieldName}.${operation}`,
     payload: Object.freeze(payload),

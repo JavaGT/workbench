@@ -207,7 +207,7 @@ export function projectAnnotatedTextRecipient({ source, descriptor, decisions }:
       : (annotation?.owner === undefined ? ['id', 'family', 'fields', 'protectedTargetIds'] : ['id', 'family', 'fields', 'owner', 'protectedTargetIds']);
     exact(annotation, keys, 'annotation');
     if (typeof annotation.id !== 'string' || annotations.has(annotation.id) || !Object.hasOwn(meta.annotationHandles, annotation.family)) fail('annotation is invalid');
-    if (annotation.protectedTargetIds !== undefined && (!Object.hasOwn(meta.protectingFamilies, annotation.family) || !Array.isArray(annotation.protectedTargetIds) || annotation.protectedTargetIds.some((id, i, all) => typeof id !== 'string' || (i > 0 && all[i - 1] >= id)))) fail('protector targets are invalid');
+    if (annotation.protectedTargetIds !== undefined && (!Object.hasOwn(meta.protectingFamilies, annotation.family) || !Array.isArray(annotation.protectedTargetIds) || annotation.protectedTargetIds.some((id: unknown, i: number, all: unknown[]) => typeof id !== 'string' || (i > 0 && (typeof all[i - 1] !== 'string' || (all[i - 1] as string) >= id))))) fail('protector targets are invalid');
     annotations.set(annotation.id, annotation);
   }
 

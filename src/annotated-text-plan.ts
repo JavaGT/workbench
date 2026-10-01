@@ -335,13 +335,6 @@ export function planTextOffsetEdit({ documentId, structureVersion, family, actor
     const updateFacts = overlapUpdateFacts({ adjustments, annotations, annotationFields, editOverlapByFamily, documentId });
     const emptied = adjustments.removeIds.map((annotationId) => overlapRemovalDisposition({ annotations, annotationId, family }));
     const removed = new Set(emptied.map((entry) => entry.annotationId));
-    const updatedById = new Map(updateFacts.map((fact) => [fact.annotationId, fact.fields]));
-    const nextAnnotations = annotations
-      .filter((annotation) => !removed.has(annotation.id))
-      .map((annotation) => ({
-        ...annotation,
-        ...(updatedById.has(annotation.id) ? { fields: updatedById.get(annotation.id) } : {}),
-      }));
     const nextRanges = ranges.filter((entry) => !removed.has(entry.annotationId));
     return unifiedPlan({
       id: documentId,
@@ -391,13 +384,6 @@ export function planTextOffsetEdit({ documentId, structureVersion, family, actor
       }
       const updateFacts = overlapUpdateFacts({ adjustments, annotations, annotationFields, editOverlapByFamily, documentId })
         .filter((fact) => !emptiedIds.has(fact.annotationId));
-      const updatedById = new Map(updateFacts.map((fact) => [fact.annotationId, fact.fields]));
-      const nextAnnotations = annotations
-        .filter((annotation) => !emptiedIds.has(annotation.id))
-        .map((annotation) => ({
-          ...annotation,
-          ...(updatedById.has(annotation.id) ? { fields: updatedById.get(annotation.id) } : {}),
-        }));
       return unifiedPlan({
         id: documentId,
         before: before(family, structureVersion),
@@ -422,13 +408,6 @@ export function planTextOffsetEdit({ documentId, structureVersion, family, actor
     }
     const updateFacts = overlapUpdateFacts({ adjustments, annotations, annotationFields, editOverlapByFamily, documentId })
       .filter((fact) => !emptiedIds.has(fact.annotationId));
-    const updatedById = new Map(updateFacts.map((fact) => [fact.annotationId, fact.fields]));
-    const nextAnnotations = annotations
-      .filter((annotation) => !emptiedIds.has(annotation.id))
-      .map((annotation) => ({
-        ...annotation,
-        ...(updatedById.has(annotation.id) ? { fields: updatedById.get(annotation.id) } : {}),
-      }));
     return unifiedPlan({
       id: documentId,
       before: before(family, structureVersion),

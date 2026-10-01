@@ -259,7 +259,7 @@ export type BlobSeamsOptions = {
   readonly tempToken?: () => string;
   /**
    * TEST SEAM: invoked synchronously immediately after THIS invocation's byte
-   * final has been published (and its byte temp removed), before the digest
+   * final has been published (with its temp link retained), before the digest
    * sidecar is published. Tests use it to force a failure AFTER a final was
    * published — planting a blocker at the sidecar final name, or swapping a
    * foreign file onto the byte final — so the atomic ownership-verified

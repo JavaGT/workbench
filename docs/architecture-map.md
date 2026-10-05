@@ -57,7 +57,7 @@ Action → authorize → handler → `_Log` append → projection (+ in-txn effe
 | `application-runtime.mjs` | Singular headless/HTTP start, recovery, maintenance, clocks |
 | `committed-log.mjs` / `cursor.mjs` / `durable-history.mjs` | Log, seq storage, authorized history reads + session undo cursors |
 | `scope-handle.mjs` | Scope key grammar |
-| `write-queue.mjs` | Single-writer serialization |
+| `write-queue.mjs` | The one collaborative writer — Single-writer serialization. `run` admits in FIFO order under bounded wait/depth (503 when starved or full); a nested `run` from the active owner joins that turn instead of queueing, so re-entry never interleaves. `close` stops admitting any new outer `run` (503) and resolves only once the turn already in flight — nested re-entry included — has released; the owner inside that turn stays admitted, so a write already underway finishes rather than failing mid-transaction |
 | `driver.mjs` / `migrations.mjs` | SQLite engagement |
 | `blob-lifecycle.mjs` (in-txn adopt) | Blob adopt atomic with commit |
 | `post-commit-effects.mjs` (declaration) | Immutable private fact + ordered external-work declarations atomic with commit |

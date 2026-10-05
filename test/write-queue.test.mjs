@@ -73,6 +73,62 @@ test('an external writer waits while a nested writer joins', async () => {
   assert.deepStrictEqual(events, ['outer-start', 'nested', 'outer-end', 'external']);
 });
 
+test('close refuses new outer runs while the active owner may still re-enter and finish', async () => {
+  // close() stops admitting writers, but a turn already in flight owns the mutex:
+  // rejecting its nested re-entry would fail a write mid-transaction during
+  // shutdown, so the owner stays admitted until its turn releases.
+  const q = createWriteQueue();
+  const events = [];
+  let signalClosed;
+  const closedNow = new Promise((resolve) => { signalClosed = resolve; });
+  let releaseOuter;
+  const outerGate = new Promise((resolve) => { releaseOuter = resolve; });
+
+  const outer = q.run(async () => {
+    events.push('outer-start');
+    await closedNow;
+    const nested = await q.run(async () => {
+      events.push('nested');
+      return 'nested-result';
+    });
+    assert.strictEqual(nested, 'nested-result');
+    assert.strictEqual(q.owned, true, 'owner keeps the turn across close');
+    await outerGate;
+    events.push('outer-end');
+    return 'outer-result';
+  });
+
+  await delay(1);
+  assert.strictEqual(q.running, true, 'outer run should hold the turn');
+
+  const closed = q.close();
+  assert.strictEqual(q.closed, true);
+  signalClosed();
+
+  await delay(1);
+  assert.deepStrictEqual(events, ['outer-start', 'nested'], 'owner must re-enter after close');
+
+  let closeSettled = false;
+  void closed.then(() => { closeSettled = true; });
+  await delay(5);
+  assert.strictEqual(closeSettled, false, 'close must wait for the in-flight turn');
+
+  releaseOuter();
+  assert.strictEqual(await outer, 'outer-result');
+  await closed;
+  assert.strictEqual(closeSettled, true, 'close resolves once the turn releases');
+
+  await assert.rejects(
+    q.run(async () => { events.push('external'); return 'external-result'; }),
+    (err) => {
+      assert.strictEqual(err.status, 503);
+      assert.match(err.message, /closed/);
+      return true;
+    },
+  );
+  assert.deepStrictEqual(events, ['outer-start', 'nested', 'outer-end']);
+});
+
 test('immediate runs always return promises', async () => {
   const q = createWriteQueue();
 

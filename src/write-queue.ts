@@ -74,13 +74,16 @@ export function createWriteQueue({
   }
 
   function run<T>(fn: () => T): Promise<T> {
+    // Ownership is resolved first: the turn already in flight holds the mutex,
+    // so its nested calls join it even after close. Refusing them would fail a
+    // write mid-transaction during shutdown instead of letting it finish.
+    if (ownership.getStore()?.active) {
+      return Promise.resolve().then(fn);
+    }
     if (closed) {
       const err = new Error('write queue is closed') as Error & { status: number };
       err.status = 503;
       return Promise.reject(err);
-    }
-    if (ownership.getStore()?.active) {
-      return Promise.resolve().then(fn);
     }
     if (waiters + 1 >= maxDepth) {
       const err = new Error('write queue: depth limit exceeded') as Error & { status: number };

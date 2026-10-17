@@ -13,7 +13,6 @@ import {
 
 } from './annotated-text-continuous.mjs';
 
-
 import {
   REGION_AFFECTED_ANNOTATION_MAX,
   REGION_MEMBERSHIP_MAX,

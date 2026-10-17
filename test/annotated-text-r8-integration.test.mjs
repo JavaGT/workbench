@@ -1,3 +1,4 @@
+import { databaseImage, databaseFromImage } from './helpers/database-image.mjs';
 import assert from 'node:assert/strict';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { test } from 'node:test';
@@ -29,6 +30,7 @@ function r8Doc({
   protectingAccess = async ({ is }) => (await is.owner()) ? grant(read) : grant(),
   access = () => grant(read, write),
   thread = false,
+  codingCardinality = 'many',
   relationTarget = 'R8Comment',
   threadAction = annotationEntityAction({
     relation: 'comment', project: 'project', author: 'author', capability: write,
@@ -43,7 +45,7 @@ function r8Doc({
       project: 'project',
       owner: 'owner',
       annotations: [
-        annotation('coding'),
+        annotation('coding', { cardinality: codingCardinality }),
         annotation('tag', { fields: { value: boolean({ default: false }) } }),
         annotation('other', { fields: { value: boolean({ default: false }) } }),
          annotation('comment', {
@@ -343,6 +345,35 @@ test('annotation.apply creates one document-scoped membership range', async () =
   await app.shutdown();
 });
 
+test('pasting inside an exclusive annotation trims its range around the new annotation', async (t) => {
+  const { app, db, binding, authoringOf, refreshBinding } = await setupDoc('hello', null, { codingCardinality: 'one' });
+  t.after(async () => { await app.shutdown(); db.close(); });
+  const apply = await app.dispatch({
+    actionId: 'exclusive-apply', type: 'R8IntegrationDocument.body.operation', scope: 'Project:p1', principal: { id: 'u1' },
+    payload: { version: 9, id: 'd1', authoring: authoringOf(binding, 'exclusive-apply'), edit: {
+      kind: 'annotation.apply', annotation: { id: 'original', family: 'coding', fields: {} },
+      from: { positionToken: binding.documentPositionToken, offset: 0, affinity: 'left' },
+      to: { positionToken: binding.documentPositionToken, offset: 5, affinity: 'right' },
+    } },
+  });
+  assert.equal(apply.ok, true, apply.failure?.message);
+  const fresh = await refreshBinding();
+  const pasted = await app.dispatch({
+    actionId: 'exclusive-paste', type: 'R8IntegrationDocument.body.operation', scope: 'Project:p1', principal: { id: 'u1' },
+    payload: { version: 9, id: 'd1', authoring: authoringOf(fresh, 'exclusive-paste'), edit: {
+      kind: 'annotation.paste', annotation: { id: 'original', family: 'coding', fields: {} },
+      at: { positionToken: fresh.documentPositionToken, offset: 2, affinity: 'right' }, text: 'zz',
+    } },
+  });
+  assert.equal(pasted.ok, true, pasted.failure?.message);
+  assert.equal(familyText(db), 'hezzllo');
+  const family = restoreTextFamily(JSON.parse(db.prepare("SELECT family_checkpoint FROM R8IntegrationDocument_body_state WHERE document_id = 'd1'").get().family_checkpoint));
+  const ranges = db.prepare('SELECT m.annotation_id, r.start_point, r.end_point FROM R8IntegrationDocument_body_membership m JOIN R8IntegrationDocument_body_range r ON r.id = m.range_id ORDER BY m.annotation_id, m.ordinal').all();
+  const offsets = (range) => projectRangeToOffsets(family, { annotationId: range.annotation_id, start: JSON.parse(range.start_point), end: JSON.parse(range.end_point) });
+  assert.deepEqual(ranges.filter((range) => range.annotation_id === 'original').map(offsets), [{ start: 0, end: 2 }, { start: 4, end: 7 }]);
+  assert.deepEqual(ranges.filter((range) => range.annotation_id !== 'original').map(offsets), [{ start: 2, end: 4 }]);
+});
+
 test('annotation.paste on a document with an existing annotation mints a fresh id', async () => {
   const { app, db, binding, authoringOf, documentPositionToken } = await setupDoc('hello world');
   assert.equal((await app.dispatch({
@@ -442,7 +473,7 @@ test('annotation.remove is an explicit delete; tampered replay is rejected witho
     },
   })).ok, true);
   const next = await refreshBinding();
-  const preimage = db.serialize();
+  const preimage = databaseImage(db);
   const removed = await app.dispatch({
     actionId: 'remove-tag', type: 'R8IntegrationDocument.body.operation', scope: 'Project:p1', principal: { id: 'u1' },
     payload: {
@@ -456,11 +487,14 @@ test('annotation.remove is an explicit delete; tampered replay is rejected witho
 
   const tampered = structuredClone(removed.events[0].data);
   tampered.facts.removedAnnotationIds = ['forged-id'];
-  db.deserialize(preimage);
-  assert.throws(
-    () => Document.projection.apply({ handle: native('R8IntegrationDocument', 'body', 'operated'), data: tampered }, db),
-  );
-  assert.deepEqual(db.serialize(), preimage);
+  const replay = databaseFromImage(preimage);
+  try {
+    const replayPreimage = databaseImage(replay.db);
+    assert.throws(
+      () => Document.projection.apply({ handle: native('R8IntegrationDocument', 'body', 'operated'), data: tampered }, replay.db),
+    );
+    assert.deepEqual(databaseImage(replay.db), replayPreimage);
+  } finally { replay.close(); }
   await app.shutdown();
 });
 

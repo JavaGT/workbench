@@ -201,6 +201,7 @@ export interface VectorPluginSource {
   readonly owns: (row: Readonly<Record<string, unknown>>) => boolean;
 }
 export interface VectorPluginOptions {
+  readonly admission?: { readonly entity: { name: string }; readonly adapter: import('../index.d.ts').AuthorizationAdapter };
   readonly id: string;
   readonly version: string;
   readonly source: VectorPluginSource;

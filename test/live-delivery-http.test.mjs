@@ -165,7 +165,7 @@ test('HTTP session delegates duplicate, gap and opaque resync recovery to the pa
       const mode = parsed.searchParams.get('mode');
       return { ok: true, json: async () => mode === 'catchup'
         ? { kind: 'catchup', envelopes: [{ type: 'event', seq: 2, event: { type: 'update', data: 2 } }], cursor: 2 }
-        : { kind: 'snapshot', snapshot: { values: mode === 'snapshot' && requests.length > 2 ? ['fresh'] : [] }, cursor: 1 } };
+        : { kind: 'snapshot', snapshot: { values: mode === 'snapshot' && requests.length > 2 ? ['fresh'] : [] }, cursor: requests.length > 2 ? 4 : 1 } };
     },
     eventSourceFactory: (url) => {
       const source = { url, close() {}, onmessage: null, onerror: null };

@@ -128,6 +128,7 @@ test('live fanout resyncs a native event on an unreadable field instead of deliv
   assert.equal(ownerEvent.type, 'event');
   assert.equal(ownerEvent.event.type, 'Note.secretBody.applied');
 
+  await new Promise((resolve) => setImmediate(resolve));
   const viewerEnvelope = viewer.drain()[0];
   assert.deepEqual(viewerEnvelope, {
     type: 'resync', entity: 'Note', id: 'n1', seq: 4,

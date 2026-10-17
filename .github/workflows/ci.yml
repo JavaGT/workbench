@@ -7,16 +7,24 @@ on:
 
 jobs:
   test:
+    timeout-minutes: 25
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
           cache: npm
       - run: npm ci
-      - run: node --experimental-test-coverage --test
-      - run: node scripts/check-coverage.mjs 85
+      - run: npm run emit:ts
+      - run: node scripts/run-tests.mjs --test-reporter=spec --experimental-test-coverage --test-coverage-lines=85
+        env:
+          WORKBENCH_KEEP_TEST_LOGS: '1'
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: test-log
+          path: /tmp/workbench-test-*/node-test.log
 
   lint:
     runs-on: ubuntu-latest
@@ -24,7 +32,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
           cache: npm
       - run: npm ci
       - run: npm run lint
@@ -35,7 +43,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
           cache: npm
       - run: npm ci
       - run: npm run typecheck

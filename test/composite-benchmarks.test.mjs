@@ -478,6 +478,8 @@ test('B4 HEAP: retained memory per active subscription stays within the ledger b
   // fraction of the setup cost.
   const fixture = await getProject(100);
   const SIZE_BUDGET_PER_SUB = 5000 * 400; // ids × ~50B budget, 8× GC-noise headroom
+  assert.equal(typeof globalThis.gc, 'function', 'heap benchmark requires --expose-gc');
+  globalThis.gc();
   const baseline = process.memoryUsage().heapUsed;
   // K=20 ACTIVE subscriptions on the public seam — distinct principals so each
   // holds its own independent ledger entry + projection token.
@@ -486,6 +488,7 @@ test('B4 HEAP: retained memory per active subscription stays within the ledger b
     subs.push(await bootstrapRecipient(fixture, principalFor(`b4-heap-${i}`)));
   }
   await new Promise((resolve) => setTimeout(resolve, 50));
+  globalThis.gc();
   const afterBootstrap = process.memoryUsage().heapUsed;
   const perSubDelta = Math.max(0, afterBootstrap - baseline) / subs.length;
   console.table([{

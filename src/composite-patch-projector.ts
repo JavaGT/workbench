@@ -327,7 +327,7 @@ function newNode(raw: Record<string, unknown>, ledgerAdmitted: boolean): Snapsho
 }
 
 /** Requirement side-capture shared by every capture mode (see captureSnapshot). */
-function attachRequirement(ctx: CaptureContext, entry: CompiledEntryLike, child: Record<string, unknown>, holderRaw: Record<string, unknown>, node: SnapshotNodeLike, ledgerAdmitted: boolean): void {
+function attachRequirement(ctx: CaptureContext, entry: CompiledEntryLike, child: Record<string, unknown>, holderRaw: Record<string, unknown>, node: SnapshotNodeLike): void {
   if (!entry.require) return;
   const { db, principal, tombstones } = ctx;
   node.required = false;
@@ -365,7 +365,7 @@ function fillCompleteEntry(ctx: CaptureContext, parentRaw: Record<string, unknow
   const rows = readRows(db, entry.entity as never, principal, entry.fk as string, entry.inverse ? parentRaw.id : parentRaw[entry.fk as string], entry.inverse === true, entry.order as never, tombstones as never);
   return rows.map((child) => {
     const node = newNode(child, ledgerAdmitted);
-    attachRequirement(ctx, entry, child, parentRaw, node, ledgerAdmitted);
+    attachRequirement(ctx, entry, child, parentRaw, node);
     for (const nestedEntry of nestedEntriesOf(entry)) {
       node.children.set(nestedEntry, fillCompleteEntry(ctx, child, nestedEntry, ledgerAdmitted));
     }
@@ -376,7 +376,7 @@ function fillCompleteEntry(ctx: CaptureContext, parentRaw: Record<string, unknow
 /** One captured affected row: fresh admission, complete value subtree, requirement honored. */
 function finishFragmentNode(ctx: CaptureContext, entry: CompiledEntryLike, raw: Record<string, unknown>, holderRaw: Record<string, unknown>): SnapshotNodeLike {
   const node = newNode(raw, false);
-  attachRequirement(ctx, entry, raw, holderRaw, node, false);
+  attachRequirement(ctx, entry, raw, holderRaw, node);
   for (const nestedEntry of nestedEntriesOf(entry)) {
     node.children.set(nestedEntry, fillCompleteEntry(ctx, raw, nestedEntry, false));
   }
@@ -825,7 +825,10 @@ export async function projectCompositePatch(input: PatchProjectorInput): Promise
     for (const [, priorAddress] of departedRows) {
       const key = `departed\u0000${priorAddress.join('\u0000')}`;
       let group = groups.get(key);
-      if (!group) group = groups.set(key, { levels: [...priorAddress], ids: new Set(), departedOnly: true }).get(key);
+      if (!group) {
+        group = { levels: [...priorAddress], ids: new Set(), departedOnly: true };
+        groups.set(key, group);
+      }
       for (const [rowId, prior] of departedRows) {
         if (prior.join('\u0000') === priorAddress.join('\u0000')) group.ids.add(`${rowId}@departed`);
       }

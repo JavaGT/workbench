@@ -25,9 +25,9 @@ test('generated refs enforce deterministic indexes and fresh-database integrity'
   assert.match(ddl, /FOREIGN KEY \("parentId"\) REFERENCES "RefParent" \("id"\) ON DELETE RESTRICT ON UPDATE NO ACTION/);
   assert.match(ddl, /CREATE INDEX IF NOT EXISTS "idx_RefChild_parentId" ON "RefChild" \("parentId"\);/);
   assert.doesNotMatch(ddl, /CREATE UNIQUE INDEX/);
-  assert.match(ddl, /parentId TEXT NOT NULL/);
-  assert.match(ddl, /optionalParentId TEXT/);
-  assert.match(ddl, /selfId TEXT/);
+  assert.match(ddl, /"parentId" TEXT NOT NULL/);
+  assert.match(ddl, /"optionalParentId" TEXT/);
+  assert.match(ddl, /"selfId" TEXT/);
   assert.deepEqual(
     db.prepare("SELECT name FROM pragma_index_list('RefChild') WHERE origin = 'c' ORDER BY name").all().map(({ name }) => name),
     ['idx_RefChild_optionalParentId', 'idx_RefChild_parentId', 'idx_RefChild_selfId'],

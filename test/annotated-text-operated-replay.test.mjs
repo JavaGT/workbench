@@ -1,3 +1,4 @@
+import { databaseImage } from './helpers/database-image.mjs';
 // Annotated-text operated version admission + replay contract (ADR 0008).
 // The projection admits exactly ONE durable operated version (v13, the
 // span-native codec). v13 rows must replay deterministically from the
@@ -17,6 +18,7 @@ import { defineSqliteSchema } from '../build/server.mjs';
 import { rowToEvent } from '../build/committed-log.mjs';
 import { txn } from '../build/driver.mjs';
 import { materializeText, restoreTextFamily, projectEndpointToOffset, textFamilyCheckpoint } from '../build/annotated-text-continuous.mjs';
+import { materializeAnnotatedTextSnapshot } from '../public/workbench-client.mjs';
 import { projectAnnotatedTextSnapshot } from '../build/annotated-text-snapshot.mjs';
 import { withAuthoringBinding } from './annotated-text-authoring-fixture.mjs';
 
@@ -340,17 +342,18 @@ test('one-cardinality exclusive trim survives replay through the real projector 
     db: rebuilt, entity: ReplayDoc, row, principal,
     fieldName: 'body', descriptor: ReplayDoc.fields.body, mintBasis: false,
   });
+  const display = materializeAnnotatedTextSnapshot(recipient, null, { family: liveFamily(rebuilt) });
   const family = liveFamily(rebuilt);
   const asOffsets = (range) => ({
     annotationId: range.annotationId,
     start: projectEndpointToOffset(family, range.start),
     end: projectEndpointToOffset(family, range.end),
   });
-  const speakerRanges = recipient.ranges.filter((range) => range.annotationId === 'speaker-a')
+  const speakerRanges = display.ranges.filter((range) => range.annotationId === 'speaker-a')
     .map(asOffsets)
     .sort((a, b) => a.start - b.start);
   assert.deepEqual(speakerRanges.map(({ start, end }) => [start, end]), [[0, 3], [7, 11]]);
-  assert.deepEqual(asOffsets(recipient.ranges.find((range) => range.annotationId === 'speaker-b')), { annotationId: 'speaker-b', start: 3, end: 7 });
+  assert.deepEqual(asOffsets(display.ranges.find((range) => range.annotationId === 'speaker-b')), { annotationId: 'speaker-b', start: 3, end: 7 });
   rebuilt.close();
 });
 
@@ -410,7 +413,7 @@ test('a durable legacy lattice _Log row fails closed on replay with no state wri
     .run('ReplayDoc:d1', 1, 'ReplayDoc.body.operated',
       JSON.stringify({ id: 'd1', version: 11, operation: { kind: 'text.apply' } }),
       'legacy-action', '2024-01-01T00:00:00.000Z');
-  const preimage = db.serialize();
+  const preimage = databaseImage(db);
 
   assert.throws(
     () => replayLog(db, projection, db),
@@ -419,7 +422,7 @@ test('a durable legacy lattice _Log row fails closed on replay with no state wri
       return true;
     },
   );
-  assert.deepEqual(db.serialize(), preimage, 'rejected legacy row must leave the DB untouched');
+  assert.deepEqual(databaseImage(db), preimage, 'rejected legacy row must leave the DB untouched');
   db.close();
 });
 
@@ -437,7 +440,7 @@ test('batch replay atomicity requires the named txn boundary: a valid v14 write 
   const rebuilt = new DatabaseSync(':memory:');
   installSchema(rebuilt);
   const projection = workbench({ db: rebuilt, entities: [declaredEntity()] }).entities.get('ReplayDoc').projection;
-  const preimage = rebuilt.serialize();
+  const preimage = databaseImage(rebuilt);
 
   // The projector owns no transaction, so the whole-log rebuild must be wrapped
   // in the framework's named txn boundary (driver txn / exclusiveTxn) to undo
@@ -449,7 +452,7 @@ test('batch replay atomicity requires the named txn boundary: a valid v14 write 
       return true;
     },
   );
-  assert.deepEqual(rebuilt.serialize(), preimage,
+  assert.deepEqual(databaseImage(rebuilt), preimage,
     'the named txn boundary rolls back the entire batch: the v13 writes are undone with the legacy rejection');
   rebuilt.close();
 });

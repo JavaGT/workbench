@@ -33,7 +33,7 @@ const logDirectory = mkdtempSync(join(tmpdir(), 'workbench-test-'));
 const logPath = join(logDirectory, 'node-test.log');
 const output = openSync(logPath, 'w');
 const started = performance.now();
-const testFiles = globSync('test/**/*.test.mjs').filter((file) => !file.startsWith('test/browser/'));
+const testFiles = [...globSync('test/**/*.test.mjs'), ...globSync('scripts/**/*.test.mjs')].filter((file) => !file.startsWith('test/browser/'));
 
 function stop(child, signal) {
 	if (child.pid === undefined) return;
@@ -79,7 +79,7 @@ process.on('exit', () => {
 
 const child = spawn(
 	process.execPath,
-	['--test', '--test-force-exit', '--test-reporter=dot', '--test-timeout=30000', ...process.argv.slice(2), ...testFiles],
+	['--expose-gc', '--test', '--test-force-exit', ...(process.argv.slice(2).some((arg) => arg.startsWith('--test-reporter')) ? [] : ['--test-reporter=dot']), '--test-timeout=30000', ...process.argv.slice(2), ...testFiles],
 	{ cwd: process.cwd(), env: process.env, stdio: ['ignore', output, output], detached: process.platform !== 'win32' },
 );
 activeChild = child;
@@ -122,7 +122,7 @@ if (result.code === 0 && !result.error && !result.timedOut) {
 	if (result.error) console.error(result.error.message);
 
   const log = readFileSync(logPath, 'utf8');
-  const failureStart = log.search(/failed tests:/i);
+  const failureStart = log.search(/fail(?:ed|ing) tests:/i);
   const relevant = failureStart === -1 ? log : log.slice(failureStart);
   const excerpt = relevant.split('\n').slice(0, MAX_FAILURE_LINES).join('\n').slice(0, MAX_FAILURE_CHARS);
   if (excerpt) console.error(excerpt);

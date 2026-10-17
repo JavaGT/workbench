@@ -36,7 +36,6 @@ import { assertUtf16Range } from '../annotated-text.ts';
 import { rawRow } from './query.ts';
 import {
   captureDeleteContribution,
-  type DeleteContribution,
   type StoredAnnotationImage,
 } from '../annotated-text-delete-history.ts';
 
@@ -305,22 +304,10 @@ function captureNativeTextHistory({
     if (!Number.isSafeInteger(from) || !Number.isSafeInteger(to) || to <= from) {
       throw new ValidationError('annotated text delete history has no valid edit window');
     }
-    let inserted: DeleteContribution['inserted'];
     if (edit.kind === 'text.replace') {
-      const rawOperation = data.operation?.operations?.[1];
-      const operation = canonicalTextOp(rawOperation) as any;
-      const payload = operation[5];
-      if (!Array.isArray(payload) || payload[0] !== 'insert') throw new ValidationError('annotated text replacement history has no insert contribution');
-      inserted = {
-        kind: 'text.insert',
-        opId: operation[2],
-        anchor: operation[5][1],
-        text: payload[2],
-        scalarCount: scalarCount(payload[2]),
-        at: from,
-      };
+      const operation = canonicalTextOp(data.operation?.operations?.[1]);
+      if (operation[5][0] !== 'insert') throw new ValidationError('annotated text replacement history has no insert contribution');
     }
-    const postDeleteMemberships = new Map(afterImages.map((image) => [image.id, image.memberships]));
     return captureDeleteContribution({
       documentId: command.id,
       family: beforeFamily,
@@ -328,9 +315,6 @@ function captureNativeTextHistory({
       toUtf16: to,
       annotations: beforePrepared,
       declarations,
-      postDeleteMemberships,
-      ...(transition === undefined ? {} : { annotationTransition: transition }),
-      ...(inserted === undefined ? {} : { inserted }),
     });
   }
 

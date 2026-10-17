@@ -78,6 +78,56 @@ test('register sets a fail-closed Set-Cookie (HttpOnly, SameSite=Lax, Path=/)', 
   assert.equal(body.token, undefined, 'the token travels in the cookie, not the body');
 });
 
+test('registration enforces the host password floor before creating an account', async (t) => {
+  const app = workbench({ db: ':memory:' }).auth({ minimumPasswordLength: 8 });
+  app.listen(0);
+  await app.ready;
+  const { port } = app.httpServer.address();
+  t.after(() => app.httpServer.close());
+  const origin = `http://127.0.0.1:${port}`;
+
+  const short = await fetch(`${origin}/auth/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'short', password: '1234567' }),
+  });
+  assert.equal(short.status, 400);
+  assert.equal(short.headers.get('set-cookie'), null);
+  assert.equal(app.db.prepare('SELECT COUNT(*) AS n FROM User').get().n, 0);
+  assert.equal(app.db.prepare('SELECT COUNT(*) AS n FROM Session').get().n, 0);
+
+  const exactFloor = await fetch(`${origin}/auth/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'valid', password: '12345678' }),
+  });
+  assert.equal(exactFloor.status, 201);
+});
+
+test('password changes enforce the same configured floor', async (t) => {
+  const app = workbench({ db: ':memory:' }).auth({ minimumPasswordLength: 8 });
+  app.listen(0);
+  await app.ready;
+  const { port } = app.httpServer.address();
+  t.after(() => app.httpServer.close());
+  const origin = `http://127.0.0.1:${port}`;
+  const registered = await fetch(`${origin}/auth/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'alice', password: '12345678' }),
+  });
+  assert.equal(registered.status, 201);
+  const cookie = registered.headers.get('set-cookie');
+  assert.ok(cookie);
+
+  const changed = await fetch(`${origin}/auth/change-password`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', cookie },
+    body: JSON.stringify({ currentPassword: '12345678', newPassword: '1234567' }),
+  });
+  assert.equal(changed.status, 400);
+});
+
 test('login never creates an unknown user', async (t) => {
   const { origin, app } = await boot(t);
   const res = await fetch(`${origin}/auth/login`, {

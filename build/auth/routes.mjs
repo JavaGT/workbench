@@ -71,6 +71,7 @@ import {
 
 
 
+
 // Build the `/auth` router. `secure` follows the app env (true only in
 // production) so the same fail-closed cookie attributes apply on login and
 // logout, and plain-http dev works. The router is mounted at `/auth` by
@@ -83,7 +84,7 @@ import {
 // always travels in the body's `username` slot (kept for backward
 // compatibility); only the lookup columns change. Every named field MUST exist
 // on the User entity — a typo fails closed at first login with a thrown lookup.
-export function authRoutes({ secure = config.env === 'production', identifyBy = ['username'], entities, db: maybeDb }                    = {}) {
+export function authRoutes({ secure = config.env === 'production', identifyBy = ['username'], minimumPasswordLength, entities, db: maybeDb }                    = {}) {
   if (!entities || !maybeDb) {
     throw new Error('authRoutes requires entities and db options');
   }
@@ -95,6 +96,8 @@ export function authRoutes({ secure = config.env === 'production', identifyBy = 
   const { createInvitation, acceptInvitation, rejectInvitation, listInvitationsForUser } = createInvitationApi({ Invitation });
   const s = router();
   const identityFields = Array.isArray(identifyBy) && identifyBy.length > 0 ? identifyBy : ['username'];
+  const passwordBelowMinimum = (password         )          => minimumPasswordLength !== undefined
+    && (typeof password !== 'string' || password.length < minimumPasswordLength);
 
   // Invitation response builder — shared by create and list routes.
   const INVITATION_FIELDS = ['token', 'targetEntity', 'targetId', 'role', 'targetUser', 'maxUses', 'useCount', 'expiresAt', 'createdBy', 'createdAt'];
@@ -208,6 +211,9 @@ export function authRoutes({ secure = config.env === 'production', identifyBy = 
     if (!username || !password) {
       return next({ status: 400, message: 'username and password are required' });
     }
+    if (passwordBelowMinimum(password)) {
+      return next({ status: 400, message: `password must be at least ${minimumPasswordLength} characters` });
+    }
     const found = findIdentity(username, next);
     if (found.failed) return;
     if (found.user) return next({ status: 409, message: 'account already exists' });
@@ -312,6 +318,9 @@ export function authRoutes({ secure = config.env === 'production', identifyBy = 
     const { currentPassword, newPassword } = req.body ?? {};
     if (!currentPassword || !newPassword) {
       return next({ status: 400, message: 'currentPassword and newPassword are required' });
+    }
+    if (passwordBelowMinimum(newPassword)) {
+      return next({ status: 400, message: `password must be at least ${minimumPasswordLength} characters` });
     }
     const user = User.getOrFail(req.principal.id);
     if (!user || !user.password.verify(currentPassword)) {

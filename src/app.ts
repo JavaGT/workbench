@@ -1190,7 +1190,7 @@ export default function workbench({
     // (chainable). Fail closed: an app with no db cannot serve auth — the routes
     // write User rows and mint Sessions, and sessionPrincipalOf has nothing to
     // look a token up in. Throw at construction (loud), not mid-login (a 500).
-    app.auth = function auth(options: any = {}) {
+    app.auth = function auth(options: { identifyBy?: readonly string[]; minimumPasswordLength?: number } = {}) {
       if (!app.db) {
         throw new Error('app.auth() requires a db — registration writes a User row, authentication mints a Session, and the session principal source has nothing to look a token up in without one (fail closed).');
       }
@@ -1209,6 +1209,7 @@ export default function workbench({
       app.mount('/auth', authRoutes({
         secure: app.config.env === 'production',
         identifyBy: options.identifyBy,
+        minimumPasswordLength: options.minimumPasswordLength,
         entities: authEntities,
         db: app.db,
       } as any));

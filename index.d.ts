@@ -2300,7 +2300,7 @@ export interface WorkbenchApp extends RouteBuilder {
   /** Register a search plugin before the app starts; returns this app for chaining. */
   registerSearchPlugin(plugin: SearchPlugin): this;
   register(...declarations: readonly (WorkbenchEntity | readonly WorkbenchEntity[])[]): this;
-  auth(options?: { identifyBy?: readonly string[] }): this;
+  auth(options?: { identifyBy?: readonly string[]; minimumPasswordLength?: number }): this;
   static(prefix: string, directory: string, options?: import('./src/server.js').ServeStaticOptions): this;
   prepareSchema(): Promise<this>;
   ddl(): Promise<this>;

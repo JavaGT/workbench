@@ -26,6 +26,7 @@ import {
 
 } from './schema-table-census.mjs';
 
+import { migrationIdentityKey } from './migration-identity.mjs';
 
 
 
@@ -660,14 +661,16 @@ export function buildOwnershipCensus(input             )               {
   }
 
   // --- migration namespace rules (consideration #12) -----------------------
-  // A schema's declared migration namespaces must be unique within that schema,
-  // and a namespace may be claimed by at most one schema across the census.
-  // Ownership is tracked per schema declaration (by ordinal, not just name) so
-  // two distinct schema declarations sharing a name cannot silently share a
-  // namespace.
+  // A namespace is claimed by at most one schema declaration across the census,
+  // and one schema may claim it across several ledger versions (the `scope@1` →
+  // `scope@2` split): each (namespace, version) pair is claimed at most once.
+  // Ordering and contiguity of those versions belong to the runner
+  // (`migration-ledger.ts`), not to this pre-touch census. Ownership is tracked
+  // per schema declaration (by ordinal, not just name) so two distinct schema
+  // declarations sharing a name cannot silently share a namespace.
   const namespaceOwner = new Map                                             ();
   for (const [schemaOrdinal, schema] of schemas.entries()) {
-    const seenInSchema = new Set        ();
+    const claimedVersions = new Set        ();
     for (const migration of schema.migrations ?? []) {
       const namespaceKey = folded(migration.namespace);
       if (namespaceKey === RESERVED_MIGRATION_NAMESPACE) {
@@ -678,10 +681,11 @@ export function buildOwnershipCensus(input             )               {
         });
         continue;
       }
-      if (seenInSchema.has(namespaceKey)) {
+      const versionKey = migrationIdentityKey(migration.namespace, migration.version);
+      if (claimedVersions.has(versionKey)) {
         errors.push({
           code: 'namespace-claim',
-          message: `schema "${schema.name}" declares migration namespace "${migration.namespace}" more than once`,
+          message: `schema "${schema.name}" declares migration namespace "${migration.namespace}" version ${migration.version} more than once`,
           name: migration.namespace,
           participants: [schema.name, schema.name],
         });
@@ -697,7 +701,7 @@ export function buildOwnershipCensus(input             )               {
         });
         continue;
       }
-      seenInSchema.add(namespaceKey);
+      claimedVersions.add(versionKey);
       namespaceOwner.set(namespaceKey, { schema: schema.name, ordinal: schemaOrdinal });
     }
   }

@@ -32,6 +32,7 @@
 
 import { createHash } from 'node:crypto';
 import { begin, commit, rollback, exclusiveTxn, type DbHandle } from './driver.ts';
+import { foldedMigrationNamespace, migrationIdentityKey } from './migration-identity.ts';
 
 export const MIGRATION_LEDGER_TABLE = '_SchemaMigration';
 
@@ -154,20 +155,12 @@ function sha256hex(value: string): string {
   return createHash('sha256').update(value).digest('hex');
 }
 
-function folded(namespace: string): string {
-  return namespace.toLowerCase();
-}
-
-function identityKey(namespace: string, version: number): string {
-  return `${folded(namespace)}\u0000${version}`;
-}
-
 // Dependencies are "namespace@version". The last '@' separates the version so a
 // namespace may contain '@' itself; the version must be a positive integer.
 const DEPENDENCY_PATTERN = /^(.+)@([1-9]\d*)$/;
 
 export function isReservedNamespace(namespace: string): boolean {
-  return folded(namespace) === RESERVED_NAMESPACE;
+  return foldedMigrationNamespace(namespace) === RESERVED_NAMESPACE;
 }
 
 /**
@@ -206,7 +199,7 @@ export function ledgerRows(db: DbHandle): AppliedLedgerRow[] {
 export function appliedVersionsByNamespace(db: DbHandle): ReadonlyMap<string, readonly number[]> {
   const byNamespace = new Map<string, number[]>();
   for (const row of ledgerRows(db)) {
-    const key = folded(row.namespace);
+    const key = foldedMigrationNamespace(row.namespace);
     const versions = byNamespace.get(key) ?? [];
     versions.push(row.version);
     byNamespace.set(key, versions);
@@ -232,8 +225,8 @@ export function migrationLedgerStateOf(db: DbHandle): MigrationLedgerState {
   const appliedVersions = rows
     .map((row) => ({ namespace: String(row.namespace), version: Number(row.version) }))
     .sort((a, b) => {
-      const aNamespace = folded(a.namespace);
-      const bNamespace = folded(b.namespace);
+      const aNamespace = foldedMigrationNamespace(a.namespace);
+      const bNamespace = foldedMigrationNamespace(b.namespace);
       if (aNamespace !== bNamespace) return aNamespace < bNamespace ? -1 : 1;
       return a.version - b.version;
     });
@@ -276,14 +269,14 @@ export function validateMigrations(
       throw new Error(`migration ${migration.namespace}@${migration.version} must declare an up function`);
     }
 
-    const identity = identityKey(migration.namespace, migration.version);
+    const identity = migrationIdentityKey(migration.namespace, migration.version);
     if (byIdentity.has(identity)) {
       throw new Error(`duplicate migration version ${migration.version} in namespace "${migration.namespace}"`);
     }
     byIdentity.set(identity, migration);
 
-    const namespaceKey = folded(migration.namespace);
-    const nameKey = folded(migration.name);
+    const namespaceKey = foldedMigrationNamespace(migration.namespace);
+    const nameKey = foldedMigrationNamespace(migration.name);
     if (!namesByNamespace.has(namespaceKey)) namesByNamespace.set(namespaceKey, new Set());
     if (namesByNamespace.get(namespaceKey)!.has(nameKey)) {
       throw new Error(`duplicate migration name "${migration.name}" in namespace "${migration.namespace}"`);
@@ -304,7 +297,7 @@ export function validateMigrations(
             `dependency "${String(dependency)}" of migration "${migration.namespace}@${migration.version}" must be "namespace@version"`,
           );
         }
-        const depKey = folded(dependency);
+        const depKey = foldedMigrationNamespace(dependency);
         if (seen.has(depKey)) {
           throw new Error(`duplicate dependency "${dependency}" on migration "${migration.namespace}@${migration.version}"`);
         }
@@ -315,7 +308,7 @@ export function validateMigrations(
         // A dependency on a DECLARED namespace must name a declared version; a
         // dependency on an undeclared namespace may resolve against the applied
         // ledger at run time.
-        const declaredInNamespace = migrations.filter((m) => folded(m.namespace) === folded(depNamespace));
+        const declaredInNamespace = migrations.filter((m) => foldedMigrationNamespace(m.namespace) === foldedMigrationNamespace(depNamespace));
         if (declaredInNamespace.length > 0 && !declaredInNamespace.some((m) => m.version === depVersion)) {
           throw new Error(
             `migration "${migration.namespace}@${migration.version}" depends on "${dependency}", which is not a declared version in namespace "${depNamespace}"`,
@@ -349,22 +342,22 @@ function resolveExecutionOrder(
 ): Migration[] {
   const migrationByKey = new Map<string, Migration>();
   for (const migration of migrations) {
-    migrationByKey.set(identityKey(migration.namespace, migration.version), migration);
+    migrationByKey.set(migrationIdentityKey(migration.namespace, migration.version), migration);
   }
 
   const unresolvedCount = new Map<string, number>();
   const dependents = new Map<string, string[]>();
   for (const migration of migrations) {
-    const key = identityKey(migration.namespace, migration.version);
+    const key = migrationIdentityKey(migration.namespace, migration.version);
     unresolvedCount.set(key, 0);
     dependents.set(key, []);
   }
 
   for (const migration of migrations) {
-    const key = identityKey(migration.namespace, migration.version);
+    const key = migrationIdentityKey(migration.namespace, migration.version);
     for (const raw of migration.dependencies ?? []) {
       const match = DEPENDENCY_PATTERN.exec(raw)!;
-      const depKey = identityKey(match[1], Number(match[2]));
+      const depKey = migrationIdentityKey(match[1], Number(match[2]));
       if (depKey === key) {
         throw new Error(`migration "${migration.namespace}@${migration.version}" depends on itself`);
       }
@@ -387,8 +380,8 @@ function resolveExecutionOrder(
   const byMigration = (a: string, b: string): number => {
     const ma = migrationByKey.get(a)!;
     const mb = migrationByKey.get(b)!;
-    if (folded(ma.namespace) !== folded(mb.namespace)) {
-      return folded(ma.namespace) < folded(mb.namespace) ? -1 : 1;
+    if (foldedMigrationNamespace(ma.namespace) !== foldedMigrationNamespace(mb.namespace)) {
+      return foldedMigrationNamespace(ma.namespace) < foldedMigrationNamespace(mb.namespace) ? -1 : 1;
     }
     return ma.version - mb.version;
   };
@@ -429,7 +422,7 @@ export function runLedgerMigrations(
 
   const appliedRows = ledgerRows(db);
   const appliedByKey = new Map<string, AppliedLedgerRow>();
-  for (const row of appliedRows) appliedByKey.set(identityKey(row.namespace, row.version), row);
+  for (const row of appliedRows) appliedByKey.set(migrationIdentityKey(row.namespace, row.version), row);
 
   // A pending lane continues exactly from the applied ledger. Declaration
   // validation catches gaps within this boot; this catches a gap after restart,
@@ -437,12 +430,12 @@ export function runLedgerMigrations(
   const pendingByNamespace = new Map<string, Migration[]>();
   const appliedMaxByNamespace = new Map<string, number>();
   for (const row of appliedRows) {
-    const namespace = folded(row.namespace);
+    const namespace = foldedMigrationNamespace(row.namespace);
     appliedMaxByNamespace.set(namespace, Math.max(appliedMaxByNamespace.get(namespace) ?? 0, row.version));
   }
   for (const migration of migrations) {
-    if (appliedByKey.has(identityKey(migration.namespace, migration.version))) continue;
-    const namespace = folded(migration.namespace);
+    if (appliedByKey.has(migrationIdentityKey(migration.namespace, migration.version))) continue;
+    const namespace = foldedMigrationNamespace(migration.namespace);
     const pending = pendingByNamespace.get(namespace) ?? [];
     pending.push(migration);
     pendingByNamespace.set(namespace, pending);
@@ -460,7 +453,7 @@ export function runLedgerMigrations(
   // Checksum enforcement: an already-applied declared migration whose immutable
   // source changed refuses startup (consideration #14) — before anything runs.
   for (const migration of migrations) {
-    const row = appliedByKey.get(identityKey(migration.namespace, migration.version));
+    const row = appliedByKey.get(migrationIdentityKey(migration.namespace, migration.version));
     if (!row) continue;
     const expected = checksumOf(migration);
     if (row.checksum !== expected) {
@@ -471,7 +464,7 @@ export function runLedgerMigrations(
   }
 
   const ordered = resolveExecutionOrder(migrations, appliedByKey);
-  const pending = ordered.filter((m) => !appliedByKey.has(identityKey(m.namespace, m.version)));
+  const pending = ordered.filter((m) => !appliedByKey.has(migrationIdentityKey(m.namespace, m.version)));
   if (pending.length === 0) return;
 
   const now = options.now ?? (() => new Date().toISOString());

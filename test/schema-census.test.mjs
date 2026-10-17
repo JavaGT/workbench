@@ -574,7 +574,7 @@ test('a migration namespace is claimed by exactly one schema', () => {
   assert.deepEqual(result.errors[0].participants, ['a', 'b']);
 });
 
-test('a schema may not declare the same migration namespace twice', () => {
+test('a schema may claim one migration namespace across several ledger versions', () => {
   const schema = {
     name: 'app',
     tables: [],
@@ -584,8 +584,29 @@ test('a schema may not declare the same migration namespace twice', () => {
     ],
   };
   const result = buildOwnershipCensus({ schemaDeclarations: [schema] });
+  assert.deepEqual(errorCodes(result), [], `unexpected errors: ${JSON.stringify(result.errors)}`);
+});
+
+test('a schema may not claim the same migration namespace version twice', () => {
+  const schema = {
+    name: 'app',
+    tables: [],
+    migrations: [
+      { namespace: 'scope', name: 'a', version: 1 },
+      { namespace: 'scope', name: 'b', version: 1 },
+    ],
+  };
+  const result = buildOwnershipCensus({ schemaDeclarations: [schema] });
   assert.deepEqual(errorCodes(result), ['namespace-claim']);
   assert.match(result.errors[0].message, /more than once/);
+});
+
+test('a namespace stays owned by its first schema across ledger versions', () => {
+  const schemaA = { name: 'a', tables: [], migrations: [{ namespace: 'scope', name: 'm1', version: 1 }] };
+  const schemaB = { name: 'b', tables: [], migrations: [{ namespace: 'scope', name: 'm2', version: 2 }] };
+  const result = buildOwnershipCensus({ schemaDeclarations: [schemaA, schemaB] });
+  assert.deepEqual(errorCodes(result), ['namespace-claim']);
+  assert.deepEqual(result.errors[0].participants, ['a', 'b']);
 });
 
 test('two distinct schema declarations sharing a name may not share a migration namespace', () => {

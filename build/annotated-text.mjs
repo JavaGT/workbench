@@ -164,7 +164,28 @@ export function frontierDominates(left          , right          )          {
 
 /** Like frontierDominates, for frontiers already validated at their boundary. */
 export function frontierDominatesValidated(left          , right          )          {
-  return right.every(([actor, counter]) => frontierCounterValidated(left, actor) >= counter);
+  // Index the left frontier once per call: dominance is then O(|left| + |right|)
+  // instead of a linear find per basis entry. Anchored endpoint projection runs
+  // this once per endpoint against the live family frontier (twice for
+  // equality), so the scan-per-entry shape was a dominant cost in the
+  // 2026-09-14 Studio highlight profile (scope#3039). A single-entry basis is
+  // just one scan, so it skips the index allocation (root-anchor walks call
+  // this per element with a one-entry right side).
+  if (right.length === 0) return true;
+  if (right.length === 1) {
+    const [actor, counter] = right[0];
+    return frontierCounterValidated(left, actor) >= counter;
+  }
+  const counters = new Map                ();
+  for (const [actor, counter] of left) {
+    // First-wins, matching the retired `find` scan exactly: duplicates cannot
+    // occur on a validated frontier, but the result stays identical if one does.
+    if (!counters.has(actor)) counters.set(actor, counter);
+  }
+  for (const [actor, counter] of right) {
+    if ((counters.get(actor) ?? 0) < counter) return false;
+  }
+  return true;
 }
 
 export function assertAnchor(value         )         {

@@ -1209,6 +1209,7 @@ export default function workbench({
       app.mount('/auth', authRoutes({
         secure: app.config.env === 'production',
         identifyBy: options.identifyBy,
+        minimumPasswordLength: options.minimumPasswordLength,
         entities: authEntities,
         db: app.db,
       } as any));

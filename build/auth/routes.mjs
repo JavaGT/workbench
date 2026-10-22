@@ -71,6 +71,8 @@ import {
 
 
 
+
+
 // Build the `/auth` router. `secure` follows the app env (true only in
 // production) so the same fail-closed cookie attributes apply on login and
 // logout, and plain-http dev works. The router is mounted at `/auth` by
@@ -83,7 +85,7 @@ import {
 // always travels in the body's `username` slot (kept for backward
 // compatibility); only the lookup columns change. Every named field MUST exist
 // on the User entity — a typo fails closed at first login with a thrown lookup.
-export function authRoutes({ secure = config.env === 'production', identifyBy = ['username'], entities, db: maybeDb }                    = {}) {
+export function authRoutes({ secure = config.env === 'production', identifyBy = ['username'], minimumPasswordLength, entities, db: maybeDb }                    = {}) {
   if (!entities || !maybeDb) {
     throw new Error('authRoutes requires entities and db options');
   }
@@ -95,6 +97,17 @@ export function authRoutes({ secure = config.env === 'production', identifyBy = 
   const { createInvitation, acceptInvitation, rejectInvitation, listInvitationsForUser } = createInvitationApi({ Invitation });
   const s = router();
   const identityFields = Array.isArray(identifyBy) && identifyBy.length > 0 ? identifyBy : ['username'];
+  // The app's password policy belongs at this mount: registration and password
+  // change are the two routes that set a password. An absent/zero floor keeps
+  // the framework default (no minimum), so existing apps are unchanged.
+  const passwordFloor = Number.isInteger(minimumPasswordLength) && (minimumPasswordLength          ) > 0 ? (minimumPasswordLength          ) : 0;
+  function passwordRefusal(password         )                                             {
+    if (typeof password !== 'string') return { status: 400, message: 'password must be a string' };
+    if (passwordFloor > 0 && password.length < passwordFloor) {
+      return { status: 400, message: `password must be at least ${passwordFloor} characters` };
+    }
+    return null;
+  }
 
   // Invitation response builder — shared by create and list routes.
   const INVITATION_FIELDS = ['token', 'targetEntity', 'targetId', 'role', 'targetUser', 'maxUses', 'useCount', 'expiresAt', 'createdBy', 'createdAt'];
@@ -226,6 +239,8 @@ export function authRoutes({ secure = config.env === 'production', identifyBy = 
     if (!username || !password) {
       return next({ status: 400, message: 'username and password are required' });
     }
+    const passwordProblem = passwordRefusal(password);
+    if (passwordProblem) return next(passwordProblem);
     const found = findIdentity(username, next);
     if (found.failed) return;
     if (found.user) return next({ status: 409, message: 'account already exists' });
@@ -331,6 +346,8 @@ export function authRoutes({ secure = config.env === 'production', identifyBy = 
     if (!currentPassword || !newPassword) {
       return next({ status: 400, message: 'currentPassword and newPassword are required' });
     }
+    const passwordProblem = passwordRefusal(newPassword);
+    if (passwordProblem) return next(passwordProblem);
     const user = User.getOrFail(req.principal.id);
     if (!user || !user.password.verify(currentPassword)) {
       return next({ status: 401, message: 'current password is incorrect' });

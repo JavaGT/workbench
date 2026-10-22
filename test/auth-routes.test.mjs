@@ -502,3 +502,52 @@ test('identifyBy: an unknown field fails closed with a 500 at first login', asyn
   });
   assert.equal(res.status, 500, 'an unknown identity field fails closed, loudly');
 });
+
+// --- #7602: email identity folds case, and collisions refuse -----------------
+
+test('identifyBy: email case folds for sign-in on a pre-existing account', async (t) => {
+  const { origin, app } = await bootWithEmail(t);
+  const { User } = await import('../build/auth/entities.mjs');
+  app.entity(User).create({ email: 'Ada.Lovelace@Example.com', password: 'hunter2' });
+  for (const variant of ['ada.lovelace@example.com', 'ADA.LOVELACE@EXAMPLE.COM', 'Ada.Lovelace@Example.com']) {
+    const res = await fetch(`${origin}/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ username: variant, password: 'hunter2' }),
+    });
+    assert.equal(res.status, 201, `${variant} signs in`);
+    assert.ok(res.headers.get('set-cookie'), `${variant} mints a session`);
+  }
+});
+
+test('identifyBy: two case-variant emails are refused, never silently merged', async (t) => {
+  const { origin, app } = await bootWithEmail(t);
+  const { User } = await import('../build/auth/entities.mjs');
+  app.entity(User).create({ email: 'dup@example.com', password: 'first' });
+  app.entity(User).create({ email: 'DUP@example.com', password: 'second' });
+  const res = await fetch(`${origin}/auth/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'Dup@Example.com', password: 'first' }),
+  });
+  assert.equal(res.status, 409, 'an ambiguous fold is a refusal, not a pick');
+  assert.equal(res.headers.get('set-cookie'), null, 'no session is minted on an ambiguous fold');
+});
+
+test('identifyBy: registration rejects a case-variant of an existing email', async (t) => {
+  const { origin, app } = await bootWithEmail(t);
+  const first = await fetch(`${origin}/auth/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'Alice@Example.com', password: 'hunter2' }),
+  });
+  assert.equal(first.status, 201);
+  const duplicate = await fetch(`${origin}/auth/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'alice@example.com', password: 'hunter2' }),
+  });
+  assert.equal(duplicate.status, 409, 'a case variant is the same identity');
+  const count = app.db.prepare('SELECT COUNT(*) AS n FROM User').get().n;
+  assert.equal(count, 1, 'no second account is created for a case variant');
+});

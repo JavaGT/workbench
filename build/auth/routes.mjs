@@ -189,6 +189,24 @@ export function authRoutes({ secure = config.env === 'production', identifyBy = 
         next({ status: 500, message: `identifyBy references unknown User field '${name}'` });
         return { failed: true, user: null };
       }
+      // Email is one identity regardless of case (#7602): a re-cased credential
+      // previously matched nothing and was reported as bad credentials. Fold the
+      // typed address and each stored address; refuse an ambiguous fold rather
+      // than silently picking one of two case-variant accounts.
+      if (name === 'email') {
+        const typedEmail = typeof credential === 'string' ? credential.trim().toLowerCase() : '';
+        if (typedEmail) {
+          const matches = User.findAll().filter(
+            (candidate     ) => typeof candidate.email === 'string' && candidate.email.trim().toLowerCase() === typedEmail,
+          );
+          if (matches.length > 1) {
+            next({ status: 409, message: 'This email matches more than one account; ask the server administrator to resolve it' });
+            return { failed: true, user: null };
+          }
+          if (matches.length === 1) return { user: matches[0], failed: false };
+        }
+        continue;
+      }
       const user = User.findOne(field.is(credential));
       if (user) return { user, failed: false };
     }

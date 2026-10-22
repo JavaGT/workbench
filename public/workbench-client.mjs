@@ -3440,7 +3440,8 @@ export function createLiveDeliverySession({
       const recovery = requestSnapshotRecovery(undefined, !hasUnknownTransmission(), true);
       if (!hasUnknownTransmission()) await recovery;
     };
-    for (const envelope of envelopes) {
+    for (let envelopeIndex = 0; envelopeIndex < envelopes.length; envelopeIndex += 1) {
+      const envelope = envelopes[envelopeIndex];
       if (closed || status === 'revoked' || status === 'unavailable' || generation !== connectionGeneration) return;
       if (!isKnownEnvelopeKind(envelope)) throw new Error('delivery batch contains an invalid recipient envelope');
       if (envelope.type === 'snapshot-patch') {
@@ -3457,7 +3458,19 @@ export function createLiveDeliverySession({
       // until ITS replacement lands — later envelopes are never evaluated
       // against a base any control in this batch declared untrusted.
       if (envelope.type === 'resync' || envelope.type === 'state-invalidate') {
-        const coverage = Number.isSafeInteger(envelope.seq) ? envelope.seq : undefined;
+        let coverage = Number.isSafeInteger(envelope.seq) ? envelope.seq : undefined;
+        // A consecutive run of sequenced legacy controls invalidates one base.
+        // Recover once at its highest fence before reading any following data.
+        if (!deltaCapable && coverage !== undefined) {
+          while (envelopeIndex + 1 < envelopes.length) {
+            const next = envelopes[envelopeIndex + 1];
+            if ((next?.type !== 'resync' && next?.type !== 'state-invalidate')
+              || !Number.isSafeInteger(next.seq)
+              || next.entity !== envelope.entity || next.id !== envelope.id) break;
+            coverage = Math.max(coverage, next.seq);
+            envelopeIndex += 1;
+          }
+        }
         // Delta mode (#159): an ordinary `resync` control re-establishes state
         // by CATCH-UP — journal patches pulled from the held cursor+token —
         // instead of a full snapshot bootstrap. That is the entire point of

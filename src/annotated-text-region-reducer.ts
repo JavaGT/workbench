@@ -12,7 +12,6 @@ import {
   resolveOffsetToEndpoint,
   type ContinuousTextFamily,
 } from './annotated-text-continuous.ts';
-import type { StructuralEndpoint } from './annotated-text-family.ts';
 import type { RegionEditDescriptor, RegionEditTransition } from './annotated-text-region-descriptor.ts';
 import {
   REGION_AFFECTED_ANNOTATION_MAX,

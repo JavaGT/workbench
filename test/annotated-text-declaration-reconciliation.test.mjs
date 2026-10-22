@@ -211,9 +211,9 @@ test('own echo and foreign declaration actions reconcile through the real Delive
   await assertMatchesFresh(ctx, session);
   assert.ok(
     sources.flatMap((source) => source.frames.flat()).some(
-      (frame) => frame?.type === 'resync' && frame.reason === 'recipient-snapshot-required',
+      (frame) => frame?.type === 'state' && frame.authoring?.family,
     ),
-    'the real Deliver loop must request an authorized snapshot for annotation-only events',
+    'the real Deliver loop must deliver an authoritative state and family for annotation-only events',
   );
   session.close();
 });

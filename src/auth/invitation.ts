@@ -265,7 +265,7 @@ export function createInvitationApi({ Invitation, db: suppliedDb }: CreateInvita
         useCount: 0,
         ...(expiresAt == null ? {} : { expiresAt }),
         createdBy: principal.id,
-        createdAt: new Date(),
+        createdAt: Date.now(),
       },
     }], { principal: authority });
     requireSuccess(result, 'creation');

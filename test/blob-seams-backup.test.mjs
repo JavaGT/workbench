@@ -297,6 +297,7 @@ test('ownership-verified rollback never removes a foreign file swapped onto the 
       census: photoCensus(),
       tempToken: () => token,
       afterByteFinalPublish: () => {
+        assert.equal(existsSync(join(blobsDir, temps.byte)), true, 'the temp link pins the owned inode until rollback finishes');
         // The hook runs AFTER this invocation published its byte final: swap a
         // foreign file in at the same path (a new inode, simulating a winner's
         // final), then block the sidecar to force the failure.

@@ -551,3 +551,26 @@ test('identifyBy: registration rejects a case-variant of an existing email', asy
   const count = app.db.prepare('SELECT COUNT(*) AS n FROM User').get().n;
   assert.equal(count, 1, 'no second account is created for a case variant');
 });
+
+test('auth: minimumPasswordLength refuses a short registration and accepts the floor', async (t) => {
+  const app = workbench({ db: ':memory:' })
+    .auth({ identifyBy: ['email', 'username'], minimumPasswordLength: 8 })
+    .mount('/notes', ownedNote());
+  app.listen(0);
+  await app.ready;
+  const { port } = app.httpServer.address();
+  t.after(() => app.httpServer.close());
+  const origin = `http://127.0.0.1:${port}`;
+  const short = await fetch(`${origin}/auth/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'short@example.com', password: 'short' }),
+  });
+  assert.equal(short.status, 400, 'a password below the app floor is refused');
+  const atFloor = await fetch(`${origin}/auth/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'floor@example.com', password: '12345678' }),
+  });
+  assert.equal(atFloor.status, 201, 'a password at the floor is accepted');
+});

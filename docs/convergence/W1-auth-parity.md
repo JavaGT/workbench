@@ -29,6 +29,14 @@ and beyond, so Scope's better-auth can be retired at end state.
 - `src/rate-limit.mjs`; job-queue bearer tokens (`src/job-queue.mjs`) as the
   existing API-key-like mechanism.
 
+## Password write policy (#7672)
+
+An app that owns a password policy passes `minimumPasswordLength` to
+`.auth()`. Workbench applies that floor to registration and password changes;
+login continues to verify the stored credential without reapplying a write
+rule. The host passes its policy value so its registration and recovery paths
+use the same boundary.
+
 ## Scope parity surface (from `~/Development/scope/prisma/schema.prisma` + `src/server/handlers/auth.ts`)
 
 Prisma auth models: `User, Session, Account, Verification, Passkey, TwoFactor,

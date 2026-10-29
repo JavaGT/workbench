@@ -310,10 +310,15 @@ function admitsAnnotatedTextAction(app: ApplicationApp, request: AdmittableActio
       .filter(([, field]) => field.kind === 'annotatedText');
     const annotatedFields = annotatedEntries.map(([name]) => name);
     if (annotatedFields.length === 0) continue;
+    const isCreate = request.type === `${entity.name}.create`;
+    const isRetire = request.type === `${entity.name}.annotatedText.retire`;
+    const isOperation = (request.payload as { version?: unknown } | null | undefined)?.version === 9
+      && annotatedFields.some((field) => request.type === `${entity.name}.${field}.operation`);
+    if (!isCreate && !isRetire && !isOperation) continue;
     const id = (request.payload as { id?: unknown } | null | undefined)?.id;
-    if (typeof id !== 'string' || id.length === 0) continue;
+    if (typeof id !== 'string' || id.length === 0) return false;
     let owningScope: string | undefined;
-    if (request.type === `${entity.name}.create`) {
+    if (isCreate) {
       try { owningScope = resolveAnnotatedTextOwningScope(annotatedEntries[0][1], entity.fields as Record<string, any>, request.payload as Record<string, any>).key; } catch { return false; }
     } else {
       const row = rawRow(app.db!, entity.name, id);
@@ -324,9 +329,7 @@ function admitsAnnotatedTextAction(app: ApplicationApp, request: AdmittableActio
     // document actions may accept it only when it is the declared owner scope.
     if (request.scope !== undefined && request.scope !== owningScope) return false;
     request.scope = owningScope;
-    if (request.type === `${entity.name}.create` || request.type === `${entity.name}.annotatedText.retire`) return true;
-    if ((request.payload as { version?: unknown } | null | undefined)?.version === 9
-      && annotatedFields.some((field) => request.type === `${entity.name}.${field}.operation`)) return true;
+    return true;
   }
   return false;
 }

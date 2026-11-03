@@ -53,7 +53,7 @@ export type PrincipalSnapshotFilter =
   | { readonly kind: 'in'; readonly field: SourceFieldHandle; readonly values: readonly string[] }
   | { readonly kind: 'isNull'; readonly field: SourceFieldHandle }
   | { readonly kind: 'equal'; readonly left: SourceFieldHandle; readonly right: SourceFieldHandle | PrincipalSnapshotPrincipalId }
-  | { readonly kind: 'exists'; readonly source: ProjectionSource; readonly where: PrincipalSnapshotFilter };
+  | { readonly kind: 'exists'; readonly source: ProjectionSource; readonly principalField: SourceFieldHandle; readonly where: PrincipalSnapshotFilter };
 
 export interface ManyCollection {
   kind: 'many';
@@ -212,10 +212,12 @@ const filter = Object.freeze({
     if (!_principalIdBrand.has(right as object)) assertBrand('principalSnapshot.filter.equal right', right, _sourceFieldBrand, 'source field handle');
     return filterNode({ kind: 'equal', left, right });
   },
-  exists(source: ProjectionSource, where: PrincipalSnapshotFilter): PrincipalSnapshotFilter {
+  exists(source: ProjectionSource, principalField: SourceFieldHandle, where: PrincipalSnapshotFilter): PrincipalSnapshotFilter {
     assertBrand('principalSnapshot.filter.exists source', source, _sourceBrand, 'projectionSource');
+    assertBrand('principalSnapshot.filter.exists principalField', principalField, _sourceFieldBrand, 'source field handle');
+    validateSource('principalSnapshot.filter.exists principalField', principalField.source, source);
     assertBrand('principalSnapshot.filter.exists where', where, _filterBrand, 'filter');
-    return filterNode({ kind: 'exists', source, where });
+    return filterNode({ kind: 'exists', source, principalField, where });
   },
 });
 

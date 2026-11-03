@@ -1555,7 +1555,7 @@ export type PrincipalSnapshotFilter = {
   | { readonly kind: 'in'; readonly field: ProjectionSourceField; readonly values: readonly string[] }
   | { readonly kind: 'isNull'; readonly field: ProjectionSourceField }
   | { readonly kind: 'equal'; readonly left: ProjectionSourceField; readonly right: ProjectionSourceField | PrincipalSnapshotPrincipalId }
-  | { readonly kind: 'exists'; readonly source: ProjectionSource; readonly where: PrincipalSnapshotFilter }
+  | { readonly kind: 'exists'; readonly source: ProjectionSource; readonly principalField: ProjectionSourceField; readonly where: PrincipalSnapshotFilter }
 );
 export interface PrincipalSnapshotMany {
   readonly [principalSnapshotManyBrand]: true;
@@ -1600,7 +1600,7 @@ export interface PrincipalSnapshotGrammar {
     in(field: ProjectionSourceField, values: readonly string[]): PrincipalSnapshotFilter;
     isNull(field: ProjectionSourceField): PrincipalSnapshotFilter;
     equal(left: ProjectionSourceField, right: ProjectionSourceField | PrincipalSnapshotPrincipalId): PrincipalSnapshotFilter;
-    exists(source: ProjectionSource, where: PrincipalSnapshotFilter): PrincipalSnapshotFilter;
+    exists(source: ProjectionSource, principalField: ProjectionSourceField, where: PrincipalSnapshotFilter): PrincipalSnapshotFilter;
   };
   readonly principal: { readonly id: PrincipalSnapshotPrincipalId };
 }

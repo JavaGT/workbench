@@ -131,6 +131,8 @@ test('principal snapshot filters fail closed on unknown roles and preserve perso
   db.exec('CREATE TABLE Project_members (Project_id TEXT NOT NULL, member_id TEXT NOT NULL, role TEXT NOT NULL)');
   const notification = projectionSource(schema, 'Notification');
   const membership = projectionSourcePhysical('Project_members', ['Project_id', 'member_id', 'role']);
+  assert.throws(() => principalSnapshot.filter.exists(membership, principalSnapshot.filter.isNull(notification.field.projectId)), /principalField requires a valid source field handle/);
+  assert.throws(() => principalSnapshot.filter.exists(membership, notification.field.id, principalSnapshot.filter.isNull(notification.field.projectId)), /principalField must come from the same projection source/);
   const allowedRoles = ['editor', 'owner'];
   const declaration = principalSnapshot('user-hub-filtered', {
     principalType: 'user',
@@ -141,12 +143,25 @@ test('principal snapshot filters fail closed on unknown roles and preserve perso
         select: principalSnapshot.select(notification.field.id, notification.field.projectId, notification.field.body),
         where: principalSnapshot.filter.or(
           principalSnapshot.filter.isNull(notification.field.projectId),
-          principalSnapshot.filter.exists(membership, principalSnapshot.filter.and(
+          principalSnapshot.filter.exists(membership, membership.field.member_id, principalSnapshot.filter.and(
             principalSnapshot.filter.equal(membership.field.Project_id, notification.field.projectId),
-            principalSnapshot.filter.equal(membership.field.member_id, principalSnapshot.principal.id),
             principalSnapshot.filter.in(membership.field.role, allowedRoles),
           )),
         ),
+      }),
+      projectNotifications: principalSnapshot.many(notification, {
+        via: notification.field.userId,
+        key: notification.field.id,
+        select: principalSnapshot.select(notification.field.id, notification.field.projectId),
+        join: {
+          source: membership,
+          on: { from: notification.field.projectId, to: membership.field.Project_id },
+          select: [membership.field.role],
+        },
+        where: principalSnapshot.filter.exists(membership, membership.field.member_id, principalSnapshot.filter.and(
+          principalSnapshot.filter.equal(membership.field.Project_id, notification.field.projectId),
+          principalSnapshot.filter.in(membership.field.role, allowedRoles),
+        )),
       }),
       memberships: principalSnapshot.many(membership, {
         via: membership.field.member_id,
@@ -185,9 +200,14 @@ test('principal snapshot filters fail closed on unknown roles and preserve perso
   const bootstrap = await delivery.bootstrap({ principal: { type: 'user', id: 'u1' }, scope });
   assert.equal(bootstrap.kind, 'snapshot');
   assert.deepEqual(bootstrap.snapshot.notifications.map((row) => row.id), ['editor-project', 'owner-project', 'personal']);
+  assert.deepEqual(bootstrap.snapshot.projectNotifications, [
+    { Notification__id: 'editor-project', Notification__projectId: 'p1', Project_members__role: 'editor' },
+    { Notification__id: 'owner-project', Notification__projectId: 'p2', Project_members__role: 'owner' },
+  ]);
   assert.deepEqual(bootstrap.snapshot.memberships.map((row) => row.Project_id), ['p1', 'p2', 'p7']);
   const sameRevisionCatchup = await delivery.catchup({ principal: { type: 'user', id: 'u1' }, scope, after: bootstrap.cursor });
   assert.equal(sameRevisionCatchup.kind, 'snapshot', 'filtered declarations replace a cached snapshot even when its cursor is current');
+  assert.deepEqual(sameRevisionCatchup.snapshot.projectNotifications, bootstrap.snapshot.projectNotifications);
   assert.deepEqual(sameRevisionCatchup.snapshot, bootstrap.snapshot);
 
   const otherScope = principalSnapshotScope({ declaration: declaration.name, principal: { type: 'user', id: 'u2' } });

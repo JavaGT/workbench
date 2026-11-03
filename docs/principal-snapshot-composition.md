@@ -100,9 +100,8 @@ const notifications = principalSnapshot.many(notificationSource, {
   select: principalSnapshot.select(notificationSource.field.id, notificationSource.field.projectId),
   where: principalSnapshot.filter.or(
     principalSnapshot.filter.isNull(notificationSource.field.projectId),
-    principalSnapshot.filter.exists(membershipSource, principalSnapshot.filter.and(
+    principalSnapshot.filter.exists(membershipSource, membershipSource.field.member_id, principalSnapshot.filter.and(
       principalSnapshot.filter.equal(membershipSource.field.Project_id, notificationSource.field.projectId),
-      principalSnapshot.filter.equal(membershipSource.field.member_id, principalSnapshot.principal.id),
       principalSnapshot.filter.in(membershipSource.field.role, ['editor', 'owner']),
     )),
   ),
@@ -110,8 +109,9 @@ const notifications = principalSnapshot.many(notificationSource, {
 ```
 
 The explicit allowlist excludes legacy and malformed role values. `exists`
-filters project-scoped rows without dropping personal rows (`projectId IS NULL`)
-and checks both the same principal and the same project. Filters run inside the
+filters project-scoped rows without dropping personal rows (`projectId IS NULL`).
+The required membership principal field is bound automatically to the request
+principal, while the predicate checks the same project. Filters run inside the
 shared projection path, so bootstrap, catchup, subscription setup, and resync
 all materialize the same authorized rows. Because a filter change can tighten
 visibility without changing a recipient's data revision, filtered declarations

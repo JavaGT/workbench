@@ -96,6 +96,9 @@ function validateSnapshotFilter(
       case 'exists': {
         if (nestedSource !== null) throw new Error('principal snapshot filters do not allow nested exists');
         if (node.source === anchor) throw new Error('principal snapshot filter exists source must differ from the anchor source');
+        if (!node.principalField || node.principalField.source !== node.source || !getSourceColumns(node.source).has(node.principalField.column)) {
+          throw new Error('principal snapshot filter exists principalField must belong to its declared source');
+        }
         if (node.source.physicalColumns === undefined && node.source.schema !== schema) {
           throw new Error(`principal snapshot filter source '${node.source.table}' must use the application schema`);
         }
@@ -280,8 +283,10 @@ function compileSnapshotFilter(filter                         , anchor          
           return `(${fieldSql(node.left, nestedSource)} = ?)`;
         }
         return `(${fieldSql(node.left, nestedSource)} = ${fieldSql(node.right, nestedSource)})`;
-      case 'exists':
-        return `(EXISTS (SELECT 1 FROM ${quote(node.source.table)} X WHERE ${compile(node.where, node.source)}))`;
+      case 'exists': {
+        params.push(principalId);
+        return `(EXISTS (SELECT 1 FROM ${quote(node.source.table)} X WHERE (X.${quote(node.principalField.column)} = ?) AND ${compile(node.where, node.source)}))`;
+      }
       default:
         throw new Error('principal snapshot filter contains an unsupported expression');
     }

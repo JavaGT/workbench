@@ -212,10 +212,12 @@ const filter = Object.freeze({
     if (!_principalIdBrand.has(right          )) assertBrand('principalSnapshot.filter.equal right', right, _sourceFieldBrand, 'source field handle');
     return filterNode({ kind: 'equal', left, right });
   },
-  exists(source                  , where                         )                          {
+  exists(source                  , principalField                   , where                         )                          {
     assertBrand('principalSnapshot.filter.exists source', source, _sourceBrand, 'projectionSource');
+    assertBrand('principalSnapshot.filter.exists principalField', principalField, _sourceFieldBrand, 'source field handle');
+    validateSource('principalSnapshot.filter.exists principalField', principalField.source, source);
     assertBrand('principalSnapshot.filter.exists where', where, _filterBrand, 'filter');
-    return filterNode({ kind: 'exists', source, where });
+    return filterNode({ kind: 'exists', source, principalField, where });
   },
 });
 

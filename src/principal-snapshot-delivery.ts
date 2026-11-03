@@ -1,5 +1,11 @@
 import { principalSnapshotScope, parsePrincipalSnapshotScope } from './principal-snapshot-scope.ts';
-import { isPrincipalSnapshotDeclaration, type PrincipalSnapshotDeclaration, type ProjectionSource } from './principal-snapshot-declaration.ts';
+import {
+  isPrincipalSnapshotDeclaration,
+  type PrincipalSnapshotDeclaration,
+  type PrincipalSnapshotFilter,
+  type ProjectionSource,
+  type SourceFieldHandle,
+} from './principal-snapshot-declaration.ts';
 import type { DbHandle } from './driver.ts';
 
 const PRINCIPAL_PREFIX = 'PrincipalSnapshot:';
@@ -40,6 +46,7 @@ export function validatePrincipalSnapshotDeclarations(
       for (const field of [collection.via, collection.key, ...(collection.select ?? []), ...(collection.orderBy ?? [])]) {
         if (!columns.has(field!.column)) throw new Error(`principal snapshot source column '${field!.column}' must be declared on '${source.table}'`);
       }
+      if (collection.where !== undefined) validateSnapshotFilter(collection.where, source, schema, sourceColumns);
       const join = collection.join;
       if (join !== undefined) {
         // `on.from` is the anchor table's FK column; `on.to` and `join.select`
@@ -58,6 +65,63 @@ export function validatePrincipalSnapshotDeclarations(
         }
       }
     }
+  }
+}
+
+function validateSnapshotFilter(
+  filter: PrincipalSnapshotFilter,
+  anchor: ProjectionSource,
+  schema: unknown,
+  getSourceColumns: (source: ProjectionSource) => Set<string>,
+): void {
+  const anchorColumns = getSourceColumns(anchor);
+  function visit(node: PrincipalSnapshotFilter, nestedSource: ProjectionSource | null, nestedColumns: Set<string> | null): void {
+    switch (node.kind) {
+      case 'and':
+      case 'or':
+        if (node.terms.length < 2) throw new Error(`principal snapshot filter '${node.kind}' requires two or more terms`);
+        node.terms.forEach((term) => visit(term, nestedSource, nestedColumns));
+        return;
+      case 'in':
+      case 'isNull':
+        validateFilterField(node.field, anchor, anchorColumns, nestedSource, nestedColumns);
+        if (node.kind === 'in' && (node.values.length === 0 || node.values.some((value) => typeof value !== 'string'))) {
+          throw new Error('principal snapshot filter in requires one or more string values');
+        }
+        return;
+      case 'equal':
+        validateFilterField(node.left, anchor, anchorColumns, nestedSource, nestedColumns);
+        if (node.right.kind !== 'principalId') validateFilterField(node.right, anchor, anchorColumns, nestedSource, nestedColumns);
+        return;
+      case 'exists': {
+        if (nestedSource !== null) throw new Error('principal snapshot filters do not allow nested exists');
+        if (node.source === anchor) throw new Error('principal snapshot filter exists source must differ from the anchor source');
+        if (node.source.physicalColumns === undefined && node.source.schema !== schema) {
+          throw new Error(`principal snapshot filter source '${node.source.table}' must use the application schema`);
+        }
+        visit(node.where, node.source, getSourceColumns(node.source));
+        return;
+      }
+      default:
+        throw new Error('principal snapshot filter contains an unsupported expression');
+    }
+  }
+  visit(filter, null, null);
+}
+
+function validateFilterField(
+  field: SourceFieldHandle,
+  anchor: ProjectionSource,
+  anchorColumns: Set<string>,
+  nestedSource: ProjectionSource | null,
+  nestedColumns: Set<string> | null,
+): void {
+  if (!field || typeof field !== 'object' || field.kind !== 'sourceField') {
+    throw new Error('principal snapshot filter requires a source field handle');
+  }
+  const columns = field.source === anchor ? anchorColumns : field.source === nestedSource ? nestedColumns : null;
+  if (!columns || !columns.has(field.column)) {
+    throw new Error(`principal snapshot filter field '${field.column}' must belong to a declared filter source`);
   }
 }
 
@@ -195,11 +259,42 @@ function joinOutputKey(source: ProjectionSource, column: string): string {
   return `${source.table}__${column}`;
 }
 
+function compileSnapshotFilter(filter: PrincipalSnapshotFilter, anchor: ProjectionSource, principalId: string): { sql: string; params: string[] } {
+  const params: string[] = [];
+  function fieldSql(field: SourceFieldHandle, nestedSource: ProjectionSource | null): string {
+    const alias = field.source === anchor ? 'A' : field.source === nestedSource ? 'X' : null;
+    if (alias === null) throw new Error('principal snapshot filter references a field outside its validated sources');
+    return `${alias}.${quote(field.column)}`;
+  }
+  function compile(node: PrincipalSnapshotFilter, nestedSource: ProjectionSource | null = null): string {
+    switch (node.kind) {
+      case 'and': return `(${node.terms.map((term) => compile(term, nestedSource)).join(' AND ')})`;
+      case 'or': return `(${node.terms.map((term) => compile(term, nestedSource)).join(' OR ')})`;
+      case 'in':
+        params.push(...node.values);
+        return `(${fieldSql(node.field, nestedSource)} IN (${node.values.map(() => '?').join(', ')}))`;
+      case 'isNull': return `(${fieldSql(node.field, nestedSource)} IS NULL)`;
+      case 'equal':
+        if (node.right.kind === 'principalId') {
+          params.push(principalId);
+          return `(${fieldSql(node.left, nestedSource)} = ?)`;
+        }
+        return `(${fieldSql(node.left, nestedSource)} = ${fieldSql(node.right, nestedSource)})`;
+      case 'exists':
+        return `(EXISTS (SELECT 1 FROM ${quote(node.source.table)} X WHERE ${compile(node.where, node.source)}))`;
+      default:
+        throw new Error('principal snapshot filter contains an unsupported expression');
+    }
+  }
+  return { sql: compile(filter), params };
+}
+
 function project(db: DbHandle, declaration: PrincipalSnapshotDeclaration, principal: PrincipalSnapshotPrincipal): PrincipalSnapshotOutput {
   const output: Record<string, readonly Readonly<Record<string, unknown>>[]> = {};
   for (const [name, collection] of Object.entries(declaration.fields)) {
     const join = collection.join;
     const nested = join !== undefined;
+    const aliasedAnchor = nested || collection.where !== undefined;
     const anchorCols = (() => {
       const selected = collection.select!.map((field) => field.column);
       return selected.includes(collection.key!.column) ? selected : [...selected, collection.key!.column];
@@ -207,18 +302,22 @@ function project(db: DbHandle, declaration: PrincipalSnapshotDeclaration, princi
     const joinCols = join?.select.map((field) => field.column) ?? [];
     // Every projected column is aliased to its deterministic output key so the
     // raw rows carry the final keys directly (no post-row rename).
-    const anchorAliases = nested ? anchorCols.map((column) => `A.${quote(column)} AS ${quote(`${collection.source!.table}__${column}`)}`) : anchorCols.map(quote);
+    const anchorAliases = nested
+      ? anchorCols.map((column) => `A.${quote(column)} AS ${quote(`${collection.source!.table}__${column}`)}`)
+      : aliasedAnchor ? anchorCols.map((column) => `A.${quote(column)} AS ${quote(column)}`) : anchorCols.map(quote);
     const joinAliases = nested ? joinCols.map((column) => `B.${quote(column)} AS ${quote(joinOutputKey(join!.source, column))}`) : [];
     const joinClause = nested
       ? ` JOIN ${quote(join!.source.table)} B ON B.${quote(join!.on.to.column)} = A.${quote(join!.on.from.column)}`
       : '';
     const orderByRaw = collection.orderBy?.length
-      ? collection.orderBy.map((field) => `${nested ? 'A.' : ''}${quote(field.column)} ${field.direction === 'desc' ? 'DESC' : 'ASC'}`).join(', ')
-      : `${nested ? 'A.' : ''}${quote(collection.key!.column)} ASC`;
-    const tableClause = nested ? `${quote(collection.source!.table)} A` : quote(collection.source!.table);
-    const viaClause = `${nested ? 'A.' : ''}${quote(collection.via!.column)} = ?`;
-    const sql = `SELECT ${[...anchorAliases, ...joinAliases].join(', ')} FROM ${tableClause}${joinClause} WHERE ${viaClause} ORDER BY ${orderByRaw}`;
-    const rows = db.prepare(sql).all(principal.id).map((raw, rowIndex) => {
+      ? collection.orderBy.map((field) => `${aliasedAnchor ? 'A.' : ''}${quote(field.column)} ${field.direction === 'desc' ? 'DESC' : 'ASC'}`).join(', ')
+      : `${aliasedAnchor ? 'A.' : ''}${quote(collection.key!.column)} ASC`;
+    const tableClause = aliasedAnchor ? `${quote(collection.source!.table)} A` : quote(collection.source!.table);
+    const viaClause = `${aliasedAnchor ? 'A.' : ''}${quote(collection.via!.column)} = ?`;
+    const compiledFilter = collection.where === undefined ? null : compileSnapshotFilter(collection.where, collection.source!, principal.id);
+    const filterClause = compiledFilter === null ? '' : ` AND ${compiledFilter.sql}`;
+    const sql = `SELECT ${[...anchorAliases, ...joinAliases].join(', ')} FROM ${tableClause}${joinClause} WHERE ${viaClause}${filterClause} ORDER BY ${orderByRaw}`;
+    const rows = db.prepare(sql).all(principal.id, ...(compiledFilter?.params ?? [])).map((raw, rowIndex) => {
       const row: Record<string, unknown> = {};
       for (const column of anchorCols) {
         const key = nested ? joinOutputKey(collection.source!, column) : column;
@@ -373,7 +472,8 @@ export function createPrincipalSnapshotDelivery({ db, declarations, authorize }:
         return Object.freeze({ kind: 'revoked' });
       }
       const revision = revisionFor(database, resolved.declaration, resolved.principal);
-      return after === revision
+      const hasRowFilters = Object.values(resolved.declaration.fields).some((collection) => collection.where !== undefined);
+      return after === revision && !hasRowFilters
         ? Object.freeze({ kind: 'catchup', envelopes: Object.freeze([]), cursor: revision })
         : pairedSnapshot(resolved);
     },

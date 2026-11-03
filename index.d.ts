@@ -1503,6 +1503,8 @@ declare const projectionSourceBrand: unique symbol;
 declare const principalSnapshotManyBrand: unique symbol;
 declare const principalSnapshotObjectBrand: unique symbol;
 declare const principalSnapshotDeclarationBrand: unique symbol;
+declare const principalSnapshotFilterBrand: unique symbol;
+declare const principalSnapshotPrincipalIdBrand: unique symbol;
 
 export interface ProjectionSourceField {
   readonly [projectionSourceFieldBrand]: true;
@@ -1542,6 +1544,19 @@ export interface PrincipalSnapshotJoin {
   readonly on: { readonly from: ProjectionSourceField; readonly to: ProjectionSourceField };
   readonly select: readonly ProjectionSourceField[];
 }
+export interface PrincipalSnapshotPrincipalId {
+  readonly [principalSnapshotPrincipalIdBrand]: true;
+  readonly kind: 'principalId';
+}
+export type PrincipalSnapshotFilter = {
+  readonly [principalSnapshotFilterBrand]: true;
+} & (
+  | { readonly kind: 'and' | 'or'; readonly terms: readonly PrincipalSnapshotFilter[] }
+  | { readonly kind: 'in'; readonly field: ProjectionSourceField; readonly values: readonly string[] }
+  | { readonly kind: 'isNull'; readonly field: ProjectionSourceField }
+  | { readonly kind: 'equal'; readonly left: ProjectionSourceField; readonly right: ProjectionSourceField | PrincipalSnapshotPrincipalId }
+  | { readonly kind: 'exists'; readonly source: ProjectionSource; readonly where: PrincipalSnapshotFilter }
+);
 export interface PrincipalSnapshotMany {
   readonly [principalSnapshotManyBrand]: true;
   readonly kind: 'many';
@@ -1551,6 +1566,7 @@ export interface PrincipalSnapshotMany {
   readonly select: readonly ProjectionSourceField[];
   readonly orderBy?: readonly ProjectionSourceFieldWithDirection[];
   readonly join?: PrincipalSnapshotJoin;
+  readonly where?: PrincipalSnapshotFilter;
 }
 export interface PrincipalSnapshotObject {
   readonly [principalSnapshotObjectBrand]: true;
@@ -1574,9 +1590,19 @@ export interface PrincipalSnapshotGrammar {
     select: readonly ProjectionSourceField[];
     orderBy?: readonly ProjectionSourceFieldWithDirection[];
     join?: { source: ProjectionSource; on: { from: ProjectionSourceField; to: ProjectionSourceField }; select: readonly ProjectionSourceField[] };
+    where?: PrincipalSnapshotFilter;
   }): PrincipalSnapshotMany;
   select(...handles: readonly ProjectionSourceField[]): readonly ProjectionSourceField[];
   orderBy(handle: ProjectionSourceField, direction?: 'asc' | 'desc'): ProjectionSourceFieldWithDirection;
+  readonly filter: {
+    and(...terms: readonly PrincipalSnapshotFilter[]): PrincipalSnapshotFilter;
+    or(...terms: readonly PrincipalSnapshotFilter[]): PrincipalSnapshotFilter;
+    in(field: ProjectionSourceField, values: readonly string[]): PrincipalSnapshotFilter;
+    isNull(field: ProjectionSourceField): PrincipalSnapshotFilter;
+    equal(left: ProjectionSourceField, right: ProjectionSourceField | PrincipalSnapshotPrincipalId): PrincipalSnapshotFilter;
+    exists(source: ProjectionSource, where: PrincipalSnapshotFilter): PrincipalSnapshotFilter;
+  };
+  readonly principal: { readonly id: PrincipalSnapshotPrincipalId };
 }
 export const principalSnapshot: PrincipalSnapshotGrammar;
 

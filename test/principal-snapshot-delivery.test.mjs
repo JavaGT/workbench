@@ -4,7 +4,7 @@ import { DatabaseSync } from 'node:sqlite';
 
 import { defineSqliteSchema } from '../build/sqlite-schema.mjs';
 import { executeFrameworkDDL } from '../build/ddl.mjs';
-import { projectionSource, principalSnapshot } from '../build/principal-snapshot-declaration.mjs';
+import { projectionSource, projectionSourcePhysical, principalSnapshot } from '../build/principal-snapshot-declaration.mjs';
 import { principalSnapshotScope } from '../build/principal-snapshot-scope.mjs';
 import { createPrincipalSnapshotDelivery } from '../build/principal-snapshot-delivery.mjs';
 import { createPrincipalSnapshotTransaction } from '../build/principal-snapshot-transaction.mjs';
@@ -113,6 +113,145 @@ test('principal delivery validation rejects a foreign source schema and undeclar
     output: principalSnapshot.object({ rows: principalSnapshot.many(foreignSource, { via: foreignSource.field.id, key: foreignSource.field.id, select: principalSnapshot.select(foreignSource.field.id) }) }),
   });
   assert.throws(() => validatePrincipalSnapshotDeclarations([foreignDeclaration], schema), /application schema/);
+});
+
+test('principal snapshot filters fail closed on unknown roles and preserve personal notifications through resync', async () => {
+  const db = new DatabaseSync(':memory:');
+  executeFrameworkDDL(db);
+  const schema = defineSqliteSchema({
+    name: 'principal-filter',
+    tables: [{ name: 'Notification', columns: [
+      { name: 'id', type: 'text', primaryKey: true },
+      { name: 'userId', type: 'text', notNull: true },
+      { name: 'projectId', type: 'text' },
+      { name: 'body', type: 'text', notNull: true },
+    ] }],
+  });
+  schema.prepare(db);
+  db.exec('CREATE TABLE Project_members (Project_id TEXT NOT NULL, member_id TEXT NOT NULL, role TEXT NOT NULL)');
+  const notification = projectionSource(schema, 'Notification');
+  const membership = projectionSourcePhysical('Project_members', ['Project_id', 'member_id', 'role']);
+  assert.throws(() => principalSnapshot.filter.exists(membership, principalSnapshot.filter.isNull(notification.field.projectId)), /principalField requires a valid source field handle/);
+  assert.throws(() => principalSnapshot.filter.exists(membership, notification.field.id, principalSnapshot.filter.isNull(notification.field.projectId)), /principalField must come from the same projection source/);
+  const allowedRoles = ['editor', 'owner'];
+  const declaration = principalSnapshot('user-hub-filtered', {
+    principalType: 'user',
+    output: principalSnapshot.object({
+      notifications: principalSnapshot.many(notification, {
+        via: notification.field.userId,
+        key: notification.field.id,
+        select: principalSnapshot.select(notification.field.id, notification.field.projectId, notification.field.body),
+        where: principalSnapshot.filter.or(
+          principalSnapshot.filter.isNull(notification.field.projectId),
+          principalSnapshot.filter.exists(membership, membership.field.member_id, principalSnapshot.filter.and(
+            principalSnapshot.filter.equal(membership.field.Project_id, notification.field.projectId),
+            principalSnapshot.filter.in(membership.field.role, allowedRoles),
+          )),
+        ),
+      }),
+      projectNotifications: principalSnapshot.many(notification, {
+        via: notification.field.userId,
+        key: notification.field.id,
+        select: principalSnapshot.select(notification.field.id, notification.field.projectId),
+        join: {
+          source: membership,
+          on: { from: notification.field.projectId, to: membership.field.Project_id },
+          select: [membership.field.role],
+        },
+        where: principalSnapshot.filter.exists(membership, membership.field.member_id, principalSnapshot.filter.and(
+          principalSnapshot.filter.equal(membership.field.Project_id, notification.field.projectId),
+          principalSnapshot.filter.in(membership.field.role, allowedRoles),
+        )),
+      }),
+      memberships: principalSnapshot.many(membership, {
+        via: membership.field.member_id,
+        key: membership.field.Project_id,
+        select: principalSnapshot.select(membership.field.Project_id, membership.field.role),
+        where: principalSnapshot.filter.in(membership.field.role, allowedRoles),
+      }),
+    }),
+  });
+  validatePrincipalSnapshotDeclarations([declaration], schema);
+
+  const insertNotification = db.prepare('INSERT INTO Notification (id, userId, projectId, body) VALUES (?, ?, ?, ?)');
+  for (const row of [
+    ['personal', 'u1', null, 'personal'],
+    ['editor-project', 'u1', 'p1', 'editor'],
+    ['owner-project', 'u1', 'p2', 'owner'],
+    ['viewer-project', 'u1', 'p3', 'viewer'],
+    ['unknown-role', 'u1', 'p4', 'unknown'],
+    ['wrong-principal', 'u1', 'p5', 'other principal'],
+    ['wrong-project', 'u1', 'p6', 'other project'],
+    ['u2-project', 'u2', 'p5', 'user two'],
+  ]) insertNotification.run(...row);
+  const insertMembership = db.prepare('INSERT INTO Project_members (Project_id, member_id, role) VALUES (?, ?, ?)');
+  for (const row of [
+    ['p1', 'u1', 'editor'], ['p2', 'u1', 'owner'], ['p3', 'u1', 'viewer'],
+    ['p4', 'u1', 'corrupt'], ['p5', 'u2', 'owner'], ['p7', 'u1', 'owner'],
+  ]) insertMembership.run(...row);
+
+  const delivery = createPrincipalSnapshotDelivery({ db, declarations: [declaration], authorize: () => true });
+  const app = { db, writeQueue: createWriteQueue(), _principalSnapshotTxActive: false };
+  const runtime = createPrincipalSnapshotTransaction(app);
+  app.principalSnapshots = { transaction: runtime.transaction };
+  runtime._registerDeclaration(declaration);
+  runtime._setWakeHook((decl, principal) => delivery.wake(decl, principal));
+  const scope = principalSnapshotScope({ declaration: declaration.name, principal: { type: 'user', id: 'u1' } });
+  const bootstrap = await delivery.bootstrap({ principal: { type: 'user', id: 'u1' }, scope });
+  assert.equal(bootstrap.kind, 'snapshot');
+  assert.deepEqual(bootstrap.snapshot.notifications.map((row) => row.id), ['editor-project', 'owner-project', 'personal']);
+  assert.deepEqual(bootstrap.snapshot.projectNotifications, [
+    { Notification__id: 'editor-project', Notification__projectId: 'p1', Project_members__role: 'editor' },
+    { Notification__id: 'owner-project', Notification__projectId: 'p2', Project_members__role: 'owner' },
+  ]);
+  assert.deepEqual(bootstrap.snapshot.memberships.map((row) => row.Project_id), ['p1', 'p2', 'p7']);
+  const sameRevisionCatchup = await delivery.catchup({ principal: { type: 'user', id: 'u1' }, scope, after: bootstrap.cursor });
+  assert.equal(sameRevisionCatchup.kind, 'snapshot', 'filtered declarations replace a cached snapshot even when its cursor is current');
+  assert.deepEqual(sameRevisionCatchup.snapshot.projectNotifications, bootstrap.snapshot.projectNotifications);
+  assert.deepEqual(sameRevisionCatchup.snapshot, bootstrap.snapshot);
+
+  const otherScope = principalSnapshotScope({ declaration: declaration.name, principal: { type: 'user', id: 'u2' } });
+  const otherBootstrap = await delivery.bootstrap({ principal: { type: 'user', id: 'u2' }, scope: otherScope });
+  assert.equal(otherBootstrap.kind, 'snapshot');
+  assert.deepEqual(otherBootstrap.snapshot.notifications.map((row) => row.id), ['u2-project']);
+
+  const envelopes = [];
+  const subscription = await delivery.subscribe({
+    principal: { type: 'user', id: 'u1' }, scope, after: 0, signal: new AbortController().signal,
+    deliver: async (batch) => envelopes.push(...batch),
+  });
+  await subscription.activate();
+  await app.principalSnapshots.transaction((tx) => {
+    db.prepare('UPDATE Project_members SET role = ? WHERE Project_id = ? AND member_id = ?').run('viewer', 'p1', 'u1');
+    tx.invalidate(declaration, { type: 'user', id: 'u1' });
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(envelopes, [{ type: 'resync', seq: 1, reason: 'recipient-snapshot-required' }]);
+  const refreshed = await delivery.bootstrap({ principal: { type: 'user', id: 'u1' }, scope });
+  assert.equal(refreshed.kind, 'snapshot');
+  assert.deepEqual(refreshed.snapshot.notifications.map((row) => row.id), ['owner-project', 'personal']);
+  assert.deepEqual(refreshed.snapshot.memberships.map((row) => row.Project_id), ['p2', 'p7']);
+});
+
+test('principal snapshot filters reject empty allowlists, forged trees, and foreign-source fields', () => {
+  const { schema } = setup();
+  const source = projectionSource(schema, 'HubItem');
+  assert.throws(() => principalSnapshot.filter.in(source.field.title, []), /one or more string values/);
+  assert.throws(() => principalSnapshot.many(source, {
+    via: source.field.recipientId, key: source.field.id,
+    select: principalSnapshot.select(source.field.title),
+    where: { kind: 'isNull', field: source.field.title },
+  }), /valid filter/);
+  const foreign = projectionSourcePhysical('Foreign', ['id']);
+  const declaration = principalSnapshot('foreign-filter', {
+    principalType: 'user',
+    output: principalSnapshot.object({ rows: principalSnapshot.many(source, {
+      via: source.field.recipientId, key: source.field.id,
+      select: principalSnapshot.select(source.field.title),
+      where: principalSnapshot.filter.in(foreign.field.id, ['allowed']),
+    }) }),
+  });
+  assert.throws(() => validatePrincipalSnapshotDeclarations([declaration], schema), /declared filter source/);
 });
 
 test('principal delivery close revokes active subscriptions exactly once and blocks later use', async () => {

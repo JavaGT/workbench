@@ -7,6 +7,8 @@ const _orderBrand = new WeakSet        ();
 const _manyBrand = new WeakSet        ();
 const _objectBrand = new WeakSet        ();
 const _declarationBrand = new WeakSet        ();
+const _filterBrand = new WeakSet        ();
+const _principalIdBrand = new WeakSet        ();
 
 function assertSqlIdentifier(label        , value         )       {
   if (typeof value !== 'string' || !SQL_IDENTIFIER.test(value)) {
@@ -19,6 +21,15 @@ function assertBrand(label        , value         , brand                 , noun
     throw new Error(`${label} requires a valid ${noun}`);
   }
 }
+
+
+
+
+
+
+
+
+
 
 
 
@@ -166,6 +177,50 @@ function validateSourceFields(label        , source         , handles           
 
 
 
+const principalId                               = Object.freeze({ kind: 'principalId' });
+_principalIdBrand.add(principalId);
+
+function filterNode                                   (node   )    {
+  _filterBrand.add(node          );
+  return Object.freeze(node);
+}
+
+const filter = Object.freeze({
+  and(...terms                                    )                          {
+    if (terms.length < 2) throw new Error('principalSnapshot.filter.and requires two or more filters');
+    for (const term of terms) assertBrand('principalSnapshot.filter.and', term, _filterBrand, 'filter');
+    return filterNode({ kind: 'and', terms: Object.freeze([...terms]) });
+  },
+  or(...terms                                    )                          {
+    if (terms.length < 2) throw new Error('principalSnapshot.filter.or requires two or more filters');
+    for (const term of terms) assertBrand('principalSnapshot.filter.or', term, _filterBrand, 'filter');
+    return filterNode({ kind: 'or', terms: Object.freeze([...terms]) });
+  },
+  in(field                   , values                   )                          {
+    assertBrand('principalSnapshot.filter.in field', field, _sourceFieldBrand, 'source field handle');
+    if (!Array.isArray(values) || values.length === 0 || values.some((value) => typeof value !== 'string')) {
+      throw new Error('principalSnapshot.filter.in requires one or more string values');
+    }
+    return filterNode({ kind: 'in', field, values: Object.freeze([...values]) });
+  },
+  isNull(field                   )                          {
+    assertBrand('principalSnapshot.filter.isNull field', field, _sourceFieldBrand, 'source field handle');
+    return filterNode({ kind: 'isNull', field });
+  },
+  equal(left                   , right                                                  )                          {
+    assertBrand('principalSnapshot.filter.equal left', left, _sourceFieldBrand, 'source field handle');
+    if (!_principalIdBrand.has(right          )) assertBrand('principalSnapshot.filter.equal right', right, _sourceFieldBrand, 'source field handle');
+    return filterNode({ kind: 'equal', left, right });
+  },
+  exists(source                  , principalField                   , where                         )                          {
+    assertBrand('principalSnapshot.filter.exists source', source, _sourceBrand, 'projectionSource');
+    assertBrand('principalSnapshot.filter.exists principalField', principalField, _sourceFieldBrand, 'source field handle');
+    validateSource('principalSnapshot.filter.exists principalField', principalField.source, source);
+    assertBrand('principalSnapshot.filter.exists where', where, _filterBrand, 'filter');
+    return filterNode({ kind: 'exists', source, principalField, where });
+  },
+});
+
 export function principalSnapshot(name        , { principalType, output }                          )                               {
   if (typeof name !== 'string' || !/^[a-z][a-z0-9-]{0,63}$/.test(name)) {
     throw new Error(`principalSnapshot name must match /^[a-z][a-z0-9-]{0,63}$/, got '${name}'`);
@@ -200,6 +255,8 @@ export function principalSnapshot(name        , { principalType, output }       
 
 
 
+
+
 principalSnapshot.object = function object(shape                                )               {
   if (!shape || typeof shape !== 'object' || Array.isArray(shape)) {
     throw new Error('principalSnapshot.object requires an output object shape');
@@ -213,6 +270,7 @@ principalSnapshot.object = function object(shape                                
   _objectBrand.add(result);
   return result;
 };
+
 
 
 
@@ -252,7 +310,7 @@ function parseJoin(anchor                  , join             )           {
   });
 }
 
-principalSnapshot.many = function many(source                  , { via, key, select, orderBy, join }              = {})                 {
+principalSnapshot.many = function many(source                  , { via, key, select, orderBy, join, where }              = {})                 {
   assertBrand('principalSnapshot.many source', source, _sourceBrand, 'projectionSource');
   assertBrand('principalSnapshot.many via', via, _sourceFieldBrand, 'source field handle');
   validateSource('principalSnapshot.many via', via .source, source);
@@ -279,6 +337,7 @@ principalSnapshot.many = function many(source                  , { via, key, sel
     }
     joinSpec = parseJoin(source, join);
   }
+  if (where !== undefined) assertBrand('principalSnapshot.many where', where, _filterBrand, 'filter');
   const result = Object.freeze({
     kind: 'many',
     source,
@@ -287,6 +346,7 @@ principalSnapshot.many = function many(source                  , { via, key, sel
     select: Object.freeze([...select]),
     orderBy: orderBy === undefined ? undefined : Object.freeze([...orderBy]),
     join: joinSpec,
+    where,
   });
   _manyBrand.add(result);
   return result                  ;
@@ -313,6 +373,9 @@ principalSnapshot.orderBy = function orderBy(handle                   , directio
   _orderBrand.add(result);
   return result;
 };
+
+principalSnapshot.filter = filter;
+principalSnapshot.principal = Object.freeze({ id: principalId });
 
 export function isPrincipalSnapshotDeclaration(value         )          {
   return value !== null && typeof value === 'object' && _declarationBrand.has(value);

@@ -7,6 +7,8 @@ const _orderBrand = new WeakSet<object>();
 const _manyBrand = new WeakSet<object>();
 const _objectBrand = new WeakSet<object>();
 const _declarationBrand = new WeakSet<object>();
+const _filterBrand = new WeakSet<object>();
+const _principalIdBrand = new WeakSet<object>();
 
 function assertSqlIdentifier(label: string, value: unknown): void {
   if (typeof value !== 'string' || !SQL_IDENTIFIER.test(value)) {
@@ -45,6 +47,14 @@ export interface JoinSpec {
   select: Readonly<SourceFieldHandle[]>;
 }
 
+export interface PrincipalSnapshotPrincipalId { readonly kind: 'principalId' }
+export type PrincipalSnapshotFilter =
+  | { readonly kind: 'and' | 'or'; readonly terms: readonly PrincipalSnapshotFilter[] }
+  | { readonly kind: 'in'; readonly field: SourceFieldHandle; readonly values: readonly string[] }
+  | { readonly kind: 'isNull'; readonly field: SourceFieldHandle }
+  | { readonly kind: 'equal'; readonly left: SourceFieldHandle; readonly right: SourceFieldHandle | PrincipalSnapshotPrincipalId }
+  | { readonly kind: 'exists'; readonly source: ProjectionSource; readonly principalField: SourceFieldHandle; readonly where: PrincipalSnapshotFilter };
+
 export interface ManyCollection {
   kind: 'many';
   source?: ProjectionSource;
@@ -53,6 +63,7 @@ export interface ManyCollection {
   select?: SourceFieldHandle[];
   orderBy?: SourceFieldHandle[];
   join?: JoinSpec;
+  where?: PrincipalSnapshotFilter;
 }
 
 export interface OutputObject {
@@ -166,6 +177,50 @@ interface PrincipalSnapshotOptions {
   output: OutputObject;
 }
 
+const principalId: PrincipalSnapshotPrincipalId = Object.freeze({ kind: 'principalId' });
+_principalIdBrand.add(principalId);
+
+function filterNode<T extends PrincipalSnapshotFilter>(node: T): T {
+  _filterBrand.add(node as object);
+  return Object.freeze(node);
+}
+
+const filter = Object.freeze({
+  and(...terms: readonly PrincipalSnapshotFilter[]): PrincipalSnapshotFilter {
+    if (terms.length < 2) throw new Error('principalSnapshot.filter.and requires two or more filters');
+    for (const term of terms) assertBrand('principalSnapshot.filter.and', term, _filterBrand, 'filter');
+    return filterNode({ kind: 'and', terms: Object.freeze([...terms]) });
+  },
+  or(...terms: readonly PrincipalSnapshotFilter[]): PrincipalSnapshotFilter {
+    if (terms.length < 2) throw new Error('principalSnapshot.filter.or requires two or more filters');
+    for (const term of terms) assertBrand('principalSnapshot.filter.or', term, _filterBrand, 'filter');
+    return filterNode({ kind: 'or', terms: Object.freeze([...terms]) });
+  },
+  in(field: SourceFieldHandle, values: readonly string[]): PrincipalSnapshotFilter {
+    assertBrand('principalSnapshot.filter.in field', field, _sourceFieldBrand, 'source field handle');
+    if (!Array.isArray(values) || values.length === 0 || values.some((value) => typeof value !== 'string')) {
+      throw new Error('principalSnapshot.filter.in requires one or more string values');
+    }
+    return filterNode({ kind: 'in', field, values: Object.freeze([...values]) });
+  },
+  isNull(field: SourceFieldHandle): PrincipalSnapshotFilter {
+    assertBrand('principalSnapshot.filter.isNull field', field, _sourceFieldBrand, 'source field handle');
+    return filterNode({ kind: 'isNull', field });
+  },
+  equal(left: SourceFieldHandle, right: SourceFieldHandle | PrincipalSnapshotPrincipalId): PrincipalSnapshotFilter {
+    assertBrand('principalSnapshot.filter.equal left', left, _sourceFieldBrand, 'source field handle');
+    if (!_principalIdBrand.has(right as object)) assertBrand('principalSnapshot.filter.equal right', right, _sourceFieldBrand, 'source field handle');
+    return filterNode({ kind: 'equal', left, right });
+  },
+  exists(source: ProjectionSource, principalField: SourceFieldHandle, where: PrincipalSnapshotFilter): PrincipalSnapshotFilter {
+    assertBrand('principalSnapshot.filter.exists source', source, _sourceBrand, 'projectionSource');
+    assertBrand('principalSnapshot.filter.exists principalField', principalField, _sourceFieldBrand, 'source field handle');
+    validateSource('principalSnapshot.filter.exists principalField', principalField.source, source);
+    assertBrand('principalSnapshot.filter.exists where', where, _filterBrand, 'filter');
+    return filterNode({ kind: 'exists', source, principalField, where });
+  },
+});
+
 export function principalSnapshot(name: string, { principalType, output }: PrincipalSnapshotOptions): PrincipalSnapshotDeclaration {
   if (typeof name !== 'string' || !/^[a-z][a-z0-9-]{0,63}$/.test(name)) {
     throw new Error(`principalSnapshot name must match /^[a-z][a-z0-9-]{0,63}$/, got '${name}'`);
@@ -198,6 +253,8 @@ export interface principalSnapshot {
   many(source: ProjectionSource, options?: ManyOptions): ManyCollection;
   select(...handles: SourceFieldHandle[]): SourceFieldHandle[];
   orderBy(handle: SourceFieldHandle, direction?: 'asc' | 'desc'): SourceFieldHandle;
+  readonly filter: typeof filter;
+  readonly principal: { readonly id: PrincipalSnapshotPrincipalId };
 }
 
 principalSnapshot.object = function object(shape: Record<string, ManyCollection>): OutputObject {
@@ -220,6 +277,7 @@ interface ManyOptions {
   select?: SourceFieldHandle[];
   orderBy?: SourceFieldHandle[];
   join?: JoinOptions;
+  where?: PrincipalSnapshotFilter;
 }
 
 interface JoinOptions {
@@ -252,7 +310,7 @@ function parseJoin(anchor: ProjectionSource, join: JoinOptions): JoinSpec {
   });
 }
 
-principalSnapshot.many = function many(source: ProjectionSource, { via, key, select, orderBy, join }: ManyOptions = {}): ManyCollection {
+principalSnapshot.many = function many(source: ProjectionSource, { via, key, select, orderBy, join, where }: ManyOptions = {}): ManyCollection {
   assertBrand('principalSnapshot.many source', source, _sourceBrand, 'projectionSource');
   assertBrand('principalSnapshot.many via', via, _sourceFieldBrand, 'source field handle');
   validateSource('principalSnapshot.many via', via!.source, source);
@@ -279,6 +337,7 @@ principalSnapshot.many = function many(source: ProjectionSource, { via, key, sel
     }
     joinSpec = parseJoin(source, join);
   }
+  if (where !== undefined) assertBrand('principalSnapshot.many where', where, _filterBrand, 'filter');
   const result = Object.freeze({
     kind: 'many',
     source,
@@ -287,6 +346,7 @@ principalSnapshot.many = function many(source: ProjectionSource, { via, key, sel
     select: Object.freeze([...select]),
     orderBy: orderBy === undefined ? undefined : Object.freeze([...orderBy]),
     join: joinSpec,
+    where,
   });
   _manyBrand.add(result);
   return result as ManyCollection;
@@ -313,6 +373,9 @@ principalSnapshot.orderBy = function orderBy(handle: SourceFieldHandle, directio
   _orderBrand.add(result);
   return result;
 };
+
+principalSnapshot.filter = filter;
+principalSnapshot.principal = Object.freeze({ id: principalId });
 
 export function isPrincipalSnapshotDeclaration(value: unknown): boolean {
   return value !== null && typeof value === 'object' && _declarationBrand.has(value);

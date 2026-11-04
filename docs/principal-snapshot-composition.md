@@ -83,6 +83,43 @@ recipient-anchored, declared-column guarantee:
   The projection is still strictly per-recipient (`via = principal.id` on the
   anchor), so the join never widens visibility beyond the anchored rows.
 
+### 1c. Filter rows with typed server-side checks
+
+Use the snapshot filter grammar when a recipient may see only some of their
+anchored rows. It accepts field handles, fixed string allowlists, and one
+principal-correlated `exists` relation; it does not accept SQL text or callbacks.
+The runtime validates every referenced source and column, quotes identifiers,
+and binds principal and allowlist values as SQL parameters. The principal anchor
+always remains an `AND` term outside the fully parenthesized filter.
+
+```ts
+const membershipSource = projectionSourcePhysical('Project_members', ['Project_id', 'member_id', 'role']);
+const notifications = principalSnapshot.many(notificationSource, {
+  via: notificationSource.field.userId,
+  key: notificationSource.field.id,
+  select: principalSnapshot.select(notificationSource.field.id, notificationSource.field.projectId),
+  where: principalSnapshot.filter.or(
+    principalSnapshot.filter.isNull(notificationSource.field.projectId),
+    principalSnapshot.filter.exists(membershipSource, membershipSource.field.member_id, principalSnapshot.filter.and(
+      principalSnapshot.filter.equal(membershipSource.field.Project_id, notificationSource.field.projectId),
+      principalSnapshot.filter.in(membershipSource.field.role, ['editor', 'owner']),
+    )),
+  ),
+});
+```
+
+The explicit allowlist excludes legacy and malformed role values. `exists`
+filters project-scoped rows without dropping personal rows (`projectId IS NULL`).
+The required membership principal field is bound automatically to the request
+principal, while the predicate checks the same project. Filters run inside the
+shared projection path, so bootstrap, catchup, subscription setup, and resync
+all materialize the same authorized rows. Because a filter change can tighten
+visibility without changing a recipient's data revision, filtered declarations
+return a replacement snapshot on every catchup, even when the cursor is current.
+This costs one full filtered projection on filtered-client reconnect/catchup, but
+prevents a client holding a pre-deployment snapshot from retaining rows removed
+by a new policy. Filterless declarations keep the empty-current-cursor shortcut.
+
 
 ## 2. Attach delivery (server)
 

@@ -201,7 +201,7 @@ test('DDL includes a TEXT column for state fields', () => {
   const sql = generateDDL(Doc);
   assert.ok(Array.isArray(sql));
   const mainDDL = sql[0];
-  assert.match(mainDDL, /status TEXT/, 'state field should produce a TEXT column');
+  assert.match(mainDDL, /"status" TEXT/, 'state field should produce a TEXT column');
 });
 
 test('create with valid state value persists the row', async (t) => {

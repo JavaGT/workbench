@@ -13,7 +13,7 @@ Structurally it is a **small machine** (compile → commit → deliver) wearing 
 
 ## Status
 
-**Implemented.** Zero runtime dependencies — Node 22+ (26 recommended):
+**Implemented.** Zero runtime dependencies — Node 24.10+ (26 recommended):
 `node:http`, `node:crypto`, `node:sqlite`, `node:fs`. Suite: `npm test`.
 
 ## Quick start

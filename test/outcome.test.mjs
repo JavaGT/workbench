@@ -11,12 +11,13 @@ import {
 } from '../build/index.mjs';
 import { failureFromError } from '../build/outcome.mjs';
 
-test('failure categories are the six stable public categories', () => {
+test('failure categories are the stable public categories', () => {
   assert.deepEqual(FAILURE_CATEGORIES, [
     'invalid-input',
     'denied',
     'unknown-action',
     'not-found',
+    'not-acceptable',
     'conflict',
     'internal',
   ]);

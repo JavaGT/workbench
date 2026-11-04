@@ -27,6 +27,7 @@ import {
   type RegionAnnotationImage,
   type RegionDeclaration,
 } from '../annotated-text-region-reducer.ts';
+import { assertStructuralEndpoint } from '../annotated-text-family.ts';
 import { frozenJsonSnapshot } from '../frozen-json.ts';
 import { markAnnotatedEntityProjection } from '../annotated-text-history.ts';
 import type { DbHandle } from '../driver.ts';
@@ -448,6 +449,28 @@ function projectBlocklessTextApply({ name, handle, db, descriptor, data }: { nam
   db.prepare(`UPDATE ${prefix}_state SET structure_version = ?, family_checkpoint = ? WHERE document_id = ?`).run(data.after.structuralRevision, serializeCompactTextFamilyCheckpoint(next), data.id);
   applyEmptiedAnnotationDispositions({ name, handle, db, prefix, data });
   applyAnnotationUpdateFacts({ name, handle, db, prefix, descriptor, data });
+  if (f.annotation !== null) {
+    if (!f.selectedRange) throw new Error(`${name}.${handle.field}.operated paste has no selected range`);
+    const annotation = f.annotation;
+    if (db.prepare(`SELECT id FROM ${prefix}_annotation WHERE id = ?`).get(annotation.id)) {
+      throw new Error(`${name}.${handle.field}.operated paste annotation already exists`);
+    }
+    // The pasted annotation uses the same declaration and full-range validation
+    // as annotation.apply; its endpoints resolve against the inserted family.
+    projectBlocklessAnnotationApplyRange({ name, handle, db, descriptor, data: {
+      ...data,
+      version: 14,
+      before: data.after,
+      operation: {
+        kind: 'annotation.apply-range',
+        annotation,
+        selection: {
+          startOffset: projectEndpointToOffset(next, assertStructuralEndpoint(f.selectedRange.start)),
+          endOffset: projectEndpointToOffset(next, assertStructuralEndpoint(f.selectedRange.end)),
+        },
+      },
+    } });
+  }
 }
 
 function projectBlocklessTextReplace({ name, handle, db, descriptor, data }: { name: string; handle: NativeEventHandle; db: Db; descriptor: FieldDescriptor; data: OperatedEnvelope }) {
@@ -729,13 +752,13 @@ function projectBlocklessAnnotationApplyRange({ name, handle, db, descriptor, da
 // in any order, so equality is compared per annotation, not row-for-row.
 // Any mismatch (count, annotation set, ordinal, or canonical endpoint text)
 // fails closed into the whole-postimage rewrite.
-function membershipRelationMatchesPostimage(db: Db, prefix: string, documentId: string, ranges: Array<{ annotationId: string; start: unknown; end: unknown }>): boolean {
+function membershipRelationMatchesPostimage(db: Db, prefix: string, documentId: string, ranges: Array<Record<string, unknown>>): boolean {
   const expected = new Map<string, Array<[string, string]>>();
   for (const entry of ranges) {
-    let endpoints = expected.get(entry.annotationId);
+    let endpoints = expected.get(entry.annotationId as string);
     if (!endpoints) {
       endpoints = [];
-      expected.set(entry.annotationId, endpoints);
+      expected.set(entry.annotationId as string, endpoints);
     }
     endpoints.push([canonicalEndpointJSON(entry.start), canonicalEndpointJSON(entry.end)]);
   }

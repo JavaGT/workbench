@@ -36,7 +36,6 @@ import { assertUtf16Range } from '../annotated-text.ts';
 import { rawRow } from './query.ts';
 import {
   captureDeleteContribution,
-  type DeleteContribution,
   type StoredAnnotationImage,
 } from '../annotated-text-delete-history.ts';
 
@@ -305,22 +304,10 @@ function captureNativeTextHistory({
     if (!Number.isSafeInteger(from) || !Number.isSafeInteger(to) || to <= from) {
       throw new ValidationError('annotated text delete history has no valid edit window');
     }
-    let inserted: DeleteContribution['inserted'];
     if (edit.kind === 'text.replace') {
-      const rawOperation = data.operation?.operations?.[1];
-      const operation = canonicalTextOp(rawOperation) as any;
-      const payload = operation[5];
-      if (!Array.isArray(payload) || payload[0] !== 'insert') throw new ValidationError('annotated text replacement history has no insert contribution');
-      inserted = {
-        kind: 'text.insert',
-        opId: operation[2],
-        anchor: operation[5][1],
-        text: payload[2],
-        scalarCount: scalarCount(payload[2]),
-        at: from,
-      };
+      const operation = canonicalTextOp(data.operation?.operations?.[1]);
+      if (operation[5][0] !== 'insert') throw new ValidationError('annotated text replacement history has no insert contribution');
     }
-    const postDeleteMemberships = new Map(afterImages.map((image) => [image.id, image.memberships]));
     return captureDeleteContribution({
       documentId: command.id,
       family: beforeFamily,
@@ -328,9 +315,6 @@ function captureNativeTextHistory({
       toUtf16: to,
       annotations: beforePrepared,
       declarations,
-      postDeleteMemberships,
-      ...(transition === undefined ? {} : { annotationTransition: transition }),
-      ...(inserted === undefined ? {} : { inserted }),
     });
   }
 
@@ -1742,9 +1726,22 @@ export function createCrudHandlers({ record, sideTableStrategyEntries, condition
             const annotationRows = db.prepare(`SELECT id, family FROM ${prefix}_annotation WHERE document_id = ?`).all(payload.id) as Array<{ id: string; family: string }>;
             const sameFamilyAnnotationIds = new Set<string>(annotationRows.filter((candidate) => candidate.family === annotationDeclaration.annotationName).map((candidate) => String(candidate.id)));
             const declaredFieldNames = Object.keys(annotationDeclaration.fields ?? {}).sort();
-            const currentRangeOffsets = (annotationId: string): Array<{ start: number | null; end: number | null }> => ranges
-              .filter((range) => range.annotationId === annotationId)
-              .map((range) => {
+            // The covering scan visits every same-family candidate and the
+            // targeted annotation's offsets are read again below, so ranges are
+            // grouped by annotation once and each candidate's projections are
+            // memoized: pure recomputation ordering, identical values, without
+            // re-scanning every committed range per candidate.
+            const rangesByAnnotationId = new Map<string, Array<(typeof ranges)[number]>>();
+            for (const range of ranges) {
+              const grouped = rangesByAnnotationId.get(range.annotationId);
+              if (grouped === undefined) rangesByAnnotationId.set(range.annotationId, [range]);
+              else grouped.push(range);
+            }
+            const offsetsByAnnotationId = new Map<string, Array<{ start: number | null; end: number | null }>>();
+            const currentRangeOffsets = (annotationId: string): Array<{ start: number | null; end: number | null }> => {
+              const memoized = offsetsByAnnotationId.get(annotationId);
+              if (memoized !== undefined) return memoized;
+              const offsets = (rangesByAnnotationId.get(annotationId) ?? []).map((range) => {
                 let start = null;
                 let end = null;
                 try {
@@ -1753,6 +1750,9 @@ export function createCrudHandlers({ record, sideTableStrategyEntries, condition
                 } catch { /* unprojectable */ }
                 return { start, end };
               });
+              offsetsByAnnotationId.set(annotationId, offsets);
+              return offsets;
+            };
             // A correction targets the single same-family annotation whose
             // committed range covers the selection, so a partial field
             // contribution merges over the current record instead of replacing

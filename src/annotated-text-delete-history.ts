@@ -118,6 +118,10 @@ export type DeleteFact = Readonly<{
 
 /** Storage-side capture view of one annotation (loaded rows, parsed endpoints). */
 export interface StoredAnnotationImage {
+  empty?: 'delete' | 'orphan';
+  cardinality?: 'many' | 'one';
+  orphan?: Readonly<{ savedQuote: string; lastRange: readonly [number, number] | null }> | null;
+  rangeOffsets?: readonly Readonly<{ ordinal: number; start: number; end: number }>[];
   id: string;
   family: string;
   /** Canonical serialized field values keyed by declared field name. */

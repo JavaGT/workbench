@@ -13,6 +13,8 @@ test('frameworkTableNames is a frozen, sorted, duplicate-free array of persisten
   const expected = [
     '_ActionReceipt',
     '_CommittedRevision',
+    '_CompositeChange',
+    '_CompositeChangeCursor',
     '_ConsumerCursor',
     '_Cursor',
     '_DeletedRowAnchor',
@@ -36,6 +38,7 @@ test('frameworkTableNames is a frozen, sorted, duplicate-free array of persisten
     '_SchemaMaintenance',
     '_SchemaMigration',
     '_SearchStaleness',
+    '_V16CapabilityClaim',
     '_Worker',
     'ApiKey',
     'BlobStore',

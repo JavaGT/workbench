@@ -57,7 +57,7 @@ function mapHandle({ record, entityName, fieldName, descriptor, row, principal, 
         : null;
       if (operation === null) return;
       const action = mapMutationAction({
-        entityName, fieldName, operation, owner: oid, member: mid, role,
+        entityName, fieldName, operation, owner: oid, member: mid, role: role ?? null,
       });
       await dispatchFieldMutation({
         entityName, fieldName, dispatch, principal,

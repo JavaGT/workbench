@@ -567,10 +567,36 @@ test('auth: minimumPasswordLength refuses a short registration and accepts the f
     body: JSON.stringify({ username: 'short@example.com', password: 'short' }),
   });
   assert.equal(short.status, 400, 'a password below the app floor is refused');
+  assert.equal(short.headers.get('set-cookie'), null, 'a refused registration creates no session');
+  assert.equal(app.db.prepare('SELECT COUNT(*) AS n FROM User').get().n, 0, 'a refused registration creates no account');
+  assert.equal(app.db.prepare('SELECT COUNT(*) AS n FROM Session').get().n, 0, 'a refused registration creates no session row');
   const atFloor = await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ username: 'floor@example.com', password: '12345678' }),
   });
   assert.equal(atFloor.status, 201, 'a password at the floor is accepted');
+});
+
+test('password changes enforce the same configured floor', async (t) => {
+  const app = workbench({ db: ':memory:' }).auth({ minimumPasswordLength: 8 });
+  app.listen(0);
+  await app.ready;
+  const { port } = app.httpServer.address();
+  t.after(() => app.httpServer.close());
+  const origin = `http://127.0.0.1:${port}`;
+  const registered = await fetch(`${origin}/auth/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'alice', password: '12345678' }),
+  });
+  assert.equal(registered.status, 201);
+  const cookie = `sid=${sidFromSetCookie(registered.headers.get('set-cookie'))}`;
+
+  const changed = await fetch(`${origin}/auth/change-password`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', cookie },
+    body: JSON.stringify({ currentPassword: '12345678', newPassword: '1234567' }),
+  });
+  assert.equal(changed.status, 400);
 });

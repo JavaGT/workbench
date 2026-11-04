@@ -1305,9 +1305,11 @@ test('annotated editor publishes only collapsed carets', async () => {
 
 test('annotated editor dedupes and coalesces caret publishes', async () => {
   const h = caretHarness();
-  h.placeCaret(1);
   h.element.focus();
   await caretTick();
+  h.calls.length = 0;
+  h.placeCaret(1);
+  await new Promise((resolve) => setTimeout(resolve, 140));
   assert.deepEqual(h.calls.filter(([kind]) => kind === 'publish'), [['publish', 1]]);
   // Repeated selectionchange events at the same offset coalesce into nothing.
   h.element.ownerDocument.dispatchEvent(new h.dom.window.Event('selectionchange'));

@@ -297,10 +297,7 @@ export class CompositePatchDelivery {
 
 // One shared visibility walk (kept out of the projector's export surface to
 // avoid a public API beyond what tests consume; both call sites use this).
-import { deriveVisibility, deriveVisibilityExtended } from './composite-patch-projector.mjs';
-function deriveVisibilityExport(plan                 , projected                         )                                                                {
-  return deriveVisibility(plan, projected);
-}
+import { deriveVisibilityExtended } from './composite-patch-projector.mjs';
 function deriveVisibilityExtendedExport(plan                 , projected                         )                                                                                                {
   return deriveVisibilityExtended(plan, projected);
 }

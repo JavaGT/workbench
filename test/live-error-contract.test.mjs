@@ -49,6 +49,7 @@ function openRawWS(port, userId) {
     let buf = Buffer.alloc(0);
     let upgraded = false;
     const inbox = [];
+    const closeFrames = [];
 
     sock.on('connect', () => sock.write(handshake));
     sock.on('data', (chunk) => {
@@ -63,7 +64,7 @@ function openRawWS(port, userId) {
           return;
         }
         upgraded = true;
-        resolve({ sock, send, nextMessage, close });
+        resolve({ sock, send, nextMessage, nextClose, close });
       }
       while (buf.length >= 2) {
         const b0 = buf[0];
@@ -77,6 +78,7 @@ function openRawWS(port, userId) {
         const opcode = b0 & 0x0f;
         buf = buf.slice(headerLen + payloadLen);
         if (opcode === 0x1) inbox.push(payload.toString('utf-8'));
+        if (opcode === 0x8) closeFrames.push({ code: payload.readUInt16BE(0), reason: payload.subarray(2).toString() });
       }
     });
     sock.on('error', reject);
@@ -97,6 +99,15 @@ function openRawWS(port, userId) {
       while (Date.now() - start <= timeoutMs) {
         if (inbox.length > 0) return JSON.parse(inbox.shift());
         await new Promise((r) => setTimeout(r, 20));
+      }
+      return null;
+    }
+
+    async function nextClose(timeoutMs = 1000) {
+      const start = Date.now();
+      while (Date.now() - start <= timeoutMs) {
+        if (closeFrames.length) return closeFrames.shift();
+        await new Promise((resolve) => setTimeout(resolve, 20));
       }
       return null;
     }
@@ -177,7 +188,7 @@ test('invalid JSON produces error with invalid-input category', async (t) => {
 
 // --- 2. Unmasked frame (protocol-level frame error) ---
 
-test('frame protocol error produces error with invalid-input category', async (t) => {
+test('an unmasked frame closes the WebSocket with protocol-error code 1002', async (t) => {
   const { app, db } = bootNote();
   await app.ready;
   const { port } = app.httpServer.address();
@@ -194,10 +205,9 @@ test('frame protocol error produces error with invalid-input category', async (t
       frame[1] = text.length; // MASK=0 (deliberately wrong)
     }
     ws.sock.write(Buffer.concat([frame, text]));
-    const msg = await ws.nextMessage();
-    assertErrorContract(msg, { expectedCategory: 'invalid-input' });
-    assert.equal(msg.failure.category, 'invalid-input');
-    assert.ok(msg.failure.message.includes('mask'), 'error message should mention masking');
+    const closeFrame = await ws.nextClose();
+    assert.deepEqual(closeFrame, { code: 1002, reason: 'Protocol error' });
+    assert.equal(await ws.nextMessage(40), null, 'invalid frames do not enter the application message protocol');
   } finally {
     ws?.close();
     shutdown(app, db);

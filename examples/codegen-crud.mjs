@@ -35,7 +35,7 @@ const Task = entity('Task', {
   ],
 });
 
-const db = new DatabaseSync('examples/codegen-crud.db');
+const db = new DatabaseSync(':memory:');
 
 // The codegen surface: coverage + actions + events + handlers, all derived.
 const crud = codegenCrud(Task);

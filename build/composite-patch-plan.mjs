@@ -79,7 +79,7 @@
 
 
 
-function relationFrom(key        , entry               , parentEntity        , parentBranchId        , path                   , branchId        )                    {
+function relationFrom(entry               , parentEntity        , parentBranchId        , path                   , branchId        )                    {
   const nestedEntries = entry.nested?.entries ?? [];
   const nestedSelectEntry = nestedEntries.find((candidate) => candidate.kind === 'select');
   const children                      = [];
@@ -87,7 +87,6 @@ function relationFrom(key        , entry               , parentEntity        , p
     for (const nestedEntry of nestedEntries) {
       if (nestedEntry.kind === 'select') continue;
       children.push(relationFrom(
-        nestedEntry.key          ,
         nestedEntry,
         entry.entity?.name          ,
         branchId,
@@ -172,7 +171,7 @@ export function compileAnchorPatchPlan(declaration                     )        
   const relations                      = [];
   for (const entry of branch.entries ?? []) {
     if (entry.kind === 'select') continue;
-    relations.push(relationFrom(entry.key          , entry, anchorName, 'anchor', [entry.key          ], entry.key          ));
+    relations.push(relationFrom(entry, anchorName, 'anchor', [entry.key          ], entry.key          ));
   }
   const tombstone = declaration.tombstone                                        ;
   const partial = {

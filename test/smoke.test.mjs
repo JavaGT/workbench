@@ -28,7 +28,7 @@ test('doc entity resolves and DDL generates without error', () => {
   // Main table must have key columns
   const main = ddl[0];
   assert.ok(main.includes('id TEXT PRIMARY KEY'));
-  assert.ok(main.includes('title TEXT'));
+  assert.ok(main.includes('"title" TEXT'));
   assert.ok(main.includes('body')); // crdt text
 
   // Map side-table

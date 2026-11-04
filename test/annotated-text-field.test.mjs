@@ -342,7 +342,7 @@ test('main entity table has no annotatedText column', () => {
     }),
   });
   const ddl = generateDDL(Doc);
-  const mainDDL = ddl.find(s => s.startsWith('CREATE TABLE IF NOT EXISTS Doc'));
+  const mainDDL = ddl.find(s => s.startsWith('CREATE TABLE IF NOT EXISTS "Doc" ('));
   assert.ok(mainDDL, 'main Doc table DDL should exist');
   assert.ok(mainDDL.includes('id TEXT PRIMARY KEY'));
   assert.ok(!mainDDL.includes('body'), 'annotatedText field should not appear in main table');

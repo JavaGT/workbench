@@ -79,7 +79,7 @@ interface PlanBranchLike {
   entries?: readonly PlanEntryLike[];
 }
 
-function relationFrom(key: string, entry: PlanEntryLike, parentEntity: string, parentBranchId: string, path: readonly string[], branchId: string): PatchPlanRelation {
+function relationFrom(entry: PlanEntryLike, parentEntity: string, parentBranchId: string, path: readonly string[], branchId: string): PatchPlanRelation {
   const nestedEntries = entry.nested?.entries ?? [];
   const nestedSelectEntry = nestedEntries.find((candidate) => candidate.kind === 'select');
   const children: PatchPlanRelation[] = [];
@@ -87,7 +87,6 @@ function relationFrom(key: string, entry: PlanEntryLike, parentEntity: string, p
     for (const nestedEntry of nestedEntries) {
       if (nestedEntry.kind === 'select') continue;
       children.push(relationFrom(
-        nestedEntry.key as string,
         nestedEntry,
         entry.entity?.name as string,
         branchId,
@@ -172,7 +171,7 @@ export function compileAnchorPatchPlan(declaration: SnapshotDeclaration): Anchor
   const relations: PatchPlanRelation[] = [];
   for (const entry of branch.entries ?? []) {
     if (entry.kind === 'select') continue;
-    relations.push(relationFrom(entry.key as string, entry, anchorName, 'anchor', [entry.key as string], entry.key as string));
+    relations.push(relationFrom(entry, anchorName, 'anchor', [entry.key as string], entry.key as string));
   }
   const tombstone = declaration.tombstone as unknown as PatchPlanTombstone | null;
   const partial = {

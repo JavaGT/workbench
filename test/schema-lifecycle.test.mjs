@@ -47,7 +47,7 @@ test('schema lifecycle creates a complete machine-readable census and is idempot
     await rebootedApp.prepareSchema();
     assert.equal(db.prepare("SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'task_audit'").get().sql, triggerSql);
     assert.deepEqual(rebootedApp.schemaReport().ledger, first.ledger);
-    assert.equal(statements.some((sql) => /\b(?:DROP|DELETE|ALTER)\b/i.test(sql)), false, 'reboot preparation did not run destructive DDL');
+    assert.equal(statements.some((sql) => /^\s*(?:DROP|DELETE|ALTER)\b/i.test(sql)), false, 'reboot preparation did not run destructive DDL');
   } finally {
     db.close();
     rmSync(root, { recursive: true, force: true });

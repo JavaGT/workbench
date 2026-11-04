@@ -116,7 +116,7 @@ export interface AnnotatedTextDocument {
   row?: unknown;
 }
 
-export type PublicCursor = number | Readonly<{ anchor: number; aggregate: number }>;
+export type PublicCursor = number | Readonly<{ anchor: number; aggregate: number }> | Readonly<{ anchor: number; composite: number }>;
 
 export type PublicBootstrapResult =
   | { kind: 'snapshot'; snapshot: unknown; cursor: PublicCursor; authoring?: unknown; projectionToken?: string; protocol?: typeof SNAPSHOT_PATCH_CAPABILITY }
@@ -494,7 +494,7 @@ export function createOwnedLiveDelivery({ db, entities, mayVerb, authorization, 
           // Admission is async, so latch stale-cursor recovery only after the
           // paused subscription has been installed. Compare now: a commit may
           // have completed while admission awaited its anchor grant.
-          if (!supplied || typeof supplied !== 'object' || supplied.aggregate !== aggregateRevision()) {
+          if (!supplied || typeof supplied !== 'object' || !('aggregate' in supplied) || supplied.aggregate !== aggregateRevision()) {
             core.resync(subscription.scope, { type: 'resync', entity: handle!.entity, id: handle!.id, seq: after ?? 0, reason: 'recipient-snapshot-required' });
             recoveryQueued = true;
           }
@@ -502,7 +502,7 @@ export function createOwnedLiveDelivery({ db, entities, mayVerb, authorization, 
           // Activation can await delivery. A member commit in that interval is
           // not represented by the anchor cursor, so never acknowledge it.
           const aggregate = aggregateRevision();
-          if (supplied && typeof supplied === 'object' && supplied.aggregate !== aggregate) {
+          if (supplied && typeof supplied === 'object' && (!('aggregate' in supplied) || supplied.aggregate !== aggregate)) {
             if (!recoveryQueued) core.resync(subscription.scope, { type: 'resync', entity: handle!.entity, id: handle!.id, seq: after ?? 0, reason: 'recipient-snapshot-required' });
             return anchor === undefined ? undefined : Object.freeze({ anchor, aggregate });
           }
@@ -629,7 +629,7 @@ export function createOwnedLiveDelivery({ db, entities, mayVerb, authorization, 
           void outcome.reason;
           return this.bootstrap({ principal: input.principal, scope: input.scope, capabilities: input.capabilities });
         }
-        if (!cursor || typeof cursor !== 'object' || cursor.aggregate !== aggregateRevision()) {
+        if (!cursor || typeof cursor !== 'object' || !('aggregate' in cursor) || cursor.aggregate !== aggregateRevision()) {
           return this.bootstrap({ principal: input.principal, scope: input.scope });
         }
         const result = await core.catchup({ ...input, after: cursor.anchor });

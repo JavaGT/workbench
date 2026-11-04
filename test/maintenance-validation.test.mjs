@@ -42,6 +42,8 @@ test('maintenance accepts zero blob TTL and fractional retention days', async ()
     blobReapTtlMs: 0,
     logRetentionDays: 0.5,
     logRetentionIntervalMs: 1,
+    resultDataRetentionDays: maintenanceDefaults.resultDataRetentionDays,
+    payloadCompressionMinBytes: maintenanceDefaults.payloadCompressionMinBytes,
     // S6/A5: the named retention policies + low-disk headroom default in when
     // they are not configured — the single TTL source, no scattered literals.
     // An explicit legacy scalar folds INTO the abandoned-upload policy (the

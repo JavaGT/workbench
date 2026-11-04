@@ -58,7 +58,7 @@ test('ephemeral field generates side-table DDL (no main-table column)', () => {
   // Should have main table + one side-table
   assert.equal(ddl.length, 2);
   // Main table should NOT have a 'cursor' column
-  assert.ok(ddl[0].includes('CREATE TABLE IF NOT EXISTS CanvasDDL'));
+  assert.ok(ddl[0].includes('CREATE TABLE IF NOT EXISTS "CanvasDDL"'));
   assert.ok(!ddl[0].includes('cursor'));
   // Side-table should exist with client_id
   assert.ok(ddl[1].includes('CREATE TABLE IF NOT EXISTS CanvasDDL_cursor'));

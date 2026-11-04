@@ -14,6 +14,7 @@ async function flush() {
 function createBudgetClient({ bootstrapImpl, subscribeImpl } = {}) {
   let deliverBatch;
   let bootstraps = 0;
+  let latestSeq = 0;
   const snapshotCalls = [];
   let closeTransport;
   const session = createLiveDeliverySession({
@@ -24,7 +25,7 @@ function createBudgetClient({ bootstrapImpl, subscribeImpl } = {}) {
       return {
         kind: 'snapshot',
         snapshot: { id: 'n1', title: `snap-${bootstraps}` },
-        cursor: request.mode === 'snapshot' ? 100 : Math.max(0, bootstraps - 1),
+        cursor: latestSeq,
       };
     },
     subscribe: async ({ deliver, closed }) => {
@@ -43,7 +44,10 @@ function createBudgetClient({ bootstrapImpl, subscribeImpl } = {}) {
     session,
     bootstraps: () => bootstraps,
     snapshotCalls: () => snapshotCalls,
-    deliver: async (envelopes) => deliverBatch(envelopes),
+    deliver: async (envelopes) => {
+      latestSeq = Math.max(latestSeq, ...envelopes.map((envelope) => envelope.seq ?? 0));
+      return deliverBatch(envelopes);
+    },
     closeTransport: () => closeTransport?.(),
   };
 }

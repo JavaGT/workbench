@@ -560,6 +560,20 @@ export interface LiveDeliveryBatchEnvelope<Payload = unknown> {
 
 export interface LiveDeliverySession<Snapshot, Payload = unknown> {
   readonly snapshot: Snapshot | null;
+  /**
+   * The pre-projection view: the last server-installed snapshot, with no pending
+   * operation's optimistic reducer applied.
+   *
+   * `snapshot` is the MERGED view (confirmed base plus every pending
+   * projection) and is what a UI should render. A consumer that must
+   * distinguish a CONFIRMED row from a merely PROJECTED one — reconciling an
+   * optimistic write, for example — reads this instead, because a projected
+   * row is indistinguishable from a confirmed one in the merged view.
+   *
+   * Both objects are already held in memory; this is a reference, not a copy.
+   * It is `null` exactly when `snapshot` is `null`.
+   */
+  readonly confirmedSnapshot: Snapshot | null;
   readonly cursor: LiveDeliveryCursor;
   readonly status: 'bootstrapping' | 'recovering' | 'catching-up' | 'live' | 'unavailable' | 'revoked';
   readonly ready: Promise<void>;

@@ -87,8 +87,10 @@ test('app registers operational consumers via public options without selecting f
 
   const admin = operationalConsumerAdmin(app);
   assert.equal(typeof admin.listFailures, 'function');
+  assert.equal(typeof admin.listRetries, 'function');
   assert.equal(typeof admin.retryFailure, 'function');
   assert.deepEqual(await admin.listFailures('facade.search'), []);
+  assert.deepEqual(await admin.listRetries('facade.search'), []);
 });
 
 test('host auto-wires postCommitEffects; createPostCommitEffectRunner remains advanced-only export', async (t) => {

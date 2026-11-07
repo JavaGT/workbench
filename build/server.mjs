@@ -33,7 +33,7 @@ export { describeEntityStorage, describeSqliteStorage } from './sqlite-storage-d
 export { readSeq as readCommittedCursor } from './committed-log.mjs';
 export { createLiveDelivery } from './live-delivery-public.mjs';
 export { createLiveDeliveryHttpHandler } from './live-delivery-http.mjs';
-// App-safe operational consumer admin — inspect and retry terminal failures.
+// App-safe operational consumer admin — inspect retry waits and retry terminal failures.
 // Consumers are registered via `workbench({ operationalConsumers: [...] })` and
 // reconciled automatically. See `defineOperationalEvent` / `operationalConsumer`
 // in the root package for declaration.

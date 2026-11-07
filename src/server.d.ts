@@ -243,8 +243,19 @@ export type OperationalFailure = Readonly<{
   detail: string;
   status: 'terminal';
 }>;
+export type OperationalRetry = Readonly<{
+  consumer: import('../index.d.ts').OperationalConsumerName;
+  scopeId: string;
+  committedEventId: string;
+  code: import('../index.d.ts').OperationalRetryReason;
+  status: 'retry';
+  /** Persisted Unix time in milliseconds when the retry becomes eligible. */
+  nextAttemptAt: number;
+}>;
 export interface OperationalConsumerAdmin {
   listFailures(consumer: import('../index.d.ts').OperationalConsumerName): Promise<readonly OperationalFailure[]>;
+  /** Sanitized durable retry inventory; omits arbitrary failure detail and payload. */
+  listRetries(consumer: import('../index.d.ts').OperationalConsumerName): Promise<readonly OperationalRetry[]>;
   retryFailure(failure: Pick<OperationalFailure, 'consumer' | 'scopeId' | 'committedEventId'>): Promise<void>;
 }
 export function operationalConsumerAdmin(workbench: import('../index.d.ts').WorkbenchApp): OperationalConsumerAdmin;

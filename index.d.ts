@@ -2022,7 +2022,8 @@ export type OperationalDelivery<TPayload> = Readonly<{
   payload: TPayload;
   idempotencyKey: OperationalIdempotencyKey;
 }>;
-export type OperationalRetry = Readonly<{ kind: 'retry'; afterMs: number }> | Readonly<{ kind: 'terminal'; code: string; detail: string }>;
+export type OperationalRetryReason = 'canonical-unavailable' | 'invalid-event' | 'invariant-violation' | 'consumer-error' | 'retry';
+export type OperationalRetry = Readonly<{ kind: 'retry'; afterMs: number; code?: OperationalRetryReason }> | Readonly<{ kind: 'terminal'; code: string; detail: string }>;
 export type OperationalEffectResult = Readonly<{ kind: 'ack' }> | OperationalRetry;
 export type OperationalConsumer<TPayload, TFields extends object = object> = Readonly<{
   name: OperationalConsumerName;

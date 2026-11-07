@@ -13,6 +13,7 @@ import workbench, {
   normalizeTierDeclaration, tierOf, isDataTier, isEntityTier, DATA_TIERS, ENTITY_TIERS, TIER_DESCRIPTIONS,
   type DataTier, type EntityTier, type HistoryMode, type HistoryVerb, type HistoryVerbMode,
   type ResolvedTier, type TierDeclaration,
+  type OperationalConsumerName, type OperationalEffectResult,
   type ActionHandle, type BatchAction, type CommittedEvent, type DispatchRequest,
   type DispatchResult, type EventHandle, type FailureCategory, type FailureOutcome,
   type InheritDirective, type Principal, type WorkbenchFailure,
@@ -32,6 +33,7 @@ import {
   type BlobStore, type SqliteStorageDescription,
   type Invitation, type JobQueue, type JobRow, type LiveDelivery, type LiveDeliveryActivation, type LiveDeliveryBootstrap, type LiveDeliveryCatchup, type LiveDeliveryEnvelope as ServerLiveDeliveryEnvelope, type Migration, type UserPrincipal,
   type ClaimedBlobLifecycle, type ClaimedBlobLifecycleState, type WorkbenchDatabase, type OperationalConsumerAdmin, type OperationalFailure, type PostCommitEffectRunner,
+  type OperationalRetry as ServerOperationalRetry,
    type ByteStore, type ByteStoreCapabilities, type ByteStoreDurability,
    type BlobCleanupState,
    createSearchPluginRegistry, createSearchSourceReader, createSearchOwnedIndexCapability, createVectorPlugin,
@@ -870,3 +872,16 @@ const endpointOffset: number = projectEndpointToOffset(family, endpoint);
 const authoringSnapshotId: string | undefined = authoringSnapshot?.snapshot.id;
 const authoringSnapshotShape: AuthoringSnapshot | undefined = authoringSnapshot?.snapshot;
 void [authoringLeaseFence, authoringEnvelopeVersion, authoringEnvelopeToken, acknowledgedFence, basisVersion, basisFrontier, endpointOffset, authoringSnapshotId, authoringSnapshotShape, nativeAuthoringDb];
+const retryResult: OperationalEffectResult = { kind: 'retry', afterMs: 30_000, code: 'canonical-unavailable' };
+const invalidEventRetry: OperationalEffectResult = { kind: 'retry', afterMs: 0, code: 'invalid-event' };
+const invariantRetry: OperationalEffectResult = { kind: 'retry', afterMs: 0, code: 'invariant-violation' };
+const retryCode: string | undefined = retryResult.kind === 'retry' ? retryResult.code : undefined;
+const serverRetry: ServerOperationalRetry = {
+	consumer: 'scope-speaker-profile-removed' as OperationalConsumerName,
+	scopeId: 'Project:project-1',
+	committedEventId: 'Project:project-1:1',
+	code: 'canonical-unavailable',
+	status: 'retry',
+	nextAttemptAt: Date.now()
+};
+void [retryCode, serverRetry, invalidEventRetry, invariantRetry];

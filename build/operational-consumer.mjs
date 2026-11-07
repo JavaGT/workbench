@@ -6,11 +6,33 @@ import { txn } from './driver.mjs';
 import { decodeConsumerLogRowData,                 } from './committed-log.mjs';
 
 const IDENTIFIER = /^[A-Za-z][A-Za-z0-9_.-]{0,127}$/;
+
+
+
+
+
+
+const RETRY_REASONS                      = new Set(['canonical-unavailable', 'invalid-event', 'invariant-violation', 'consumer-error', 'retry']);
+/** Fixed, non-content descriptions exposed by the operator inventory. */
+const FAILURE_DETAILS                                   = {
+  'canonical-unavailable': 'The consumer could not read its canonical evidence.',
+  'invalid-event': 'The committed event could not be decoded or projected.',
+  'invariant-violation': 'The consumer returned a result outside its contract.',
+  'consumer-error': 'The consumer callback threw.',
+  retry: 'The consumer requested another attempt.',
+  terminal: 'The consumer reported a terminal failure.',
+};
+function failureDetail(code        )         { return FAILURE_DETAILS[code] ?? 'The consumer reported a terminal failure.'; }
+function retryReason(code                    )                         {
+  return code !== undefined && RETRY_REASONS.has(code) ? (code                          ) : 'retry';
+}
 const cursorName = (name        ) => `operational:${name}`;
 
 function fail(message        )        { throw new TypeError(`operational consumer: ${message}`); }
 
 function canonical(value         )         { return JSON.stringify(value)          ; }
+
+
 
 
 
@@ -216,15 +238,15 @@ export function createOperationalConsumers(consumers                     = [], {
     // malformed legacy (non-v16) rows degrade to {} as before.
     try {
       data = decodeConsumerLogRowData(row                         , {});
-    } catch (error) {
-      await recordFailure(db, consumer, row, declarationFingerprint, { kind: 'retry', afterMs: 0 }, String(error));
+    } catch {
+      await recordFailure(db, consumer, row, declarationFingerprint, { kind: 'retry', afterMs: 0, code: 'invalid-event' }, failureDetail('invalid-event'));
       return false;
     }
     const fields = Object.create(null)                           ;
     for (const field of consumer.event.fields) fields[field] = data[field];
     let payload         ;
-    try { payload = json(consumer.event.project(Object.freeze(fields), metadata(row)), 'projection result must be JSON serializable'); } catch (error) {
-      await recordFailure(db, consumer, row, declarationFingerprint, { kind: 'retry', afterMs: 0 }, String(error));
+    try { payload = json(consumer.event.project(Object.freeze(fields), metadata(row)), 'projection result must be JSON serializable'); } catch {
+      await recordFailure(db, consumer, row, declarationFingerprint, { kind: 'retry', afterMs: 0, code: 'invalid-event' }, failureDetail('invalid-event'));
       return false;
     }
     const partial = Object.freeze({ metadata: metadata(row), payload });
@@ -233,19 +255,23 @@ export function createOperationalConsumers(consumers                     = [], {
       idempotencyKey = consumer.idempotencyKey(partial);
       if (typeof idempotencyKey !== 'string' || idempotencyKey.length === 0) fail('idempotencyKey must return a non-empty string');
       if (consumer.idempotencyKey(partial) !== idempotencyKey) fail('idempotencyKey must be deterministic');
-    } catch (error) { await recordFailure(db, consumer, row, declarationFingerprint, { kind: 'retry', afterMs: 0 }, String(error)); return false; }
+    } catch { await recordFailure(db, consumer, row, declarationFingerprint, { kind: 'retry', afterMs: 0, code: 'invariant-violation' }, failureDetail('invariant-violation')); return false; }
     let result                           ;
-    try { result = await consumer.handle(Object.freeze({ ...partial, idempotencyKey })); } catch (error) { result = { kind: 'retry', afterMs: 0, detail: String(error) }; }
+    try { result = await consumer.handle(Object.freeze({ ...partial, idempotencyKey })); } catch { result = { kind: 'retry', afterMs: 0, code: 'consumer-error' }; }
     if (!result || !['ack', 'retry', 'terminal'].includes(result.kind)) {
-      await recordFailure(db, consumer, row, declarationFingerprint, { kind: 'retry', afterMs: 0 }, 'handle must return ack, retry, or terminal');
+      await recordFailure(db, consumer, row, declarationFingerprint, { kind: 'retry', afterMs: 0, code: 'invariant-violation' }, failureDetail('invariant-violation'));
       return false;
     }
     if (result.kind === 'retry' && (!Number.isFinite(result.afterMs) || Number(result.afterMs) < 0)) {
-      await recordFailure(db, consumer, row, declarationFingerprint, { kind: 'retry', afterMs: 0 }, 'retry afterMs must be a non-negative finite number');
+      await recordFailure(db, consumer, row, declarationFingerprint, { kind: 'retry', afterMs: 0, code: 'invariant-violation' }, failureDetail('invariant-violation'));
       return false;
     }
-    if (result.kind === 'terminal' && (typeof result.code !== 'string' || typeof result.detail !== 'string')) {
-      await recordFailure(db, consumer, row, declarationFingerprint, { kind: 'retry', afterMs: 0 }, 'terminal result requires string code and detail');
+    if (result.kind === 'retry' && result.code !== undefined && (typeof result.code !== 'string' || !IDENTIFIER.test(result.code))) {
+      await recordFailure(db, consumer, row, declarationFingerprint, { kind: 'retry', afterMs: 0, code: 'invariant-violation' }, failureDetail('invariant-violation'));
+      return false;
+    }
+    if (result.kind === 'terminal' && (typeof result.code !== 'string' || !IDENTIFIER.test(result.code) || typeof result.detail !== 'string')) {
+      await recordFailure(db, consumer, row, declarationFingerprint, { kind: 'retry', afterMs: 0, code: 'invalid-event' }, failureDetail('invalid-event'));
       return false;
     }
     if (result.kind === 'ack') {
@@ -261,11 +287,15 @@ export function createOperationalConsumers(consumers                     = [], {
 
   async function recordFailure(db          , consumer                     , row        , declarationFingerprint        , result               , detail        )                {
     const terminal = result.kind === 'terminal';
+    // Persist only a typed reason and a fixed description. Consumer detail and
+    // thrown errors may carry payload text and never reach the durable row.
+    const code = terminal ? String(result.code ?? 'terminal') : retryReason(result.code);
+    const safeDetail = terminal ? (result.code ? failureDetail(String(result.code)) : detail) : failureDetail(code);
     await txn(db, () => db.prepare(`INSERT INTO _OperationalConsumerFailure
       (consumer, scope, committedEventId, declarationFingerprint, code, detail, status, nextAttemptAt)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(consumer, scope, committedEventId) DO UPDATE SET code = excluded.code, detail = excluded.detail, status = excluded.status, nextAttemptAt = excluded.nextAttemptAt`)
-      .run(consumer.name, row.scope, `${row.scope}:${row.seq}`, declarationFingerprint, terminal ? String(result.code ?? 'terminal') : 'retry', detail, terminal ? 'terminal' : 'retry', terminal ? null : now() + Math.max(0, Number(result.afterMs) || 0)));
+      .run(consumer.name, row.scope, `${row.scope}:${row.seq}`, declarationFingerprint, code, safeDetail, terminal ? 'terminal' : 'retry', terminal ? null : now() + Math.max(0, Math.ceil(Number(result.afterMs) || 0))));
   }
 
   async function reconcile(db          )                {
@@ -313,6 +343,12 @@ export function operationalConsumerAdmin(workbench                              
     async listFailures(consumer        ) {
       return workbench.db.prepare(`SELECT consumer, scope AS scopeId, committedEventId, declarationFingerprint, code, detail, status
         FROM _OperationalConsumerFailure WHERE consumer = ? AND status = 'terminal' ORDER BY scope, committedEventId`).all(consumer);
+    },
+    async listRetries(consumer        ) {
+      const rows = workbench.db.prepare(`SELECT consumer, scope AS scopeId, committedEventId, code, status, nextAttemptAt
+        FROM _OperationalConsumerFailure WHERE consumer = ? AND status = 'retry' AND nextAttemptAt IS NOT NULL
+        ORDER BY nextAttemptAt, scope, committedEventId`).all(consumer);
+      return rows.map((row) => ({ ...row, code: retryReason(typeof (row                      ).code === 'string' ? (row                    ).code : undefined) }));
     },
     async retryFailure(failure                                                                 ) {
       const update = () => workbench.db.prepare(`UPDATE _OperationalConsumerFailure SET status = 'retry', nextAttemptAt = 0

@@ -671,6 +671,55 @@ export interface AnnotatedTextOptions {
   carets?: Readonly<{ field: string; cell: string }>;
 }
 
+/** One stored annotation image as commit-time admission sees it. `before` is
+ *  null for a create; `after` is null for a removal. */
+export interface AnnotatedTextAnnotationImage {
+  readonly id: string;
+  readonly family: string;
+  readonly fields: Record<string, unknown>;
+  readonly protectedTargetIds: readonly string[];
+  readonly memberships: readonly Readonly<Record<string, unknown>>[];
+  readonly prerequisites: readonly Readonly<{ entity: string; id: string }>[];
+  readonly empty?: 'delete' | 'orphan';
+  readonly cardinality?: 'many' | 'one';
+  readonly orphan?: Readonly<{ savedQuote: string; lastRange: readonly [number, number] | null }> | null;
+}
+
+/** One annotation whose stored image changed in the committing transaction.
+ *  The old and new images carry the declared annotation fields (for Scope's
+ *  `speakers` family, the `speaker` profile id) and range memberships. */
+export interface AnnotatedTextMutationChange {
+  readonly entity: string;
+  readonly field: string;
+  readonly documentId: string;
+  /** Owning document scope (`Project:<id>` for a project-owned document). */
+  readonly scope: string;
+  readonly actionId: string;
+  readonly actionType: string;
+  readonly principal: Principal | null | undefined;
+  readonly family: string;
+  readonly annotationId: string;
+  readonly before: AnnotatedTextAnnotationImage | null;
+  readonly after: AnnotatedTextAnnotationImage | null;
+}
+
+/** Return false (or throw) to refuse the whole commit. The callback runs inside
+ *  the committing SQLite transaction after projection and before the receipt,
+ *  so a refusal leaves no log row, annotation row, or `_ActionReceipt`. */
+export type AnnotatedTextAdmission = (
+  change: AnnotatedTextMutationChange,
+) => boolean | void | Promise<boolean | void>;
+
+/** Register a commit-time guard for every annotated-text mutation. `families`
+ *  limits which annotation families are loaded; absent loads every declared
+ *  family. The same hook covers generated operations, declared annotation
+ *  actions, composed registered actions, undo/redo, and document create/remove
+ *  (initial annotation capture and retirement). */
+export interface AnnotatedTextAdmissionDeclaration {
+  readonly families?: readonly string[];
+  readonly admit: AnnotatedTextAdmission;
+}
+
 export type AnnotatedTextAnnotationEntityActionHandle<
   Descriptor extends AnnotatedTextAnnotationEntityActionDescriptor = AnnotatedTextAnnotationEntityActionDescriptor,
 > = Readonly<{
@@ -1976,6 +2025,10 @@ export interface WorkbenchOptions {
   blobRecycle?: Readonly<{ root: string }>;
   operationalConsumers?: readonly OperationalConsumer<unknown, any>[];
   blobLifecycle?: BlobLifecycleOptions;
+  /** Commit-time guard for every annotated-text mutation (generated
+   *  operations, declared annotation actions, composition, undo/redo/replay,
+   *  and document create/remove). Runs inside the committing transaction. */
+  annotatedTextAdmission?: AnnotatedTextAdmissionDeclaration;
 }
 
 export type PendingBlobKey = string & { readonly __brand: 'PendingBlobKey' };

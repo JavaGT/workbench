@@ -31,6 +31,7 @@ import { rawRow } from './entity/query.mjs';
 import { readDeletedRowAnchor } from './deleted-row-anchor.mjs';
 import { validateAnnotatedTextEntityActions } from './annotated-text-field.mjs';
 import { createAnnotatedTextKernelSeam } from './annotated-text-kernel.mjs';
+import { createAnnotatedTextMutationAdmission } from './annotated-text-admission.mjs';
 import { createHistoryContributionPolicyRegistry, compileCompoundContributionPolicy } from './history-contribution-policy.mjs';
 import { validateProtectedArtefactsDeclaration } from './protected-artefact-store.mjs';
 import { compileRegionFieldPolicy,                                   } from './annotated-text-region-operation.mjs';
@@ -338,6 +339,10 @@ function buildEffects(entities                  ) {
 }
 
 function buildDurableAdmission(app     , annotatedKernel     ) {
+  const annotatedMutation = createAnnotatedTextMutationAdmission({
+    entities: app.entities ?? new Map(),
+    registration: app._annotatedTextAdmission,
+  });
   const registeredEventTypes = new Set(
     (app.actions ?? []).flatMap((action     ) =>
       (action.projections ?? []).flatMap((projection     ) => projection.eventTypes ?? [])),
@@ -375,6 +380,7 @@ function buildDurableAdmission(app     , annotatedKernel     ) {
     });
   }
   return {
+    ...(annotatedMutation === null ? {} : { annotatedMutation }),
     async beforeProjection({ entityName, verb, principal, event, payload, db: hookDb, now }     ) {
       if (registeredEventTypes.has(event?.type)) return true;
       if (event?.[CASCADE_PREAUTHORIZED]) return true;

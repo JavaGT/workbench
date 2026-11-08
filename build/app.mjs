@@ -119,6 +119,7 @@ import { makeMountable } from './router.mjs';
 
 
 
+
 const publicWorkbenchOptionsAreCovered                                   = true;
 void publicWorkbenchOptionsAreCovered;
 
@@ -312,6 +313,7 @@ export default function workbench({
   operationalConsumers = [],
   blobLifecycle,
   blobRecycle,
+  annotatedTextAdmission,
 }                   = {}) {
   // envGate (cso #15): fail-closed at app construction — required env vars must be set.
   for (const v of requireEnv) {
@@ -549,6 +551,10 @@ export default function workbench({
     app.resolveScope = resolveScope;
     app.scopeSnapshot = scopeSnapshot;
     app._history = history;
+    // Application-owned commit-time admission for annotated-text mutations.
+    // The kernel compiles it from the declared annotation families; without a
+    // declaration the commit path stays byte-identical.
+    app._annotatedTextAdmission = annotatedTextAdmission;
     // Per-app config — options override env fallbacks (SPEC §3). `app.config` is
     // the one place a mounted route / transport reads this app's port, env,
     // viewsDir, and session duration instead of the process-wide singleton. An

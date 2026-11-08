@@ -94,6 +94,10 @@ export function loadAnnotationImages(db: DbHandle, options: {
     cardinality?: string;
   }>;
   deserializeFields?: boolean;
+  /** Restrict the load to these annotation families. Rows outside the set are
+   *  ignored instead of participating in the image. Absent loads every
+   *  declared family (the historical behavior). */
+  families?: Iterable<string>;
 }): Array<{
   id: string;
   family: string;
@@ -106,9 +110,13 @@ export function loadAnnotationImages(db: DbHandle, options: {
     orphan?: { savedQuote: string; lastRange: readonly [number, number] | null } | null;
   }> {
   const { prefix, documentId } = options;
-  const declarations = [...options.declarations];
+  const familyFilter = options.families === undefined ? null : new Set(options.families);
+  const declarations = [...options.declarations]
+    .filter((declared) => familyFilter === null || familyFilter.has(declared.annotationName));
   const deserialize = options.deserializeFields === true;
-  const rows = db.prepare(`SELECT id, family, project_id, owner_id FROM ${prefix}_annotation WHERE document_id = ? ORDER BY id`).all(documentId) as unknown as StoredAnnotationRow[];
+  const allRows = db.prepare(`SELECT id, family, project_id, owner_id FROM ${prefix}_annotation WHERE document_id = ? ORDER BY id`).all(documentId) as unknown as StoredAnnotationRow[];
+  const rows = familyFilter === null ? allRows : allRows.filter((row) => familyFilter.has(row.family));
+  const annotationIds = new Set(rows.map((row) => row.id));
   const targets = db.prepare(
     `SELECT edge.annotation_id, edge.target_annotation_id FROM ${prefix}_annotation_protected_target AS edge
       JOIN ${prefix}_annotation AS annotation ON annotation.id = edge.annotation_id
@@ -116,9 +124,13 @@ export function loadAnnotationImages(db: DbHandle, options: {
      ORDER BY edge.annotation_id, edge.target_annotation_id`,
   ).all(documentId) as unknown as Array<{ annotation_id: string; target_annotation_id: string }>;
   const targetsByAnnotation = new Map<string, string[]>();
-  for (const edge of targets) targetsByAnnotation.set(edge.annotation_id, [...(targetsByAnnotation.get(edge.annotation_id) ?? []), edge.target_annotation_id]);
+  for (const edge of targets) {
+    if (!annotationIds.has(edge.annotation_id)) continue;
+    targetsByAnnotation.set(edge.annotation_id, [...(targetsByAnnotation.get(edge.annotation_id) ?? []), edge.target_annotation_id]);
+  }
   const membershipsByAnnotation = new Map<string, AnnotationMembershipEntry[]>();
   for (const row of annotationRangeRows(db, prefix, documentId)) {
+    if (!annotationIds.has(row.annotation_id)) continue;
     const entries = membershipsByAnnotation.get(row.annotation_id) ?? [];
     entries.push({ ordinal: row.ordinal, start: assertStructuralEndpoint(JSON.parse(row.start_point)), end: assertStructuralEndpoint(JSON.parse(row.end_point)) });
     membershipsByAnnotation.set(row.annotation_id, entries);

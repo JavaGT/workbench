@@ -157,6 +157,10 @@ export function durableMutationVariant({
   admission?: {
     beforeProjection: (context: any) => Promise<unknown>;
     afterProjection: (context: any) => Promise<unknown>;
+    annotatedMutation?: {
+      before: (context: any) => unknown;
+      after: (context: any) => Promise<unknown>;
+    };
   };
   blobAdapter?: { adoptInTxn: (db: unknown, events: unknown[]) => Promise<unknown> };
   effectsRegistry?: unknown;
@@ -210,8 +214,10 @@ export function durableMutationVariant({
       // footprint. This shallow module interface keeps scheduler admission on
       // the durable variant instead of exporting low-level append/authorize
       // primitives across the seam.
+      const admittedEvents: any[] = [];
       for (const e of events) {
         const withHandle = eventWithParsedHandle(e);
+        admittedEvents.push(withHandle);
         const verb = lifecycleVerb(withHandle.handle);
         if (!verb) continue;
         requireAdmission(await admission.beforeProjection({
@@ -225,6 +231,11 @@ export function durableMutationVariant({
           payload,
         }));
       }
+      // Application-owned annotation admission: snapshot the pre-image now and
+      // compare it after projection, inside the same transaction.
+      const annotatedState = admission.annotatedMutation?.before({
+        db, events: admittedEvents, actionId, actionType: type, scope: _scope, principal, payload, now,
+      }) ?? null;
 
       // Append events to _Log with per-scope sequence numbers. NOW tokens in the
       // event data are resolved to the commit-time ISO here (ADR #24) — before
@@ -301,6 +312,15 @@ export function durableMutationVariant({
 
       // Blob adoption is in-txn and atomic with the log + projection writes.
       await blobAdapter.adoptInTxn(db, finalizedEvents);
+
+      // Application-owned annotation admission runs after projection has
+      // materialized the new annotation images and before any receipt write.
+      // A refusal throws here and rolls the whole coordinated transaction back.
+      if (admission.annotatedMutation !== undefined) {
+        await admission.annotatedMutation.after({
+          db, events: finalizedEvents, state: annotatedState, actionId, actionType: type, scope: _scope, principal, payload, now,
+        });
+      }
 
       // Composite journal evidence pass 2 + routing (#122): after projection,
       // capture after-images, route every finalized event through the compiled
@@ -495,6 +515,10 @@ export function liveMutationVariant({
   admission?: {
     beforeProjection: (context: any) => Promise<unknown>;
     afterProjection: (context: any) => Promise<unknown>;
+    annotatedMutation?: {
+      before: (context: any) => unknown;
+      after: (context: any) => Promise<unknown>;
+    };
   };
   blobAdapter?: { adoptInTxn: (db: unknown, events: unknown[]) => Promise<unknown> };
   effectsRegistry?: unknown;
@@ -542,8 +566,10 @@ export function liveMutationVariant({
       // Pre-projection admission — runs IN-TXN against the PRE-mutation row,
       // before the row change and before the receipt. Denial leaves zero
       // footprint, exactly as on the durable lane.
+      const admittedEvents: any[] = [];
       for (const e of events) {
         const withHandle = eventWithParsedHandle(e);
+        admittedEvents.push(withHandle);
         const verb = lifecycleVerb(withHandle.handle);
         if (!verb) continue;
         requireAdmission(await admission.beforeProjection({
@@ -557,6 +583,9 @@ export function liveMutationVariant({
           payload,
         }));
       }
+      const annotatedState = admission.annotatedMutation?.before({
+        db, events: admittedEvents, actionId, actionType: type, scope: owningScope, principal, payload, now,
+      }) ?? null;
 
       // No-history sequence allocation: events carry a transaction-local seq so
       // projections and consumers observe a monotonic per-scope order, but no
@@ -629,6 +658,12 @@ export function liveMutationVariant({
 
       // Blob adoption is in-txn and atomic with the projection + receipt writes.
       await blobAdapter.adoptInTxn(db, finalizedEvents);
+
+      if (admission.annotatedMutation !== undefined) {
+        await admission.annotatedMutation.after({
+          db, events: finalizedEvents, state: annotatedState, actionId, actionType: type, scope: owningScope, principal, payload, now,
+        });
+      }
 
       // Post-projection admission — runs IN-TXN after projection. Create
       // row-grants need this deep visibility: the row exists only after the

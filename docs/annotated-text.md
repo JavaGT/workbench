@@ -173,6 +173,23 @@ therefore prevents a replay or a new snapshot from becoming an access bypass.
 The recipient projection is the confidentiality boundary, not a client-side
 filter.
 
+### Application commit admission
+
+`workbench({ annotatedTextAdmission: { families, admit } })` registers a
+transaction-bound guard for annotation changes the framework cannot judge alone.
+Inside the committing transaction, after projection and before the receipt,
+Workbench loads the registered families' stored images before and after the
+commit and calls `admit(change)` for every created, removed, or changed
+annotation. `change.before` and `change.after` carry the annotation id, family,
+declared fields, range memberships, and protected edges; one side is null for a
+create or removal.
+
+The hook covers generated `.operation` and `.compensate` actions, declared
+annotation actions, composed registered actions, undo/redo, and document
+create/removal. Returning false (or throwing) refuses the whole commit with no
+`_Log` row, annotation row, or `_ActionReceipt`. `families` limits the snapshot
+to the families the application owns; unregistered families are never loaded.
+
 ## History and recovery
 
 The session exposes the shared `history` surface for `undo` and `redo` where

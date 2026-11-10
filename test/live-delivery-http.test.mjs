@@ -453,3 +453,72 @@ test('HTTP session includes credentials for both bootstrap and SSE', async () =>
   assert.deepEqual(sourceOptions, { withCredentials: true });
   session.close();
 });
+
+test('close() aborts the bootstrap request the session is awaiting, and schedules no retry (#7407)', async () => {
+  let attempts = 0;
+  let requestSignal;
+  const session = createLiveDeliveryHttpSession({
+    baseUrl: 'https://example.test/live-delivery', scope: 'Project:p1',
+    fetchImpl: (_url, options) => {
+      attempts += 1;
+      requestSignal = options.signal;
+      return new Promise((_resolve, reject) => {
+        options.signal.addEventListener('abort', () => reject(new DOMException('The operation was aborted.', 'AbortError')), { once: true });
+      });
+    },
+    eventSourceFactory: () => ({ close() {} }),
+    validateSnapshot: (value) => value,
+    sendAction: async () => ({ ok: true }),
+    historySession: 'tab-a',
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  // Every bootstrap carries the current connection generation's signal.
+  assert.ok(requestSignal instanceof AbortSignal);
+  assert.equal(requestSignal.aborted, false);
+
+  session.close();
+
+  // A hung request is cancelled with the session, not merely ignored when it
+  // finally answers, and the retryable failure it produces schedules nothing.
+  assert.equal(requestSignal.aborted, true);
+  await session.ready;
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(attempts, 1);
+});
+
+test('a connection generation replacement aborts the bootstrap it superseded (#7407)', async () => {
+  const signals = [];
+  let attempts = 0;
+  const session = createLiveDeliveryHttpSession({
+    baseUrl: 'https://example.test/live-delivery', scope: 'Project:p1',
+    fetchImpl: (url, options) => {
+      attempts += 1;
+      signals.push(options.signal);
+      if (new URL(url).searchParams.get('mode') === 'snapshot') {
+        return new Promise((_resolve, reject) => {
+          options.signal.addEventListener('abort', () => reject(new DOMException('The operation was aborted.', 'AbortError')), { once: true });
+        });
+      }
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({ kind: 'catchup', envelopes: [], cursor: 0 }) });
+    },
+    eventSourceFactory: () => ({ close() {} }),
+    validateSnapshot: (value) => value,
+    sendAction: async () => ({ ok: true }),
+    historySession: 'tab-a',
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(attempts, 1);
+  const first = signals[0];
+  assert.equal(first.aborted, false);
+
+  await session.reconnect();
+
+  // The superseded generation's request cannot stay open beside its successor:
+  // the first signal is aborted, and the next request uses a different handle
+  // (which in turn belongs to the newer generation).
+  assert.equal(first.aborted, true);
+  assert.equal(attempts, 2);
+  assert.notEqual(signals[1], first);
+  session.close();
+});

@@ -91,6 +91,46 @@ test('login never creates an unknown user', async (t) => {
   assert.equal(app.db.prepare('SELECT COUNT(*) AS n FROM User').get().n, 0);
 });
 
+test('an active login lockout answers exactly like a wrong password', async (t) => {
+  const { origin } = await boot(t);
+  const login = (username, password) => fetch(`${origin}/auth/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  });
+
+  assert.equal((await fetch(`${origin}/auth/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'alice', password: 'hunter2' }),
+  })).status, 201);
+
+  // Three consecutive failures arm the lock; the fourth attempt meets it.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    assert.equal((await login('alice', 'wrong')).status, 401);
+  }
+  const locked = await login('alice', 'wrong');
+  const unknown = await login('nobody@example.test', 'wrong');
+
+  // Same status, same body — the unauthenticated caller cannot tell a real
+  // address whose lock is active from an address that never existed.
+  assert.equal(locked.status, 401, 'an active lock is a failed login, not a distinct status');
+  assert.equal(unknown.status, 401);
+  assert.equal(locked.headers.get('set-cookie'), null);
+  assert.equal(unknown.headers.get('set-cookie'), null);
+  assert.deepEqual(
+    await locked.json(),
+    await unknown.json(),
+    'the lockout body must be byte-identical to the wrong-password body',
+  );
+
+  // The lock still refuses the attempt — including a CORRECT password — for
+  // its whole window. Uniform copy must not weaken the rate limit.
+  const correctWhileLocked = await login('alice', 'hunter2');
+  assert.equal(correctWhileLocked.status, 401, 'an active lock refuses even the correct password');
+  assert.equal(correctWhileLocked.headers.get('set-cookie'), null);
+});
+
 test('register rejects an existing identity without minting a session', async (t) => {
   const { origin, app } = await boot(t);
   const register = () => fetch(`${origin}/auth/register`, {

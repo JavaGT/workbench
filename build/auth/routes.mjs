@@ -33,7 +33,7 @@ import { verifyTotp, verifyBackupCode } from './totp.mjs';
 import { loginChallengeStore } from './login-challenge.mjs';
 import { evaluateLockout, nextFailedAttemptCount, loginLockoutDecision, totpLockoutDecision } from './lockout.mjs';
 import { txn, begin, commit, rollback,               } from '../driver.mjs';
-import { serializeField } from '../field-strategy.mjs';
+import { serializeField, verifyHash } from '../field-strategy.mjs';
 import {
   generateChallenge,
   challengeStore,
@@ -72,6 +72,13 @@ import {
 
 
 
+
+// A scrypt digest of a random password that was never stored anywhere: the
+// login route verifies a miss against it so an unknown identity costs the same
+// one scrypt a known identity's wrong password costs (see the login route).
+// `salt:digest` is the stored-cell shape `verifyHash` reads.
+const LOGIN_DECOY_HASH =
+  '57fe0f27ec0e50aae5f5a04d905cb5d5:9e2aeee12a38d92ff7d9c544c79e335c447e6c26390af3468ade7abc44390da2adc3fe72e0674c280b0d0f445284698372a45fe088fa18ac2b52e86abeb56947';
 
 // Build the `/auth` router. `secure` follows the app env (true only in
 // production) so the same fail-closed cookie attributes apply on login and
@@ -256,17 +263,43 @@ export function authRoutes({ secure = config.env === 'production', identifyBy = 
     const found = findIdentity(username, next);
     if (found.failed) return;
     const user = found.user;
-    if (!user) return next({ status: 401, message: 'bad credentials' });
+    if (!user) {
+      // An unknown identity and a known one with a wrong password must be the
+      // SAME answer, byte for byte and in the time it takes to arrive — the
+      // login route is unauthenticated, so either difference is an account
+      // enumeration oracle. `bad credentials` is that shared answer.
+      //
+      // The work is equalized too: a known identity pays one scrypt in
+      // `user.password.verify` below, so the miss pays one against a hash
+      // nobody knows. Without it the status would stop answering the question
+      // while the response time kept answering it.
+      verifyHash(password, LOGIN_DECOY_HASH);
+      return next({ status: 401, message: 'bad credentials' });
+    }
     {
-      // Lockout check — before password verification so scrypt is skipped
-      // when the account is locked. A non-existent user has no lockout state.
       // A lock that has expired must not let the stale failed-attempt counter
       // instantly relock the next wrong password, so the count restarts at 0.
+      //
+      // An active lock answers `bad credentials`, not a distinct status: only
+      // existing accounts can be locked, so a lockout-only status or body told
+      // an unauthenticated caller that the address it guessed was real. The
+      // lock still refuses the attempt (a correct password included) for its
+      // whole window; what changed is that the refusal is indistinguishable
+      // from the wrong-password refusal it is already indistinguishable from
+      // in intent. The alternative — a uniform lockout for every address —
+      // would let anyone lock out any address, so it is not taken.
+      //
+      // The verdict is read before the password is checked, but the check runs
+      // anyway — including while the lock is active. That is the timing half of
+      // the same property: an address that has been locked (three failures) and
+      // an address that never existed must both cost one scrypt, or the fourth
+      // probe answers by duration what the status no longer answers.
       const verdict = evaluateLockout(user.failedLoginAttempts, user.lockedUntil);
+      const passwordMatches = user.password.verify(password);
       if (verdict.locked) {
-        return next({ status: 403, message: 'account locked', details: { retryAfterMs: verdict.retryAfterMs } });
+        return next({ status: 401, message: 'bad credentials' });
       }
-      if (!user.password.verify(password)) {
+      if (!passwordMatches) {
         // Failed attempt: increment counter and optionally lock the account.
         const attempts = nextFailedAttemptCount(verdict.resetAttempts, user.failedLoginAttempts);
         const decision = loginLockoutDecision({ attempts });

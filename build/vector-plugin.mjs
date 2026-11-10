@@ -67,6 +67,12 @@ export class VectorPluginValidationError extends Error {
 
 
 
+
+
+
+
+
+
 function assertModelSpace(modelSpace                  )       {
   if (typeof modelSpace.model !== 'string' || modelSpace.model.length === 0) {
     throw new TypeError('vector model-space requires a non-empty model identity');
@@ -78,6 +84,21 @@ function assertModelSpace(modelSpace                  )       {
 
 function generationIdentity(modelSpace                  , sequence        )         {
   return `${modelSpace.model}:${modelSpace.dimensions}:${sequence}`;
+}
+
+function matchesScope(source                                   , scope                                   )          {
+  for (const key of Object.keys(scope)) {
+    if (source[key] !== scope[key]) return false;
+  }
+  return true;
+}
+
+function validateScope(scope         )                                                {
+  if (scope === undefined) return undefined;
+  if (scope === null || typeof scope !== 'object' || Array.isArray(scope)) {
+    throw new TypeError('vector search scope must be a source-row predicate object');
+  }
+  return scope                                     ;
 }
 
 function validateVector(
@@ -201,9 +222,16 @@ export function createVectorPlugin(options                     )               {
     if (request.principal === undefined) throw new VectorPluginValidationError('unauthorized-source-ownership', 'vector search requires a principal for result admission');
     const query = request.query                     ;
     const vector = validateVector(query?.vector, query?.model, modelSpace, 'query');
-    const limit = request.limit ?? active.size;
+    const scope = validateScope(query?.scope);
+    // Scope is part of candidate selection, not a filter over ranked output: the
+    // nearest-neighbour pass and therefore the caller's window see only matching
+    // rows, so a bound on `limit` never spends itself on another partition.
+    const pool = scope === undefined
+      ? [...active.values()]
+      : [...active.values()].filter((entry) => matchesScope(entry.source, scope));
+    const limit = request.limit ?? pool.length;
     const hits                                      = [];
-    const entries = await nearestVectorsInterruptibly([...active.values()], vector, Math.max(1, limit), request.signal);
+    const entries = await nearestVectorsInterruptibly(pool, vector, Math.max(1, limit), request.signal);
     if (request.signal?.aborted) return { hits: [] };
     const candidates = entries.map((entry) => {
       const row = ctx.reader.row(options.source.entity, entry.id) ?? null;

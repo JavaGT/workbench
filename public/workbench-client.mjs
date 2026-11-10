@@ -2454,6 +2454,25 @@ export function createLiveDeliverySession({
   let reconnecting = false;
   let reconnectRequested = false;
   let connectionGeneration = 0;
+  // Every connection generation owns one abort controller. The request that
+  // generation is awaiting is cancelled when the generation is replaced (a
+  // reconnect, or a stream close that starts one), so a superseded bootstrap
+  // can never stay open beside its successor, and close() cancels a hung
+  // request outright. A bounded boot must also settle its transport, and a
+  // fetch the transport cannot abandon is not settled (Scope #7407).
+  let connectionAbort = new AbortController();
+
+  /**
+   * Begin a connection generation: abort whatever the previous generation was
+   * awaiting, then mint its successor. Every replacement site goes through
+   * here so the abort can never be forgotten in one path and kept in another.
+   */
+  function beginConnectionGeneration() {
+    connectionAbort.abort();
+    connectionAbort = new AbortController();
+    connectionGeneration += 1;
+    return connectionGeneration;
+  }
   let recoveryGeneration = 0;
   let snapshotGeneration = 0;
   let receiptGeneration = 0;
@@ -3354,6 +3373,10 @@ export function createLiveDeliverySession({
     const result = await bootstrap({
       after: mode === 'catchup' ? cursor : undefined,
       mode,
+      // This generation's cancellation handle. `beginConnectionGeneration`
+      // aborts it on replacement, and `close()` aborts it for good, so a hung
+      // bootstrap request cannot outlive the session that asked for it.
+      signal: connectionAbort.signal,
       // Capability advertisement (#156 client): every recovery attempt offers
       // snapshot-patch support; a patch-capable host answers with its protocol
       // echo + fresh projectionToken, a legacy host ignores the extra field.
@@ -3561,7 +3584,7 @@ export function createLiveDeliverySession({
   }
 
   async function connect() {
-    const generation = ++connectionGeneration;
+    const generation = beginConnectionGeneration();
     const nextSubscription = await subscribe({
       after: cursor,
       deliver: (envelopes) => {
@@ -3571,7 +3594,7 @@ export function createLiveDeliverySession({
       revoke,
       closed: () => {
         if (generation !== connectionGeneration) return;
-        connectionGeneration += 1;
+        beginConnectionGeneration();
         if (reconnecting) reconnectRequested = true;
         else reconnect().catch(() => {});
       },
@@ -3616,8 +3639,10 @@ export function createLiveDeliverySession({
           // Invalidate the old transport before recovery reauthorizes the stream.
           // The old cycle is cancelled so its late bootstrap cannot install
           // state; an uncovered receipt fence is re-queued as a new cycle.
+          // This also aborts the previous generation's in-flight request, so the
+          // superseded bootstrap cannot stay open beside its successor.
           const pendingReceiptFloor = snapshotRecoveryCycle?.receiptFloor ?? snapshotRecoveryFloor;
-          connectionGeneration += 1;
+          beginConnectionGeneration();
           if (snapshotRecoveryCycle) snapshotRecoveryCycle = null;
           subscription?.close?.();
           subscription = null;
@@ -3980,6 +4005,10 @@ export function createLiveDeliverySession({
     close() {
       if (closed) return;
       closed = true;
+      // Settle the transport: the current generation's request is cancelled,
+      // not merely ignored when it eventually answers. `cancelRecoveryRetries`
+      // below then stops any retry the failure would otherwise schedule.
+      connectionAbort.abort();
       cancelSnapshotRecovery();
       cancelCatchupRecovery();
       finishRecoveryWarning();
@@ -4030,7 +4059,7 @@ export function createLiveDeliveryHttpSession({
   const batchActionEndpoint = new URL('/workbench/actions/batch', new URL(baseUrl, globalThis.location?.href ?? 'http://workbench.local')).toString();
   const historyEndpoint = new URL('/workbench/history', new URL(baseUrl, globalThis.location?.href ?? 'http://workbench.local')).toString();
 
-  async function bootstrap({ after, mode, projectionToken }) {
+  async function bootstrap({ after, mode, projectionToken, signal }) {
     const url = new URL(endpoint, globalThis.location?.href ?? 'http://workbench.local');
     if (!requestIdentity) url.searchParams.set('scope', scope);
     for (const [key, value] of Object.entries(requestIdentity ?? {})) url.searchParams.set(key, value);
@@ -4046,7 +4075,10 @@ export function createLiveDeliveryHttpSession({
     }
     let response;
     try {
-      response = await fetchImpl(url.toString(), { credentials: 'include' });
+      // The signal is this connection generation's cancellation handle. An
+      // aborted request is a retryable transport outcome, exactly like a
+      // network failure: it must never masquerade as a terminal verdict.
+      response = await fetchImpl(url.toString(), signal ? { credentials: 'include', signal } : { credentials: 'include' });
     } catch {
       return { kind: 'retry' };
     }

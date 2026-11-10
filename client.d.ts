@@ -524,7 +524,16 @@ export type LiveDeliveryDispatchResult =
   | { ok: false; status: 'outcome-unknown'; opId: string; settlement: LiveDeliverySettlement; deliveryError: { message: string } };
 
 export interface LiveDeliverySessionConfig<Snapshot, Payload = unknown> {
-  bootstrap(input: { after?: LiveDeliveryCursor; mode: 'snapshot' | 'catchup' }): Promise<LiveDeliveryBootstrap<Snapshot>>;
+  /**
+   * Fetch one snapshot or catch-up.
+   *
+   * `signal` is the current CONNECTION GENERATION's cancellation handle. The
+   * session aborts it when that generation is replaced (a reconnect, or the
+   * stream closing into one) and when the session is closed, so an
+   * implementation must forward it to its request. A bootstrap that ignores it
+   * leaves a hung request open after the session that asked for it has gone.
+   */
+  bootstrap(input: { after?: LiveDeliveryCursor; mode: 'snapshot' | 'catchup'; signal?: AbortSignal }): Promise<LiveDeliveryBootstrap<Snapshot>>;
   subscribe(input: {
     after: LiveDeliveryCursor;
     deliver: (envelopes: readonly LiveDeliveryEnvelope[]) => Promise<void>;
@@ -584,6 +593,11 @@ export interface LiveDeliverySession<Snapshot, Payload = unknown> {
   operations(): Array<{ opId: string; actionId: string; status: 'pending'; error: unknown }>;
   pendingCount(): number;
   subscribe(listener: (snapshot: Snapshot | null) => void): () => void;
+  /**
+   * End the session. Aborts the current generation's bootstrap/catch-up
+   * request, cancels retry scheduling, settles pending operations and closes the
+   * stream, so no background work outlives this call.
+   */
   close(): void;
 }
 

@@ -52,6 +52,12 @@ export interface VectorPluginOptions {
 export interface VectorSearchQuery {
   readonly model: string;
   readonly vector: readonly number[];
+  // A source-row equality predicate applied to the index BEFORE nearest-neighbour
+  // selection, so a caller's window (limit/offset) is served from the matching
+  // partition instead of the whole index. Without it, a shared index would let
+  // one partition's rows consume another partition's entire candidate window.
+  // Omitted means the whole index.
+  readonly scope?: Readonly<Record<string, unknown>>;
 }
 
 export interface VectorPlugin extends SearchPlugin, SearchShadowCapabilities {
@@ -78,6 +84,21 @@ function assertModelSpace(modelSpace: VectorModelSpace): void {
 
 function generationIdentity(modelSpace: VectorModelSpace, sequence: number): string {
   return `${modelSpace.model}:${modelSpace.dimensions}:${sequence}`;
+}
+
+function matchesScope(source: Readonly<Record<string, unknown>>, scope: Readonly<Record<string, unknown>>): boolean {
+  for (const key of Object.keys(scope)) {
+    if (source[key] !== scope[key]) return false;
+  }
+  return true;
+}
+
+function validateScope(scope: unknown): Readonly<Record<string, unknown>> | undefined {
+  if (scope === undefined) return undefined;
+  if (scope === null || typeof scope !== 'object' || Array.isArray(scope)) {
+    throw new TypeError('vector search scope must be a source-row predicate object');
+  }
+  return scope as Readonly<Record<string, unknown>>;
 }
 
 function validateVector(
@@ -201,9 +222,16 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
     if (request.principal === undefined) throw new VectorPluginValidationError('unauthorized-source-ownership', 'vector search requires a principal for result admission');
     const query = request.query as VectorSearchQuery;
     const vector = validateVector(query?.vector, query?.model, modelSpace, 'query');
-    const limit = request.limit ?? active.size;
+    const scope = validateScope(query?.scope);
+    // Scope is part of candidate selection, not a filter over ranked output: the
+    // nearest-neighbour pass and therefore the caller's window see only matching
+    // rows, so a bound on `limit` never spends itself on another partition.
+    const pool = scope === undefined
+      ? [...active.values()]
+      : [...active.values()].filter((entry) => matchesScope(entry.source, scope));
+    const limit = request.limit ?? pool.length;
     const hits: Readonly<Record<string, unknown>>[] = [];
-    const entries = await nearestVectorsInterruptibly([...active.values()], vector, Math.max(1, limit), request.signal);
+    const entries = await nearestVectorsInterruptibly(pool, vector, Math.max(1, limit), request.signal);
     if (request.signal?.aborted) return { hits: [] };
     const candidates = entries.map((entry) => {
       const row = ctx.reader.row(options.source.entity, entry.id) ?? null;

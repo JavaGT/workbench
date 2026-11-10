@@ -255,6 +255,75 @@ test('vector plugin supports A3 shadow rebuild, validation, and parity census', 
   assert.equal(kit.plugin.indexCensus({}).Note.count, 1);
 });
 
+test('vector search scope is a candidate-selection predicate, not a post-ranking filter', async (t) => {
+  const db = new DatabaseSync(':memory:');
+  t.after(() => db.close());
+  db.exec('CREATE TABLE Note (id TEXT PRIMARY KEY, projectId TEXT, embedding TEXT, embedding_model TEXT);');
+  const registry = createSearchPluginRegistry();
+  const plugin = createVectorPlugin({
+    id: 'project-vectors',
+    version: '1.0.0',
+    source: {
+      entity: 'Note',
+      vector: 'embedding',
+      model: 'embedding_model',
+      owns: () => true,
+    },
+    modelSpace: { model: 'embed-v1', dimensions: 2 },
+  });
+  registry.register(plugin);
+  registry.bindSource(db);
+  const insert = (id, projectId, embedding) => {
+    db.prepare('INSERT INTO Note (id, projectId, embedding, embedding_model) VALUES (?, ?, ?, ?)')
+      .run(id, projectId, JSON.stringify(embedding), 'embed-v1');
+  };
+  // The foreign row outranks every row of the queried project, so a window that
+  // ranks the whole index first cannot reach the project's own match.
+  insert('foreign-nearest', 'project-b', [1, 0]);
+  insert('own-match', 'project-a', [0.1, 0.995]);
+  insert('own-other', 'project-a', [0, 1]);
+  insert('foreign-other', 'project-b', [0, 1]);
+  const rebuilt = await registry.rebuild('project-vectors');
+  assert.equal(rebuilt.ok, true, rebuilt.lastError?.message);
+
+  const global = await registry.search('project-vectors', {
+    principal: PRINCIPAL,
+    query: { model: 'embed-v1', vector: [1, 0] },
+    limit: 1,
+  });
+  assert.deepEqual(global.result.hits.map((hit) => hit.id), ['foreign-nearest'], 'unscoped search ranks the whole index');
+
+  const scoped = await registry.search('project-vectors', {
+    principal: PRINCIPAL,
+    query: { model: 'embed-v1', vector: [1, 0], scope: { projectId: 'project-a' } },
+    limit: 1,
+  });
+  assert.deepEqual(scoped.result.hits.map((hit) => hit.id), ['own-match'], 'scoped search ranks only the matching partition');
+
+  const scopedWindow = await registry.search('project-vectors', {
+    principal: PRINCIPAL,
+    query: { model: 'embed-v1', vector: [1, 0], scope: { projectId: 'project-a' } },
+    offset: 1,
+    limit: 1,
+  });
+  assert.deepEqual(scopedWindow.result.hits.map((hit) => hit.id), ['own-other'], 'the caller window slices the scoped ranking');
+
+  const emptyScope = await registry.search('project-vectors', {
+    principal: PRINCIPAL,
+    query: { model: 'embed-v1', vector: [1, 0], scope: { projectId: 'project-missing' } },
+    limit: 1,
+  });
+  assert.deepEqual(emptyScope.result.hits, [], 'a partition with no rows yields no hits');
+
+  const invalidScope = await registry.search('project-vectors', {
+    principal: PRINCIPAL,
+    query: { model: 'embed-v1', vector: [1, 0], scope: ['project-a'] },
+    limit: 1,
+  });
+  assert.equal(invalidScope.ok, false);
+  assert.match(invalidScope.lastError?.message ?? '', /source-row predicate/);
+});
+
 test('validation errors retain a typed code', () => {
   const kit = setup();
   assert.throws(

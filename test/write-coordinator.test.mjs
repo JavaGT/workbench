@@ -352,6 +352,9 @@ test('owned-index statements are census-authorized, atomic, fenced, and host-exe
     await assert.rejects(async () => operation(), /not authorized|authorization|prohibited|owned-index/i, `${sql} must be refused by SQLite's authorizer`);
   }
   await assert.rejects(async () => index.query({ sql: 'SELECT sqlite_version()' }), /not authorized|authorization|prohibited/i, 'an unallowlisted function is refused');
+  if (typeof globalThis.Bun === 'undefined') {
+    await assert.rejects(async () => index.query({ sql: 'SELECT load_extension(?)', params: ['/tmp/denied'] }), /not authorized|authorization|prohibited/i, 'loading extensions is refused');
+  }
   db.close();
 });
 

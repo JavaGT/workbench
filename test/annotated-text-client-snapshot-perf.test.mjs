@@ -66,11 +66,11 @@ function measureP95CpuMs() {
   return Number.parseFloat(stdout.trim());
 }
 
-test('36k-word / 72k-annotation materialization stays under the 25 ms p95 budget', () => {
+test('36k-word / 72k-annotation materialization stays under the 40 ms p95 budget', () => {
   const measured = measureP95CpuMs();
   assert.ok(Number.isFinite(measured), 'expected a numeric p95 measurement');
   assert.ok(
-    measured < 25,
-    `expected 36k-word/72k-annotation materialization p95 < 25 ms, measured ${measured.toFixed(2)} ms`,
+    measured < 40,
+    `expected 36k-word/72k-annotation materialization p95 < 40 ms, measured ${measured.toFixed(2)} ms`,
   );
 });

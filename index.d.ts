@@ -2,8 +2,24 @@
 
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import type { SearchPlugin, SearchPluginRegistry } from './src/server.js';
-import type { CensusEntry } from './src/schema-census.js';
-import type { MigrationLedgerState } from './src/migration-ledger.js';
+
+export type CensusObjectKind = 'table' | 'index' | 'trigger' | 'virtual-table';
+export type CensusOwnerKind = 'framework' | 'entity' | 'schema' | 'plugin' | 'sqlite-artifact';
+
+export interface CensusEntry {
+  readonly kind: CensusOwnerKind;
+  readonly owner: string;
+  readonly objectKind: CensusObjectKind | 'shadow-table';
+  readonly name: string;
+}
+
+export type MigrationLedgerEntry = Readonly<{ namespace: string; version: number }>;
+
+export interface MigrationLedgerState {
+  readonly table: '_SchemaMigration';
+  readonly appliedVersions: readonly MigrationLedgerEntry[];
+  readonly maxVersion: number;
+}
 
 export interface WorkbenchStatement {
   run(...params: unknown[]): { changes: number | bigint };

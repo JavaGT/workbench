@@ -434,7 +434,9 @@ test('decodeCbor supports all RFC 8949 major types 0-7 including arrays/x5c, boo
   // Truncated input throws.
   assert.throws(() => decodeCbor(Buffer.from([0x44, 0x01, 0x02])), /truncated/);
 
-  // Registration attestation with packed attStmt containing x5c byte-string array + booleans.
+  // Registration attestation with packed attStmt containing x5c byte-string array + booleans:
+  // decodeCbor parses the full CBOR structure (including x5c arrays and booleans),
+  // while verifyRegistration fails closed on unverified 'packed' attestation (#245).
   const keypair = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
   const rp = rpConfig({});
   const challenge = generateChallenge();
@@ -447,8 +449,15 @@ test('decodeCbor supports all RFC 8949 major types 0-7 including arrays/x5c, boo
       trusted: true,
     },
   });
-  const regResult = verifyRegistration(challenge, payload.credential, rp);
-  assert.equal(regResult.credentialId, payload.credentialId);
+  const decodedAttestation = decodeCbor(Buffer.from(payload.credential.response.attestationObject, 'base64url')).value;
+  assert.equal(decodedAttestation.fmt, 'packed');
+  assert.equal(decodedAttestation.attStmt.alg, -7);
+  assert.equal(decodedAttestation.attStmt.trusted, true);
+  assert.equal(decodedAttestation.attStmt.x5c.length, 2);
+  assert.throws(
+    () => verifyRegistration(challenge, payload.credential, rp),
+    /unsupported attestation format: packed/,
+  );
 });
 
 test('passkeys support ES256, RS256, and EdDSA end-to-end over HTTP', async (t) => {

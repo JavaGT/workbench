@@ -54,5 +54,74 @@ export { defineOperationalEvent, operationalConsumer } from './operational-consu
 export { principalSnapshot, projectionSource, projectionSourcePhysical } from './principal-snapshot-declaration.mjs';
 export { principalSnapshotScope } from './principal-snapshot-scope.mjs';
 export { logRetentionReport,                         } from './committed-log.mjs';
+export {
+  compileQueryContract,
+  executeQueryPage,
+  acceptQueryPage,
+  overlayOptimisticQueryPage,
+  readCommittedRevision,
+  createQueryInvalidationHub,
+  createQueryInvalidationConsumer,
+  queryAuthorizationFields,
+  withReadSnapshot,
+  QueryScopedReadError,
+  QueryContentionError,
+  QUERY_OPERATORS,
+  OPERATORS_BY_FIELD_TYPE,
+  QUERY_PAGE_SIZE_MIN,
+  QUERY_PAGE_SIZE_MAX,
+  QUERY_PAGE_SIZE_CEILING,
+  QUERY_OFFSET_MAX,
+  QUERY_EXPRESSION_MAX_DEPTH,
+  QUERY_EXPRESSION_MAX_LEAVES,
+  QUERY_REGISTRATION_MAX,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+} from './query-scoped-read.mjs';
+export {
+  compileQueryFamily,
+  executeQueryFamily,
+  createQueryFamilyRegistry,
+  queryFamilyDependencies,
+  registerQueryFamilyInvalidation,
+  queryFamilyChangedSince,
+  DYNAMIC_VALUE_TYPES,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+} from './query-family.mjs';
 
 export { default } from './app.mjs';

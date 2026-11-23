@@ -512,6 +512,25 @@ test('annotated editor discards buffered successor after its predecessor is reje
   harness.binding.close();
 });
 
+test('annotated editor reports a non-envelope HTTP failure as a readable error', async () => {
+  // decodeResult's non-envelope branch has no `failure`/`deliveryError`; the
+  // raw result stringifies to '[object Object]' and carries document text.
+  const harness = setup('private document text');
+  harness.session.replace = async () => ({ ok: false, httpStatus: 502, error: 'http 502' });
+  harness.select(1);
+  harness.beforeinput('insertText', 'secret buffered text');
+  await flushInput();
+
+  assert.equal(harness.errors.length, 1, 'the failed write is reported exactly once');
+  const reported = harness.errors[0];
+  assert.ok(reported instanceof Error, 'onError receives a real Error');
+  assert.equal(reported.message, 'http 502');
+  assert.notEqual(String(reported), '[object Object]');
+  assert.match(String(reported), /http 502/);
+  assert.doesNotMatch(String(reported), /private|secret/);
+  harness.binding.close();
+});
+
 test('annotated editor submits new input from a foreign snapshot after its predecessor settles', async () => {
   const harness = setup('a');
   let settle;

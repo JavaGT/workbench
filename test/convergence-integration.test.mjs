@@ -76,7 +76,7 @@ test('W1: registration creates user and sets a session cookie', async (t) => {
   const res = await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice', password: 'hunter2' }),
+    body: JSON.stringify({ username: 'alice', password: 'hunter2-secret' }),
   });
   assert.equal(res.status, 201, `register: expected 201 got ${res.status}`);
   const cookie = res.headers.get('set-cookie');
@@ -95,13 +95,13 @@ test('W1: wrong password returns 401', async (t) => {
   await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'bob', password: 'right' }),
+    body: JSON.stringify({ username: 'bob', password: 'right-password' }),
   });
 
   const res = await fetch(`${origin}/auth/login`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'bob', password: 'wrong' }),
+    body: JSON.stringify({ username: 'bob', password: 'wrong-password' }),
   });
   assert.equal(res.status, 401, 'wrong password returns 401');
 });
@@ -112,7 +112,7 @@ test('W1: authed user creates and reads an entity through session cookie', async
   const login = await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice', password: 'hunter2' }),
+    body: JSON.stringify({ username: 'alice', password: 'hunter2-secret' }),
   });
   const sid = sidFromSetCookie(login.headers.get('set-cookie'));
 

@@ -385,6 +385,75 @@ export interface ReadBlobStreamArgs extends Omit<ReadBlobArgs, 'read'> {
  */
 export function readBlobStream(args: ReadBlobStreamArgs): Promise<Readable>;
 
+export interface ParsedByteRange {
+  readonly kind: 'range';
+  /** Inclusive start byte offset (0 <= start <= end < totalSize). */
+  readonly start: number;
+  /** Inclusive end byte offset (0 <= start <= end < totalSize). */
+  readonly end: number;
+  /** Byte count of the slice (end - start + 1). */
+  readonly length: number;
+  /** Formatted RFC 9110 Content-Range header value (`bytes start-end/total`). */
+  readonly contentRange: string;
+}
+
+export type ParsedByteRangeResult =
+  | Readonly<{ kind: 'none' }>
+  | Readonly<ParsedByteRange>
+  | Readonly<{ kind: 'unsatisfiable'; contentRange: string }>;
+
+/**
+ * Parse an HTTP `Range` header per RFC 9110 §14.1.2 for single byte ranges:
+ * `bytes=start-end`, `bytes=start-`, and `bytes=-suffix`.
+ */
+export function parseByteRange(
+  rangeHeader: string | string[] | null | undefined,
+  totalSize: number,
+): ParsedByteRangeResult;
+
+export interface BlobMediaMetadata {
+  readonly size: number;
+  readonly mime?: string | null;
+  readonly sha256?: string | null;
+  readonly etag?: string | null;
+}
+
+export interface ServeAuthorizedBlobArgs {
+  readonly req: {
+    readonly method?: string;
+    readonly headers: Record<string, string | string[] | undefined>;
+  };
+  readonly res: import('node:http').ServerResponse;
+  readonly principal: Principal;
+  readonly resource: unknown;
+  readonly field: string;
+  readonly operation?: string | { readonly operation: string };
+  readonly authorize: import('../index.d.ts').AuthorizationAdapter;
+  readonly entity?: { readonly name: string; readonly [key: string]: unknown };
+  readonly db?: WorkbenchDatabase;
+  /**
+   * Resolve blob metadata (size, mime, sha256/etag) ONLY after admission has
+   * succeeded. Returning null/undefined or throwing collapses to opaque 403.
+   */
+  readonly stat: () => BlobMediaMetadata | null | undefined;
+  /**
+   * Construct a readable byte stream for half-open `[start, end)` (or full blob
+   * when omitted). Called ONLY for `GET` (never `HEAD`, and never before
+   * authorization succeeds).
+   */
+  readonly readStream: (range?: [start?: number, end?: number], options?: { signal?: AbortSignal }) => Readable;
+}
+
+/**
+ * Authorized HTTP media playback handler (`GET` / `HEAD`) with RFC 9110 byte
+ * range support (`200`, `206 Partial Content`, `416 Range Not Satisfiable`) and
+ * backpressure-safe streaming.
+ */
+export function serveAuthorizedBlob(args: ServeAuthorizedBlobArgs): Promise<void>;
+
+/** Alias for {@link serveAuthorizedBlob} for HTTP handler ergonomics. */
+export const handleAuthorizedBlobRequest: typeof serveAuthorizedBlob;
+
 // ---------------------------------------------------------------------------
 // Framework table names (derived from DDL generators)
 // ---------------------------------------------------------------------------

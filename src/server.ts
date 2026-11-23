@@ -44,7 +44,20 @@ export { operationalConsumerAdmin } from './operational-consumer.ts';
 // export is for custom wiring only.
 export { createPostCommitEffectRunner } from './post-commit-effects.ts';
 export { pendingBlobStager, declaredBlobField, readClaimedBlob, claimedBlobLifecycle, stagedBlobReader } from './pending-blob.ts';
-export { readBlob, readBlobStream, BlobReadDeniedError, type ReadBlobArgs, type ReadBlobStreamArgs } from './authorized-blob-read.ts';
+export {
+  readBlob,
+  readBlobStream,
+  BlobReadDeniedError,
+  parseByteRange,
+  serveAuthorizedBlob,
+  handleAuthorizedBlobRequest,
+  type ReadBlobArgs,
+  type ReadBlobStreamArgs,
+  type ParsedByteRange,
+  type ParsedByteRangeResult,
+  type BlobMediaMetadata,
+  type ServeAuthorizedBlobArgs,
+} from './authorized-blob-read.ts';
 export { BlobSlotNotFoundError, BlobTooLargeError } from './fs-blobs.ts';
 export { createHistoryReader } from './history-read.ts';
 // Search plugins are server-only: they receive constrained source and

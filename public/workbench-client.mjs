@@ -177,7 +177,6 @@ class LiveSyncSession {
     this._reconnectAttempt = 0;
     this._maxBackoff = options.maxBackoff ?? 5000;
     this._backoffBase = options.backoffBase ?? 200;
-    this._watchdog = null;
     this._connCallbacks = new Set();
     // The latest volatile caret position (if any) while the socket is offline.
     // Replays after a reconnect so a caret move during a reconnect window is
@@ -328,10 +327,6 @@ class LiveSyncSession {
     this._state = 'closing';
     this._generation++;
     this._clearReconnect();
-    if (this._watchdog) {
-      clearInterval(this._watchdog);
-      this._watchdog = null;
-    }
     if (this._socket) {
       try { this._socket.close(); } catch { /* ignore */ }
       this._socket = null;
@@ -448,7 +443,6 @@ class LiveSyncSession {
       const stopTimers = () => {
         if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
         if (connectTimeout) { clearTimeout(connectTimeout); connectTimeout = null; }
-        if (this._watchdog) { clearInterval(this._watchdog); this._watchdog = null; }
       };
 
       const resolveOpen = () => {
@@ -465,23 +459,6 @@ class LiveSyncSession {
         this._state = 'online';
         this._emitConnectionStatus('connected');
         this._reconcileDesired();
-        // Watchdog: some servers (incl. this framework's hand-rolled WS) do
-        // not complete the close handshake — they ack the close frame but
-        // never destroy the socket, so the client's 'close' event never fires
-        // and readyState sticks at 2 (CLOSING). Poll readyState and fire the
-        // same drop path the 'close' listener would when the socket is no
-        // longer OPEN. unref'd so it never pins the event loop on its own.
-        this._watchdog = setInterval(() => {
-          if (this._closed || generation !== this._generation || ws !== this._socket) {
-            clearInterval(this._watchdog); this._watchdog = null;
-            return;
-          }
-          if (ws.readyState !== 1) {
-            clearInterval(this._watchdog); this._watchdog = null;
-            this._retireSocket(ws, generation);
-          }
-        }, 100);
-        if (typeof this._watchdog.unref === 'function') this._watchdog.unref();
         resolve();
       };
 
@@ -546,7 +523,6 @@ class LiveSyncSession {
 
   _retireSocket(ws, generation) {
     if (this._closed || generation !== this._generation) return;
-    if (this._watchdog) { clearInterval(this._watchdog); this._watchdog = null; }
     if (this._socket === ws) this._socket = null;
     this._generation++;
     this._subRequests.clear();
@@ -901,7 +877,7 @@ export class LiveList {
       );
       const { snapshot, seq, reducers } = await this._decode(snapRes);
       this._assertActive(epoch);
-      this._state = snapshot;
+      this._installSnapshot(snapshot);
       await this._installTextReducers(reducers);
       this._cursor = seq;
       this._removed = false;
@@ -1175,7 +1151,7 @@ export class LiveList {
         );
         const { snapshot, seq, reducers } = await this._decode(snapRes);
         this._assertActive(epoch);
-        this._state = snapshot;
+        this._installSnapshot(snapshot);
         await this._installTextReducers(reducers);
         this._cursor = seq;
         this._removed = false;
@@ -1309,6 +1285,19 @@ export class LiveList {
     }
   }
 
+  /**
+   * Install an authoritative snapshot. Always a NEW object identity, so a
+   * reactive framework (Solid createSignal, React state, etc.) observes the
+   * change even when the server re-sends an equal row. Nested values are
+   * shared by reference; every mutation path below is copy-on-write, so the
+   * fetched object is never aliased as the live state.
+   */
+  _installSnapshot(snapshot) {
+    this._state = snapshot && typeof snapshot === 'object' && !Array.isArray(snapshot)
+      ? { ...snapshot }
+      : snapshot;
+  }
+
   /** CRUD operations (2-part types: ticket.created / .updated / .removed). */
   _applyCrud(verb, event, delta) {
     switch (verb) {
@@ -1322,10 +1311,11 @@ export class LiveList {
         break;
 
       case 'updated': {
-        if (this._state == null) {
-          this._state = {};
-          this._removed = false;
-        }
+        // Copy-on-write: publish a NEW top-level object every applied change so
+        // identity-comparing reactive frameworks see the update. Unchanged
+        // fields keep their references (structural sharing).
+        const next = { ...(this._state ?? {}) };
+        if (this._state == null) this._removed = false;
         // Value-XOR-delta: the server sends BOTH the whole new value (event.data)
         // and a per-field delta for diff-eligible/native kinds. A field present
         // in `delta` is applied ONLY via the delta below — assigning its whole
@@ -1338,13 +1328,14 @@ export class LiveList {
           for (const key of Object.keys(event.data)) {
             if (key === 'id') continue;
             if (delta && Object.prototype.hasOwnProperty.call(delta, key)) continue;
-            this._state[key] = event.data[key];
+            next[key] = event.data[key];
           }
         }
         // Apply per-kind delta for the fields the delta owns.
         if (delta) {
-          this._applyDelta(delta);
+          this._applyDelta(delta, next);
         }
+        this._state = next;
         break;
       }
 
@@ -1358,25 +1349,27 @@ export class LiveList {
   }
 
   /** Apply value, state, struct, or map deltas. Text CRDTs fold native ops. */
-  _applyDelta(delta) {
+  _applyDelta(delta, state = this._state) {
+    const next = state ?? {};
     for (const [field, d] of Object.entries(delta)) {
       if (d == null) continue;
       try {
         if ('set' in d) {
           // Value delta: {set: v}
-          this._state[field] = d.set;
+          next[field] = d.set;
         } else if ('from' in d && 'to' in d) {
           // State delta: {from, to}
-          this._state[field] = d.to;
+          next[field] = d.to;
         } else if ('cells' in d) {
           // Struct delta: {cells: {[name]: {set: v}}}
-          this._state[field] = { ...(this._state[field] ?? {}) };
+          const clone = { ...(next[field] ?? {}) };
           for (const [name, cell] of Object.entries(d.cells)) {
-            this._state[field][name] = cell.set;
+            clone[name] = cell.set;
           }
+          next[field] = clone;
         } else if ('added' in d || 'removed' in d || 'changed' in d) {
           // Map delta (native storeMapDiff): {added:[], removed:[], changed:[]}
-          const m = { ...(this._state[field] ?? {}) };
+          const m = { ...(next[field] ?? {}) };
           if (d.added) {
             for (const entry of d.added) {
               m[entry.member] = entry.role;
@@ -1392,12 +1385,23 @@ export class LiveList {
               delete m[member];
             }
           }
-          this._state[field] = m;
+          next[field] = m;
         }
       } catch {
         // Malformed delta for this field — skip.
       }
     }
+  }
+
+  /**
+   * Start a top-level copy-on-write for an in-place field write so the applied
+   * change publishes a NEW state identity while unchanged fields keep their
+   * references (structural sharing). Returns the writable object.
+   */
+  _writableState() {
+    if (this._state == null || typeof this._state !== 'object') this._state = {};
+    else this._state = { ...this._state };
+    return this._state;
   }
 
   /**
@@ -1436,14 +1440,16 @@ export class LiveList {
 
       case 'appended':
         // Log append — push the full data as an entry.
+        this._writableState();
         this._state[field] = [...(this._state[field] ?? []), data];
         break;
 
       case 'added':
       case 'changed': {
         // Map add/change — {member, role}
-        const m = { ...(this._state[field] ?? {}) };
+        const m = { ...(this._state?.[field] ?? {}) };
         m[data.member] = data.role;
+        this._writableState();
         this._state[field] = m;
         break;
       }
@@ -1452,8 +1458,9 @@ export class LiveList {
         // Disambiguate: 3-part .removed could be map or ordered.
         // data.member → map remove; data.id → ordered remove.
         if ('member' in data) {
-          const m = { ...(this._state[field] ?? {}) };
+          const m = { ...(this._state?.[field] ?? {}) };
           delete m[data.member];
+          this._writableState();
           this._state[field] = m;
         } else if ('id' in data) {
           this._applyOrderedOp(field, 'removed', data);
@@ -1517,7 +1524,8 @@ export class LiveList {
     // a string/locale compare would mis-order (e.g. 2 before 10) and diverge.
     this._ordered[field].sort((a, b) => a.key - b.key);
 
-    // Expose as the sorted array of item values.
+    // Expose as the sorted array of item values (new state identity each op).
+    this._writableState();
     this._state[field] = this._ordered[field].map(e => e.item);
   }
 
@@ -1537,6 +1545,7 @@ export class LiveList {
 
   /** Materialize one field's folded text state into public view. */
   _rematerializeTextField(field) {
+    this._writableState();
     this._state[field] = materializeText(this._textStates[field]);
   }
 
@@ -3456,11 +3465,14 @@ export function createLiveDeliverySession({
       snapshotGeneration += 1;
       lastSnapshotInstalledFromReceipt = Boolean(mode === 'snapshot' && snapshotRecoveryCycle?.fromReceipt);
       settleSnapshotConfirmations(receiptGenerationAtStart);
-      publish();
-      if (closed || status === 'revoked' || generation !== recoveryGeneration) return;
+      // Exactly ONE publish per settled recovery, with the final status already
+      // installed. The snapshot and the `live` transition reach listeners in the
+      // same turn, so no observer sees a settled snapshot under a stale
+      // recovering/catching-up status.
       finishRecoveryWarning();
       status = 'live';
       publish();
+      if (closed || status === 'revoked' || generation !== recoveryGeneration) return;
       if (initialized && !reconnecting) settleAdmissions(true);
       if (mode === 'snapshot' && snapshotRecoveryCycle
         && (snapshotRecoveryCycle.floor == null || cursorAnchor(cursor) >= snapshotRecoveryCycle.floor)

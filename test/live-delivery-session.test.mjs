@@ -127,6 +127,52 @@ describe('LiveDeliverySession', () => {
     await reconnect;
   });
 
+  it('publishes exactly once per settled recovery with the final live status installed', async () => {
+    let bootstraps = 0;
+    const session = createLiveDeliverySession({
+      bootstrap: async ({ mode }) => {
+        bootstraps += 1;
+        if (mode === 'catchup') return { kind: 'catchup', envelopes: [], cursor: 1 };
+        return { kind: 'snapshot', snapshot: { values: [`snap-${bootstraps}`] }, cursor: bootstraps };
+      },
+      subscribe: async () => ({ close() {} }),
+      validateSnapshot: (snapshot) => snapshot,
+      sendAction: async () => ({ ok: true }),
+    });
+    await session.ready;
+
+    // Snapshot recovery (reconnect catch-up) settles live in one publish.
+    const reconnectStatuses = [];
+    const unsubscribe = session.subscribe(() => reconnectStatuses.push(session.status));
+    reconnectStatuses.length = 0; // drop the immediate replay subscribe() delivers
+    await session.reconnect();
+    assert.deepEqual(reconnectStatuses, ['live'], 'one publish per settled recovery, status live');
+    unsubscribe();
+    session.close();
+
+    // A resync control drives a full snapshot recovery: exactly one publish,
+    // with the final `live` status already installed (no interim publish under
+    // the recovering status).
+    let deliver = null;
+    let snapshotBootstraps = 0;
+    const resyncSession = createLiveDeliverySession({
+      bootstrap: async () => {
+        snapshotBootstraps += 1;
+        return { kind: 'snapshot', snapshot: { values: [`snap-${snapshotBootstraps}`] }, cursor: snapshotBootstraps };
+      },
+      subscribe: async ({ deliver: deliverFn }) => { deliver = deliverFn; return { close() {} }; },
+      validateSnapshot: (snapshot) => snapshot,
+      sendAction: async () => ({ ok: true }),
+    });
+    await resyncSession.ready;
+    const publications = [];
+    resyncSession.subscribe(() => publications.push(resyncSession.status));
+    publications.length = 0; // drop the immediate replay subscribe() delivers
+    await deliver([{ type: 'resync', seq: 2, reason: 'recipient-snapshot-required' }]);
+    assert.deepEqual(publications, ['live'], 'one publish for a settled snapshot recovery');
+    resyncSession.close();
+  });
+
   it('silently drops duplicate delivery and confirms pending work only through its echo', async () => {
     const { session, deliver } = setup();
     await session.ready;

@@ -51,6 +51,15 @@ function sha256hex(s        )         {
   return createHash('sha256').update(s).digest('hex');
 }
 
+const SHA256_HEX_RE = /^[0-9a-f]{64}$/i;
+
+// Hash an opaque session token before storing in `Session.token` or querying
+// against it. Storing only SHA-256 digests prevents a read-only DB compromise
+// from yielding usable session cookies.
+export function hashSessionToken(token        )         {
+  return sha256hex(token);
+}
+
 // The session cookie name. The cookie value is an opaque token; it never carries
 // identity, only a key into the Session table.
 export const SESSION_COOKIE = 'sid';
@@ -77,16 +86,33 @@ export function parseCookies(header                           )                 
   return cookies;
 }
 
+
+
+
+
+
+
+
+
+
 // Build the `Set-Cookie` header value for a session token. Fail-closed defaults:
 // HttpOnly (never readable by client JS), SameSite=Lax (CSRF-resistant), Secure
 // (TLS-only), Path=/. `secure` may be dropped for a non-TLS context (local dev /
 // tests over plain http); HttpOnly and SameSite are never dropped.
 // cso M2: In production, secure:false is refused — tokens must be TLS-only.
-export function sessionCookie(token        , { secure = true, env = config.env }                                     = {})         {
+export function sessionCookie(
+  token        ,
+  { secure = true, env = config.env, maxAge, ttlMs }                       = {},
+)         {
   if (env === 'production' && !secure) {
     throw new Error('sessionCookie secure:false is not permitted in production');
   }
   const attributes = [`${SESSION_COOKIE}=${token}`, 'HttpOnly', 'SameSite=Lax', 'Path=/'];
+  if (typeof maxAge === 'number' && Number.isFinite(maxAge) && maxAge >= 0) {
+    attributes.push(`Max-Age=${Math.floor(maxAge)}`);
+  } else if (typeof ttlMs === 'number' && Number.isFinite(ttlMs) && ttlMs >= 0) {
+    attributes.push(`Max-Age=${Math.floor(ttlMs / 1000)}`);
+  }
   if (secure) attributes.push('Secure');
   return attributes.join('; ');
 }
@@ -98,8 +124,31 @@ export function sessionCookie(token        , { secure = true, env = config.env }
 // stable per-session key — a single client cannot rotate another user's token,
 // and the IP gate (which runs first) is the non-spoofable base that holds when no
 // cookie is present. sessionPrincipalOf reuses this same read.
+//
+// Fail closed on duplicate `sid` cookies (#218): if a request carries more than
+// one `sid=...` pair (e.g. cookie-jar smuggling / subdomain shadow cookie),
+// reject the ambiguous header and yield `undefined` (→ anonymous).
 export function sessionTokenOf(req             )                     {
-  return parseCookies(req.headers?.cookie)[SESSION_COOKIE] || undefined;
+  const header = req.headers?.cookie;
+  if (!header) return undefined;
+  let count = 0;
+  let value                    ;
+  for (const pair of header.split(';')) {
+    const eq = pair.indexOf('=');
+    if (eq === -1) continue;
+    const name = pair.slice(0, eq).trim();
+    if (name !== SESSION_COOKIE) continue;
+    count += 1;
+    if (count > 1) return undefined;
+    const raw = pair.slice(eq + 1).trim();
+    try {
+      value = decodeURIComponent(raw);
+    } catch {
+      return undefined;
+    }
+  }
+  if (count !== 1 || !value) return undefined;
+  return value;
 }
 
 function sessionCreatedAtMs(value         )                {
@@ -158,9 +207,19 @@ export function sessionPrincipalOf(db       , { durationMs = config.sessionDurat
       // listen time. The identity comes entirely from the server-side Session
       // row; the client supplied only the token. principal() re-validates the
       // closed type union, so a corrupt stored type is anonymous too.
-      const row = db
-        .prepare(select)
-        .get(token)                                 ;
+      //
+      // Look up by SHA-256 hash first (the canonical at-rest representation
+      // written by Session.create). Fall back to a raw lookup ONLY when the
+      // incoming token is not itself a 64-hex SHA-256 digest — this preserves
+      // legacy/test fixtures that insert short plaintext tokens directly while
+      // ensuring a stolen Session.token hash from a DB dump can never be
+      // replayed as a cookie.
+      const stmt = db.prepare(select);
+      const tokenHash = hashSessionToken(token);
+      let row = stmt.get(tokenHash)                                 ;
+      if (!row && !SHA256_HEX_RE.test(token)) {
+        row = stmt.get(token)                                 ;
+      }
       if (!row) return anonymous;
       // Session cleanup reclaims expired rows eventually; authorization must not
       // wait for that scheduler. Validate timestamps in JavaScript because SQLite

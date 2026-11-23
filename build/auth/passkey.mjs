@@ -6,15 +6,19 @@
 //
 // Registration uses `navigator.credentials.create()` (attestation); login uses
 // `navigator.credentials.get()` (assertion). The server issues challenges,
-// stores them with TTL, and verifies the client's response against the stored
-// challenge + the stored credential's public key.
+// stores them with TTL + bounded capacity (or optional SQLite persistence), and
+// verifies the client's response against the stored challenge + the stored
+// credential's public key.
 //
 //   - generateChallenge() → random bytes, base64url-encoded
-//   - challengeStore — an in-memory Map with TTL cleanup
+//   - challengeStore — bounded in-memory Map with TTL cleanup (+ optional SQLite)
+//   - decodeCbor(buf, offset) → complete RFC 8949 CBOR decoder (major types 0–7)
 //   - verifyRegistration(challenge, credential, rp) → parses attestation,
-//     validates RP ID hash, extracts credential ID + public key
-//   - verifyAuthentication(challenge, credential, storedCredential, rp) →
-//     validates assertion, verifies signature against stored public key
+//     validates RP ID hash, extracts credential ID + SPKI public key (ES256,
+//     RS256, EdDSA)
+//   - verifyAuthentication(challenge, credential, storedCredential, rp, options)
+//     → validates assertion (UP + UV by default), verifies signature against
+//     stored public key (ES256, RS256, EdDSA)
 //   - parseClientDataJSON(base64url) → decoded JSON with { challenge, origin, type }
 //   - parseAuthenticatorData(buf) → { rpIdHash, flags, signCount }
 
@@ -25,6 +29,7 @@ import crypto from 'node:crypto';
 // Sensible defaults; overridable via config.rp per-app.
 
 // The RP identity an app overrides per-app (cfg.rp) and the frozen default.
+
 
 
 
@@ -46,11 +51,15 @@ const defaultRp                     = Object.freeze({
 // later layer can mutate the RP identity.
 export function rpConfig(cfg            = {})                     {
   const rp = cfg?.rp ?? {};
-  return Object.freeze({
+  const result           = {
     name: rp.name ?? defaultRp.name,
     id: rp.id ?? defaultRp.id,
     origin: rp.origin ?? defaultRp.origin,
-  });
+  };
+  if (typeof rp.requireUserVerification === 'boolean') {
+    result.requireUserVerification = rp.requireUserVerification;
+  }
+  return Object.freeze(result);
 }
 
 // ---- challenge generation ----------------------------------------------------
@@ -64,6 +73,18 @@ export function generateChallenge(length = 32)         {
 // ---- challenge store ---------------------------------------------------------
 
 const DEFAULT_CHALLENGE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const DEFAULT_MAX_CHALLENGES = 10_000;
+
+
+
+
+
+
+
+
+
+
+
 
 // A stored challenge entry: the caller's data plus the creation timestamp the
 // TTL sweep and the expiry check read.
@@ -79,31 +100,162 @@ const DEFAULT_CHALLENGE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
 
 
-// createChallengeStore(ttlMs) → { set, get, consume, destroy }. An in-memory Map
-// with TTL-based expiry: entries older than ttlMs are dropped. `consume` is a
-// single-use read (get + delete) so a challenge cannot be replayed.
-export function createChallengeStore(ttlMs = DEFAULT_CHALLENGE_TTL_MS)                 {
+
+
+
+
+
+
+
+
+function ensurePasskeyChallengeTable(db           )       {
+  const ddl = `
+    CREATE TABLE IF NOT EXISTS _PasskeyChallenge (
+      challenge TEXT PRIMARY KEY,
+      data TEXT NOT NULL,
+      created INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx__PasskeyChallenge_created ON _PasskeyChallenge (created);
+  `;
+  if (typeof db.exec === 'function') {
+    db.exec(ddl);
+  } else {
+    db.prepare(`
+      CREATE TABLE IF NOT EXISTS _PasskeyChallenge (
+        challenge TEXT PRIMARY KEY,
+        data TEXT NOT NULL,
+        created INTEGER NOT NULL
+      )
+    `).run();
+    db.prepare('CREATE INDEX IF NOT EXISTS idx__PasskeyChallenge_created ON _PasskeyChallenge (created)').run();
+  }
+}
+
+// createChallengeStore(ttlMsOrOptions, extraOptions) → { set, get, consume,
+// size, destroy }. A bounded store with TTL-based expiry: entries older than
+// ttlMs are dropped and insertions above maxSize evict expired entries first,
+// then oldest entries. `consume` is a single-use read (get + delete) so a
+// challenge cannot be replayed. Passing `{ db }` persists challenges in SQLite
+// so pending ceremonies survive restarts.
+export function createChallengeStore(
+  ttlMsOrOptions                                 = DEFAULT_CHALLENGE_TTL_MS,
+  extraOptions                                       = {},
+)                 {
+  const opts                        = typeof ttlMsOrOptions === 'object' && ttlMsOrOptions !== null
+    ? ttlMsOrOptions
+    : { ttlMs: ttlMsOrOptions, ...extraOptions };
+  const ttlMs = typeof opts.ttlMs === 'number' && Number.isFinite(opts.ttlMs) && opts.ttlMs > 0
+    ? opts.ttlMs
+    : DEFAULT_CHALLENGE_TTL_MS;
+  const maxSize = Number.isInteger(opts.maxSize) && (opts.maxSize          ) > 0
+    ? (opts.maxSize          )
+    : DEFAULT_MAX_CHALLENGES;
+  const db = opts.db ?? null;
+  const now = opts.now ?? Date.now;
+
+  if (db) {
+    ensurePasskeyChallengeTable(db);
+
+    const sweepExpiredSql = () => {
+      db.prepare('DELETE FROM _PasskeyChallenge WHERE created < ?').run(now() - ttlMs);
+    };
+
+    const cleanup = setInterval(() => {
+      try {
+        sweepExpiredSql();
+      } catch {
+        // Ignore if db was closed.
+      }
+    }, 60_000);
+    cleanup.unref();
+
+    return {
+      set(challenge, data = {}) {
+        sweepExpiredSql();
+        const countRow = db.prepare('SELECT COUNT(*) AS n FROM _PasskeyChallenge').get()                 ;
+        if (countRow.n >= maxSize) {
+          const excess = countRow.n - maxSize + 1;
+          db.prepare(`
+            DELETE FROM _PasskeyChallenge
+            WHERE challenge IN (
+              SELECT challenge FROM _PasskeyChallenge
+              ORDER BY created ASC
+              LIMIT ?
+            )
+          `).run(excess);
+        }
+        db.prepare(
+          'INSERT OR REPLACE INTO _PasskeyChallenge (challenge, data, created) VALUES (?, ?, ?)',
+        ).run(challenge, JSON.stringify(data), now());
+        return challenge;
+      },
+      get(challenge) {
+        const row = db.prepare(
+          'SELECT data, created FROM _PasskeyChallenge WHERE challenge = ?',
+        ).get(challenge)                                                 ;
+        if (!row) return null;
+        if (now() - row.created > ttlMs) {
+          db.prepare('DELETE FROM _PasskeyChallenge WHERE challenge = ?').run(challenge);
+          return null;
+        }
+        const parsed = JSON.parse(row.data)                           ;
+        return Object.freeze({ ...parsed, created: row.created });
+      },
+      consume(challenge) {
+        const row = db.prepare(
+          'SELECT data, created FROM _PasskeyChallenge WHERE challenge = ?',
+        ).get(challenge)                                                 ;
+        if (!row) return null;
+        const del = db.prepare('DELETE FROM _PasskeyChallenge WHERE challenge = ?').run(challenge);
+        if (Number(del.changes) !== 1) return null;
+        if (now() - row.created > ttlMs) return null;
+        const parsed = JSON.parse(row.data)                           ;
+        return Object.freeze({ ...parsed, created: row.created });
+      },
+      size() {
+        sweepExpiredSql();
+        const row = db.prepare('SELECT COUNT(*) AS n FROM _PasskeyChallenge').get()                 ;
+        return row.n;
+      },
+      destroy() {
+        clearInterval(cleanup);
+      },
+    };
+  }
+
   const store = new Map                        ();
+
+  function sweepExpired()       {
+    const current = now();
+    for (const [challenge, entry] of store) {
+      if (current - entry.created > ttlMs) store.delete(challenge);
+    }
+  }
+
+  function evictIfFull()       {
+    if (store.size < maxSize) return;
+    sweepExpired();
+    for (const challenge of store.keys()) {
+      if (store.size < maxSize) break;
+      store.delete(challenge);
+    }
+  }
 
   // Periodic cleanup sweeps expired entries every 60 seconds. The interval is
   // unref'd so it doesn't keep the process alive.
-  const cleanup = setInterval(() => {
-    const now = Date.now();
-    for (const [challenge, entry] of store) {
-      if (now - entry.created > ttlMs) store.delete(challenge);
-    }
-  }, 60_000);
+  const cleanup = setInterval(sweepExpired, 60_000);
   cleanup.unref();
 
   return {
     set(challenge, data = {}) {
-      store.set(challenge, Object.freeze({ ...data, created: Date.now() }));
+      if (!store.has(challenge)) evictIfFull();
+      store.set(challenge, Object.freeze({ ...data, created: now() }));
       return challenge;
     },
     get(challenge) {
       const entry = store.get(challenge);
       if (!entry) return null;
-      if (Date.now() - entry.created > ttlMs) {
+      if (now() - entry.created > ttlMs) {
         store.delete(challenge);
         return null;
       }
@@ -113,6 +265,10 @@ export function createChallengeStore(ttlMs = DEFAULT_CHALLENGE_TTL_MS)          
       const entry = this.get(challenge);
       if (entry) store.delete(challenge);
       return entry;
+    },
+    size() {
+      sweepExpired();
+      return store.size;
     },
     destroy() {
       clearInterval(cleanup);
@@ -156,73 +312,219 @@ function sha256(data        )         {
 //   byte 32:     flags (bit 0: UP, bit 2: UV, bit 6: AT, bit 7: ED)
 //   bytes 33–36: sign counter (32-bit big-endian)
 export function parseAuthenticatorData(authData        )                                                         {
-  const rpIdHash = authData.slice(0, 32);
+  if (!Buffer.isBuffer(authData) || authData.length < 37) {
+    throw new Error('authenticator data too short (expected at least 37 bytes)');
+  }
+  const rpIdHash = authData.subarray(0, 32);
   const flags = authData[32];
   const signCount = authData.readUInt32BE(33);
   return { rpIdHash, flags, signCount };
 }
 
-// ---- minimal CBOR decoder ----------------------------------------------------
-// Only the types needed to parse a WebAuthn attestation object:
-//   - unsigned integer (major 0)
-//   - negative integer (major 1)
-//   - byte string (major 2)
-//   - text string (major 3)
-//   - map (major 5)
+// ---- complete RFC 8949 CBOR decoder ------------------------------------------
+// Supports all CBOR major types 0–7:
+//   - major 0: unsigned integer (0..23, u8, u16, u32, u64)
+//   - major 1: negative integer (-1 - n)
+//   - major 2: byte string (definite & indefinite length)
+//   - major 3: text string (definite & indefinite length)
+//   - major 4: array (definite & indefinite length)
+//   - major 5: map (definite & indefinite length, null-prototype to block __proto__)
+//   - major 6: semantic tag ({ tag, value })
+//   - major 7: simple values (false, true, null, undefined, simple) and IEEE 754
+//              float16 / float32 / float64
 
-// The decoder's return shape: the decoded value (number, string, Buffer, or a
-// map record) plus the offset just past the consumed bytes.
+const MAX_CBOR_DEPTH = 64;
 
 
 
 
 
-function decodeCborLen(buf        , offset        )                               {
+
+
+
+
+
+
+function assertBounds(buf        , end        )       {
+  if (end > buf.length) {
+    throw new Error(`truncated CBOR input (needed offset ${end}, length ${buf.length})`);
+  }
+}
+
+function decodeCborUint(buf        , offset        )                               {
+  assertBounds(buf, offset + 1);
   const ai = buf[offset] & 0x1f;
   if (ai < 24) return { len: ai, pos: offset + 1 };
-  if (ai === 24) return { len: buf[offset + 1], pos: offset + 2 };
-  if (ai === 25) return { len: buf.readUInt16BE(offset + 1), pos: offset + 3 };
-  if (ai === 26) return { len: buf.readUInt32BE(offset + 1), pos: offset + 5 };
+  if (ai === 24) {
+    assertBounds(buf, offset + 2);
+    return { len: buf[offset + 1], pos: offset + 2 };
+  }
+  if (ai === 25) {
+    assertBounds(buf, offset + 3);
+    return { len: buf.readUInt16BE(offset + 1), pos: offset + 3 };
+  }
+  if (ai === 26) {
+    assertBounds(buf, offset + 5);
+    return { len: buf.readUInt32BE(offset + 1), pos: offset + 5 };
+  }
   if (ai === 27) {
+    assertBounds(buf, offset + 9);
     const hi = buf.readUInt32BE(offset + 1);
     const lo = buf.readUInt32BE(offset + 5);
     return { len: Number((BigInt(hi) << 32n) | BigInt(lo)), pos: offset + 9 };
   }
-  throw new Error(`unsupported CBOR length encoding: ${ai}`);
+  throw new Error(`unsupported CBOR additional info: ${ai} at offset ${offset}`);
 }
 
-function decodeCbor(buf        , offset = 0)             {
+function decodeFloat16(bits        )         {
+  const sign = (bits & 0x8000) ? -1 : 1;
+  const exp = (bits >>> 10) & 0x1f;
+  const frac = bits & 0x03ff;
+  if (exp === 0) {
+    return sign * Math.pow(2, -14) * (frac / 1024);
+  }
+  if (exp === 0x1f) {
+    return frac === 0 ? sign * Infinity : NaN;
+  }
+  return sign * Math.pow(2, exp - 15) * (1 + frac / 1024);
+}
+
+export function decodeCbor(buf        , offset = 0, depth = 0)             {
+  if (depth > MAX_CBOR_DEPTH) {
+    throw new Error('CBOR nesting depth exceeded');
+  }
+  assertBounds(buf, offset + 1);
   const byte = buf[offset];
   const major = byte >> 5;
+  const ai = byte & 0x1f;
 
   switch (major) {
     case 0: { // unsigned integer
-      const { len, pos } = decodeCborLen(buf, offset);
+      const { len, pos } = decodeCborUint(buf, offset);
       return { value: len, pos };
     }
     case 1: { // negative integer: value = -1 - n
-      const { len, pos } = decodeCborLen(buf, offset);
+      const { len, pos } = decodeCborUint(buf, offset);
       return { value: -1 - len, pos };
     }
-    case 2: { // byte string
-      const { len, pos } = decodeCborLen(buf, offset);
-      return { value: buf.slice(pos, pos + len), pos: pos + len };
+    case 2: { // byte string (definite or indefinite)
+      if (ai === 31) {
+        const chunks           = [];
+        let p = offset + 1;
+        while (true) {
+          assertBounds(buf, p + 1);
+          if (buf[p] === 0xff) {
+            return { value: Buffer.concat(chunks), pos: p + 1 };
+          }
+          if ((buf[p] >> 5) !== 2 || (buf[p] & 0x1f) === 31) {
+            throw new Error(`invalid chunk inside indefinite CBOR byte string at offset ${p}`);
+          }
+          const chunk = decodeCbor(buf, p, depth + 1);
+          chunks.push(chunk.value          );
+          p = chunk.pos;
+        }
+      }
+      const { len, pos } = decodeCborUint(buf, offset);
+      assertBounds(buf, pos + len);
+      return { value: Buffer.from(buf.subarray(pos, pos + len)), pos: pos + len };
     }
-    case 3: { // text string
-      const { len, pos } = decodeCborLen(buf, offset);
-      return { value: buf.slice(pos, pos + len).toString('utf-8'), pos: pos + len };
+    case 3: { // text string (definite or indefinite)
+      if (ai === 31) {
+        const chunks           = [];
+        let p = offset + 1;
+        while (true) {
+          assertBounds(buf, p + 1);
+          if (buf[p] === 0xff) {
+            return { value: chunks.join(''), pos: p + 1 };
+          }
+          if ((buf[p] >> 5) !== 3 || (buf[p] & 0x1f) === 31) {
+            throw new Error(`invalid chunk inside indefinite CBOR text string at offset ${p}`);
+          }
+          const chunk = decodeCbor(buf, p, depth + 1);
+          chunks.push(chunk.value          );
+          p = chunk.pos;
+        }
+      }
+      const { len, pos } = decodeCborUint(buf, offset);
+      assertBounds(buf, pos + len);
+      return { value: buf.subarray(pos, pos + len).toString('utf-8'), pos: pos + len };
     }
-    case 5: { // map
-      const { len: count, pos: afterLen } = decodeCborLen(buf, offset);
-      const map                          = {};
+    case 4: { // array (definite or indefinite)
+      const arr            = [];
+      if (ai === 31) {
+        let p = offset + 1;
+        while (true) {
+          assertBounds(buf, p + 1);
+          if (buf[p] === 0xff) {
+            return { value: arr, pos: p + 1 };
+          }
+          const item = decodeCbor(buf, p, depth + 1);
+          arr.push(item.value);
+          p = item.pos;
+        }
+      }
+      const { len: count, pos: afterLen } = decodeCborUint(buf, offset);
       let p = afterLen;
       for (let i = 0; i < count; i++) {
-        const key = decodeCbor(buf, p);
-        const val = decodeCbor(buf, key.pos);
+        const item = decodeCbor(buf, p, depth + 1);
+        arr.push(item.value);
+        p = item.pos;
+      }
+      return { value: arr, pos: p };
+    }
+    case 5: { // map (definite or indefinite)
+      const map                          = Object.create(null);
+      if (ai === 31) {
+        let p = offset + 1;
+        while (true) {
+          assertBounds(buf, p + 1);
+          if (buf[p] === 0xff) {
+            return { value: map, pos: p + 1 };
+          }
+          const key = decodeCbor(buf, p, depth + 1);
+          const val = decodeCbor(buf, key.pos, depth + 1);
+          map[String(key.value)] = val.value;
+          p = val.pos;
+        }
+      }
+      const { len: count, pos: afterLen } = decodeCborUint(buf, offset);
+      let p = afterLen;
+      for (let i = 0; i < count; i++) {
+        const key = decodeCbor(buf, p, depth + 1);
+        const val = decodeCbor(buf, key.pos, depth + 1);
         map[String(key.value)] = val.value;
         p = val.pos;
       }
       return { value: map, pos: p };
+    }
+    case 6: { // semantic tag
+      const { len: tag, pos: afterTag } = decodeCborUint(buf, offset);
+      const inner = decodeCbor(buf, afterTag, depth + 1);
+      return { value: { tag, value: inner.value }                  , pos: inner.pos };
+    }
+    case 7: { // simple values and IEEE 754 floating-point numbers
+      if (ai < 20) return { value: ai, pos: offset + 1 };
+      if (ai === 20) return { value: false, pos: offset + 1 };
+      if (ai === 21) return { value: true, pos: offset + 1 };
+      if (ai === 22) return { value: null, pos: offset + 1 };
+      if (ai === 23) return { value: undefined, pos: offset + 1 };
+      if (ai === 24) {
+        assertBounds(buf, offset + 2);
+        return { value: buf[offset + 1], pos: offset + 2 };
+      }
+      if (ai === 25) {
+        assertBounds(buf, offset + 3);
+        return { value: decodeFloat16(buf.readUInt16BE(offset + 1)), pos: offset + 3 };
+      }
+      if (ai === 26) {
+        assertBounds(buf, offset + 5);
+        return { value: buf.readFloatBE(offset + 1), pos: offset + 5 };
+      }
+      if (ai === 27) {
+        assertBounds(buf, offset + 9);
+        return { value: buf.readDoubleBE(offset + 1), pos: offset + 9 };
+      }
+      throw new Error(`unexpected CBOR simple/break byte 0x${byte.toString(16)} at offset ${offset}`);
     }
     default:
       throw new Error(`unsupported CBOR major type: ${major} (byte 0x${byte.toString(16)} at offset ${offset})`);
@@ -236,7 +538,7 @@ function decodeCbor(buf        , offset = 0)             {
 function parseAttestationObject(base64urlStr        )                                                       {
   const buf = base64urlToBuffer(base64urlStr);
   const { value } = decodeCbor(buf, 0);
-  if (value == null || typeof value !== 'object') {
+  if (value == null || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error('attestation object is not a CBOR map');
   }
   const { fmt, attStmt, authData } = value                           ;
@@ -253,95 +555,102 @@ function parseAttestationObject(base64urlStr        )                           
 // credential data section (byte 37 of the full authData). Extracts the
 // credential ID and the COSE-encoded public key.
 function extractAttestedCredentialData(authData        , offset = 37)                                              {
+  if (authData.length < offset + 18) {
+    throw new Error('attested credential data truncated');
+  }
   // AAGUID: 16 bytes
   const aaguidOffset = offset + 16;
   // Credential ID length: 2 bytes big-endian
   const credIdLen = authData.readUInt16BE(aaguidOffset);
   const credIdStart = aaguidOffset + 2;
-  const credentialId = authData.slice(credIdStart, credIdStart + credIdLen);
+  if (authData.length < credIdStart + credIdLen + 1) {
+    throw new Error('attested credential data missing credentialId or public key');
+  }
+  const credentialId = Buffer.from(authData.subarray(credIdStart, credIdStart + credIdLen));
   // Remaining bytes: COSE public key
-  const coseKeyBuf = authData.slice(credIdStart + credIdLen);
+  const coseKeyBuf = authData.subarray(credIdStart + credIdLen);
   const publicKey = decodeCosePublicKey(coseKeyBuf);
   return { credentialId, publicKey };
 }
 
 // ---- COSE public key conversion ----------------------------------------------
-// Converts a COSE_Key-encoded EC P-256 (ES256) public key to DER/SPKI format.
-// The stored format (per the entity spec) is base64url of DER/SubjectPublicKeyInfo.
-//
-// COSE_Key for P-256:
-//   { 1: 2 (kty: EC2), 3: -7 (alg: ES256), -1: 1 (crv: P-256),
-//     -2: x (bytes), -3: y (bytes) }
-//
-// SPKI for P-256 (DER):
-//   30 59  — SEQUENCE (89 bytes)
-//     30 13 — SEQUENCE (19 bytes) — algorithm identifier
-//       06 07 — OID 2A8648CE3D0201 (ecPublicKey)
-//       06 08 — OID 2A8648CE3D030107 (prime256v1)
-//     03 42 — BIT STRING (66 bytes)
-//       00   — unused bits
-//       04   — uncompressed point prefix
-//       <x> <y> — 32 bytes each
+// Converts a COSE_Key-encoded public key to DER/SPKI format.
+// Supported WebAuthn algorithms:
+//   - ES256 (alg: -7):   kty=2 (EC2), crv=1 (P-256), x (-2), y (-3)
+//   - RS256 (alg: -257): kty=3 (RSA), n (-1), e (-2)
+//   - EdDSA (alg: -8):   kty=1 (OKP), crv=6 (Ed25519), x (-2)
 
-function decodeCosePublicKey(coseBuf        )         {
+export function decodeCosePublicKey(coseBuf        )         {
   const { value } = decodeCbor(coseBuf, 0);
-  if (value == null || typeof value !== 'object') {
+  if (value == null || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error('credential public key is not a CBOR map');
   }
   const coseKey = value                                    ;
+  const kty = coseKey[1];
+  const alg = coseKey[3];
 
-  // Validate it's an EC2 P-256 key
-  if (coseKey[1] !== 2) throw new Error('COSE key kty is not EC2');
-  if (coseKey[-1] !== 1) throw new Error('COSE key crv is not P-256');
-  const x = coseKey[-2];
-  const y = coseKey[-3];
-  if (!Buffer.isBuffer(x) || x.length !== 32) throw new Error('invalid COSE key x coordinate');
-  if (!Buffer.isBuffer(y) || y.length !== 32) throw new Error('invalid COSE key y coordinate');
-
-  // Build DER/SPKI encoding
-  const ecPublicKeyOid = Buffer.from('2a8648ce3d0201', 'hex');    // 1.2.840.10045.2.1
-  const prime256v1Oid = Buffer.from('2a8648ce3d030107', 'hex');   // 1.2.840.10045.3.1.7
-
-  // AlgorithmIdentifier SEQUENCE
-  const algoSeq = Buffer.concat([
-    Buffer.from([0x30, 0x13]),                                   // SEQUENCE (19)
-    Buffer.from([0x06, ecPublicKeyOid.length, ...ecPublicKeyOid]),
-    Buffer.from([0x06, prime256v1Oid.length, ...prime256v1Oid]),
-  ]);
-
-  // Uncompressed point: 04 || x || y
-  const point = Buffer.concat([Buffer.from([0x04]), x, y]);
-
-  // BIT STRING wrapper
-  const bitString = Buffer.concat([
-    Buffer.from([0x00]), // unused bits
-    point,
-  ]);
-
-  // Wrap in SEQUENCE for the SPKI
-  const spki = Buffer.concat([
-    Buffer.from([0x30]),                                          // SEQUENCE tag
-    encodeDerLength(algoSeq.length + 2 + bitString.length),       // length
-    algoSeq,
-    Buffer.from([0x03]),                                         // BIT STRING tag
-    encodeDerLength(bitString.length),                            // length
-    bitString,
-  ]);
-
-  return spki;
-}
-
-// encodeDerLength(n) → DER length encoding bytes
-function encodeDerLength(n        )         {
-  if (n < 0x80) return Buffer.from([n]);
-  // Long form: first byte = 0x80 | numOctets, then the octets
-  const octets           = [];
-  let rem = n;
-  while (rem > 0) {
-    octets.unshift(rem & 0xff);
-    rem >>>= 8;
+  // ES256: EC2 P-256
+  if (kty === 2) {
+    if (alg != null && alg !== -7) {
+      throw new Error(`unsupported EC2 COSE algorithm: ${String(alg)}`);
+    }
+    if (coseKey[-1] !== 1) throw new Error('COSE key crv is not P-256');
+    const x = coseKey[-2];
+    const y = coseKey[-3];
+    if (!Buffer.isBuffer(x) || x.length !== 32) throw new Error('invalid COSE key x coordinate');
+    if (!Buffer.isBuffer(y) || y.length !== 32) throw new Error('invalid COSE key y coordinate');
+    const keyObj = crypto.createPublicKey({
+      key: {
+        kty: 'EC',
+        crv: 'P-256',
+        x: x.toString('base64url'),
+        y: y.toString('base64url'),
+      },
+      format: 'jwk',
+    });
+    return keyObj.export({ format: 'der', type: 'spki' });
   }
-  return Buffer.from([0x80 | octets.length, ...octets]);
+
+  // RS256: RSA
+  if (kty === 3) {
+    if (alg != null && alg !== -257) {
+      throw new Error(`unsupported RSA COSE algorithm: ${String(alg)}`);
+    }
+    const n = coseKey[-1];
+    const e = coseKey[-2];
+    if (!Buffer.isBuffer(n) || n.length < 128) throw new Error('invalid COSE RSA modulus');
+    if (!Buffer.isBuffer(e) || e.length === 0) throw new Error('invalid COSE RSA exponent');
+    const keyObj = crypto.createPublicKey({
+      key: {
+        kty: 'RSA',
+        n: n.toString('base64url'),
+        e: e.toString('base64url'),
+      },
+      format: 'jwk',
+    });
+    return keyObj.export({ format: 'der', type: 'spki' });
+  }
+
+  // EdDSA: OKP Ed25519
+  if (kty === 1) {
+    if (alg != null && alg !== -8) {
+      throw new Error(`unsupported OKP COSE algorithm: ${String(alg)}`);
+    }
+    if (coseKey[-1] !== 6) throw new Error('COSE OKP key crv is not Ed25519');
+    const x = coseKey[-2];
+    if (!Buffer.isBuffer(x) || x.length !== 32) throw new Error('invalid COSE Ed25519 public key');
+    const keyObj = crypto.createPublicKey({
+      key: {
+        kty: 'OKP',
+        crv: 'Ed25519',
+        x: x.toString('base64url'),
+      },
+      format: 'jwk',
+    });
+    return keyObj.export({ format: 'der', type: 'spki' });
+  }
+
+  throw new Error(`unsupported COSE key type (kty): ${String(kty)}`);
 }
 
 // ---- registration verification -----------------------------------------------
@@ -369,6 +678,10 @@ function encodeDerLength(n        )         {
 // The stored Credential entity row the assertion verifier reads: the credential
 // id (base64url), the public key (DER/SPKI, base64url), and the last-seen sign
 // counter (replay protection).
+
+
+
+
 
 
 
@@ -432,7 +745,7 @@ export function verifyRegistration(challenge        , credential                
 
 // ---- authentication verification ---------------------------------------------
 
-// verifyAuthentication(challenge, credential, storedCredential, rp) → { signCount }
+// verifyAuthentication(challenge, credential, storedCredential, rp, options) → { signCount }
 // Verifies a WebAuthn assertion response against a stored Credential entity row.
 //
 // credential shape (from client):
@@ -441,8 +754,18 @@ export function verifyRegistration(challenge        , credential                
 // storedCredential shape: { credentialId, publicKey (base64url SPKI), signCount }
 //
 // Throws on any validation failure; on success returns the new signCount to
-// update the stored credential (replay protection).
-export function verifyAuthentication(challenge        , credential                     , storedCredential                  , rp                    )                        {
+// update the stored credential (replay protection). Enforces User Verification
+// (UV, bit 0x04) by default for passwordless passkey login; callers may pass
+// `{ requireUserVerification: false }` when UV is explicitly optional.
+export function verifyAuthentication(
+  challenge        ,
+  credential                     ,
+  storedCredential                  ,
+  rp                    ,
+  options                              = {},
+)                        {
+  const requireUserVerification = options.requireUserVerification ?? rp.requireUserVerification ?? true;
+
   // 1. Parse and validate clientDataJSON
   const clientData = parseClientDataJSON(credential.response.clientDataJSON);
 
@@ -466,9 +789,12 @@ export function verifyAuthentication(challenge        , credential              
     throw new Error('RP ID hash mismatch in authenticator data');
   }
 
-  // 4. Verify user present flag (UP, bit 0)
+  // 4. Verify user present flag (UP, bit 0) and user verified flag (UV, bit 2)
   if (!(parsed.flags & 0x01)) {
     throw new Error('user not present (UP flag not set)');
+  }
+  if (requireUserVerification && !(parsed.flags & 0x04)) {
+    throw new Error('user verification required (UV flag not set)');
   }
 
   // 5. Counter check (replay protection). If both are zero (first use of a
@@ -492,12 +818,76 @@ export function verifyAuthentication(challenge        , credential              
     type: 'spki',
   });
 
-  const valid = crypto.verify('sha256', signatureBase, publicKey, signature);
+  const keyType = publicKey.asymmetricKeyType;
+  let valid         ;
+  if (keyType === 'ed25519') {
+    valid = crypto.verify(null, signatureBase, publicKey, signature);
+  } else if (keyType === 'ec' || keyType === 'rsa') {
+    valid = crypto.verify('sha256', signatureBase, publicKey, signature);
+  } else {
+    throw new Error(`unsupported public key type: ${String(keyType)}`);
+  }
+
   if (!valid) {
     throw new Error('invalid signature on authentication assertion');
   }
 
   return { signCount: parsed.signCount };
+}
+
+// ---- CBOR encoding helpers (for synthetic test builders) ---------------------
+
+function encodeCborHead(major        , n        )         {
+  const prefix = major << 5;
+  if (n < 24) return Buffer.from([prefix | n]);
+  if (n < 0x100) return Buffer.from([prefix | 24, n]);
+  if (n < 0x10000) {
+    const b = Buffer.alloc(3);
+    b[0] = prefix | 25;
+    b.writeUInt16BE(n, 1);
+    return b;
+  }
+  const b = Buffer.alloc(5);
+  b[0] = prefix | 26;
+  b.writeUInt32BE(n, 1);
+  return b;
+}
+
+function encodeCborValue(value         )         {
+  if (value === false) return Buffer.from([0xf4]);
+  if (value === true) return Buffer.from([0xf5]);
+  if (value === null) return Buffer.from([0xf6]);
+  if (value === undefined) return Buffer.from([0xf7]);
+  if (typeof value === 'number') {
+    if (Number.isInteger(value)) {
+      if (value >= 0) return encodeCborHead(0, value);
+      return encodeCborHead(1, -1 - value);
+    }
+    const b = Buffer.alloc(9);
+    b[0] = 0xfb;
+    b.writeDoubleBE(value, 1);
+    return b;
+  }
+  if (Buffer.isBuffer(value)) {
+    return Buffer.concat([encodeCborHead(2, value.length), value]);
+  }
+  if (typeof value === 'string') {
+    const utf8 = Buffer.from(value, 'utf-8');
+    return Buffer.concat([encodeCborHead(3, utf8.length), utf8]);
+  }
+  if (Array.isArray(value)) {
+    return Buffer.concat([encodeCborHead(4, value.length), ...value.map(encodeCborValue)]);
+  }
+  if (typeof value === 'object') {
+    const entries = Object.entries(value                           );
+    const parts = [encodeCborHead(5, entries.length)];
+    for (const [k, v] of entries) {
+      const numericKey = /^-?\d+$/.test(k) ? Number(k) : k;
+      parts.push(encodeCborValue(numericKey), encodeCborValue(v));
+    }
+    return Buffer.concat(parts);
+  }
+  throw new Error(`cannot CBOR-encode value of type ${typeof value}`);
 }
 
 // ---- synthetic credential builders (for testing) -----------------------------
@@ -555,90 +945,46 @@ export function buildClientDataJSON({ challenge, origin, type }
 }
 
 // signAssertion(privateKey, authenticatorData, clientDataJSON) → base64url sig.
-// Signs authenticatorData || SHA256(clientDataJSON) with the given privateKey.
+// Signs authenticatorData || SHA256(clientDataJSON) with the given privateKey
+// (supports EC P-256, RSA RS256, and Ed25519 EdDSA).
 export function signAssertion(privateKey           , authenticatorDataBuf        , clientDataJSONBase64url        )         {
   const clientDataHash = sha256(base64urlToBuffer(clientDataJSONBase64url));
   const signatureBase = Buffer.concat([authenticatorDataBuf, clientDataHash]);
+  if (privateKey.asymmetricKeyType === 'ed25519') {
+    return crypto.sign(null, signatureBase, privateKey).toString('base64url');
+  }
   return crypto.sign('sha256', signatureBase, privateKey).toString('base64url');
 }
 
-// cosePublicKeyFromKeyPair(keypair) → base64url of COSE-encoded P-256 public key.
-// For constructing synthetic attestation authData with the keypair's public key
-// in the COSE format an authenticator would embed.
+// cosePublicKeyFromKeyPair(keypair) → base64url of COSE-encoded public key.
+// Supports EC P-256 (ES256), RSA (RS256), and OKP Ed25519 (EdDSA).
 export function cosePublicKeyFromKeyPair(keypair
 
  )         {
   const jwk = keypair.publicKey.export({ format: 'jwk' });
+  if (jwk.kty === 'RSA') {
+    const n = base64urlToBuffer(jwk.n );
+    const e = base64urlToBuffer(jwk.e );
+    return encodeCborValue({ 1: 3, 3: -257, '-1': n, '-2': e }).toString('base64url');
+  }
+  if (jwk.kty === 'OKP' && jwk.crv === 'Ed25519') {
+    const x = base64urlToBuffer(jwk.x );
+    return encodeCborValue({ 1: 1, 3: -8, '-1': 6, '-2': x }).toString('base64url');
+  }
+  // Default: EC P-256 (ES256)
   const x = base64urlToBuffer(jwk.x );
   const y = base64urlToBuffer(jwk.y );
-
-  // Build COSE_Key for P-256 (ES256):
-  //   { 1: 2, 3: -7, -1: 1, -2: h'x', -3: h'y' }
-  // CBOR encoding:
-  //   A5          # map(5)
-  //     01 02     # 1: 2
-  //     03 26     # 3: -7 (0x20 + 6 = 0x26)
-  //     20 01     # -1: 1 (0x20 + 0 = 0x20)
-  //     21 58 20  # -2: bytes(32)  (0x20 + 1 = 0x21)
-  //        <x bytes 32>
-  //     22 58 20  # -3: bytes(32)  (0x20 + 2 = 0x22)
-  //        <y bytes 32>
-  const parts = [
-    Buffer.from([0xa5]),                     // map(5)
-    Buffer.from([0x01, 0x02]),              // 1: 2
-    Buffer.from([0x03, 0x26]),              // 3: -7
-    Buffer.from([0x20, 0x01]),              // -1: 1
-    Buffer.from([0x21, 0x58, 0x20, ...x]), // -2: bytes(32)
-    Buffer.from([0x22, 0x58, 0x20, ...y]), // -3: bytes(32)
-  ];
-  return Buffer.concat(parts).toString('base64url');
+  return encodeCborValue({ 1: 2, 3: -7, '-1': 1, '-2': x, '-3': y }).toString('base64url');
 }
 
-// buildAttestationObject({ fmt, authData }) → base64url-encoded CBOR.
-// Constructs a minimal CBOR attestation object for test registration.
-//   { "fmt": fmt, "attStmt": {}, "authData": authData }
-export function buildAttestationObject({ fmt = 'none', authData }
+// buildAttestationObject({ fmt, attStmt, authData }) → base64url-encoded CBOR.
+// Constructs a CBOR attestation object for test registration.
+//   { "fmt": fmt, "attStmt": attStmt, "authData": authData }
+export function buildAttestationObject({ fmt = 'none', attStmt = {}, authData }
+
 
 
  )         {
   const authDataBuf = typeof authData === 'string' ? base64urlToBuffer(authData) : authData;
-  const fmtBuf = Buffer.from(fmt, 'utf-8');
-
-  // Build CBOR: A3 — map(3)
-  //   key "fmt" (text(3)) → value text(len(fmt))
-  //   key "attStmt" (text(7)) → value map(0) = A0
-  //   key "authData" (text(8)) → value bytes(len(authData))
-  const cborFmtKey = Buffer.from([0x63, 0x66, 0x6d, 0x74]); // text(3) "fmt"
-  const cborFmtVal = Buffer.concat([Buffer.from([0x60 + fmtBuf.length]), fmtBuf]);
-  const cborAttStmtKey = Buffer.from([0x67, 0x61, 0x74, 0x74, 0x53, 0x74, 0x6d, 0x74]); // text(7) "attStmt"
-  const cborAttStmtVal = Buffer.from([0xa0]); // map(0)
-  const cborAuthDataKey = Buffer.from([0x68, 0x61, 0x75, 0x74, 0x68, 0x44, 0x61, 0x74, 0x61]); // text(8) "authData"
-
-  // Byte string encoding for authData
-  let byteStrHeader;
-  if (authDataBuf.length < 24) {
-    byteStrHeader = Buffer.from([0x40 + authDataBuf.length]);
-  } else if (authDataBuf.length < 0x100) {
-    byteStrHeader = Buffer.from([0x58, authDataBuf.length]);
-  } else if (authDataBuf.length < 0x10000) {
-    const h = Buffer.alloc(3);
-    h[0] = 0x59;
-    h.writeUInt16BE(authDataBuf.length, 1);
-    byteStrHeader = h;
-  } else {
-    const h = Buffer.alloc(5);
-    h[0] = 0x5a;
-    h.writeUInt32BE(authDataBuf.length, 1);
-    byteStrHeader = h;
-  }
-
-  // Count elements in the map for the header
-  const cborHeader = Buffer.from([0xa3]); // map(3)
-
-  return Buffer.concat([
-    cborHeader,
-    cborFmtKey, cborFmtVal,
-    cborAttStmtKey, cborAttStmtVal,
-    cborAuthDataKey, byteStrHeader, authDataBuf,
-  ]).toString('base64url');
+  return encodeCborValue({ fmt, attStmt, authData: authDataBuf }).toString('base64url');
 }

@@ -24,6 +24,7 @@
 // split: workbench owns challenge issue/verify + credential storage; the app owns
 // the UI (button, prompt, error display).
 
+import { randomBytes, randomUUID } from 'node:crypto';
 import { router } from '../app.mjs';
 import { admin } from '../grant.mjs';
 import { allowAnonymous, requireUser } from '../route-gate.mjs';
@@ -32,24 +33,27 @@ import { createInvitationApi } from './invitation.mjs';
 import {
   sessionCookie,
   sessionTokenOf,
+  hashSessionToken,
   SESSION_COOKIE,
   isValidApiKeyEntityName,
   isReservedApiKeyEntityName,
   isValidApiKeyRole,
 } from './session.mjs';
 import { config,                      } from '../config.mjs';
-import { verifyTotp, verifyBackupCode } from './totp.mjs';
-import { loginChallengeStore } from './login-challenge.mjs';
+import { verifyTotpStep, verifyBackupCode } from './totp.mjs';
+import { loginChallengeStore as defaultLoginChallengeStore, createLoginChallengeStore } from './login-challenge.mjs';
 import { evaluateLockout, nextFailedAttemptCount, loginLockoutDecision, totpLockoutDecision } from './lockout.mjs';
 import { txn, begin, commit, rollback,               } from '../driver.mjs';
-import { serializeField, verifyHash } from '../field-strategy.mjs';
+import { hashPasswordAsync, verifyHashAsync } from '../field-strategy.mjs';
 import {
   generateChallenge,
-  challengeStore,
+  challengeStore as defaultPasskeyChallengeStore,
+  createChallengeStore,
   verifyRegistration,
   verifyAuthentication,
   rpConfig,
   parseClientDataJSON,
+
 } from './passkey.mjs';
 
 
@@ -61,6 +65,38 @@ import {
 // res is the response facade, and next forwards an error to the error renderer.
 // The entity facades (User, Session, ...) are compiled bindings from the untyped
 // entity layer, so they stay `any`; the request surface is pinned here.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -169,10 +205,33 @@ async function authorizeScopedApiKey({
 
 // A scrypt digest of a random password that was never stored anywhere: the
 // login route verifies a miss against it so an unknown identity costs the same
-// one scrypt a known identity's wrong password costs (see the login route).
-// `salt:digest` is the stored-cell shape `verifyHash` reads.
+// one async scrypt a known identity's wrong password costs (see the login route).
+// The `scrypt:` prefix ensures the decoy check runs native scrypt once and
+// never falls through to legacy better-auth scrypt.
 const LOGIN_DECOY_HASH =
-  '57fe0f27ec0e50aae5f5a04d905cb5d5:9e2aeee12a38d92ff7d9c544c79e335c447e6c26390af3468ade7abc44390da2adc3fe72e0674c280b0d0f445284698372a45fe088fa18ac2b52e86abeb56947';
+  'scrypt:57fe0f27ec0e50aae5f5a04d905cb5d5:9e2aeee12a38d92ff7d9c544c79e335c447e6c26390af3468ade7abc44390da2adc3fe72e0674c280b0d0f445284698372a45fe088fa18ac2b52e86abeb56947';
+
+const DEFAULT_MIN_PASSWORD_LENGTH = 8;
+const DEFAULT_PASSWORD_RESET_TTL_MS = 60 * 60 * 1000; // 1 hour
+const TOTP_REPLAY_TTL_MS = 120_000; // > 90s (±1 step) window
+const TOTP_REPLAY_MAX_ENTRIES = 10_000;
+const SHA256_HEX_RE = /^[0-9a-f]{64}$/i;
+const SAFE_SQL_IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+function parseSessionCreatedAtMs(value         )                {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (value instanceof Date) {
+    const ts = value.getTime();
+    return Number.isFinite(ts) ? ts : null;
+  }
+  if (typeof value !== 'string') return null;
+  if (/^-?\d+(?:\.\d+)?$/.test(value)) {
+    const ts = Number(value);
+    return Number.isFinite(ts) ? ts : null;
+  }
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) && new Date(parsed).toISOString() === value ? parsed : null;
+}
 
 // Build the `/auth` router. `secure` follows the app env (true only in
 // production) so the same fail-closed cookie attributes apply on login and
@@ -190,6 +249,16 @@ export function authRoutes({
   secure = config.env === 'production',
   identifyBy = ['username'],
   minimumPasswordLength,
+  sessionDurationMs = config.sessionDurationMs,
+  totpIssuer = 'workbench',
+  requireUserVerification = true,
+  persistChallenges = false,
+  passkeyChallengeStore: suppliedPasskeyStore,
+  loginChallengeStore: suppliedLoginStore,
+  emailSeam,
+  app: emailApp,
+  sendPasswordResetEmail,
+  passwordResetTtlMs = DEFAULT_PASSWORD_RESET_TTL_MS,
   authorizeApiKey,
   entities,
   db: maybeDb,
@@ -203,12 +272,58 @@ export function authRoutes({
   const db           = maybeDb;
   const { User, Session, Credential, Invitation, ApiKey, TwoFactor } = entities;
   const { createInvitation, acceptInvitation, rejectInvitation, listInvitationsForUser } = createInvitationApi({ Invitation });
+  const passkeyStore                 = suppliedPasskeyStore
+    ?? (persistChallenges ? createChallengeStore({ db }) : defaultPasskeyChallengeStore);
+  const activeLoginChallengeStore = suppliedLoginStore
+    ?? (persistChallenges ? createLoginChallengeStore(undefined, undefined, undefined, { db }) : defaultLoginChallengeStore);
   const s = router();
   const identityFields = Array.isArray(identifyBy) && identifyBy.length > 0 ? identifyBy : ['username'];
-  // The app's password policy belongs at this mount: registration and password
-  // change are the two routes that set a password. An absent/zero floor keeps
-  // the framework default (no minimum), so existing apps are unchanged.
-  const passwordFloor = Number.isInteger(minimumPasswordLength) && (minimumPasswordLength          ) > 0 ? (minimumPasswordLength          ) : 0;
+  // Password length floor defaults to 8 characters; apps may raise it or pass 0
+  // explicitly if they manage their own password policy upstream.
+  const passwordFloor = minimumPasswordLength === undefined
+    ? DEFAULT_MIN_PASSWORD_LENGTH
+    : (Number.isInteger(minimumPasswordLength) && minimumPasswordLength > 0 ? minimumPasswordLength : 0);
+  const resetTtlMs = typeof passwordResetTtlMs === 'number' && Number.isFinite(passwordResetTtlMs) && passwordResetTtlMs > 0
+    ? passwordResetTtlMs
+    : DEFAULT_PASSWORD_RESET_TTL_MS;
+
+  let authIndexesEnsured = false;
+  function ensureAuthIndexes()       {
+    if (authIndexesEnsured) return;
+    authIndexesEnsured = true;
+    const statements = [
+      'CREATE INDEX IF NOT EXISTS idx_User_email_lower ON User (lower(trim(email)))',
+      'CREATE INDEX IF NOT EXISTS idx_User_username ON User (username)',
+      'CREATE INDEX IF NOT EXISTS idx_Session_token ON Session (token)',
+      'CREATE INDEX IF NOT EXISTS idx_Session_principal ON Session (principalType, principalId)',
+      'CREATE UNIQUE INDEX IF NOT EXISTS idx_Credential_credentialId ON Credential (credentialId)',
+    ];
+    for (const sql of statements) {
+      try {
+        db.prepare(sql).run();
+      } catch {
+        // Table or optional column may not exist in a partial test schema.
+      }
+    }
+  }
+
+  let passwordResetTableEnsured = false;
+  function ensurePasswordResetTable()       {
+    if (passwordResetTableEnsured) return;
+    db.prepare(`
+      CREATE TABLE IF NOT EXISTS _PasswordResetToken (
+        id TEXT PRIMARY KEY,
+        userId TEXT NOT NULL,
+        tokenHash TEXT NOT NULL UNIQUE,
+        expiresAt INTEGER NOT NULL,
+        usedAt INTEGER,
+        createdAt INTEGER NOT NULL
+      )
+    `).run();
+    db.prepare('CREATE INDEX IF NOT EXISTS idx__PasswordResetToken_userId ON _PasswordResetToken (userId)').run();
+    passwordResetTableEnsured = true;
+  }
+
   function passwordRefusal(password         )                                             {
     if (typeof password !== 'string') return { status: 400, message: 'password must be a string' };
     if (passwordFloor > 0 && password.length < passwordFloor) {
@@ -223,18 +338,85 @@ export function authRoutes({
     return Object.fromEntries(INVITATION_FIELDS.map(f => [f, inv[f]]));
   }
 
+  // Bounded TOTP replay guard: tracks `(userId, secret, counter)` entries for
+  // 120s (> 90s ±1 window) in memory alongside the persistent `lastTotpCounter`
+  // column on TwoFactor so replaying the same code within the validity window
+  // is rejected.
+  const totpReplayMap = new Map                ();
+
+  function totpReplayKey(userId        , secret        , counter        )         {
+    return `${userId}:${secret}:${counter}`;
+  }
+
+  function sweepTotpReplayMap(now        )       {
+    for (const [key, expiresAt] of totpReplayMap) {
+      if (expiresAt <= now) totpReplayMap.delete(key);
+    }
+  }
+
+  function isTotpCounterReplayed(
+    userId        ,
+    twoFactor                                                     ,
+    counter        ,
+  )          {
+    const now = Date.now();
+    if (typeof twoFactor.lastTotpCounter === 'number' && counter <= twoFactor.lastTotpCounter) {
+      return true;
+    }
+    const key = totpReplayKey(userId, twoFactor.secret, counter);
+    const exp = totpReplayMap.get(key);
+    if (exp !== undefined) {
+      if (exp > now) return true;
+      totpReplayMap.delete(key);
+    }
+    return false;
+  }
+
+  function recordTotpCounterMemory(userId        , secret        , counter        )       {
+    const now = Date.now();
+    if (totpReplayMap.size >= TOTP_REPLAY_MAX_ENTRIES) {
+      sweepTotpReplayMap(now);
+      for (const k of totpReplayMap.keys()) {
+        if (totpReplayMap.size < TOTP_REPLAY_MAX_ENTRIES) break;
+        totpReplayMap.delete(k);
+      }
+    }
+    totpReplayMap.set(totpReplayKey(userId, secret, counter), now + TOTP_REPLAY_TTL_MS);
+  }
+
+  function persistTotpCounterDb(twoFactorId         , counter        )       {
+    try {
+      db.prepare('UPDATE TwoFactor SET lastTotpCounter = ? WHERE id = ?').run(counter, twoFactorId);
+    } catch {
+      // Legacy TwoFactor table without lastTotpCounter column — in-memory guard still applies.
+    }
+  }
+
   // TOTP backup-code verification helper — shared by disable and authenticate routes.
-  function verifyTotpOrBackupCode(twoFactor                                                 , token        )                                                                   {
+  function verifyTotpOrBackupCode(
+    userId        ,
+    twoFactor                                                                                  ,
+    token        ,
+  )                                                                                               {
     const backupCodes = JSON.parse(twoFactor.backupCodes || '[]');
-    const isTotpValid = verifyTotp(twoFactor.secret, token);
+    const stepResult = verifyTotpStep(twoFactor.secret, token);
+    const isTotpValid = stepResult.valid
+      && stepResult.counter !== null
+      && !isTotpCounterReplayed(userId, twoFactor, stepResult.counter);
     const isBackupValid = verifyBackupCode(backupCodes, token);
-    return { isValid: isTotpValid || isBackupValid, usedBackup: isBackupValid, backupCodes };
+    return {
+      isValid: isTotpValid || isBackupValid,
+      usedBackup: isBackupValid,
+      totpCounter: isTotpValid ? stepResult.counter : null,
+      backupCodes,
+    };
   }
 
   // The shared outcome of settling one second-factor token (the disable and
   // authenticate routes each settle inside their own driver transaction):
   //   - 'ok'      — the token was valid; the TOTP fence was reset and a backup
-  //                 code's removal was persisted in the caller's transaction.
+  //                 code's removal (or TOTP replay step) was persisted in the
+  //                 caller's transaction.
   //   - 'invalid' — a failed non-backup attempt; the failed-attempt/lockout
   //                 counters were advanced in the caller's transaction.
   //   - 'locked'  — the TOTP fence is active and the token is not a backup code;
@@ -274,9 +456,9 @@ export function authRoutes({
   // removed and rejects. A backup code is only removed here — never by a
   // read-only pre-check — so the removal commits atomically with the caller's
   // final write (a minted Session or a deleted enrollment).
-  function settleSecondFactor(row     , token        )                      {
+  function settleSecondFactor(userId        , row     , token        )                      {
     const verdict = evaluateLockout(row.totpFailedAttempts, row.totpLockedUntil);
-    const { isValid, usedBackup, backupCodes } = verifyTotpOrBackupCode(row, token);
+    const { isValid, usedBackup, totpCounter, backupCodes } = verifyTotpOrBackupCode(userId, row, token);
     // Only a backup code may lift an ACTIVE lock; a TOTP token — valid or not —
     // is rejected while the lock holds, and the failed-attempt counter is not
     // advanced (the lock itself already throttles).
@@ -292,51 +474,105 @@ export function authRoutes({
       recordTotpFailure(row, verdict.locked ? false : verdict.resetAttempts);
       return { kind: 'invalid' };
     }
-    // Valid: clear the TOTP fence; a backup code's one-time consumption is
-    // persisted here, inside the caller's transaction.
+    // Valid: clear the TOTP fence; a backup code's one-time consumption or
+    // TOTP replay step is persisted here, inside the caller's transaction.
     db.prepare('UPDATE TwoFactor SET totpFailedAttempts = 0, totpLockedUntil = NULL WHERE id = ?')
       .run(row.id);
     if (usedBackup) {
       db.prepare('UPDATE TwoFactor SET backupCodes = ? WHERE id = ?')
         .run(JSON.stringify(backupCodes), row.id);
+    } else if (totpCounter !== null) {
+      persistTotpCounterDb(row.id, totpCounter);
     }
-    return { kind: 'ok', usedBackup };
+    return { kind: 'ok', usedBackup, totpCounter, secret: row.secret };
   }
 
-  function findIdentity(credential         , next          )                                 {
+  function rawPasswordOfUser(userId         )                {
+    const row = db.prepare('SELECT password FROM User WHERE id = ?').get(userId)                                      ;
+    return typeof row?.password === 'string' ? row.password : null;
+  }
+
+  function recordLoginFailure(
+    user                                                                                   ,
+    resetAttempts         ,
+  )       {
+    const attempts = nextFailedAttemptCount(resetAttempts, user.failedLoginAttempts);
+    const decision = loginLockoutDecision({ attempts });
+    if (decision) {
+      db.prepare('UPDATE User SET failedLoginAttempts = ?, lockedUntil = ? WHERE id = ?')
+        .run(attempts, decision.lockedUntil, user.id);
+    } else {
+      db.prepare('UPDATE User SET failedLoginAttempts = ?, lockedUntil = ? WHERE id = ?')
+        .run(attempts, resetAttempts ? null : user.lockedUntil, user.id);
+    }
+  }
+
+  function findIdentity(credential         , next          )                                                             {
+    ensureAuthIndexes();
     for (const name of identityFields) {
       const field = User[name];
       if (!field) {
         next({ status: 500, message: `identifyBy references unknown User field '${name}'` });
-        return { failed: true, user: null };
+        return { failed: true, user: null, rawPassword: null };
       }
-      // Email is one identity regardless of case (#7602): a re-cased credential
-      // previously matched nothing and was reported as bad credentials. Fold the
-      // typed address and each stored address; refuse an ambiguous fold rather
-      // than silently picking one of two case-variant accounts.
+      // Email is one identity regardless of case (#7602): perform a direct
+      // indexed SQL lookup (LIMIT 2 to detect ambiguous case-variant duplicates)
+      // rather than an O(N) full-table JS scan.
       if (name === 'email') {
         const typedEmail = typeof credential === 'string' ? credential.trim().toLowerCase() : '';
         if (typedEmail) {
-          const matches = User.findAll().filter(
-            (candidate     ) => typeof candidate.email === 'string' && candidate.email.trim().toLowerCase() === typedEmail,
-          );
+          const matches = db.prepare(
+            'SELECT * FROM User WHERE lower(trim(email)) = ? LIMIT 2',
+          ).all(typedEmail)                             ;
           if (matches.length > 1) {
             next({ status: 409, message: 'This email matches more than one account; ask the server administrator to resolve it' });
-            return { failed: true, user: null };
+            return { failed: true, user: null, rawPassword: null };
           }
-          if (matches.length === 1) return { user: matches[0], failed: false };
+          if (matches.length === 1) {
+            const rawRow = matches[0];
+            const rawPassword = typeof rawRow.password === 'string' ? rawRow.password : null;
+            const user = typeof User.hydrate === 'function' ? User.hydrate({ ...rawRow }) : User.findById(rawRow.id);
+            return { user, rawPassword, failed: false };
+          }
         }
         continue;
       }
       const user = User.findOne(field.is(credential));
-      if (user) return { user, failed: false };
+      if (user) {
+        return { user, rawPassword: rawPasswordOfUser(user.id), failed: false };
+      }
     }
-    return { user: null, failed: false };
+    return { user: null, rawPassword: null, failed: false };
+  }
+
+  function findSessionRowByToken(plainToken        )                                                                                        {
+    const stmt = db.prepare('SELECT id, principalType, principalId, createdAt FROM Session WHERE token = ? LIMIT 1');
+    const tokenHash = hashSessionToken(plainToken);
+    const hashed = stmt.get(tokenHash)                                                                                              ;
+    if (hashed) return hashed;
+    if (!SHA256_HEX_RE.test(plainToken)) {
+      const legacy = stmt.get(plainToken)                                                                                              ;
+      if (legacy) return legacy;
+    }
+    return null;
+  }
+
+  function revokeOtherSessions(userId         , req             )       {
+    const currentToken = sessionTokenOf(req);
+    const currentRow = currentToken ? findSessionRowByToken(currentToken) : null;
+    if (currentRow && currentRow.principalType === 'user' && String(currentRow.principalId) === String(userId)) {
+      db.prepare("DELETE FROM Session WHERE principalType = 'user' AND principalId = ? AND id != ?")
+        .run(String(userId), currentRow.id);
+    } else {
+      db.prepare("DELETE FROM Session WHERE principalType = 'user' AND principalId = ?")
+        .run(String(userId));
+    }
   }
 
   function createSessionResponse(user                                  , res              ) {
+    ensureAuthIndexes();
     const session = Session.create({ userId: user.id });
-    res.setHeader('set-cookie', sessionCookie(session.token, { secure }));
+    res.setHeader('set-cookie', sessionCookie(session.token, { secure, ttlMs: sessionDurationMs }));
     res.status(201).json({ user: { id: user.id, username: user.username } });
   }
 
@@ -352,7 +588,15 @@ export function authRoutes({
     const found = findIdentity(username, next);
     if (found.failed) return;
     if (found.user) return next({ status: 409, message: 'account already exists' });
-    const user = User.create({ [identityFields[0]]: username, password });
+    const primaryField = identityFields[0];
+    if (!SAFE_SQL_IDENT_RE.test(primaryField) || !User[primaryField]) {
+      return next({ status: 500, message: `identifyBy references unknown User field '${primaryField}'` });
+    }
+    const hashedPassword = await hashPasswordAsync(password          );
+    const id = randomUUID();
+    db.prepare(`INSERT INTO User (id, ${primaryField}, password) VALUES (?, ?, ?)`)
+      .run(id, String(username), hashedPassword);
+    const user = User.getOrFail(id);
     createSessionResponse(user, res);
   });
 
@@ -370,50 +614,21 @@ export function authRoutes({
       // login route is unauthenticated, so either difference is an account
       // enumeration oracle. `bad credentials` is that shared answer.
       //
-      // The work is equalized too: a known identity pays one scrypt in
-      // `user.password.verify` below, so the miss pays one against a hash
-      // nobody knows. Without it the status would stop answering the question
-      // while the response time kept answering it.
-      verifyHash(password, LOGIN_DECOY_HASH);
+      // The work is equalized too: a known identity pays one async scrypt in
+      // `verifyHashAsync` below, so the miss pays one against a hash nobody
+      // knows without blocking the event loop.
+      await verifyHashAsync(password, LOGIN_DECOY_HASH);
       return next({ status: 401, message: 'bad credentials' });
     }
     {
-      // A lock that has expired must not let the stale failed-attempt counter
-      // instantly relock the next wrong password, so the count restarts at 0.
-      //
-      // An active lock answers `bad credentials`, not a distinct status: only
-      // existing accounts can be locked, so a lockout-only status or body told
-      // an unauthenticated caller that the address it guessed was real. The
-      // lock still refuses the attempt (a correct password included) for its
-      // whole window; what changed is that the refusal is indistinguishable
-      // from the wrong-password refusal it is already indistinguishable from
-      // in intent. The alternative — a uniform lockout for every address —
-      // would let anyone lock out any address, so it is not taken.
-      //
-      // The verdict is read before the password is checked, but the check runs
-      // anyway — including while the lock is active. That is the timing half of
-      // the same property: an address that has been locked (three failures) and
-      // an address that never existed must both cost one scrypt, or the fourth
-      // probe answers by duration what the status no longer answers.
       const verdict = evaluateLockout(user.failedLoginAttempts, user.lockedUntil);
-      const passwordMatches = user.password.verify(password);
+      const passwordMatches = await verifyHashAsync(password, found.rawPassword);
       if (verdict.locked) {
         return next({ status: 401, message: 'bad credentials' });
       }
       if (!passwordMatches) {
         // Failed attempt: increment counter and optionally lock the account.
-        const attempts = nextFailedAttemptCount(verdict.resetAttempts, user.failedLoginAttempts);
-        const decision = loginLockoutDecision({ attempts });
-        if (decision) {
-          db.prepare('UPDATE User SET failedLoginAttempts = ?, lockedUntil = ? WHERE id = ?')
-            .run(attempts, decision.lockedUntil, user.id);
-        } else {
-          // Clearing the expired lock's stale timestamp along with the counter
-          // so the series re-accumulates from 0 instead of being frozen at 1
-          // (which would let the account bypass re-locking entirely).
-          db.prepare('UPDATE User SET failedLoginAttempts = ?, lockedUntil = ? WHERE id = ?')
-            .run(attempts, verdict.resetAttempts ? null : user.lockedUntil, user.id);
-        }
+        recordLoginFailure(user, verdict.resetAttempts);
         return next({ status: 401, message: 'bad credentials' });
       }
       // Successful login: reset lockout counter.
@@ -429,7 +644,7 @@ export function authRoutes({
     // the caller passed this user's password.
     const twoFactor = TwoFactor.findOne(TwoFactor.userId.is(user.id));
     if (twoFactor && twoFactor.enabled === 1) {
-      const challenge = loginChallengeStore.set(user.id);
+      const challenge = activeLoginChallengeStore.set(user.id);
       return res.json({ requiresTotp: true, challenge, userId: user.id });
     }
     createSessionResponse(user, res);
@@ -437,17 +652,67 @@ export function authRoutes({
 
   // logout: inherits the default-on `requireUser` gate, so a caller without a
   // valid session is denied at the gate before reaching here. Read the opaque
-  // sid token from the cookie, delete that Session row, and clear the cookie
-  // with the SAME attributes plus Max-Age=0 so the browser drops it. 204.
+  // sid token from the cookie, delete that Session row (by SHA-256 hash), and
+  // clear the cookie with the SAME attributes plus Max-Age=0 so the browser
+  // drops it. 204.
   s.post('/logout', async (req             , res              ) => {
     const token = sessionTokenOf(req);
     if (token) {
-      const row = Session.findOne(Session.token.is(token));
+      const row = findSessionRowByToken(token);
       if (row) Session.delete(row.id);
     }
     // Max-Age=0 expires the cookie immediately; the attributes match login so
     // the browser scopes the deletion to the same cookie (Path/Domain match).
-    res.setHeader('set-cookie', `${sessionCookie('', { secure })}; Max-Age=0`);
+    res.setHeader('set-cookie', sessionCookie('', { secure, maxAge: 0 }));
+    res.sendStatus(204);
+  });
+
+  // GET /auth/sessions — list the current user's active sessions without
+  // exposing stored token hashes.
+  s.get('/sessions', requireUser(), (req             , res              , next          ) => {
+    if (req.principal.type !== 'user') {
+      return next({ status: 403, message: 'a user principal is required to list sessions' });
+    }
+    const currentToken = sessionTokenOf(req);
+    const currentRow = currentToken ? findSessionRowByToken(currentToken) : null;
+    const rows = db.prepare(
+      "SELECT id, createdAt FROM Session WHERE principalType = 'user' AND principalId = ? ORDER BY createdAt DESC",
+    ).all(String(req.principal.id))                                             ;
+    const now = Date.now();
+    const active = rows
+      .filter((row) => {
+        const createdAt = parseSessionCreatedAtMs(row.createdAt);
+        return createdAt !== null && createdAt <= now && now - createdAt < sessionDurationMs;
+      })
+      .map((row) => ({
+        id: row.id,
+        createdAt: row.createdAt,
+        current: currentRow !== null && row.id === currentRow.id,
+      }));
+    res.json(active);
+  });
+
+  // DELETE /auth/sessions/:id — revoke one of the current user's sessions.
+  s.delete('/sessions/:id', requireUser(), (req             , res              , next          ) => {
+    if (req.principal.type !== 'user') {
+      return next({ status: 403, message: 'a user principal is required to revoke a session' });
+    }
+    const { id } = req.params;
+    const row = db.prepare(
+      'SELECT id, principalType, principalId FROM Session WHERE id = ? LIMIT 1',
+    ).get(id)                                                                          ;
+    if (!row) {
+      return next({ status: 404, message: 'session not found' });
+    }
+    if (row.principalType !== 'user' || String(row.principalId) !== String(req.principal.id)) {
+      return next({ status: 403, message: 'not your session' });
+    }
+    const currentToken = sessionTokenOf(req);
+    const currentRow = currentToken ? findSessionRowByToken(currentToken) : null;
+    Session.delete(row.id);
+    if (currentRow && currentRow.id === row.id) {
+      res.setHeader('set-cookie', sessionCookie('', { secure, maxAge: 0 }));
+    }
     res.sendStatus(204);
   });
 
@@ -473,9 +738,10 @@ export function authRoutes({
 
   // POST /auth/change-password — update the authenticated user's password.
   // requireUser(): only a valid session may change its own password. Verifies
-  // the current password against the stored hash before setting the new one.
+  // the current password asynchronously against the stored hash before setting
+  // the new one, and revokes all other active sessions for that user.
   // 204 on success; 400 if the body is incomplete, 401 if wrong current pw.
-  s.post('/change-password', requireUser(), (req             , res              , next          ) => {
+  s.post('/change-password', requireUser(), async (req             , res              , next          ) => {
     const { currentPassword, newPassword } = req.body ?? {};
     if (!currentPassword || !newPassword) {
       return next({ status: 400, message: 'currentPassword and newPassword are required' });
@@ -483,15 +749,129 @@ export function authRoutes({
     const passwordProblem = passwordRefusal(newPassword);
     if (passwordProblem) return next(passwordProblem);
     const user = User.getOrFail(req.principal.id);
-    if (!user || !user.password.verify(currentPassword)) {
+    const storedPassword = user ? rawPasswordOfUser(user.id) : null;
+    if (!user || !(await verifyHashAsync(currentPassword, storedPassword))) {
       return next({ status: 401, message: 'current password is incorrect' });
     }
-    // Re-digest the new password through the hash field strategy rather than
-    // going through the entity action-dispatch pipeline (which needs authz
-    // gate resolution). This matches the existing pattern for framework-internal
-    // auth mutations — TOTP disable uses raw SQL at auth-routes.mjs:494).
-    const serialized = serializeField({ kind: 'hash', type: 'hash' }, newPassword);
+    const serialized = await hashPasswordAsync(newPassword          );
     db.prepare('UPDATE User SET password = ? WHERE id = ?').run(serialized, user.id);
+    revokeOtherSessions(user.id, req);
+    res.sendStatus(204);
+  });
+
+  // POST /auth/password-reset/request — issue a single-use expiring password
+  // reset token (stored SHA-256 hashed) and deliver it via emailSeam when
+  // configured. Always returns 200 { ok: true } to prevent account enumeration.
+  s.post('/password-reset/request', allowAnonymous(), async (req             , res              , next          ) => {
+    const identifier = req.body?.email ?? req.body?.username;
+    if (typeof identifier !== 'string' || identifier.trim().length === 0) {
+      return next({ status: 400, message: 'email or username is required' });
+    }
+    ensurePasswordResetTable();
+    const found = findIdentity(identifier, next);
+    if (found.failed) return;
+    let user = found.user;
+    if (!user && typeof req.body?.email === 'string' && !identityFields.includes('email')) {
+      const normalized = req.body.email.trim().toLowerCase();
+      const rows = db.prepare('SELECT * FROM User WHERE lower(trim(email)) = ? LIMIT 2')
+        .all(normalized)                             ;
+      if (rows.length === 1) {
+        user = typeof User.hydrate === 'function' ? User.hydrate({ ...rows[0] }) : User.findById(rows[0].id);
+      }
+    }
+    if (user) {
+      const plainToken = randomBytes(32).toString('base64url');
+      const tokenHash = hashSessionToken(plainToken);
+      const now = Date.now();
+      const expiresAt = now + resetTtlMs;
+      db.prepare('DELETE FROM _PasswordResetToken WHERE userId = ? AND usedAt IS NULL').run(String(user.id));
+      db.prepare(
+        'INSERT INTO _PasswordResetToken (id, userId, tokenHash, expiresAt, usedAt, createdAt) VALUES (?, ?, ?, ?, NULL, ?)',
+      ).run(randomUUID(), String(user.id), tokenHash, expiresAt, now);
+
+      const to = String(user.email || user.username || identifier);
+      const emailPayload = {
+        to,
+        subject: 'Password reset',
+        body: `Use this single-use token to reset your password: ${plainToken}`,
+      };
+      if (emailSeam) {
+        try {
+          if (emailApp?.jobs && typeof emailSeam.send === 'function') {
+            emailSeam.send(emailApp, emailPayload);
+          } else if (typeof emailSeam.transport === 'function') {
+            await emailSeam.transport(emailPayload);
+          }
+        } catch {
+          // Best-effort post-commit delivery; do not leak delivery failures.
+        }
+      }
+      if (typeof sendPasswordResetEmail === 'function') {
+        try {
+          await sendPasswordResetEmail({
+            user: { id: String(user.id), username: user.username ?? null, email: user.email ?? null },
+            to,
+            token: plainToken,
+            expiresAt,
+          });
+        } catch {
+          // Best-effort delivery; do not leak failures.
+        }
+      }
+    }
+    res.status(200).json({ ok: true });
+  });
+
+  // POST /auth/password-reset/confirm — validate and atomically consume a
+  // single-use reset token, update the user's password asynchronously, clear
+  // login lockout, and revoke all existing sessions for that user.
+  s.post('/password-reset/confirm', allowAnonymous(), async (req             , res              , next          ) => {
+    const token = req.body?.token;
+    const newPassword = req.body?.newPassword ?? req.body?.password;
+    if (typeof token !== 'string' || token.length === 0 || newPassword == null) {
+      return next({ status: 400, message: 'token and newPassword are required' });
+    }
+    const passwordProblem = passwordRefusal(newPassword);
+    if (passwordProblem) return next(passwordProblem);
+    ensurePasswordResetTable();
+
+    // Compute scrypt off the SQLite transaction to avoid holding the write lock.
+    const hashedPassword = await hashPasswordAsync(newPassword          );
+    const tokenHash = hashSessionToken(token);
+    const now = Date.now();
+
+    let outcome                          ;
+
+    try {
+      await txn(db, () => {
+        const row = db.prepare(
+          'SELECT id, userId, expiresAt, usedAt FROM _PasswordResetToken WHERE tokenHash = ? LIMIT 1',
+        ).get(tokenHash)                                                                                        ;
+        if (!row || row.usedAt !== null || row.expiresAt <= now) {
+          outcome = 'invalid';
+          return;
+        }
+        const consumed = db.prepare(
+          'UPDATE _PasswordResetToken SET usedAt = ? WHERE id = ? AND usedAt IS NULL',
+        ).run(now, row.id);
+        if (Number(consumed.changes) !== 1) {
+          outcome = 'invalid';
+          return;
+        }
+        db.prepare('UPDATE User SET password = ?, failedLoginAttempts = 0, lockedUntil = NULL WHERE id = ?')
+          .run(hashedPassword, row.userId);
+        db.prepare("DELETE FROM Session WHERE principalType = 'user' AND principalId = ?")
+          .run(row.userId);
+        outcome = 'ok';
+      });
+    } catch (err) {
+      const e = err                                          ;
+      return next({ status: e.status ?? 500, message: e.message });
+    }
+
+    if (outcome !== 'ok') {
+      return next({ status: 400, message: 'invalid or expired reset token' });
+    }
     res.sendStatus(204);
   });
 
@@ -504,7 +884,7 @@ export function authRoutes({
   // identity). Returns { challenge, rp: { name, id } }.
   s.get('/passkey/challenge', allowAnonymous(), (_req             , res              ) => {
     const challenge = generateChallenge();
-    challengeStore.set(challenge);
+    passkeyStore.set(challenge);
     res.json({ challenge, rp: { name: rp.name, id: rp.id } });
   });
 
@@ -512,7 +892,9 @@ export function authRoutes({
   // requireUser: the caller must have an existing session (password login first,
   // then enroll passkey). The credential's userId is the requesting principal's
   // id — a passkey is always bound to the authenticated user who registered it.
+  // Rejects duplicate credential IDs fail-closed (#245).
   s.post('/passkey/register', requireUser(), (req             , res              , next          ) => {
+    ensureAuthIndexes();
     const credential = (req.body ?? {}).credential                                                               ;
     if (!credential || !credential.response?.clientDataJSON || !credential.response?.attestationObject) {
       return next({ status: 400, message: 'credential with clientDataJSON and attestationObject is required' });
@@ -526,7 +908,7 @@ export function authRoutes({
       const e = err                        ;
       return next({ status: 400, message: `invalid clientDataJSON: ${e.message}` });
     }
-    const entry = challengeStore.consume(String(clientData.challenge));
+    const entry = passkeyStore.consume(String(clientData.challenge));
     if (!entry) {
       return next({ status: 400, message: 'unknown or expired challenge' });
     }
@@ -539,25 +921,41 @@ export function authRoutes({
       return next({ status: 400, message: `registration failed: ${e.message}` });
     }
 
+    // Reject duplicate credential IDs fail-closed (#245).
+    const existing = Credential.findOne(Credential.credentialId.is(result.credentialId));
+    if (existing) {
+      return next({ status: 409, message: 'credential already registered' });
+    }
+
     const userId = req.principal.id;
-    Credential.create({
-      credentialId: result.credentialId,
-      publicKey: result.publicKey,
-      userId,
-      signCount: result.signCount,
-      name: credential.name || 'Passkey',
-      transports: Array.isArray(credential.transports) ? credential.transports.join(',') : '',
-      backedUp: credential.backedUp ? 1 : 0,
-      createdAt: new Date(),
-    });
+    try {
+      Credential.create({
+        credentialId: result.credentialId,
+        publicKey: result.publicKey,
+        userId,
+        signCount: result.signCount,
+        name: credential.name || 'Passkey',
+        transports: Array.isArray(credential.transports) ? credential.transports.join(',') : '',
+        backedUp: credential.backedUp ? 1 : 0,
+        createdAt: new Date().toISOString(),
+      });
+    } catch (err) {
+      const e = err                        ;
+      if (e.message && /unique/i.test(e.message)) {
+        return next({ status: 409, message: 'credential already registered' });
+      }
+      return next({ status: 500, message: e.message });
+    }
     res.status(201).json({ ok: true });
   });
 
   // POST /auth/passkey/authenticate — sign in with a passkey.
   // allowAnonymous: the caller proves identity by demonstrating possession of the
-  // private key. On successful verification, the framework mints a Session and
-  // sets the `sid` cookie — the same authentication pathway as password login.
+  // private key. Enforces User Verification (UV) by default and applies login
+  // lockout to prevent brute-force / replay abuse. On successful verification,
+  // the framework mints a Session and sets the `sid` cookie.
   s.post('/passkey/authenticate', allowAnonymous(), (req             , res              , next          ) => {
+    ensureAuthIndexes();
     const credential = (req.body ?? {}).credential                                                                 ;
     if (!credential || !credential.response?.clientDataJSON || !credential.response?.authenticatorData || !credential.response?.signature) {
       return next({ status: 400, message: 'credential with clientDataJSON, authenticatorData, and signature is required' });
@@ -571,7 +969,7 @@ export function authRoutes({
       const e = err                        ;
       return next({ status: 400, message: `invalid clientDataJSON: ${e.message}` });
     }
-    const entry = challengeStore.consume(String(clientData.challenge));
+    const entry = passkeyStore.consume(String(clientData.challenge));
     if (!entry) {
       return next({ status: 400, message: 'unknown or expired challenge' });
     }
@@ -586,22 +984,29 @@ export function authRoutes({
       return next({ status: 400, message: 'unknown credential' });
     }
 
+    const user = User.getOrFail(storedCredential.userId);
+    const verdict = evaluateLockout(user.failedLoginAttempts, user.lockedUntil);
+    if (verdict.locked) {
+      return next({ status: 401, message: 'bad credentials' });
+    }
+
     let result;
     try {
-      result = verifyAuthentication(String(clientData.challenge), credential, storedCredential, rp);
+      result = verifyAuthentication(String(clientData.challenge), credential, storedCredential, rp, {
+        requireUserVerification,
+      });
     } catch (err) {
+      recordLoginFailure(user, verdict.resetAttempts);
       const e = err                        ;
       return next({ status: 401, message: `authentication failed: ${e.message}` });
     }
 
-    // Update the counter (replay protection). The unstored query API is the
-    // same trust class the login/lookup paths already use.
+    // Successful authentication: reset lockout counter and update signCount.
+    db.prepare('UPDATE User SET failedLoginAttempts = 0, lockedUntil = NULL WHERE id = ?').run(user.id);
     db.prepare('UPDATE Credential SET signCount = ? WHERE id = ?').run(result.signCount, storedCredential.id);
 
-    // Look up the user
-    const user = User.getOrFail(storedCredential.userId);
     const session = Session.create({ userId: user.id });
-    res.setHeader('set-cookie', sessionCookie(session.token, { secure }));
+    res.setHeader('set-cookie', sessionCookie(session.token, { secure, ttlMs: sessionDurationMs }));
     res.status(201).json({ user: { id: user.id, username: user.username } });
   });
 
@@ -888,7 +1293,7 @@ export function authRoutes({
     }
     const user = User.getOrFail(userId);
     try {
-      const result = TwoFactor.create({ userId, username: user.username });
+      const result = TwoFactor.create({ userId, username: user.username, issuer: totpIssuer });
       res.status(201).json({
         secret: result.secret,
         uri: result.uri,
@@ -901,15 +1306,15 @@ export function authRoutes({
   });
 
   // POST /auth/totp/verify — verify a TOTP token against the stored secret.
-  // requireUser: only an authenticated user can verify. On the first successful
-  // verify after enrollment, sets enabled=1 and verifiedAt=now. Returns
-  // { verified: true } or 400.
+  // requireUser: only an authenticated user can verify. Enforces replay
+  // protection within the 90s window. On the first successful verify after
+  // enrollment, sets enabled=1 and verifiedAt=now. Returns { verified: true } or 400.
   s.post('/totp/verify', requireUser(), (req             , res              , next          ) => {
     const { token } = req.body ?? {};
     if (!token) {
       return next({ status: 400, message: 'token is required' });
     }
-    const userId = req.principal.id;
+    const userId = String(req.principal.id);
     const twoFactor = TwoFactor.findOne(TwoFactor.userId.is(userId));
     if (!twoFactor) {
       return next({ status: 400, message: 'TOTP not enrolled' });
@@ -921,16 +1326,19 @@ export function authRoutes({
     if (verdict.locked) {
       return next({ status: 429, message: 'TOTP temporarily locked', details: { retryAfterMs: verdict.retryAfterMs } });
     }
-    if (!verifyTotp(twoFactor.secret, token          )) {
-      // Failed TOTP attempt: advance the shared counter/lock normalization —
-      // the same write authenticate and disable use — so an expired lock's
-      // stale fence is cleared and the series re-accumulates from 0.
+    const stepResult = verifyTotpStep(twoFactor.secret, token          );
+    if (!stepResult.valid || stepResult.counter === null || isTotpCounterReplayed(userId, twoFactor, stepResult.counter)) {
+      // Failed TOTP attempt (or replay): advance the shared counter/lock
+      // normalization — the same write authenticate and disable use — so an
+      // expired lock's stale fence is cleared and the series re-accumulates from 0.
       recordTotpFailure(twoFactor, verdict.resetAttempts);
       return next({ status: 400, message: 'invalid TOTP token' });
     }
-    // Successful TOTP verification: reset counter.
+    // Successful TOTP verification: reset counter and record replay step.
     db.prepare('UPDATE TwoFactor SET totpFailedAttempts = 0, totpLockedUntil = NULL WHERE id = ?')
       .run(twoFactor.id);
+    persistTotpCounterDb(twoFactor.id, stepResult.counter);
+    recordTotpCounterMemory(userId, twoFactor.secret, stepResult.counter);
     // First successful verification: flip enabled to 1 and set verifiedAt.
     if (twoFactor.enabled === 0) {
       db.prepare('UPDATE TwoFactor SET enabled = 1, verifiedAt = ? WHERE id = ?')
@@ -939,7 +1347,8 @@ export function authRoutes({
     res.json({ verified: true });
   });
 
-  // POST /auth/totp/disable — remove the TOTP enrollment.
+  // POST /auth/totp/disable — remove the TOTP enrollment and revoke all other
+  // active sessions for the user.
   // requireUser: only an authenticated user can disable. Requires a valid TOTP
   // token, a backup code, or the user's password to confirm the action.
   s.post('/totp/disable', requireUser(), async (req             , res              , next          ) => {
@@ -947,16 +1356,18 @@ export function authRoutes({
     if (!token && !password) {
       return next({ status: 400, message: 'token or password is required' });
     }
-    const userId = req.principal.id;
+    const userId = String(req.principal.id);
     // Allow password as an alternative to TOTP token.
     if (password) {
       const user = User.getOrFail(userId);
-      if (!user.password.verify(password)) {
+      const storedPassword = rawPasswordOfUser(user.id);
+      if (!(await verifyHashAsync(password, storedPassword))) {
         return next({ status: 400, message: 'invalid password' });
       }
-      // Password verified — proceed to delete.
+      // Password verified — proceed to delete and revoke other sessions.
       const twoFactor = TwoFactor.findOne(TwoFactor.userId.is(userId));
       if (twoFactor) TwoFactor.delete(twoFactor.id);
+      revokeOtherSessions(userId, req);
       return res.sendStatus(204);
     }
     const twoFactor = TwoFactor.findOne(TwoFactor.userId.is(userId));
@@ -965,9 +1376,9 @@ export function authRoutes({
     }
     const tokenValue = String(token);
 
-    // Verifying the factor, consuming a backup code, and removing the
-    // enrollment commit in ONE driver transaction: a valid token can never
-    // leave the enrollment half-disabled with a backup code burned.
+    // Verifying the factor, consuming a backup code, removing the enrollment,
+    // and revoking other sessions commit in ONE driver transaction: a valid
+    // token can never leave the enrollment half-disabled with a backup code burned.
 
 
 
@@ -982,13 +1393,14 @@ export function authRoutes({
           outcome = { kind: 'gone' };
           return;
         }
-        const settled = settleSecondFactor(row, tokenValue);
+        const settled = settleSecondFactor(userId, row, tokenValue);
         if (settled.kind !== 'ok') {
           outcome = settled;
           return;
         }
         TwoFactor.delete(row.id);
-        outcome = { kind: 'ok' };
+        revokeOtherSessions(userId, req);
+        outcome = { kind: 'ok', totpCounter: settled.totpCounter, secret: settled.secret };
       });
     } catch (err) {
       const e = err                                          ;
@@ -1006,39 +1418,13 @@ export function authRoutes({
     if (outcome.kind === 'invalid') {
       return next({ status: 400, message: 'invalid token or backup code' });
     }
+    if (outcome.totpCounter !== null) {
+      recordTotpCounterMemory(userId, outcome.secret, outcome.totpCounter);
+    }
     res.sendStatus(204);
   });
 
   // POST /auth/totp/authenticate — complete login with TOTP 2FA.
-  // allowAnonymous: the caller already provided a password via /auth/login, which
-  // returned { requiresTotp: true, challenge }. The user is derived FROM the
-  // challenge CLAIM (bound server-side to the user who passed the password); a
-  // client-supplied userId is never trusted here. The route accepts either a
-  // valid TOTP token or an unused backup code, settles the challenge, mints a
-  // Session, and sets the sid cookie — the same authentication pathway as
-  // password login. TOTP and backup success share ONE response so the response
-  // never reveals which factor was used.
-  //
-  // The challenge lifecycle is the claim protocol in login-challenge.mjs, and
-  // this route is its ONLY settlement consumer:
-  //   1. reserve the challenge atomically (userId comes only from the claim);
-  //   2. enter the write transaction;
-  //   3. re-read the TwoFactor row under the write lock;
-  //   4. verify the authoritative TOTP / backup-code hashes;
-  //   5. valid → reset the fence, remove a used backup code, mint the Session
-  //      in the SAME transaction;
-  //   6. settle the claim only against the CONFIRMED transaction outcome
-  //      (finalize on commit, fail on invalid/locked, release on gone);
-  //   7. build the response only after finalization.
-  //
-  // The driver's callback form (`txn`) cannot tell a confirmed rollback from an
-  // ambiguous COMMIT, and the claim settlement depends on that, so this route
-  // uses the driver's sync primitives (the documented alternative call style)
-  // instead: a successful COMMIT is confirmed; a failed COMMIT followed by a
-  // successful ROLLBACK is a confirmed no-commit; a failed ROLLBACK means the
-  // transaction's fate is unknown and the claim must be invalidated — never
-  // released, so a maybe-committed session cannot be paired with a reusable
-  // challenge.
   s.post('/totp/authenticate', allowAnonymous(), async (req             , res              , next          ) => {
     const { challenge, token } = req.body ?? {};
     if (!challenge || !token) {
@@ -1048,19 +1434,16 @@ export function authRoutes({
 
     // 1. Reserve the challenge atomically. A racing second request for the same
     // challenge is rejected HERE, before any SQL.
-    const claim = loginChallengeStore.reserve(challengeId);
+    const claim = activeLoginChallengeStore.reserve(challengeId);
     if (!claim) {
       return next({ status: 400, message: 'unknown or expired challenge' });
     }
-    const userId = claim.userId;
+    const userId = String(claim.userId);
     const tokenValue = String(token);
 
     // 2. Enter the write transaction and complete the second factor + mint the
-    // Session in it. The backup-code removal (one-time), the fence reset, and
-    // the Session row commit together or not at all: a valid backup code is
-    // never durably consumed unless the session actually exists, and a second
-    // concurrent submission re-reads the code under the write lock and is
-    // rejected.
+    // Session in it. The backup-code removal (one-time), the fence reset, the
+    // replay counter, and the Session row commit together or not at all.
 
 
 
@@ -1076,16 +1459,22 @@ export function authRoutes({
       if (!row || row.enabled !== 1) {
         outcome = { kind: 'gone' };
       } else {
-        // 4. Verify against the authoritative hashes.
-        const settled = settleSecondFactor(row, tokenValue);
+        // 4. Verify against the authoritative hashes + replay guard.
+        const settled = settleSecondFactor(userId, row, tokenValue);
         if (settled.kind !== 'ok') {
           outcome = settled;
         } else {
-          // 5. Valid factor: fence reset + one-time code removal already wrote
-          // inside this transaction; mint the Session in it too.
+          // 5. Valid factor: fence reset + one-time code removal / replay step
+          // already wrote inside this transaction; mint the Session in it too.
           const session = Session.create({ userId });
           const user = User.getOrFail(userId);
-          outcome = { kind: 'ok', session, username: user.username };
+          outcome = {
+            kind: 'ok',
+            session,
+            username: user.username,
+            totpCounter: settled.totpCounter,
+            secret: settled.secret,
+          };
         }
       }
       commit(db);
@@ -1102,52 +1491,39 @@ export function authRoutes({
 
     // 6. Settle the claim against the CONFIRMED transaction outcome.
     if (commitStatus === 'ambiguous') {
-      // The driver could not confirm whether the commit landed. Fail closed:
-      // invalidate the challenge (never release it) — a session may exist, and
-      // the challenge must not be reusable either way.
-      loginChallengeStore.finalize(claim);
+      activeLoginChallengeStore.finalize(claim);
       return next({ status: 500, message: 'authentication outcome could not be confirmed; please log in again' });
     }
     if (commitStatus === 'rolled-back') {
-      // Confirmed no-commit: release the claim, preserving the challenge and
-      // the code (both rolled back) for a retry if they are still live.
-      loginChallengeStore.release(claim);
+      activeLoginChallengeStore.release(claim);
       const e = error                                          ;
       return next({ status: e.status ?? 500, message: e.message });
     }
     // Committed.
     if (!outcome) {
-      // A confirmed commit with no recorded outcome is defensively unreachable
-      // (outcome is always assigned before commit), but if it ever happens a
-      // session may exist, so the challenge must not be reusable either way.
-      // Fail closed: invalidate the claim (finalize deletes it; a mismatched
-      // claim also invalidates) before surfacing the 500 — never return with
-      // the challenge left permanently reserved.
-      loginChallengeStore.finalize(claim);
+      activeLoginChallengeStore.finalize(claim);
       return next({ status: 500, message: 'authentication did not settle' });
     }
     if (outcome.kind === 'locked') {
-      // A failed attempt under lockout still consumes one challenge attempt, so
-      // the max-attempt cap holds even when the TOTP lockout is active.
-      loginChallengeStore.fail(claim);
+      activeLoginChallengeStore.fail(claim);
       return next({ status: 429, message: 'TOTP temporarily locked', details: { retryAfterMs: outcome.retryAfterMs } });
     }
     if (outcome.kind === 'gone') {
-      loginChallengeStore.release(claim);
+      activeLoginChallengeStore.release(claim);
       return next({ status: 400, message: 'TOTP not enabled for this user' });
     }
     if (outcome.kind === 'invalid') {
-      // Invalid second factor: consume one challenge attempt, never a backup code.
-      loginChallengeStore.fail(claim);
+      activeLoginChallengeStore.fail(claim);
       return next({ status: 400, message: 'invalid token or backup code' });
     }
-    // 7. Finalize the claim, then build the response — never before. If the
-    // challenge cannot be finalized, fail closed: the session and code are
-    // committed, but no cookie is issued and the client gets no session token.
-    if (!loginChallengeStore.finalize(claim)) {
+    if (outcome.totpCounter !== null) {
+      recordTotpCounterMemory(userId, outcome.secret, outcome.totpCounter);
+    }
+    // 7. Finalize the claim, then build the response — never before.
+    if (!activeLoginChallengeStore.finalize(claim)) {
       return next({ status: 500, message: 'login challenge could not be finalized' });
     }
-    res.setHeader('set-cookie', sessionCookie(outcome.session.token, { secure }));
+    res.setHeader('set-cookie', sessionCookie(outcome.session.token, { secure, ttlMs: sessionDurationMs }));
     res.status(201).json({ user: { id: userId, username: outcome.username } });
   });
 

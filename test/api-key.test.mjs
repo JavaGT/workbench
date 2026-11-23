@@ -18,7 +18,7 @@ import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 
 import workbench, { anonymous, ApiKey } from '../build/internal.mjs';
-import { apiKeyPrincipalOf, sessionPrincipalOf, SESSION_COOKIE } from '../build/auth/session.mjs';
+import { apiKeyPrincipalOf, sessionPrincipalOf, hashSessionToken, SESSION_COOKIE } from '../build/auth/session.mjs';
 import { principal } from '../build/principal.mjs';
 import { requireUser } from '../build/route-gate.mjs';
 import { entity, text, ref, scope, grant, read, write, subscribe } from '../build/index.mjs';
@@ -321,7 +321,7 @@ test('HTTP: create key returns plain token once with prefix and name', async (t)
   const loginRes = await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice', password: 'hunter2' }),
+    body: JSON.stringify({ username: 'alice', password: 'hunter22' }),
   });
   const cookie = `sid=${sidFromSetCookie(loginRes.headers.get('set-cookie'))}`;
 
@@ -359,7 +359,7 @@ test('HTTP: list keys shows prefix and name but no token or hash', async (t) => 
   const loginRes = await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice', password: 'hunter2' }),
+    body: JSON.stringify({ username: 'alice', password: 'hunter22' }),
   });
   const cookie = `sid=${sidFromSetCookie(loginRes.headers.get('set-cookie'))}`;
 
@@ -401,7 +401,7 @@ test('HTTP: use key in Bearer header to access protected route', async (t) => {
   const loginRes = await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice', password: 'hunter2' }),
+    body: JSON.stringify({ username: 'alice', password: 'hunter22' }),
   });
   const cookie = `sid=${sidFromSetCookie(loginRes.headers.get('set-cookie'))}`;
 
@@ -437,7 +437,7 @@ test('HTTP: revoke key → subsequent Bearer request returns 401', async (t) => 
   const loginRes = await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice', password: 'hunter2' }),
+    body: JSON.stringify({ username: 'alice', password: 'hunter22' }),
   });
   const cookie = `sid=${sidFromSetCookie(loginRes.headers.get('set-cookie'))}`;
 
@@ -487,7 +487,7 @@ test('HTTP: cannot revoke another user\'s key', async (t) => {
   const aliceLogin = await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice', password: 'hunter2' }),
+    body: JSON.stringify({ username: 'alice', password: 'hunter22' }),
   });
   const aliceCookie = `sid=${sidFromSetCookie(aliceLogin.headers.get('set-cookie'))}`;
 
@@ -502,7 +502,7 @@ test('HTTP: cannot revoke another user\'s key', async (t) => {
   const bobLogin = await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'bob', password: 'sekret' }),
+    body: JSON.stringify({ username: 'bob', password: 'sekret12' }),
   });
   const bobCookie = `sid=${sidFromSetCookie(bobLogin.headers.get('set-cookie'))}`;
 
@@ -520,7 +520,7 @@ test('HTTP: list keys returns only the current user\'s keys', async (t) => {
   const aliceLogin = await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice', password: 'hunter2' }),
+    body: JSON.stringify({ username: 'alice', password: 'hunter22' }),
   });
   const aliceCookie = `sid=${sidFromSetCookie(aliceLogin.headers.get('set-cookie'))}`;
 
@@ -534,7 +534,7 @@ test('HTTP: list keys returns only the current user\'s keys', async (t) => {
   const bobLogin = await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'bob', password: 'sekret' }),
+    body: JSON.stringify({ username: 'bob', password: 'sekret12' }),
   });
   const bobCookie = `sid=${sidFromSetCookie(bobLogin.headers.get('set-cookie'))}`;
 
@@ -633,7 +633,7 @@ test('session principal takes priority over Bearer token when both are present',
   const loginRes = await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice', password: 'hunter2' }),
+    body: JSON.stringify({ username: 'alice', password: 'hunter22' }),
   });
   const cookie = `sid=${sidFromSetCookie(loginRes.headers.get('set-cookie'))}`;
 
@@ -665,7 +665,7 @@ test('an expired session falls back to a valid Bearer token', async (t) => {
   const loginRes = await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice', password: 'hunter2' }),
+    body: JSON.stringify({ username: 'alice', password: 'hunter22' }),
   });
   const cookie = `sid=${sidFromSetCookie(loginRes.headers.get('set-cookie'))}`;
   const keyRes = await fetch(`${origin}/auth/api-key/create`, {
@@ -674,7 +674,7 @@ test('an expired session falls back to a valid Bearer token', async (t) => {
     body: JSON.stringify({ name: 'fallback-key' }),
   });
   const { token: apiToken } = await keyRes.json();
-  app.db.prepare('UPDATE Session SET createdAt = ? WHERE token = ?').run(Date.now() - 7 * 86_400_000, cookie.slice('sid='.length));
+  app.db.prepare('UPDATE Session SET createdAt = ? WHERE token = ?').run(Date.now() - 7 * 86_400_000, hashSessionToken(cookie.slice('sid='.length)));
 
   const res = await fetch(`${origin}/notes`, {
     headers: { cookie, authorization: `Bearer ${apiToken}` },

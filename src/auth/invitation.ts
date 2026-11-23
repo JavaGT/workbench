@@ -251,6 +251,18 @@ export function createInvitationApi({ Invitation, db: suppliedDb }: CreateInvita
     if (maxUses != null && (!Number.isInteger(maxUses) || (maxUses as number) < 1)) {
       throw httpError(400, 'maxUses must be a positive integer');
     }
+    let normalizedExpiresAt: number | null = null;
+    if (expiresAt != null) {
+      if (expiresAt instanceof Date) {
+        const ms = expiresAt.getTime();
+        if (!Number.isFinite(ms)) throw httpError(400, 'expiresAt must be a valid timestamp');
+        normalizedExpiresAt = ms;
+      } else if (typeof expiresAt === 'number' && Number.isFinite(expiresAt)) {
+        normalizedExpiresAt = expiresAt;
+      } else {
+        throw httpError(400, 'expiresAt must be a finite timestamp');
+      }
+    }
 
     const authority = invitationCreationPrincipal(principal);
     const result = await appRuntime.batch(() => [{
@@ -263,9 +275,9 @@ export function createInvitationApi({ Invitation, db: suppliedDb }: CreateInvita
         ...(targetUser == null ? {} : { targetUser }),
         ...(maxUses == null ? {} : { maxUses }),
         useCount: 0,
-        ...(expiresAt == null ? {} : { expiresAt }),
+        ...(normalizedExpiresAt == null ? {} : { expiresAt: normalizedExpiresAt }),
         createdBy: principal.id,
-        createdAt: Date.now(),
+        createdAt: new Date().toISOString(),
       },
     }], { principal: authority });
     requireSuccess(result, 'creation');

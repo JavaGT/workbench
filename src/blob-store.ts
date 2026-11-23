@@ -52,9 +52,12 @@
 
 import { createHash, randomUUID } from 'node:crypto';
 import type { Readable } from 'node:stream';
-import { fsBlobs, hasPathFor, type ByteStore, type ByteStoreCapabilities } from './fs-blobs.ts';
+import { BlobSlotNotFoundError, fsBlobs, hasPathFor, type ByteStore, type ByteStoreCapabilities } from './fs-blobs.ts';
 import type { BlobCensus } from './blob-census.ts';
 import type { DbHandle } from './driver.ts';
+
+/** Default maximum upload size in bytes for streaming uploads (50 MiB). */
+export const DEFAULT_BLOB_MAX_BYTES = 50 * 1024 * 1024;
 
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 
@@ -153,11 +156,46 @@ export interface BlobStore {
    * are computed on the way past. Resolves with the attested byteLength +
    * digests of EXACTLY what landed; `maxBytes` aborts MID-STREAM (the typed
    * `BlobTooLargeError`) and no readable pending slot survives a failed or
-   * aborted write. Like upload, records the generation's 'pending' metadata
-   * row (mime defaults to null) — the ONLY production caller is the
-   * pending-blob stager, which supplies the id and reads the attestation.
+   * aborted write. When `coordinate` is supplied, ONLY the SQLite metadata
+   * insert runs inside it so streaming disk I/O never holds the write queue.
    */
-  writePendingStream(id: string, bytes: AsyncIterable<Uint8Array>, options?: { maxBytes?: number; mime?: string }): Promise<{ byteLength: number; sha256: string; md5: string }>;
+  writePendingStream(
+    id: string,
+    bytes: AsyncIterable<Uint8Array>,
+    options?: {
+      maxBytes?: number;
+      mime?: string;
+      coordinate?: <T>(fn: () => T | Promise<T>) => Promise<T>;
+    },
+  ): Promise<{ byteLength: number; sha256: string; md5: string }>;
+  /**
+   * Stream bytes into the pending byte-store slot WITHOUT touching SQLite.
+   * Callers pair this with {@link BlobStore.recordPending} inside the write
+   * coordinator and {@link BlobStore.removePendingSlot} if metadata registration
+   * fails or aborts, so large streaming uploads never hold the write queue.
+   */
+  stagePendingStream(
+    id: string,
+    bytes: AsyncIterable<Uint8Array>,
+    options?: { maxBytes?: number },
+  ): Promise<{ byteLength: number; sha256: string; md5: string }>;
+  /**
+   * Record the 'pending' BlobStore metadata row for bytes already staged via
+   * {@link BlobStore.stagePendingStream}. Must be invoked inside the caller's
+   * write-coordinator turn.
+   */
+  recordPending(
+    id: string,
+    attested: { byteLength: number; sha256: string; md5: string },
+    options?: { mime?: string | null },
+  ): UploadedBlob;
+  /**
+   * Remove ONLY the pending byte-store slot (no SQLite mutation). Used to
+   * clean up staged bytes when a coordinated metadata insert fails or aborts.
+   */
+  removePendingSlot(id: string): void;
+  /** Configured default upload byte cap (defaults to 50 MiB). */
+  readonly maxBytes: number;
   /**
    * Stream a PENDING-slot range as a Node Readable (large media), cancellable
    * via an AbortSignal (#738 W1). Same strict bounds and missing-slot signal
@@ -255,6 +293,11 @@ export interface BlobStoreOptions {
    * declare free space refuses uploads.
    */
   lowDiskHeadroomBytes?: number;
+  /**
+   * Maximum streaming upload size in bytes (defaults to 50 MiB). Enforced
+   * mid-stream by stagePendingStream / writePendingStream and POST /blobs.
+   */
+  maxBytes?: number;
 }
 
 // The failure a durable byte store throws when free space is below (or
@@ -266,7 +309,7 @@ function lowDiskError(): Error & { code: string } {
   return Object.assign(new Error(BLOB_STORAGE_UNDER_DISK_LIMIT), { code: BLOB_STORAGE_UNDER_DISK_LIMIT });
 }
 
-export function createBlobStore({ root, stagingRoot, db, bytes, lowDiskHeadroomBytes = 0 }: BlobStoreOptions): BlobStore {
+export function createBlobStore({ root, stagingRoot, db, bytes, lowDiskHeadroomBytes = 0, maxBytes }: BlobStoreOptions): BlobStore {
   // The byte store owns where bytes live (node:fs by default; S3 later). It is
   // the ONLY seam for byte storage — every read/write/remove/finalize goes
   // through it. `root` is accepted for back-compat (`blobs: { root }`): when no
@@ -274,6 +317,10 @@ export function createBlobStore({ root, stagingRoot, db, bytes, lowDiskHeadroomB
   // be passed directly as `root`'s replacement once a caller hands a store in.
   const store: ByteStore = bytes
     ?? fsBlobs(stagingRoot ? { root: root as string, stagingRoot } : { root: root as string });
+  const configuredMaxBytes = maxBytes ?? store.maxBytes ?? DEFAULT_BLOB_MAX_BYTES;
+  if (!Number.isFinite(configuredMaxBytes) || configuredMaxBytes < 0) {
+    throw new Error('invalid maxBytes');
+  }
   const { writePending, writePendingStream, finalizePending, readRange, readPending, readRangeStream, readPendingStream, remove, exists } = store;
 
   // The low-disk guard (#27): before accepting a NEW upload, a durable byte
@@ -375,20 +422,66 @@ export function createBlobStore({ root, stagingRoot, db, bytes, lowDiskHeadroomB
     return readPendingStream(id, range, options);
   }
 
+  // Stream bytes into the pending byte-store slot WITHOUT touching SQLite:
+  // callers invoke this OUTSIDE the write coordinator so multi-hundred-MB
+  // uploads never stall concurrent database writes.
+  async function stagePendingStreamBytes(
+    id: string,
+    bytes: AsyncIterable<Uint8Array>,
+    { maxBytes: limit }: { maxBytes?: number } = {},
+  ): Promise<{ byteLength: number; sha256: string; md5: string }> {
+    safeId(id);
+    assertDiskHeadroom();
+    const effectiveLimit = limit !== undefined ? limit : configuredMaxBytes;
+    return await writePendingStream(id, bytes, { maxBytes: effectiveLimit });
+  }
+
+  // Record the 'pending' BlobStore metadata row for bytes already staged via
+  // stagePendingStreamBytes. Must run inside the caller's write-coordinator turn.
+  function recordPending(
+    id: string,
+    attested: { byteLength: number; sha256: string; md5: string },
+    { mime = null }: { mime?: string | null } = {},
+  ): UploadedBlob {
+    safeId(id);
+    const normalizedMime = mime ?? null;
+    recordPendingRow(id, attested, normalizedMime);
+    return { id, md5: attested.md5, sha256: attested.sha256, size: attested.byteLength, mime: normalizedMime };
+  }
+
+  // Remove ONLY the pending byte-store slot (no SQLite mutation), for cleaning
+  // up staged bytes if a coordinated metadata insert fails or aborts.
+  function removePendingSlot(id: string): void {
+    safeId(id);
+    if (exists(id, { pending: true })) remove(id, { pending: true });
+  }
+
   // Pending-slot stream write (#738 W2): id validation + the same low-disk
   // guard as upload (a streamed payload lands on disk too), then straight to
   // the byte store — hash-while-write, mid-stream maxBytes abort. On success
   // it records the generation's 'pending' metadata row from the ATTESTED
-  // values (the same row upload writes), so validateClaim's stat() check sees
-  // identical metadata whichever path staged the bytes.
-  async function writePendingStreamBytes(id: string, bytes: AsyncIterable<Uint8Array>, { mime, ...limits }: { maxBytes?: number; mime?: string } = {}) {
-    safeId(id);
-    assertDiskHeadroom();
-    const attested = await writePendingStream(id, bytes, limits);
+  // values (the same row upload writes), optionally inside `coordinate` so
+  // streaming I/O never holds the write queue.
+  async function writePendingStreamBytes(
+    id: string,
+    bytes: AsyncIterable<Uint8Array>,
+    {
+      mime,
+      coordinate,
+      ...limits
+    }: {
+      maxBytes?: number;
+      mime?: string;
+      coordinate?: <T>(fn: () => T | Promise<T>) => Promise<T>;
+    } = {},
+  ) {
+    const attested = await stagePendingStreamBytes(id, bytes, limits);
+    const register = () => recordPending(id, attested, { mime });
     try {
-      recordPendingRow(id, attested, mime ?? null);
+      if (coordinate) await coordinate(register);
+      else register();
     } catch (error) {
-      try { if (exists(id, { pending: true })) remove(id, { pending: true }); } catch {}
+      try { removePendingSlot(id); } catch {}
       throw error;
     }
     return attested;
@@ -424,18 +517,45 @@ export function createBlobStore({ root, stagingRoot, db, bytes, lowDiskHeadroomB
   // Stage NEW bytes for an existing adopted generation (S6/A5 #1). The old
   // generation must be adopted AND readable — a failed validation (missing,
   // not adopted, unreadable, or a failed staging write) throws before anything
-  // switched, leaving the old generation readable and authoritative. The staged
-  // replacement is a normal 'pending' generation the caller switches into the
-  // owning reference via switchReplacement inside their coordinated txn.
+  // switched, leaving the old generation readable and authoritative. Validates
+  // via stored metadata, slot stat, and bounded 1-byte probes so multi-hundred-MB
+  // blobs are never buffered whole into RAM. The staged replacement is a normal
+  // 'pending' generation the caller switches into the owning reference via
+  // switchReplacement inside their coordinated txn.
   function replace(previousId: string, options: BlobUploadOptions): BlobReplacementStage {
     safeId(previousId);
-    const previous = db.prepare('SELECT status FROM BlobStore WHERE id = ?').get(previousId) as { status?: string } | undefined;
+    const previous = db.prepare('SELECT status, size FROM BlobStore WHERE id = ?').get(previousId) as { status?: string; size?: number } | undefined;
     if (!previous) throw new Error(`replaced generation '${previousId}' does not exist`);
     if (previous.status !== 'adopted') {
       throw new Error(`replaced generation '${previousId}' is '${previous.status}', not adopted — refusing to stage a replacement`);
     }
     try {
-      readRangeBytes(previousId);
+      if (!exists(previousId, { pending: false })) {
+        throw new BlobSlotNotFoundError();
+      }
+      const expectedSize = typeof previous.size === 'number' && Number.isInteger(previous.size) && previous.size >= 0
+        ? previous.size
+        : null;
+      if (typeof store.statSlot === 'function') {
+        const slotStat = store.statSlot(previousId, { pending: false });
+        if (!slotStat) throw new BlobSlotNotFoundError();
+        if (expectedSize !== null && slotStat.size !== expectedSize) {
+          throw new Error(`blob size mismatch (expected ${expectedSize}, found ${slotStat.size})`);
+        }
+      }
+      // Bounded readability probe: never read the entire blob into RAM.
+      if (expectedSize === 0) {
+        readRangeBytes(previousId, [0, 0]);
+      } else {
+        const head = readRangeBytes(previousId, [0, 1]);
+        if (expectedSize !== null && expectedSize > 0 && head.length !== 1) {
+          throw new Error('blob is truncated');
+        }
+        if (expectedSize !== null && expectedSize > 1) {
+          const tail = readRangeBytes(previousId, [expectedSize - 1, expectedSize]);
+          if (tail.length !== 1) throw new Error('blob is truncated');
+        }
+      }
     } catch (error) {
       throw new Error(
         `replaced generation '${previousId}' is unreadable — refusing to stage a replacement: ${error instanceof Error ? error.message : String(error)}`,
@@ -691,7 +811,11 @@ export function createBlobStore({ root, stagingRoot, db, bytes, lowDiskHeadroomB
     readPending: readPendingBytes,
     readRangeStream: readRangeStreamBytes,
     writePendingStream: writePendingStreamBytes,
+    stagePendingStream: stagePendingStreamBytes,
+    recordPending,
+    removePendingSlot,
     readPendingStream: readPendingStreamBytes,
+    maxBytes: configuredMaxBytes,
     discardPending,
     discard,
     replace,

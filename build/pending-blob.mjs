@@ -71,6 +71,7 @@ export function declaredBlobField(field         )                    {
 
 
 
+
 /**
  * The S1/A6 recycle seam the delete path routes through (S6/A5): when the app
  * owns a recycle manager (`createRecycleManager` over the backup root with the
@@ -90,6 +91,7 @@ export function declaredBlobField(field         )                    {
 
 
                                        
+
 
 
 
@@ -216,37 +218,75 @@ export function createPendingBlobLifecycle(app                , options         
   const byActionField = new Map(fields.map((field)                              => [`${field.actionName}:${field.field}`, field]));
   if (byActionField.size !== fields.length) throw new TypeError('blobLifecycle fields must not contain duplicate actionName/field pairs');
   async function stage(principal           , request                         )                             {
-    return app.writeQueue.run(() => stageInQueue(principal, request));
-  }
-  async function stageInQueue(principal           , request         )                             {
     const candidate = request                                       ;
     if (!candidate || typeof candidate.scopeId !== 'string' || !candidate.scopeId || typeof candidate.resourceId !== 'string' || !candidate.resourceId) throw new TypeError('scopeId and resourceId are required');
     const authenticatedPrincipalKey = principalKey(principal);
     if (candidate.scopeId.includes('/') || candidate.scopeId === '.' || candidate.scopeId === '..' || candidate.resourceId.includes('/') || candidate.resourceId === '.' || candidate.resourceId === '..') throw new TypeError('scopeId and resourceId must be single safe path segments');
-    const pendingKey = `${candidate.scopeId}/${candidate.resourceId}.${hash(authenticatedPrincipalKey)}.pending`;
-    const existing = app.db.prepare('SELECT 1 FROM _PendingBlob WHERE pendingKey = ?').get(pendingKey);
-    if (existing) failure('PENDING_KEY_EXISTS');
-    // The streamed write path (#738 W2): bytes NEVER materialize as one whole
-    // buffer here. A Uint8Array is wrapped as a single-chunk iterable so both
-    // request shapes share ONE write + attestation code path; digests come
-    // from the hash-while-write values, and the byte store guarantees no
-    // readable pending slot survives a failed or over-limit write. A failed
-    // staging throws BEFORE any durable row exists (the INSERT below is only
-    // reached on a completed write).
-    const blobId = randomUUID();
     const direct = candidate.bytes instanceof Uint8Array ? candidate.bytes : undefined;
     // Async wrapper: the uniform AsyncIterable shape both backends stream from.
     const source = direct
       ? (async function* one() { yield direct; })()
       : candidate.bytes;
     if (!source || typeof (source                             )[Symbol.asyncIterator] !== 'function') throw new TypeError('bytes must be Uint8Array or AsyncIterable<Uint8Array>');
-    const attested = await app.blobs.writePendingStream(blobId, source                             , { mime: candidate.mediaType });
+
+    const pendingKey = `${candidate.scopeId}/${candidate.resourceId}.${hash(authenticatedPrincipalKey)}.pending`;
+    // Fast-fail read check before streaming potentially hundreds of megabytes
+    // to disk. Uniqueness is still enforced atomically inside writeQueue.run
+    // below so concurrent staging races cannot collide.
+    const existing = app.db.prepare('SELECT 1 FROM _PendingBlob WHERE pendingKey = ?').get(pendingKey);
+    if (existing) failure('PENDING_KEY_EXISTS');
+
+    // The streamed write path (#738 W2 / #287): bytes NEVER materialize as one
+    // whole buffer AND disk streaming + hashing run OUTSIDE app.writeQueue.run
+    // so concurrent SQLite writes commit without stalling during large uploads.
+    // The write queue is acquired ONLY for the sub-millisecond SQLite metadata
+    // inserts, and any staged bytes are removed on disk if metadata commit fails.
+    const blobId = randomUUID();
+    const maxBytes = candidate.maxBytes ?? options.maxBytes;
     const claimToken = token();
+    const claimTokenHash = hash(claimToken);
+
+    if (typeof app.blobs.stagePendingStream === 'function' && typeof app.blobs.recordPending === 'function') {
+      const attested = await app.blobs.stagePendingStream(
+        blobId,
+        source                             ,
+        maxBytes !== undefined ? { maxBytes } : undefined,
+      );
+      try {
+        await app.writeQueue.run(() => txn(app.db, () => {
+          const raced = app.db.prepare('SELECT 1 FROM _PendingBlob WHERE pendingKey = ?').get(pendingKey);
+          if (raced) failure('PENDING_KEY_EXISTS');
+          app.blobs.recordPending(blobId, attested, { mime: candidate.mediaType });
+          app.db.prepare(`INSERT INTO _PendingBlob
+            (pendingKey, blobId, claimTokenHash, principalKey, resourceId, contentDigest, byteLength, status, scopeId, createdAt)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`)
+            .run(pendingKey, blobId, claimTokenHash, authenticatedPrincipalKey, candidate.resourceId, attested.sha256, attested.byteLength, candidate.scopeId, new Date().toISOString());
+        }));
+      } catch (error) {
+        try {
+          if (typeof app.blobs.removePendingSlot === 'function') app.blobs.removePendingSlot(blobId);
+          else app.blobs.discardPending(blobId);
+        } catch {}
+        throw error;
+      }
+      return Object.freeze({ claim: Object.freeze({ pendingKey, claimToken }), pendingKey, byteLength: attested.byteLength, contentDigest: attested.sha256 });
+    }
+
+    // Fallback for minimal test doubles that only implement writePendingStream.
+    const attested = await app.blobs.writePendingStream(
+      blobId,
+      source                             ,
+      { mime: candidate.mediaType, ...(maxBytes !== undefined ? { maxBytes } : {}) },
+    );
     try {
-      app.db.prepare(`INSERT INTO _PendingBlob
-        (pendingKey, blobId, claimTokenHash, principalKey, resourceId, contentDigest, byteLength, status, scopeId, createdAt)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`)
-        .run(pendingKey, blobId, hash(claimToken), authenticatedPrincipalKey, candidate.resourceId, attested.sha256, attested.byteLength, candidate.scopeId, new Date().toISOString());
+      await app.writeQueue.run(() => {
+        const raced = app.db.prepare('SELECT 1 FROM _PendingBlob WHERE pendingKey = ?').get(pendingKey);
+        if (raced) failure('PENDING_KEY_EXISTS');
+        app.db.prepare(`INSERT INTO _PendingBlob
+          (pendingKey, blobId, claimTokenHash, principalKey, resourceId, contentDigest, byteLength, status, scopeId, createdAt)
+          VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`)
+          .run(pendingKey, blobId, claimTokenHash, authenticatedPrincipalKey, candidate.resourceId, attested.sha256, attested.byteLength, candidate.scopeId, new Date().toISOString());
+      });
     } catch (error) {
       try { app.blobs.discardPending(blobId); } catch {}
       throw error;

@@ -5,11 +5,14 @@
 // route matching in the request handler, like /health. Auth runs through the
 // SAME engine as REST (mayVerb / mayRow / readScope), not a second path.
 //
-// Exports: handleResyncRoute, handleBlobUploadRoute, handleJobRoute,
-// handleClientSdkRoute.
+// Exports: handleResyncRoute, handleBlobUploadRoute, handleBlobReadRoute,
+// handleJobRoute, handleClientSdkRoute.
 
+import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import type { ServerResponse } from 'node:http';
 import { dirname, join } from 'node:path';
+import type { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 
 import { sendJson, type HttpResponseLike } from './http-response.ts';
@@ -21,6 +24,9 @@ import type { DbHandle } from './driver.ts';
 import { BodyError, readRawBody, readRequestBody } from './http-body.ts';
 import { scopeOf, tryParseScopeKey } from './scope-handle.ts';
 import { createdTextReducerSeeds, textReducerCheckpoints } from './text-reducer-transport.ts';
+import { BlobTooLargeError } from './fs-blobs.ts';
+import { DEFAULT_BLOB_MAX_BYTES, type BlobStore, type UploadedBlob } from './blob-store.ts';
+import { serveAuthorizedBlob } from './authorized-blob-read.ts';
 
 /**
  * Locate the owning scope of a deleted annotated-text document by decoding its
@@ -55,10 +61,16 @@ import { parseEventType } from './event-handle.ts';
 import { createLiveEnvelopeBuilder } from './live-delivery-envelope.ts';
 import { hasAnnotatedTextFields, projectEntitySnapshot } from './entity-snapshot-projection.ts';
 import { projectRowForRecipient } from './entity/projection.ts';
-import { readableFieldNames } from './field-admission.ts';
-import type { AuthorizationAdapter } from './authorization-adapter.ts';
+import { mayReadField, readableFieldNames } from './field-admission.ts';
+import {
+  createAuthorizationAdapter,
+  type AuthorizationAdapter,
+  type AuthorizationDb,
+  type ResourceEntityLike,
+} from './authorization-adapter.ts';
 import { resolveAnnotatedTextOwningScope } from './annotated-text-field.ts';
-import type { Principal } from './principal.ts';
+import { anonymous, collapseForAdmission, type Principal } from './principal.ts';
+import { failure } from './outcome.ts';
 
 interface FrameworkRequest {
   url?: string;
@@ -70,6 +82,8 @@ interface FrameworkRequest {
   resume(): unknown;
   aborted?: boolean;
   destroyed?: boolean;
+  raw?: FrameworkRequest;
+  principal?: Principal;
 }
 
 interface FrameworkJobs {
@@ -102,7 +116,11 @@ interface FrameworkApp extends CrudAppLike {
   resolveScope?: (scope: string) => unknown | Promise<unknown>;
   scopeSnapshot?: (scope: string, principal: Principal, anchor: ScopeAnchor) => unknown | Promise<unknown>;
   jobs?: FrameworkJobs;
-  blobs?: { upload(options: { bytes: Buffer; mime: string }): unknown };
+  blobs?: Partial<BlobStore> & {
+    upload?: (options: { bytes: Buffer; mime: string }) => unknown;
+    maxBytes?: number;
+  };
+  blobMaxBytes?: number;
   // The one platform write coordinator: blob-metadata writes enter through it.
   writeCoordinator?: { run<T>(fn: () => T | Promise<T>): Promise<T> };
   [key: string]: unknown;
@@ -156,6 +174,9 @@ export async function handleResyncRoute(
 ): Promise<boolean> {
   const url = new URL(req.url ?? '/', 'http://localhost');
   const seg = url.pathname.split('/').filter(Boolean);
+  if (seg[0] === 'blobs' && seg.length === 4) {
+    return handleBlobReadRoute(app, req, res, principal);
+  }
   const isSnapshot = seg[0] === 'snapshot';
   const isEventsSince = seg[0] === 'events-since';
   const isSnapshots = seg[0] === 'snapshots' && seg.length === 1;
@@ -591,22 +612,130 @@ async function eventsSinceRoute(
   return true;
 }
 
-// Framework-owned blob upload endpoint (spec #2, eng-review Walk 1b). NOT a
-// mounted route: `POST /blobs` streams the request body to the BlobStore as a
-// PENDING blob (`.pending` file + row), returning { id, md5, sha256, size, mime }.
-// The blob is ADOPTED later by the dispatch that references it (an entity field
-// marked `blob: true` carrying the blob id) — adopted IN that dispatch's
-// transaction, finalized post-commit. A rolled-back dispatch leaves it pending
-// for the reaper. Route-gate fail-closed: anonymous → 401 (same admission as a
-// mounted route — no second auth path). Returns true when handled; false to fall
-// through to matchRoute.
-const BLOB_LIMIT = 50_000_000; // ~50mb upload cap (SPEC §3 size-guard default).
+// Framework-owned blob upload endpoint (spec #2, eng-review Walk 1b, #287). NOT
+// a mounted route: `POST /blobs` streams the request body directly to the byte
+// store's pending slot OUTSIDE the write coordinator (computing md5+sha256 on
+// the way past and enforcing `maxBytes` mid-stream), then acquires the write
+// coordinator ONLY for the sub-millisecond SQLite metadata INSERT, returning
+// { id, md5, sha256, size, mime }. A rolled-back dispatch leaves it pending for
+// the reaper. Route-gate fail-closed: anonymous → 401. Returns true when
+// handled; false to fall through to matchRoute.
+export interface BlobUploadRouteOptions {
+  maxBytes?: number;
+}
+
+function firstHeaderString(value: string | string[] | undefined): string {
+  if (Array.isArray(value)) return value[0] ?? '';
+  return value ?? '';
+}
+
+function toUint8ArrayChunk(chunk: unknown): Uint8Array {
+  if (chunk instanceof Uint8Array) return chunk;
+  if (typeof chunk === 'string') return Buffer.from(chunk);
+  throw new TypeError('streamed blob chunk must be Uint8Array');
+}
+
+// Adapt a Node IncomingMessage (or EventEmitter test double) into a
+// backpressure-aware AsyncIterable<Uint8Array> WITHOUT calling req.destroy() on
+// early return (such as a mid-stream 413 BlobTooLargeError), so the HTTP
+// response flushes cleanly while unread request bytes drain.
+function requestBodyAsyncIterable(req: FrameworkRequest): {
+  stream: AsyncIterable<Uint8Array>;
+  drain: () => void;
+} {
+  const raw = (req.raw ?? req) as FrameworkRequest & {
+    [Symbol.asyncIterator]?: () => AsyncIterator<unknown>;
+  };
+  const drain = () => {
+    try { raw.resume?.(); } catch {}
+  };
+
+  if (typeof raw.on !== 'function' && typeof raw[Symbol.asyncIterator] === 'function') {
+    const stream = (async function* iterateNative() {
+      for await (const chunk of raw as AsyncIterable<unknown>) {
+        yield toUint8ArrayChunk(chunk);
+      }
+    })();
+    return { stream, drain };
+  }
+
+  const stream = (async function* iterateEvents() {
+    if (raw.aborted || raw.destroyed) {
+      throw new BodyError('request body was aborted', 400);
+    }
+    const queue: Uint8Array[] = [];
+    let done = false;
+    let streamError: unknown = null;
+    let notify: (() => void) | null = null;
+    const wake = () => {
+      const fn = notify;
+      notify = null;
+      fn?.();
+    };
+    const onData = (chunk: unknown) => {
+      try {
+        queue.push(toUint8ArrayChunk(chunk));
+        raw.pause?.();
+      } catch (err) {
+        streamError = err;
+      }
+      wake();
+    };
+    const onEnd = () => { done = true; wake(); };
+    const onError = (err: unknown) => { streamError = err; wake(); };
+    const onAborted = () => { streamError = new BodyError('request body was aborted', 400); wake(); };
+    const onClose = () => {
+      if (!done && streamError === null) {
+        streamError = new BodyError('request body closed before completion', 400);
+        wake();
+      }
+    };
+
+    raw.on('data', onData as never);
+    raw.on('end', onEnd as never);
+    raw.on('error', onError as never);
+    raw.on('aborted', onAborted as never);
+    raw.on('close', onClose as never);
+    try {
+      while (true) {
+        while (queue.length > 0) {
+          yield queue.shift()!;
+        }
+        if (streamError !== null) throw streamError;
+        if (done) break;
+        raw.resume?.();
+        await new Promise<void>((resolve) => { notify = resolve; });
+      }
+    } finally {
+      raw.off?.('data', onData as never);
+      raw.off?.('end', onEnd as never);
+      raw.off?.('error', onError as never);
+      raw.off?.('aborted', onAborted as never);
+      raw.off?.('close', onClose as never);
+    }
+  })();
+  return { stream, drain };
+}
+
+function resolveBlobUploadMaxBytes(
+  app: FrameworkApp,
+  options?: BlobUploadRouteOptions,
+): number {
+  const candidates = [options?.maxBytes, app.blobs?.maxBytes, app.blobMaxBytes];
+  for (const candidate of candidates) {
+    if (typeof candidate === 'number' && Number.isFinite(candidate) && candidate >= 0) {
+      return candidate;
+    }
+  }
+  return DEFAULT_BLOB_MAX_BYTES;
+}
 
 export async function handleBlobUploadRoute(
   app: FrameworkApp | null | undefined,
   req: FrameworkRequest,
   res: HttpResponseLike,
   principal: Principal | null | undefined,
+  options?: BlobUploadRouteOptions,
 ): Promise<boolean> {
   const url = new URL(req.url ?? '/', 'http://localhost');
   if (url.pathname !== '/blobs' || req.method !== 'POST') return false;
@@ -616,9 +745,93 @@ export async function handleBlobUploadRoute(
     reject(res, 401, 'unauthorized');
     return true;
   }
+
+  const maxBytes = resolveBlobUploadMaxBytes(app, options);
+  const rawReq = req.raw ?? req;
+  const declaredLengthHeader = firstHeaderString(rawReq.headers['content-length']);
+  const declaredLength = declaredLengthHeader ? Number(declaredLengthHeader) : NaN;
+  if (Number.isSafeInteger(declaredLength) && declaredLength > maxBytes) {
+    try { rawReq.resume?.(); } catch {}
+    reject(res, 413, `blob exceeds ${maxBytes} bytes`);
+    return true;
+  }
+
+  const mime = (firstHeaderString(rawReq.headers['content-type']) || 'application/octet-stream')
+    .split(';')[0]
+    .trim() || 'application/octet-stream';
+  const coordinator = app.writeCoordinator;
+  const blobs = app.blobs;
+
+  // Streaming upload path (#287): stream chunks directly to disk + hash
+  // OUTSIDE app.writeCoordinator.run(...), then acquire the coordinator ONLY
+  // for the sub-millisecond SQLite metadata row insert.
+  if (typeof blobs.stagePendingStream === 'function' && typeof blobs.recordPending === 'function') {
+    const blobId = randomUUID();
+    const { stream, drain } = requestBodyAsyncIterable(req);
+    let attested: { byteLength: number; sha256: string; md5: string };
+    try {
+      attested = await blobs.stagePendingStream(blobId, stream, { maxBytes });
+    } catch (err) {
+      if (err instanceof BlobTooLargeError) {
+        drain();
+        reject(res, 413, err.message);
+        return true;
+      }
+      if (err instanceof BodyError) {
+        reject(res, err.status, err.message);
+        return true;
+      }
+      throw err;
+    }
+    let meta: UploadedBlob;
+    try {
+      const register = () => blobs.recordPending!(blobId, attested, { mime });
+      meta = coordinator ? await coordinator.run(register) : register();
+    } catch (err) {
+      try { blobs.removePendingSlot?.(blobId); } catch {}
+      throw err;
+    }
+    sendJson(res, 201, meta);
+    return true;
+  }
+
+  if (typeof blobs.writePendingStream === 'function') {
+    const blobId = randomUUID();
+    const { stream, drain } = requestBodyAsyncIterable(req);
+    let attested: { byteLength: number; sha256: string; md5: string };
+    try {
+      attested = await blobs.writePendingStream(blobId, stream, {
+        maxBytes,
+        mime,
+        ...(coordinator ? { coordinate: <T>(fn: () => T | Promise<T>) => coordinator.run(fn) } : {}),
+      });
+    } catch (err) {
+      if (err instanceof BlobTooLargeError) {
+        drain();
+        reject(res, 413, err.message);
+        return true;
+      }
+      if (err instanceof BodyError) {
+        reject(res, err.status, err.message);
+        return true;
+      }
+      throw err;
+    }
+    sendJson(res, 201, {
+      id: blobId,
+      md5: attested.md5,
+      sha256: attested.sha256,
+      size: attested.byteLength,
+      mime,
+    });
+    return true;
+  }
+
+  // Legacy fallback for minimal test doubles implementing only upload().
+  if (typeof blobs.upload !== 'function') return false;
   let bytes: Buffer;
   try {
-    bytes = await readRawBody(req, BLOB_LIMIT);
+    bytes = await readRawBody(rawReq as never, maxBytes);
   } catch (err) {
     if (err instanceof BodyError) {
       reject(res, err.status, err.message);
@@ -626,17 +839,194 @@ export async function handleBlobUploadRoute(
     }
     throw err;
   }
-  const mime = (req.headers['content-type'] ?? 'application/octet-stream').split(';')[0].trim();
-  // Blob METADATA writes enter through the ONE platform write coordinator (the
-  // /blobs route is a framework write path — never a second mutation route). The
-  // body stream was read BEFORE the turn, so the mutex is not held while
-  // uploading; the hashing + metadata INSERT + pending-slot write take the turn.
-  const coordinator = app.writeCoordinator;
-  const blobs = app.blobs;
   const meta = coordinator
-    ? await coordinator.run(() => blobs.upload({ bytes, mime }))
+    ? await coordinator.run(() => blobs.upload!({ bytes, mime }))
     : blobs.upload({ bytes, mime });
   sendJson(res, 201, meta);
+  return true;
+}
+
+// Per-app cache of the compiled SQL scopeFilter AuthorizationAdapter used by
+// handleBlobReadRoute (`GET`/`HEAD /blobs/:entity/:id/:field`).
+const blobReadAdapters = new WeakMap<object, { adapter: AuthorizationAdapter; registered: Set<string> }>();
+
+function getEntityBlobAdapter(app: FrameworkApp, entity: CrudEntity, fieldName: string): {
+  adapter: AuthorizationAdapter;
+  resourceName: string;
+} {
+  let entry = blobReadAdapters.get(app);
+  if (!entry) {
+    entry = {
+      adapter: createAuthorizationAdapter({ db: app.db as unknown as AuthorizationDb }),
+      registered: new Set<string>(),
+    };
+    blobReadAdapters.set(app, entry);
+  }
+  const resourceName = `${entity.name}.${fieldName}`;
+  if (!entry.registered.has(resourceName)) {
+    const entityLike = entity as unknown as ResourceEntityLike;
+    if (entityLike.readScope && entityLike.scopeAst) {
+      entry.adapter.registerResource({
+        category: 'blob',
+        name: resourceName,
+        entity: entityLike,
+        db: app.db as unknown as AuthorizationDb,
+      });
+      entry.registered.add(resourceName);
+    }
+  }
+  return { adapter: entry.adapter, resourceName };
+}
+
+function sendOpaqueBlobReadForbidden(res: HttpResponseLike, isHead: boolean): void {
+  if (isHead) {
+    res.writeHead(403, {
+      'content-type': 'application/json; charset=utf-8',
+      'content-length': '0',
+      'cache-control': 'private, no-store',
+    });
+    res.end();
+    return;
+  }
+  sendFailure(
+    sendJson as unknown as SendJson,
+    res,
+    failure('denied', 'forbidden'),
+    { status: 403, headers: { 'cache-control': 'private, no-store' } },
+  );
+}
+
+// Framework-owned authorized blob media route (#287):
+// `GET`/`HEAD /blobs/:entity/:id/:field`.
+//
+// Evaluates the owning entity's compiled SQL `scopeFilter` (including
+// `membership()` and `inherit(...)` grants) plus row/field `.can` read
+// admission via the single authorization seam, then serves bytes via
+// `serveAuthorizedBlob` (`200`, `206 Partial Content`, `416`, `HEAD`,
+// `ETag`, `Accept-Ranges: bytes`, `Cache-Control: private, no-store`,
+// backpressure-safe streaming via `pumpWebStreamToResponse`). Every denial,
+// missing entity/field, missing row, or missing blob fails closed with an
+// opaque `403`.
+export async function handleBlobReadRoute(
+  app: FrameworkApp | null | undefined,
+  req: FrameworkRequest,
+  res: HttpResponseLike,
+  principal?: Principal | null,
+): Promise<boolean> {
+  const method = (req.method ?? '').toUpperCase();
+  if (method !== 'GET' && method !== 'HEAD') return false;
+  const url = new URL(req.url ?? '/', 'http://localhost');
+  const seg = url.pathname.split('/').filter(Boolean);
+  if (seg.length !== 4 || seg[0] !== 'blobs') return false;
+  if (!app || !app.entities || !app.db || !app.blobs) return false;
+  const isHead = method === 'HEAD';
+
+  let entityName: string;
+  let id: string;
+  let fieldName: string;
+  try {
+    entityName = decodeURIComponent(seg[1]!);
+    id = decodeURIComponent(seg[2]!);
+    fieldName = decodeURIComponent(seg[3]!);
+  } catch {
+    sendOpaqueBlobReadForbidden(res, isHead);
+    return true;
+  }
+
+  const entity = app.entities.get(entityName);
+  const descriptor = entity?.fields?.[fieldName] as { blob?: unknown } | undefined;
+  if (!entity || !descriptor || descriptor.blob !== true) {
+    sendOpaqueBlobReadForbidden(res, isHead);
+    return true;
+  }
+
+  const blobs = app.blobs;
+  if (typeof blobs.stat !== 'function' || typeof blobs.readRangeStream !== 'function') {
+    sendOpaqueBlobReadForbidden(res, isHead);
+    return true;
+  }
+
+  const effectivePrincipal: Principal = principal ?? req.principal ?? anonymous;
+  const storedRow = rawRow(app.db, entity.name, id) as Record<string, unknown> | undefined;
+  const { adapter: entityBlobAdapter, resourceName } = getEntityBlobAdapter(app, entity, fieldName);
+  const appAuthz = routeAuthorization(app);
+
+  // Compose the compiled SQL `blob` scopeFilter admission with row/field read
+  // capability admission (`.can` / `inherit(...)` / field access). If an app
+  // explicitly registered a `blob` policy on its custom `_authorization`
+  // adapter, honor it directly.
+  const routeBlobAuthorize: AuthorizationAdapter = {
+    registerResource: (input) => entityBlobAdapter.registerResource(input),
+    admit: async (input) => {
+      if (input.category !== 'blob') return entityBlobAdapter.admit(input);
+      if (appAuthz) {
+        const customByField = await appAuthz.admit({ ...input, resourceName: fieldName });
+        if (customByField.reasonCode !== 'no-resource') return customByField;
+        const customByQualified = await appAuthz.admit({ ...input, resourceName });
+        if (customByQualified.reasonCode !== 'no-resource') return customByQualified;
+      }
+      const scopeDecision = await entityBlobAdapter.admit({
+        ...input,
+        resourceName,
+        entity: entity as unknown as ResourceEntityLike,
+        db: app.db as unknown as AuthorizationDb,
+      });
+      if (!scopeDecision.admitted || !storedRow) return scopeDecision;
+      const collapsed = collapseForAdmission(input.principal);
+      const materialized = entity.deserializeRow({ ...storedRow });
+      const fieldAllowed = await mayReadField(
+        entity as never,
+        fieldName,
+        materialized,
+        collapsed,
+        appAuthz,
+      );
+      if (!fieldAllowed) {
+        return Object.freeze({
+          ...scopeDecision,
+          admitted: false,
+          reasonCode: 'no-capability' as const,
+        });
+      }
+      return scopeDecision;
+    },
+  };
+
+  let resolvedBlobId: string | null = null;
+  const resolveAdoptedBlobId = (): string | null => {
+    if (!storedRow) return null;
+    const rawId = storedRow[fieldName];
+    return typeof rawId === 'string' && rawId.length > 0 ? rawId : null;
+  };
+
+  await serveAuthorizedBlob({
+    req,
+    res: res as unknown as ServerResponse,
+    principal: effectivePrincipal,
+    resource: storedRow ?? null,
+    field: resourceName,
+    authorize: routeBlobAuthorize,
+    entity: entity as unknown as ResourceEntityLike,
+    db: app.db as unknown as AuthorizationDb,
+    stat: () => {
+      const blobId = resolveAdoptedBlobId();
+      if (!blobId) return null;
+      const meta = blobs.stat!(blobId);
+      if (!meta || meta.status !== 'adopted') return null;
+      // Confirm the final byte slot exists without reading bytes into RAM so
+      // HEAD also fails closed with opaque 403 when bytes are missing on disk.
+      if (typeof blobs.readRange === 'function') {
+        blobs.readRange(blobId, [0, 0]);
+      }
+      resolvedBlobId = blobId;
+      return { size: meta.size, mime: meta.mime, sha256: meta.sha256 };
+    },
+    readStream: (range, options): Readable => {
+      const blobId = resolvedBlobId ?? resolveAdoptedBlobId();
+      if (!blobId) throw new Error('blob not found');
+      return blobs.readRangeStream!(blobId, range, options);
+    },
+  });
   return true;
 }
 

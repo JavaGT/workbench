@@ -306,6 +306,17 @@ export class BlobTooLargeError extends Error {
 
 
 
+
+
+
+
+
+
+
+
+
+
+
                                                     
 
 
@@ -362,6 +373,10 @@ export { abortError };
 
 
 
+
+
+
+
 // Range validation shared by every byte read (buffered and streaming) across
 // conforming backends, so the strict-bound guarantees are ONE code path. Reads
 // reject negative / non-finite / non-integer / inverted bounds cleanly (→
@@ -387,7 +402,10 @@ export function validateBlobRange(
   return { start: startValue, end: endValue, length: endValue - startValue };
 }
 
-export function fsBlobs({ root, stagingRoot }                )                                       {
+export function fsBlobs({ root, stagingRoot, maxBytes: defaultMaxBytes }                )                                       {
+  if (defaultMaxBytes !== undefined && (!Number.isFinite(defaultMaxBytes) || defaultMaxBytes < 0)) {
+    throw new Error('invalid maxBytes');
+  }
   mkdirSync(root, { recursive: true });
   if (stagingRoot) mkdirSync(stagingRoot, { recursive: true });
 
@@ -581,6 +599,16 @@ export function fsBlobs({ root, stagingRoot }                )                  
     return existsSync(pathFor(id, { pending }));
   }
 
+  function statSlot(id        , { pending }                    = {})                          {
+    safeId(id);
+    try {
+      return { size: statSync(pathFor(id, { pending })).size };
+    } catch (err) {
+      if ((err                         ).code === 'ENOENT') return null;
+      throw err;
+    }
+  }
+
   // Free bytes on the filesystem holding the final slots, via statfs (bavail ×
   // frsize = bytes available to this process). Throws never — an unreadable
   // statfs returns null so the caller can fail closed.
@@ -595,6 +623,7 @@ export function fsBlobs({ root, stagingRoot }                )                  
 
   return {
     capabilities,
+    ...(defaultMaxBytes !== undefined ? { maxBytes: defaultMaxBytes } : {}),
     writePending,
     writePendingStream,
     finalizePending,
@@ -604,6 +633,7 @@ export function fsBlobs({ root, stagingRoot }                )                  
     readPendingStream,
     remove,
     exists,
+    statSlot,
     freeBytes,
     pathFor,
   };

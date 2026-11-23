@@ -124,6 +124,25 @@ function wireDocumentOf(span) {
   return { text: wire, redactions };
 }
 
+// A failed result normally carries a known envelope (`failure` for a rejected
+// write, `deliveryError` for an uncertain one). A transport-level rejection can
+// instead carry only `error` — e.g. `{ ok: false, httpStatus: 502, error:
+// 'http 502' }` from decodeResult's non-envelope branch. Passing that whole
+// object to onError renders '[object Object]' in hosts that stringify it and
+// risks exposing the in-flight document text, so extract a meaningful Error:
+// keep real Errors, use a string or a `.message` as the message, and fall back
+// to a static one (issue #251).
+function extractFailure(result) {
+  const known = result?.failure ?? result?.deliveryError;
+  if (known) return known;
+  const error = result?.error;
+  if (error instanceof Error) return error;
+  const message = typeof error === 'string'
+    ? error
+    : typeof error?.message === 'string' ? error.message : '';
+  return new Error(message.length > 0 ? message : 'annotated text operation failed');
+}
+
 /** Bind a blockless plain-text contenteditable to an annotated-text session.
  * The document is ONE `text` with absolute `ranges` and document-wide
  * `redactions`; the editor renders one contentEditable root span and reads
@@ -1082,7 +1101,7 @@ export function bindAnnotatedTextEditor({ element, session, onError = () => {}, 
   function report(work) {
     element.setAttribute('aria-busy', 'true');
     const tracked = Promise.resolve(work).then(async (result) => {
-      if (result?.ok === false) onError(result.failure ?? result.deliveryError ?? result);
+      if (result?.ok === false) onError(extractFailure(result));
       if (result?.ok && result.settlement?.wait) await result.settlement.wait();
       return result;
     }, onError).finally(() => {

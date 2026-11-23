@@ -515,6 +515,20 @@ export function createDurableHistoryRuntime({
     return Object.freeze(result);
   }
 
+  function replayRetryResultData(scope: string, retry: ParsedReceipt): unknown {
+    const stored = retry.resultData;
+    if (stored && typeof stored === 'object') {
+      const envelope = stored as { __workbenchMixedReplay?: { resultData?: unknown } };
+      if (envelope.__workbenchMixedReplay && typeof envelope.__workbenchMixedReplay === 'object'
+        && 'resultData' in envelope.__workbenchMixedReplay) {
+        return envelope.__workbenchMixedReplay.resultData;
+      }
+      return stored;
+    }
+    if (stored !== null && stored !== undefined) return stored;
+    return Object.freeze({ actionId: retry.actionId, confirmedThrough: readSeq(db, scope) });
+  }
+
   async function move(operation: 'undo' | 'redo', args: MoveArgs = {}): Promise<unknown> {
     const key = identity(args);
     await admitted(historyDescriptor, { operation, scope: key.scope, session: args.session, principal: args.principal });
@@ -553,19 +567,14 @@ export function createDurableHistoryRuntime({
         });
       }
       // A retried move must carry the same receipt the HTTP skin reconciles
-      // against, including the benign empty ($history.empty) no-op (#230). Prefer
-      // the confirmed-through stored with the original receipt.
-      const storedResult = retry.resultData && typeof retry.resultData === 'object'
-        ? retry.resultData as { confirmedThrough?: unknown }
-        : null;
-      const confirmedThrough = storedResult && Number.isSafeInteger(storedResult.confirmedThrough)
-        ? storedResult.confirmedThrough as number
-        : readSeq(db, key.scope);
-      const retried: { ok: boolean; deduped: boolean; events: readonly LogEvent[]; empty?: boolean; resultData: Readonly<{ actionId: string; confirmedThrough: number }> } = {
+      // against, including extended receipts (e.g. annotated-text authoring
+      // receipts), mixed-replay envelopes, and benign $history.empty no-ops (#230).
+      const resultData = replayRetryResultData(key.scope, retry);
+      const retried: { ok: boolean; deduped: boolean; events: readonly LogEvent[]; empty?: boolean; resultData: unknown } = {
         ok: true,
         deduped: true,
         events: Object.freeze(eventsFromReceipt(db, retry, parseEventType)),
-        resultData: Object.freeze({ actionId: retry.actionId, confirmedThrough }),
+        resultData,
       };
       if (retry.actionType === '$history.empty') retried.empty = true;
       return Object.freeze(retried);
@@ -743,7 +752,15 @@ export function createDurableHistoryRuntime({
       if (retry.operation !== 'undoToPoint' || retry.principalKey !== key.principalKey || retry.sessionId !== key.sessionId) {
         throw conflict('history action id is already bound to another operation');
       }
-      return Object.freeze({ ok: true, deduped: true, events: Object.freeze(eventsFromReceipt(db, retry, parseEventType)) });
+      const resultData = replayRetryResultData(key.scope, retry);
+      const retried: { ok: boolean; deduped: boolean; events: readonly LogEvent[]; empty?: boolean; resultData: unknown } = {
+        ok: true,
+        deduped: true,
+        events: Object.freeze(eventsFromReceipt(db, retry, parseEventType)),
+        resultData,
+      };
+      if (retry.actionType === '$history.empty') retried.empty = true;
+      return Object.freeze(retried);
     }
     const expected = currentCursor(db, key);
     if (revisionArg !== revision(expected)) throw conflict('history cursor is stale');

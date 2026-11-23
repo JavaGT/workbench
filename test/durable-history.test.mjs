@@ -1006,6 +1006,46 @@ test('empty-cursor undo returns a receipt-shaped no-op instead of a missing rece
   assert.deepEqual(retry.resultData, result.resultData);
 });
 
+test('history move retry preserves extended receipt fields and unwraps mixed-replay fence (#230)', async () => {
+  const db = new DatabaseSync(':memory:'); executeFrameworkDDL(db); const server = makeServer(db);
+  await set(server, { actionId: 'ext-a1', value: 1, before: 0, session: 'tab-a' });
+  const c1 = await server.history.cursor({ scope, principal, session: 'tab-a' });
+  await server.history.undo({ scope, principal, session: 'tab-a', actionId: 'ext-u1', revision: c1.revision });
+  const extendedReceipt = { version: 1, actionId: 'ext-u1', confirmedThrough: 2, authoring: { marker: 'issued' } };
+  db.prepare('UPDATE _ActionReceipt SET resultData = ? WHERE actionId = ?').run(JSON.stringify(extendedReceipt), 'ext-u1');
+  const retryExt = await server.history.undo({ scope, principal, session: 'tab-a', actionId: 'ext-u1', revision: c1.revision });
+  assert.equal(retryExt.deduped, true);
+  assert.deepEqual(retryExt.resultData, extendedReceipt);
+
+  // Mixed-replay envelope stores the original confirmedThrough nested inside
+  // __workbenchMixedReplay.resultData; retry must unwrap it even after later
+  // events advance scope seq.
+  const mixedEnvelope = {
+    __workbenchMixedReplay: {
+      durableIndexes: [0],
+      liveIndexes: [],
+      liveEvents: [],
+      resultData: { actionId: 'ext-u1', confirmedThrough: 2 },
+    },
+  };
+  db.prepare('UPDATE _ActionReceipt SET resultData = ? WHERE actionId = ?').run(JSON.stringify(mixedEnvelope), 'ext-u1');
+  await set(server, { actionId: 'ext-a2', value: 2, before: 0, session: 'tab-a' });
+  const retryMixed = await server.history.undo({ scope, principal, session: 'tab-a', actionId: 'ext-u1', revision: c1.revision });
+  assert.equal(retryMixed.deduped, true);
+  assert.deepEqual(retryMixed.resultData, { actionId: 'ext-u1', confirmedThrough: 2 });
+
+  // undoToPoint empty retry also returns stored resultData symmetrically.
+  const c2 = await server.history.cursor({ scope, principal, session: 'tab-a' });
+  const seq = 3;
+  const utp = await server.history.undoToPoint({ scope, principal, session: 'tab-a', actionId: 'utp-empty-1', revision: c2.revision, seq });
+  assert.equal(utp.empty, true);
+  assert.deepEqual(utp.resultData, { actionId: 'utp-empty-1', confirmedThrough: seq });
+  const utpRetry = await server.history.undoToPoint({ scope, principal, session: 'tab-a', actionId: 'utp-empty-1', revision: c2.revision, seq });
+  assert.equal(utpRetry.deduped, true);
+  assert.equal(utpRetry.empty, true);
+  assert.deepEqual(utpRetry.resultData, utp.resultData);
+});
+
 test('malformed persisted cursor fails closed without a history write', async () => {
   const db = new DatabaseSync(':memory:'); executeFrameworkDDL(db); const server = makeServer(db);
   await set(server, { actionId: 'malformed-a1', value: 1, before: 0, session: 'tab-a' });

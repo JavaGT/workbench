@@ -131,10 +131,11 @@ export function compileMembershipAuthz(entityName: string, fields: Record<string
     const fieldName = resolveFieldName(fields, roleName, fieldSpec);
     const descriptor = fields[fieldName];
 
-    // Determine DB role values for runtime filtering.
+    // Determine DB role values for runtime and SQL filtering.
+    const descriptorRoles = resolveDescriptorRoles(descriptor);
     const dbRoles = fieldSpec?.role
-      ? (Array.isArray(fieldSpec.role) ? [...fieldSpec.role] : [fieldSpec.role])
-      : resolveDescriptorRoles(descriptor);
+      ? (Array.isArray(fieldSpec.role) ? fieldSpec.role.map((r) => String(r)) : [String(fieldSpec.role)])
+      : (descriptorRoles.includes(roleName) ? [roleName] : descriptorRoles);
 
     fieldMappings.set(roleName, { fieldName, dbRoles, capabilities });
 
@@ -301,9 +302,11 @@ function resolveFieldName(fields: Record<string, FieldDescriptor>, roleName: str
 }
 
 // Extract role values from a field descriptor, normalized to an array.
+// map() stores declared roles on `descriptor.roles`; accept `descriptor.role`
+// too for callers passing a hand-constructed descriptor.
 function resolveDescriptorRoles(descriptor: FieldDescriptor | undefined): string[] {
   if (!descriptor) return [];
-  const role = descriptor.role;
+  const role = descriptor.roles ?? descriptor.role;
   if (Array.isArray(role)) return role.map((r) => String(r));
   if (role) return [String(role)];
   return [];
@@ -315,12 +318,15 @@ function buildCheckEntry(entityName: string, fieldName: string, dbRoles: string[
   const ownerCol = membershipOwnerCol(entityName);
 
   // Harvest face: returns an existsMembership AST node for scope→SQL lowering.
+  // When a role constraint is present, carry it onto the AST node so SQL
+  // scope filtering excludes unauthorized roles identically to `run`.
   const harvest = (): AstNode => {
     return makeNode({
       node: 'existsMembership',
       table,
       ownerCol,
       param: PRINCIPAL_ID_PARAM,
+      ...(dbRoles.length > 0 ? { roles: Object.freeze([...dbRoles]) } : {}),
     });
   };
 

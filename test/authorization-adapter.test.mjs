@@ -16,7 +16,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  text, date, ref, map, scope, grant, deny, read, write, subscribe, everyone,
+  text, date, ref, map, scope, grant, deny, read, write, subscribe, everyone, anyOf,
   principal, anonymous, requireUser, allowAnonymous,
 } from '../build/index.mjs';
 import { entity, NonCompilableError } from '../build/internal.mjs';
@@ -614,4 +614,61 @@ test('decisions are frozen and traces never carry payload values', async () => {
   assert.ok(Object.isFrozen(d.trace));
   assert.ok(d.trace.every((entry) => !String(entry.outcome).includes('bob')));
   assert.ok(d.trace.every((entry) => typeof entry.check === 'string' && typeof entry.outcome === 'boolean'));
+});
+
+test('entity admission runs .can (rowCapabilities) exactly once per admitted request', async () => {
+  let canCalls = 0;
+  const CountedNote = entity('CountedNote', {
+    body: text(),
+    owner: ref('User', { role: 'owner', readonly: true }),
+    grant: () => [
+      scope(({ is }) => is.owner()).can(async ({ is }) => {
+        canCalls += 1;
+        return (await is.owner()) ? grant(read, write, subscribe) : deny('no');
+      }),
+    ],
+  });
+  const adapter = createAuthorizationAdapter();
+  const d = await adapter.admit({
+    category: 'entity', verb: 'update', principal: alice, entity: CountedNote, row: aliceRow,
+  });
+  assert.equal(d.admitted, true);
+  assert.deepEqual(d.capabilities, [read, write, subscribe]);
+  assert.equal(canCalls, 1, '.can must execute exactly once per admitted entity request');
+});
+
+test('DB-less three-valued anyOf(is.owner(), is.collaborator()) admits owner and fails closed for non-owners', async () => {
+  const adapter = createAuthorizationAdapter();
+  adapter.registerResource({
+    category: 'search',
+    name: 'docs',
+    scope: ({ is }) => anyOf(is.owner(), is.collaborator()),
+    fields: {
+      owner: ref('User', { role: 'owner' }),
+      collaborators: map(ref('User')),
+    },
+    checks: { collaborator: ({ docs, principal: p }) => docs.collaborators.has(p.id) },
+  });
+  // Owner branch proves true even though membership branch is UNEVALUABLE without DB.
+  const ownerDecision = await adapter.admit({
+    category: 'search', operation: 'search', principal: alice, resourceName: 'docs',
+    row: { id: 'd1', owner: 'alice' },
+  });
+  assert.equal(ownerDecision.admitted, true, 'owner admits under 3VL anyOf(owner, membership)');
+
+  // Non-owner: owner branch is false and membership branch is UNEVALUABLE → fail closed.
+  const nonOwnerDecision = await adapter.admit({
+    category: 'search', operation: 'search', principal: bob, resourceName: 'docs',
+    row: { id: 'd1', owner: 'alice' },
+  });
+  assert.equal(nonOwnerDecision.admitted, false, 'non-owner fails closed without DB');
+  assert.equal(nonOwnerDecision.reasonCode, 'no-row-scope');
+
+  // Anonymous: owner branch is UNEVALUABLE (NULL) and membership is UNEVALUABLE → fail closed.
+  const anonDecision = await adapter.admit({
+    category: 'search', operation: 'search', principal: anonymous, resourceName: 'docs',
+    row: { id: 'd1', owner: 'alice' },
+  });
+  assert.equal(anonDecision.admitted, false, 'anonymous fails closed without DB');
+  assert.equal(anonDecision.reasonCode, 'no-row-scope');
 });

@@ -174,6 +174,7 @@ export function buildCheckRegistry({ fields = {}, declaredChecks = {}, entityNam
     const harvest = (): unknown => {
       const entityContext = entityName ? { [entityName]: compileSelfHandle } : {};
       const result = fn({
+        entity: compileSelfHandle,
         ...entityContext,
         principal: { id: PRINCIPAL_ID_TOKEN, attributes: { token: PRINCIPAL_ATTR_TOKEN } },
       });

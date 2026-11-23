@@ -33,20 +33,27 @@
 // there, never falling back to loading every row and filtering in JS.
 
 import { getLog } from './log.ts';
-import type { Capability } from './grant.ts';
+import { read, write, subscribe, admin, type Capability } from './grant.ts';
 import { operationCategory, type OperationCategory } from './operation.ts';
 import { collapseForAdmission, statusOf, type Principal } from './principal.ts';
 import type { Gate, PrincipalLike } from './route-gate.ts';
 import { requireUser } from './route-gate.ts';
+import { prepareCached, type DbHandle } from './driver.ts';
 import {
   mayRow as moduleMayRow,
-  mayVerb as moduleMayVerb,
   fieldCapabilities as moduleFieldCapabilities,
   rowCapabilities,
   type EntityRecord,
 } from './row-grant.ts';
 import { buildCheckRegistry } from './registry.ts';
-import { compileReadScope, rowMatchesScope, type ReadScopeTemplate } from './scope-sql.ts';
+import {
+  bindReadScope,
+  compileInheritScope,
+  compileReadScope,
+  rowMatchesScope,
+  type AstNode,
+  type ReadScopeTemplate,
+} from './scope-sql.ts';
 import { DecisionTrace } from './decision-trace.ts';
 import type { DecisionTraceEntry } from './decision-trace.ts';
 
@@ -148,16 +155,29 @@ export interface ActionAdmitInput {
   readonly resourceId?: string | null;
 }
 
+export type AuthorizationDb = Pick<DbHandle, 'prepare'>;
+
+export interface ResourceEntityLike {
+  readonly name: string;
+  readonly fields?: Readonly<Record<string, unknown>>;
+  readonly registry?: Readonly<Record<string, unknown>>;
+  readonly readScope?: ReadScopeTemplate | { readonly sql: string; readonly params: Record<string, unknown>; readonly nearest?: ReadScopeTemplate['nearest'] };
+  readonly scopeAst?: AstNode;
+  readonly scopeFilter?: (principal: unknown) => { sql: string; params: Record<string, unknown> };
+  readonly runtime?: { readonly db?: AuthorizationDb } | unknown;
+}
+
 // Plugin-resource admission (blob / search / subscription / policy): keyed by
 // category, optionally naming a resource registered on this adapter. A named
 // but unregistered resource denies ('no-resource'); an absent row denies
-// ('no-row-scope'). The row's visibility is decided by the caller under the
-// resource's REGISTERED (compiled) scope — this seam never loads rows itself —
-// and, for a named registered resource, admit() re-verifies the supplied row
-// against the registered scope before admitting (a row outside that scope, or a
-// scope this seam cannot evaluate without a database, denies 'no-row-scope').
-// `row` must carry the STORED cell form (the shape SQL returns) so the scope's
-// serialized literals compare correctly.
+// ('no-row-scope'). For a named registered resource, admit() verifies the
+// supplied row against the resource's REGISTERED (compiled) scope before
+// admitting: when a database handle is available (on the adapter, registered
+// resource, or entity runtime), admission executes the compiled SQL scopeFilter
+// (`SELECT 1 FROM <entity> AS t0 WHERE (<scopeSql>) AND t0.id = :__wb_id LIMIT 1`)
+// — the one compiled SQL authz engine; when no database is available, admission
+// falls back to single-row evaluation (`rowMatchesScope`), where `row` carries
+// stored cell values.
 export interface ResourceAdmitInput {
   readonly category: PluginResourceCategory;
   readonly principal: Principal;
@@ -165,6 +185,8 @@ export interface ResourceAdmitInput {
   readonly resourceName: string;
   readonly row?: unknown;
   readonly resourceId?: string | null;
+  readonly entity?: ResourceEntityLike;
+  readonly db?: AuthorizationDb;
 }
 
 export type AdmitInput =
@@ -174,15 +196,22 @@ export type AdmitInput =
   | ResourceAdmitInput;
 
 // Resource registration for the non-entity categories. The scope predicate
-// must compile to constrained SQL here (a non-compilable scope throws
-// NonCompilableError at registration, never a silent load-all-then-filter
-// fallback). `fields`/`checks` supply the compile registry the scope may use.
+// (or inherit directive, or entity carrying a compiled read-scope) must compile
+// to constrained SQL here (a non-compilable scope throws NonCompilableError at
+// registration, never a silent load-all-then-filter fallback). `fields`/`checks`
+// supply the compile registry the scope may use; `entity`/`table`/`entityName`/
+// `db` bind the SQL evaluation target when a database is available.
 export interface ResourceRegistration {
   readonly category: PluginResourceCategory;
   readonly name: string;
-  readonly scope: (ctx: { is: unknown; fields: unknown }) => unknown;
+  readonly scope?: ((ctx: { is: unknown; fields: unknown }) => unknown) | { readonly inherit: unknown; readonly via?: unknown };
   readonly fields?: Readonly<Record<string, unknown>>;
   readonly checks?: Readonly<Record<string, (ctx: unknown) => boolean>>;
+  readonly registry?: Readonly<Record<string, unknown>>;
+  readonly entity?: ResourceEntityLike;
+  readonly entityName?: string;
+  readonly table?: string;
+  readonly db?: AuthorizationDb;
 }
 
 export type MayRowFn = (entity: EntityRecord, verb: string, row: unknown, principal: unknown) => Promise<boolean>;
@@ -190,6 +219,7 @@ export type MayVerbFn = (entity: EntityRecord, verb: string, row: unknown, princ
 
 export interface AuthorizationAdapterOptions {
   trace?: boolean;
+  db?: AuthorizationDb;
   mayRow?: MayRowFn;
   mayVerb?: MayVerbFn;
   fieldCapabilities?: (entity: EntityRecord, fieldName: string, row: unknown, principal: Principal) => Promise<{ granted: boolean; capabilities: readonly Capability[] }>;
@@ -209,17 +239,95 @@ function traceDefault(): boolean {
 
 const RESOURCE_KEY_SEPARATOR = '\u0000';
 const resourceKey = (category: PluginResourceCategory, name: string): string => `${category}${RESOURCE_KEY_SEPARATOR}${name}`;
+const SQL_IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+const VERB_CAPABILITY: Readonly<Record<string, Capability>> = Object.freeze(
+  Object.assign(Object.create(null), {
+    list: read,
+    read,
+    create: write,
+    update: write,
+    remove: write,
+    subscribe,
+    admin,
+  }),
+);
+
+interface RegisteredResource {
+  readonly template: ReadScopeTemplate;
+  readonly tableName: string;
+  readonly explicitTable: boolean;
+  readonly useEntityScopeFilter: boolean;
+  readonly entity?: ResourceEntityLike;
+  readonly db?: AuthorizationDb;
+}
+
+function runtimeDbOf(entity: ResourceEntityLike | undefined): AuthorizationDb | undefined {
+  const db = (entity?.runtime as { db?: AuthorizationDb } | null | undefined)?.db;
+  return db && typeof db.prepare === 'function' ? db : undefined;
+}
+
+function isMissingTableError(error: unknown): boolean {
+  const message = (error as { message?: unknown } | null | undefined)?.message;
+  return typeof message === 'string' && /no such table/i.test(message);
+}
 
 export function createAuthorizationAdapter(options: AuthorizationAdapterOptions = {}): AuthorizationAdapter {
   const traceEnabled = options.trace ?? traceDefault();
-  const resources = new Map<string, ReadScopeTemplate>();
+  const adapterDb = options.db && typeof options.db.prepare === 'function' ? options.db : undefined;
+  const resources = new Map<string, RegisteredResource>();
 
-  // The row-admission engine: an injected mayRow wins outright; otherwise the
-  // module default mayRow with an injected mayVerb as its per-verb capability
-  // engine (the default mayRow already defaults to the module mayVerb).
-  const runMayRow = options.mayRow
-    ? (entity: EntityRecord, verb: string, row: unknown, principal: Principal) => options.mayRow!(entity, verb, row, principal)
-    : (entity: EntityRecord, verb: string, row: unknown, principal: Principal) => moduleMayRow(entity, verb, row, principal, options.mayVerb ?? moduleMayVerb);
+  // Evaluate row admission and capture conferred capabilities in ONE pass so
+  // `.can` (rowCapabilities) executes at most once per admitted entity request.
+  // An injected mayRow/mayVerb retains authority without re-running `.can`.
+  async function runMayRowWithCapabilities(
+    entity: EntityRecord,
+    verb: string,
+    row: unknown,
+    principal: Principal,
+  ): Promise<{ allowed: boolean; capabilities: readonly Capability[] }> {
+    if (options.mayRow) {
+      const allowed = await options.mayRow(entity, verb, row, principal);
+      if (!allowed) return { allowed: false, capabilities: [] };
+      const required = VERB_CAPABILITY[verb];
+      return { allowed: true, capabilities: required ? [required] : [] };
+    }
+    if (options.mayVerb) {
+      const allowed = await moduleMayRow(entity, verb, row, principal, options.mayVerb);
+      if (!allowed) return { allowed: false, capabilities: [] };
+      const required = VERB_CAPABILITY[verb];
+      return { allowed: true, capabilities: required ? [required] : [] };
+    }
+    let capabilities: readonly Capability[] = [];
+    const allowed = await moduleMayRow(entity, verb, row, principal, async (targetEntity, targetVerb, targetRow, targetPrincipal) => {
+      const required = VERB_CAPABILITY[targetVerb];
+      if (!required) return false;
+      const decision = await rowCapabilities(targetEntity, targetRow, targetPrincipal);
+      if (!decision.granted) {
+        getLog().debug('auth', `${targetVerb} denied`, {
+          entity: targetEntity.name,
+          id: (targetRow as Record<string, unknown> | null | undefined)?.id,
+          principal: (targetPrincipal as { id?: string | null } | null | undefined)?.id ?? 'anon',
+          verb: targetVerb,
+          reason: 'grant returned no capabilities',
+        });
+        return false;
+      }
+      capabilities = decision.capabilities;
+      const ok = decision.capabilities.includes(required);
+      if (!ok) {
+        getLog().debug('auth', `${targetVerb} denied`, {
+          entity: targetEntity.name,
+          id: (targetRow as Record<string, unknown> | null | undefined)?.id,
+          principal: (targetPrincipal as { id?: string | null } | null | undefined)?.id ?? 'anon',
+          verb: targetVerb,
+          reason: `missing ${required.capability}`,
+        });
+      }
+      return ok;
+    });
+    return { allowed, capabilities: allowed ? capabilities : [] };
+  }
   const runFieldCapabilities = options.fieldCapabilities ?? moduleFieldCapabilities;
 
   function settle(
@@ -276,13 +384,10 @@ export function createAuthorizationAdapter(options: AuthorizationAdapterOptions 
       return settle(input, trace, true, null, decision.capabilities, resourceIdOf(input, row), operation);
     }
 
-    const allowed = await runMayRow(entity, input.verb, row, collapsed);
+    const { allowed, capabilities } = await runMayRowWithCapabilities(entity, input.verb, row, collapsed);
     trace.record(`row.may.${input.verb}`, allowed);
     if (!allowed) return settle(input, trace, false, 'no-capability', [], resourceIdOf(input, row), operation);
-    // Report the conferred capability set (informational). mayRow decided the
-    // admission; rowCapabilities only reads the grant again for the report.
-    const caps = await rowCapabilities(entity, row, collapsed);
-    return settle(input, trace, true, null, caps.granted ? caps.capabilities : [], resourceIdOf(input, row), operation);
+    return settle(input, trace, true, null, capabilities, resourceIdOf(input, row), operation);
   }
 
   function admitPrincipal(input: PrincipalAdmitInput, collapsed: Principal, trace: DecisionTrace, operation: OperationCategory | null): AdmissionDecision {
@@ -302,12 +407,49 @@ export function createAuthorizationAdapter(options: AuthorizationAdapterOptions 
       const label = `${requirement.entity?.name ?? 'row'}.${requirement.verb}`;
       trace.record(`requirement.${label}.visible`, requirement.row != null);
       if (requirement.row == null) return settle(input, trace, false, 'no-row-scope', [], input.resourceId ?? null, operation);
-      const allowed = await runMayRow(requirement.entity, requirement.verb, requirement.row, collapsed);
+      const { allowed } = await runMayRowWithCapabilities(requirement.entity, requirement.verb, requirement.row, collapsed);
       trace.record(`requirement.${label}.may`, allowed);
       if (!allowed) return settle(input, trace, false, 'no-capability', [], input.resourceId ?? null, operation);
       if (requirement.capability) grantedCapabilities.push(requirement.capability);
     }
     return settle(input, trace, true, null, grantedCapabilities, input.resourceId ?? null, operation);
+  }
+
+  function evaluateResourceScope(
+    registered: RegisteredResource,
+    input: ResourceAdmitInput,
+    collapsed: Principal,
+  ): boolean {
+    const db = (input.db && typeof input.db.prepare === 'function' ? input.db : undefined)
+      ?? runtimeDbOf(input.entity)
+      ?? registered.db
+      ?? runtimeDbOf(registered.entity)
+      ?? adapterDb;
+    const tableName = input.entity?.name ?? registered.tableName;
+    const rowId = rowIdOf(input.row, input.resourceId);
+
+    if (db && SQL_IDENTIFIER.test(tableName) && rowId != null) {
+      const bound = registered.useEntityScopeFilter && registered.entity?.scopeFilter
+        ? registered.entity.scopeFilter(collapsed)
+        : bindReadScope(registered.template, collapsed);
+      if (!bound) return false;
+      const sql = `SELECT 1 FROM ${tableName} AS t0 WHERE (${bound.sql}) AND t0.id = :__wb_id LIMIT 1`;
+      try {
+        const hit = prepareCached(db, sql).get({ ...bound.params, __wb_id: rowId });
+        return hit !== undefined;
+      } catch (error) {
+        // If no table/entity was explicitly bound (e.g. a field-named blob
+        // resource registered on a shared DB-backed adapter whose name is not a
+        // SQL table), fall back to single-row evaluation; explicit tables fail
+        // closed (rethrow -> policy-error).
+        if (!registered.explicitTable && !input.entity && isMissingTableError(error)) {
+          return rowMatchesScope(registered.template, input.row as Record<string, unknown>, collapsed);
+        }
+        throw error;
+      }
+    }
+
+    return rowMatchesScope(registered.template, input.row as Record<string, unknown>, collapsed);
   }
 
   function admitResource(input: ResourceAdmitInput, collapsed: Principal, trace: DecisionTrace, operation: OperationCategory | null): AdmissionDecision {
@@ -317,14 +459,7 @@ export function createAuthorizationAdapter(options: AuthorizationAdapterOptions 
       if (!registered) return settle(input, trace, false, 'no-resource', [], input.resourceId ?? null, operation);
       trace.record('resource.row', input.row != null);
       if (input.row == null) return settle(input, trace, false, 'no-row-scope', [], input.resourceId ?? null, operation);
-      // The registered scope is the resource's real visibility constraint
-      // (S3/S4/S6) — not a registration-time validation artifact. The caller's
-      // read happened under this compiled scope, and admission re-verifies the
-      // supplied row satisfies it before admitting. A row outside the scope —
-      // or a scope unverifiable against a single row (membership/join/match) —
-      // denies 'no-row-scope', evaluated under the collapsed principal so an
-      // anonymous identity binds NULL exactly like the SQL path.
-      const inScope = rowMatchesScope(registered, input.row as Record<string, unknown>, collapsed);
+      const inScope = evaluateResourceScope(registered, input, collapsed);
       trace.record('resource.scope', inScope);
       if (!inScope) return settle(input, trace, false, 'no-row-scope', [], input.resourceId ?? null, operation);
       return settle(input, trace, true, null, [], input.resourceId ?? null, operation);
@@ -387,29 +522,88 @@ export function createAuthorizationAdapter(options: AuthorizationAdapterOptions 
     if (typeof input.name !== 'string' || input.name.length === 0) {
       throw new Error('resource registration requires a non-empty name');
     }
-    if (typeof input.scope !== 'function') {
+    const explicitTableName = input.table ?? input.entityName ?? input.entity?.name ?? null;
+    if (explicitTableName !== null && !SQL_IDENTIFIER.test(explicitTableName)) {
+      throw new Error(
+        `resource '${input.category}/${input.name}' has invalid SQL table identifier '${explicitTableName}'`,
+      );
+    }
+    const tableName = explicitTableName ?? input.name;
+    const where = `authorization adapter resource '${input.category}/${input.name}'`;
+
+    let template: ReadScopeTemplate;
+    let useEntityScopeFilter = false;
+    const scopeInput = input.scope;
+    const isInheritDirective = scopeInput !== null
+      && typeof scopeInput === 'object'
+      && 'inherit' in scopeInput
+      && Boolean((scopeInput as { inherit?: unknown }).inherit);
+
+    if (typeof scopeInput === 'function') {
+      const fields = (input.fields ?? input.entity?.fields ?? {}) as Record<string, unknown>;
+      const builtRegistry = buildCheckRegistry({
+        fields,
+        declaredChecks: input.checks as Record<string, (ctx: unknown) => boolean> | undefined,
+        entityName: tableName,
+      });
+      const mergedRegistry: Record<string, unknown> = { ...builtRegistry };
+      if (input.entity?.registry) {
+        for (const [key, entry] of Object.entries(input.entity.registry)) {
+          if (!input.checks || !Object.hasOwn(input.checks, key)) {
+            const existing = mergedRegistry[key] as { harvest?: unknown } | undefined;
+            const incoming = entry as { harvest?: unknown } | undefined;
+            if (!existing || (incoming?.harvest && !existing.harvest)) {
+              mergedRegistry[key] = entry;
+            }
+          }
+        }
+      }
+      if (input.registry) {
+        Object.assign(mergedRegistry, input.registry);
+      }
+      template = compileReadScope(scopeInput, {
+        fields,
+        where,
+        registry: mergedRegistry,
+        entityName: tableName,
+      });
+    } else if (isInheritDirective) {
+      template = compileInheritScope(scopeInput as { inherit: unknown; via?: unknown }, { where });
+    } else if (scopeInput === undefined && input.entity?.readScope && input.entity?.scopeAst) {
+      template = {
+        sql: input.entity.readScope.sql,
+        params: input.entity.readScope.params,
+        nearest: input.entity.readScope.nearest ?? null,
+        ast: input.entity.scopeAst,
+      };
+      useEntityScopeFilter = typeof input.entity.scopeFilter === 'function';
+    } else {
       throw new Error(
         `resource '${input.category}/${input.name}' registration requires a scope predicate — ` +
           'a resource with no row scope would load every row and filter in JS (forbidden). ' +
           'Provide a scope that compiles to constrained SQL, or register none at all.',
       );
     }
-    const fields = input.fields ?? {};
-    const registry = buildCheckRegistry({
-      fields,
-      declaredChecks: input.checks as Record<string, (ctx: unknown) => boolean> | undefined,
-      entityName: input.name,
+
+    const resourceDb = input.db && typeof input.db.prepare === 'function' ? input.db : undefined;
+    resources.set(resourceKey(input.category, input.name), {
+      template,
+      tableName,
+      explicitTable: explicitTableName !== null,
+      useEntityScopeFilter,
+      entity: input.entity,
+      db: resourceDb,
     });
-    const template = compileReadScope(input.scope, {
-      fields,
-      where: `authorization adapter resource '${input.category}/${input.name}'`,
-      registry: registry as unknown as Record<string, unknown>,
-      entityName: input.name,
-    });
-    resources.set(resourceKey(input.category, input.name), template);
   }
 
   return Object.freeze({ admit, registerResource });
+}
+
+function rowIdOf(row: unknown, fallbackId?: string | null): string | number | null {
+  const id = (row as { id?: unknown } | null | undefined)?.id;
+  if (typeof id === 'string' || typeof id === 'number') return id;
+  if (fallbackId != null && fallbackId.length > 0) return fallbackId;
+  return null;
 }
 
 function resourceIdOf(input: EntityAdmitInput, row: unknown): string | null {

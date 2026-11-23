@@ -304,6 +304,17 @@ export interface ByteStore {
   exists(id: string, options: { pending: boolean }): boolean;
 
   /**
+   * OPTIONAL: return the stored byte length of a pending or final slot without
+   * reading its bytes into memory, or `null` when the slot does not exist.
+   */
+  statSlot?(id: string, options?: FsBlobSlotOptions): { size: number } | null;
+
+  /**
+   * OPTIONAL: default upload byte cap configured on this byte store.
+   */
+  readonly maxBytes?: number;
+
+  /**
    * The free bytes available to this process on the backend's storage, or
    * `null` when the backend cannot declare it (S6/A5 low-disk guard). A
    * `durable` backend is expected to implement it — the upload guard refuses
@@ -360,6 +371,10 @@ export interface FsBlobsOptions {
    * keep their on-disk files.
    */
   stagingRoot?: string;
+  /**
+   * Optional default maximum upload size in bytes for streaming uploads.
+   */
+  maxBytes?: number;
 }
 
 // Range validation shared by every byte read (buffered and streaming) across
@@ -387,7 +402,10 @@ export function validateBlobRange(
   return { start: startValue, end: endValue, length: endValue - startValue };
 }
 
-export function fsBlobs({ root, stagingRoot }: FsBlobsOptions): ByteStore & ByteStoreTestDebugHandle {
+export function fsBlobs({ root, stagingRoot, maxBytes: defaultMaxBytes }: FsBlobsOptions): ByteStore & ByteStoreTestDebugHandle {
+  if (defaultMaxBytes !== undefined && (!Number.isFinite(defaultMaxBytes) || defaultMaxBytes < 0)) {
+    throw new Error('invalid maxBytes');
+  }
   mkdirSync(root, { recursive: true });
   if (stagingRoot) mkdirSync(stagingRoot, { recursive: true });
 
@@ -581,6 +599,16 @@ export function fsBlobs({ root, stagingRoot }: FsBlobsOptions): ByteStore & Byte
     return existsSync(pathFor(id, { pending }));
   }
 
+  function statSlot(id: string, { pending }: FsBlobSlotOptions = {}): { size: number } | null {
+    safeId(id);
+    try {
+      return { size: statSync(pathFor(id, { pending })).size };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw err;
+    }
+  }
+
   // Free bytes on the filesystem holding the final slots, via statfs (bavail ×
   // frsize = bytes available to this process). Throws never — an unreadable
   // statfs returns null so the caller can fail closed.
@@ -595,6 +623,7 @@ export function fsBlobs({ root, stagingRoot }: FsBlobsOptions): ByteStore & Byte
 
   return {
     capabilities,
+    ...(defaultMaxBytes !== undefined ? { maxBytes: defaultMaxBytes } : {}),
     writePending,
     writePendingStream,
     finalizePending,
@@ -604,6 +633,7 @@ export function fsBlobs({ root, stagingRoot }: FsBlobsOptions): ByteStore & Byte
     readPendingStream,
     remove,
     exists,
+    statSlot,
     freeBytes,
     pathFor,
   };

@@ -248,6 +248,30 @@ test('apiKeyPrincipalOf returns anonymous for expired key', () => {
   assert.equal(p.type, 'anonymous', 'expired key → anonymous');
 });
 
+// #219: a non-null expiresAt that is not a finite number must never fall
+// through `expiresAt <= Date.now()` and grant an apiKey principal.
+test('#219: apiKeyPrincipalOf fails closed on malformed expiresAt values', () => {
+  const app = bootApp();
+  const ApiKey_b = app.entity(ApiKey);
+  const resolver = apiKeyPrincipalOf(app.db);
+
+  for (const corrupt of ['not-a-date', 'NaN', 'Infinity', '-Infinity', 'true', '{}']) {
+    const key = ApiKey_b.create({ name: 'corrupt-expiry', createdBy: 'u1' });
+    app.db.prepare('UPDATE ApiKey SET expiresAt = ? WHERE id = ?').run(corrupt, key.id);
+    const p = resolver({ headers: { authorization: `Bearer ${key.plainToken}` } });
+    assert.equal(p.type, 'anonymous', `malformed expiresAt ${JSON.stringify(corrupt)} must be anonymous`);
+  }
+
+  // A finite numeric-string expiry in the future remains valid admission.
+  const good = ApiKey_b.create({ name: 'good-expiry', createdBy: 'u1' });
+  app.db.prepare('UPDATE ApiKey SET expiresAt = ? WHERE id = ?').run(String(Date.now() + 60_000), good.id);
+  assert.equal(
+    resolver({ headers: { authorization: `Bearer ${good.plainToken}` } }).type,
+    'apiKey',
+    'finite numeric expiry still resolves',
+  );
+});
+
 test('apiKeyPrincipalOf returns anonymous for malformed Authorization header', () => {
   const app = bootApp();
 

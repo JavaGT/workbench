@@ -159,6 +159,90 @@ test('verifyRegistration accepts a valid attestation', () => {
   assert.equal(result.signCount, 0);
 });
 
+// ---- #245: attestation structure / fmt fail-closed ---------------------------
+
+// A synthetic `fmt: none` registration credential. `overrides` lets a test
+// corrupt exactly one part of the ceremony while every other check stays valid.
+function syntheticRegistration(challenge, rp, overrides = {}) {
+  const keypair = overrides.keypair ?? crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
+  const credentialId = overrides.credentialId ?? generateChallenge(32);
+  const clientDataJSON = buildClientDataJSON({ challenge, origin: rp.origin, type: 'webauthn.create' });
+  const authData = buildAuthenticatorData({
+    rpIdHash: buildRpIdHash(rp.id),
+    flags: 0x45, // UP + UV + AT
+    signCount: 0,
+    credentialId,
+    publicKey: cosePublicKeyFromKeyPair(keypair),
+  });
+  const attestationObject = buildAttestationObject({
+    fmt: 'fmt' in overrides ? overrides.fmt : 'none',
+    attStmt: 'attStmt' in overrides ? overrides.attStmt : {},
+    authData: overrides.authData ?? authData,
+  });
+  return {
+    credentialId,
+    credential: {
+      id: 'id' in overrides ? overrides.id : credentialId,
+      rawId: 'rawId' in overrides ? overrides.rawId : credentialId,
+      response: {
+        clientDataJSON,
+        attestationObject: overrides.attestationObject ?? attestationObject,
+      },
+      type: 'public-key',
+    },
+  };
+}
+
+test('#245: verifyRegistration accepts fmt "none" with an empty attStmt', () => {
+  const rp = rpConfig({});
+  const challenge = generateChallenge();
+  const { credential, credentialId } = syntheticRegistration(challenge, rp);
+  const result = verifyRegistration(challenge, credential, rp);
+  assert.equal(result.credentialId, credentialId);
+});
+
+test('#245: verifyRegistration rejects unsupported attestation formats', () => {
+  const rp = rpConfig({});
+  const challenge = generateChallenge();
+  for (const fmt of ['packed', 'tpm', 'fido-u2f', 'android-key']) {
+    const { credential } = syntheticRegistration(challenge, rp, { fmt });
+    assert.throws(
+      () => verifyRegistration(challenge, credential, rp),
+      /unsupported attestation format/,
+      `fmt ${fmt} must be rejected`,
+    );
+  }
+});
+
+test('#245: verifyRegistration rejects malformed attestation structure', () => {
+  const rp = rpConfig({});
+  const challenge = generateChallenge();
+  for (const fmt of ['', 42, null]) {
+    const { credential } = syntheticRegistration(challenge, rp, { fmt });
+    assert.throws(() => verifyRegistration(challenge, credential, rp), /fmt/);
+  }
+  // WebAuthn requires an empty attStmt for 'none'.
+  const withStmt = syntheticRegistration(challenge, rp, { attStmt: { sig: Buffer.from([1]) } });
+  assert.throws(() => verifyRegistration(challenge, withStmt.credential, rp), /empty attStmt/);
+  // A second CBOR item after the attestation object is trailing garbage.
+  const { credential } = syntheticRegistration(challenge, rp);
+  const trailing = Buffer.concat([
+    Buffer.from(credential.response.attestationObject, 'base64url'),
+    Buffer.from([0x00]),
+  ]).toString('base64url');
+  credential.response.attestationObject = trailing;
+  assert.throws(() => verifyRegistration(challenge, credential, rp), /trailing data/);
+});
+
+test('#245: verifyRegistration rejects a client id that does not match attested data', () => {
+  const rp = rpConfig({});
+  const challenge = generateChallenge();
+  const byId = syntheticRegistration(challenge, rp, { id: generateChallenge(32) });
+  assert.throws(() => verifyRegistration(challenge, byId.credential, rp), /does not match attested/);
+  const byRawId = syntheticRegistration(challenge, rp, { rawId: generateChallenge(32) });
+  assert.throws(() => verifyRegistration(challenge, byRawId.credential, rp), /does not match attested/);
+});
+
 test('verifyRegistration rejects challenge mismatch', () => {
   const { keypair } = generateTestKeypair();
   const rp = rpConfig({});
@@ -566,6 +650,61 @@ test('passkey register + authenticate + list + delete round-trip', async (t) => 
   const listAfter = await fetch(`${origin}/auth/passkey`, { headers: { cookie: `sid=${newSid}` } });
   const credsAfter = await listAfter.json();
   assert.equal(credsAfter.length, 0);
+});
+
+// #245: an attacker who knows a victim's credentialId must not be able to
+// register a second key under it and shadow/lock out the victim's passkey.
+test('#245: registering a duplicate credentialId is rejected before storing', async (t) => {
+  const { origin } = await boot(t);
+
+  const loginRes = await fetch(`${origin}/auth/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'dup-owner', password: 'passkey-test' }),
+  });
+  assert.equal(loginRes.status, 201);
+  const cookie = `sid=${sidFromSetCookie(loginRes.headers.get('set-cookie'))}`;
+
+  const rp = rpConfig({});
+  const credentialId = generateChallenge(32);
+
+  async function registerWithFreshChallenge() {
+    const challengeRes = await fetch(`${origin}/auth/passkey/challenge`);
+    const { challenge } = await challengeRes.json();
+    const keypair = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
+    const clientDataJSON = buildClientDataJSON({ challenge, origin: rp.origin, type: 'webauthn.create' });
+    const authData = buildAuthenticatorData({
+      rpIdHash: buildRpIdHash(rp.id),
+      flags: 0x45,
+      signCount: 0,
+      credentialId,
+      publicKey: cosePublicKeyFromKeyPair(keypair),
+    });
+    const attestationObject = buildAttestationObject({ fmt: 'none', authData });
+    return fetch(`${origin}/auth/passkey/register`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({
+        credential: {
+          id: credentialId,
+          rawId: credentialId,
+          response: { clientDataJSON, attestationObject },
+          type: 'public-key',
+        },
+      }),
+    });
+  }
+
+  const first = await registerWithFreshChallenge();
+  assert.equal(first.status, 201, `first register failed: ${await first.text()}`);
+
+  const duplicate = await registerWithFreshChallenge();
+  assert.equal(duplicate.status, 409, `duplicate register was not rejected: ${await duplicate.text()}`);
+
+  const listRes = await fetch(`${origin}/auth/passkey`, { headers: { cookie } });
+  const creds = await listRes.json();
+  assert.equal(creds.length, 1, 'the original credential was not shadowed');
+  assert.equal(creds[0].credentialId, credentialId);
 });
 
 test('register without a name keeps it absent and lists name: null (#231)', async (t) => {

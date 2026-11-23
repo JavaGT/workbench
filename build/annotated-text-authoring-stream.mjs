@@ -86,22 +86,6 @@ function clientNonceHash(nonce        )         {
   return createHash('sha256').update(nonce).digest('hex');
 }
 
-export function allocateStreamToken()         {
-  return randomToken();
-}
-
-export function allocateLeaseToken()         {
-  return randomToken();
-}
-
-export function allocatePositionToken()         {
-  return randomToken();
-}
-
-export function allocateSnapshotToken()         {
-  return randomToken();
-}
-
 export function allocateClientNonce()         {
   return randomToken();
 }
@@ -410,19 +394,6 @@ export function issuePositionFrame({ db, prefix, leaseId, fence, familyCheckpoin
     redactions,
     checkCapacity: true,
   });
-}
-
-export function issueSnapshot({ db, prefix, leaseId, fence }
-
-
-
-
- )                        {
-  const id = randomToken();
-  const issuedAt = now();
-  if (!hasCapacity({ db, prefix, leaseId, bytes: rowBytes([id, leaseId, fence, issuedAt, null]) })) return null;
-  db.prepare(`INSERT INTO ${prefix}_authoring_snapshot (id, lease_id, fence, issued_at) VALUES (?, ?, ?, ?)`).run(id, leaseId, fence, issuedAt);
-  return { id, fence };
 }
 
 // A snapshot is one retained unit. Capacity failure must not leave predecessor

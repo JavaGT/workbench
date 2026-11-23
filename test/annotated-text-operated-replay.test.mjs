@@ -1,10 +1,10 @@
 import { databaseImage } from './helpers/database-image.mjs';
 // Annotated-text operated version admission + replay contract (ADR 0008).
-// The projection admits exactly ONE durable operated version (v13, the
-// span-native codec). v13 rows must replay deterministically from the
-// committed _Log through the real projector seam (rowToEvent + projection),
-// and every other version — legacy lattice v1–v12 or unknown — must fail
-// closed with a stable, diagnosable error before touching durable state.
+// The projection admits exactly two durable operated versions: v14 (live
+// authoring) and v16 (composed region actions). They replay deterministically
+// from the committed _Log through the real projector seam (rowToEvent +
+// projection). Every other version — retired v13/v15, legacy lattice v1–v12,
+// or unknown — fails closed with a stable, diagnosable error before any write.
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -113,10 +113,10 @@ function replayLog(source, projection, target) {
   }
 }
 
-// Seed the committed v13 log: create + one of every v13 operated operation
-// kind, all through the real app dispatch path. The premise guard at the end
-// fixes that every durable operated row this fixture replays is version 13.
-async function seedV13LiveLog(t) {
+// Seed the committed v14 log: create + one of every live authoring operated
+// operation kind, all through the real app dispatch path. The premise guard at
+// the end fixes that every durable operated row this fixture replays is v14.
+async function seedLiveLog(t) {
   const live = new DatabaseSync(':memory:');
   installSchema(live);
   const ReplayDoc = declaredEntity();
@@ -199,7 +199,7 @@ async function seedV13LiveLog(t) {
 }
 
 test('compact v14 operated rows replay deterministically through the real projector/rebuild seam', async (t) => {
-  const { live } = await seedV13LiveLog(t);
+  const { live } = await seedLiveLog(t);
 
   const liveState = projectedState(live);
   assert.equal(familyText(live), 'xhello world');
@@ -219,45 +219,41 @@ test('compact v14 operated rows replay deterministically through the real projec
   rebuilt.close();
 });
 
-test('historical v13 operated rows replay into the compact v2 projection state', async (t) => {
-  const { live } = await seedV13LiveLog(t);
-  const derivation = new DatabaseSync(':memory:');
-  const historicalLog = new DatabaseSync(':memory:');
+test('retired v13 and v15 operated rows fail closed on replay with zero writes', async (t) => {
+  const { live } = await seedLiveLog(t);
+  const retiredLog = new DatabaseSync(':memory:');
   const rebuilt = new DatabaseSync(':memory:');
-  for (const db of [derivation, historicalLog, rebuilt]) installSchema(db);
-  const derivationProjection = workbench({ db: derivation, entities: [declaredEntity()] }).entities.get('ReplayDoc').projection;
-  const rebuiltProjection = workbench({ db: rebuilt, entities: [declaredEntity()] }).entities.get('ReplayDoc').projection;
-  const insertLog = historicalLog.prepare(
+  installSchema(retiredLog);
+  installSchema(rebuilt);
+  const insertLog = retiredLog.prepare(
     'INSERT INTO _Log (scope, seq, eventType, eventData, actionId, committedAt) VALUES (?, ?, ?, ?, ?, ?)',
   );
-
-  for (const raw of live.prepare('SELECT * FROM _Log ORDER BY seq').all()) {
-    const event = rowToEvent(raw, parseEventType);
-    derivationProjection.apply(event, derivation);
-    let eventData = raw.eventData;
-    if (raw.eventType === 'ReplayDoc.body.operated') {
-      const data = JSON.parse(raw.eventData);
-      const state = derivation.prepare("SELECT family_checkpoint FROM ReplayDoc_body_state WHERE document_id = 'd1'").get();
-      const family = textFamilyCheckpoint(restoreTextFamily(JSON.parse(state.family_checkpoint)));
-      eventData = JSON.stringify({ ...data, version: 13, facts: { ...data.facts, family } });
-    }
-    insertLog.run(raw.scope, raw.seq, raw.eventType, eventData, raw.actionId, raw.committedAt);
+  const source = live.prepare("SELECT * FROM _Log WHERE eventType = 'ReplayDoc.body.operated' ORDER BY seq").all()[0];
+  const data = JSON.parse(source.eventData);
+  for (const [index, version] of [13, 15].entries()) {
+    insertLog.run(source.scope, index + 1, source.eventType,
+      JSON.stringify({ ...data, version }), `retired-v${version}`, '2024-01-01T00:00:00.000Z');
   }
 
-  const historicalVersions = historicalLog.prepare(
+  const retiredVersions = retiredLog.prepare(
     "SELECT eventData FROM _Log WHERE eventType = 'ReplayDoc.body.operated' ORDER BY seq",
   ).all().map((row) => JSON.parse(row.eventData).version);
-  assert.deepEqual(historicalVersions, [13, 13, 13, 13], 'fixture contains genuine historical operated rows');
-  replayLog(historicalLog, rebuiltProjection, rebuilt);
+  assert.deepEqual(retiredVersions, [13, 15], 'fixture contains genuine retired operated rows');
 
-  assert.deepEqual(projectedState(rebuilt), projectedState(live));
-  const persisted = JSON.parse(rebuilt.prepare(
-    "SELECT family_checkpoint FROM ReplayDoc_body_state WHERE document_id = 'd1'",
-  ).get().family_checkpoint);
-  assert.equal(persisted.checkpoint.version, 2, 'v13 replay is normalized to the compact durable projection form');
-  assert.equal(familyText(rebuilt), 'xhello world');
-  derivation.close();
-  historicalLog.close();
+  const projection = workbench({ db: rebuilt, entities: [declaredEntity()] }).entities.get('ReplayDoc').projection;
+  const preimage = databaseImage(rebuilt);
+  for (const [index, version] of [13, 15].entries()) {
+    const row = retiredLog.prepare('SELECT * FROM _Log WHERE seq = ?').get(index + 1);
+    assert.throws(
+      () => projection.apply(rowToEvent(row, parseEventType), rebuilt),
+      (error) => {
+        assertVersionGuardMessage(error.message, version);
+        return true;
+      },
+    );
+  }
+  assert.deepEqual(databaseImage(rebuilt), preimage, 'retired operated versions must write nothing');
+  retiredLog.close();
   rebuilt.close();
 });
 
@@ -369,8 +365,8 @@ function assertVersionGuardMessage(message, version) {
   const versionText = String(version);
   assert.match(message, /ReplayDoc\.body\.operated event version/);
   assert.match(message, new RegExp(`version ${versionText} is not supported`));
-  assert.match(message, /only operated versions 13, 14, 15, and 16 are replayable/);
-  assert.match(message, /pre-13 lattice rows were retired/);
+  assert.match(message, /only operated versions 14 and 16 are replayable/);
+  assert.match(message, /retired versions 13 and 15/);
 }
 
 test('legacy lattice and unknown operated versions fail closed with a stable error', () => {
@@ -427,7 +423,7 @@ test('a durable legacy lattice _Log row fails closed on replay with no state wri
 });
 
 test('batch replay atomicity requires the named txn boundary: a valid v14 write and a later legacy v11 row roll back together', async (t) => {
-  const { live } = await seedV13LiveLog(t);
+  const { live } = await seedLiveLog(t);
 
   // Append a trailing pre-13 lattice row to the committed log, after the
   // create and the four v14 operated rows.
@@ -453,6 +449,6 @@ test('batch replay atomicity requires the named txn boundary: a valid v14 write 
     },
   );
   assert.deepEqual(databaseImage(rebuilt), preimage,
-    'the named txn boundary rolls back the entire batch: the v13 writes are undone with the legacy rejection');
+    'the named txn boundary rolls back the entire batch: the v14 writes are undone with the legacy rejection');
   rebuilt.close();
 });

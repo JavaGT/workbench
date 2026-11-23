@@ -124,6 +124,7 @@ RGA grammar: [`adr/0005-annotated-text-kernel.md`](./adr/0005-annotated-text-ker
 | Module | Role |
 | --- | --- |
 | `annotated-text.mjs` / `annotated-text-family.mjs` / `annotated-text-continuous.mjs` | RGA grammar, run/piece-aware reducer, compact checkpoints, continuous endpoint projection |
+| `annotated-text-operated-event.mjs` | Sole operated-envelope grammar and version gate: v14 (live authoring) and v16 (composed region actions) only; retired v13/v15 reject fail-closed (#315) |
 | `annotated-text-crud.mjs` | Compile/Commit-loop CRUD handlers for import, v9 operations, history compensation, retirement erasure, and declared annotation actions (extracted from `entity/crud.mjs`) |
 | `annotated-text-projection.mjs` | Commit-loop projection reducer for initialization, imported-range seeding, operated events, incremental membership sync, retirement, and removal cleanup (extracted from `entity/projection.mjs`) |
 | `annotated-text-admit.mjs` / `annotated-text-admission.mjs` | Commit-loop v9 authoring admission, stale visible plain-insert rebase, and application-owned annotation delta/wording admission |

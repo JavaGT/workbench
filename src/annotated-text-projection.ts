@@ -15,7 +15,6 @@ import {
   resolveOffsetToEndpoint,
   restoreTextFamilySerialized,
   serializeCompactTextFamilyCheckpoint,
-  textFamilyCheckpoint as continuousTextFamilyCheckpoint,
 } from './annotated-text-continuous.ts';
 import { resolveDeclarationMeasurementExtension } from './annotated-text-field.ts';
 import { annotationRangeRows, attachAnnotationRange, canonicalEndpointJSON, loadAnnotationImages } from './annotated-text-storage.ts';
@@ -378,7 +377,7 @@ export function applyAnnotatedTextNativeEvent({ name, fields, handle, event, db 
 }
 
 function canonicalToReplayPayload(canonical: CanonicalOperatedEvent): OperatedEnvelope {
-  const version = canonical.wireVersion === 13 ? 13 : canonical.wireVersion === 14 ? 14 : 15;
+  const version = canonical.wireVersion === 14 ? 14 : 16;
   let operation: OperatedEnvelope['operation'];
   switch (canonical.kind) {
     case 'text.apply':
@@ -466,19 +465,18 @@ function projectBlocklessTextApply({ name, handle, db, descriptor, data }: { nam
   const operation = data.operation;
   const f = data.facts;
   if (!operation || operation.kind !== 'text.apply' || !Array.isArray(operation.operation) ||
-      (data.version === 13 && !f.family) || !isTextRevision(data.before) || !isTextRevision(data.after)) throw new Error(`${name}.${handle.field}.operated v${data.version} text.apply event has invalid data`);
+      !isTextRevision(data.before) || !isTextRevision(data.after)) throw new Error(`${name}.${handle.field}.operated v${data.version} text.apply event has invalid data`);
   const currentRow = db.prepare(`SELECT structure_version, family_checkpoint FROM ${prefix}_state WHERE document_id = ?`).get(data.id);
-  if (!currentRow) throw new Error(`${name}.${handle.field}.operated v13 document does not exist`);
+  if (!currentRow) throw new Error(`${name}.${handle.field}.operated v14 document does not exist`);
   const current = restoreTextFamilySerialized(currentRow.family_checkpoint as string);
   if (currentRow.structure_version !== data.before.structuralRevision ||
-      JSON.stringify(current.checkpoint.frontier) !== JSON.stringify(data.before.frontier)) throw new Error(`${name}.${handle.field}.operated v13 event conflicts with projection state`);
+      JSON.stringify(current.checkpoint.frontier) !== JSON.stringify(data.before.frontier)) throw new Error(`${name}.${handle.field}.operated v14 event conflicts with projection state`);
   let canonical;
-  try { canonical = canonicalTextOp(operation.operation); } catch { throw new Error(`${name}.${handle.field}.operated v13 text operation is invalid`); }
-  if (JSON.stringify(canonical) !== JSON.stringify(operation.operation) || JSON.stringify(canonical[4]) !== JSON.stringify(data.before.frontier)) throw new Error(`${name}.${handle.field}.operated v13 text operation is not canonical or has the wrong frontier`);
+  try { canonical = canonicalTextOp(operation.operation); } catch { throw new Error(`${name}.${handle.field}.operated v14 text operation is invalid`); }
+  if (JSON.stringify(canonical) !== JSON.stringify(operation.operation) || JSON.stringify(canonical[4]) !== JSON.stringify(data.before.frontier)) throw new Error(`${name}.${handle.field}.operated v14 text operation is not canonical or has the wrong frontier`);
   let next;
-  try { next = applyContinuousTextOperation(current, canonical); } catch { throw new Error(`${name}.${handle.field}.operated v13 text operation is not applicable to prior state`); }
-  if ((data.version === 13 && JSON.stringify(continuousTextFamilyCheckpoint(next)) !== JSON.stringify(f.family)) ||
-      JSON.stringify(data.after.frontier) !== JSON.stringify(next.checkpoint.frontier)) throw new Error(`${name}.${handle.field}.operated v${data.version} family does not match the operation`);
+  try { next = applyContinuousTextOperation(current, canonical); } catch { throw new Error(`${name}.${handle.field}.operated v14 text operation is not applicable to prior state`); }
+  if (JSON.stringify(data.after.frontier) !== JSON.stringify(next.checkpoint.frontier)) throw new Error(`${name}.${handle.field}.operated v${data.version} family does not match the operation`);
   db.prepare(`UPDATE ${prefix}_state SET structure_version = ?, family_checkpoint = ? WHERE document_id = ?`).run(data.after.structuralRevision, serializeCompactTextFamilyCheckpoint(next), data.id);
   applyEmptiedAnnotationDispositions({ name, handle, db, prefix, data });
   applyAnnotationUpdateFacts({ name, handle, db, prefix, descriptor, data });
@@ -507,23 +505,21 @@ function projectBlocklessTextApply({ name, handle, db, descriptor, data }: { nam
 function projectBlocklessTextReplace({ name, handle, db, descriptor, data }: { name: string; handle: NativeEventHandle; db: Db; descriptor: AnnotatedTextFieldDescriptor; data: OperatedEnvelope }) {
   const prefix = `${name}_${handle.field}`;
   const operation = data.operation;
-  const f = data.facts;
   if (!operation || operation.kind !== 'text.replace' || !Array.isArray(operation.operations) || operation.operations.length !== 2 ||
-      (data.version === 13 && !f.family) || !isTextRevision(data.before) || !isTextRevision(data.after)) throw new Error(`${name}.${handle.field}.operated v${data.version} text.replace event has invalid data`);
+      !isTextRevision(data.before) || !isTextRevision(data.after)) throw new Error(`${name}.${handle.field}.operated v${data.version} text.replace event has invalid data`);
   const currentRow = db.prepare(`SELECT structure_version, family_checkpoint FROM ${prefix}_state WHERE document_id = ?`).get(data.id);
-  if (!currentRow) throw new Error(`${name}.${handle.field}.operated v13 document does not exist`);
+  if (!currentRow) throw new Error(`${name}.${handle.field}.operated v14 document does not exist`);
   const current = restoreTextFamilySerialized(currentRow.family_checkpoint as string);
   if (currentRow.structure_version !== data.before.structuralRevision ||
-      JSON.stringify(current.checkpoint.frontier) !== JSON.stringify(data.before.frontier)) throw new Error(`${name}.${handle.field}.operated v13 event conflicts with projection state`);
+      JSON.stringify(current.checkpoint.frontier) !== JSON.stringify(data.before.frontier)) throw new Error(`${name}.${handle.field}.operated v14 event conflicts with projection state`);
   let next = current;
   for (const raw of operation.operations) {
     let canonical;
-    try { canonical = canonicalTextOp(raw); } catch { throw new Error(`${name}.${handle.field}.operated v13 replace operation is invalid`); }
-    if (JSON.stringify(canonical[4]) !== JSON.stringify(next.checkpoint.frontier)) throw new Error(`${name}.${handle.field}.operated v13 replace operation has the wrong frontier`);
-    try { next = applyContinuousTextOperation(next, canonical); } catch { throw new Error(`${name}.${handle.field}.operated v13 replace operation is not applicable to prior state`); }
+    try { canonical = canonicalTextOp(raw); } catch { throw new Error(`${name}.${handle.field}.operated v14 replace operation is invalid`); }
+    if (JSON.stringify(canonical[4]) !== JSON.stringify(next.checkpoint.frontier)) throw new Error(`${name}.${handle.field}.operated v14 replace operation has the wrong frontier`);
+    try { next = applyContinuousTextOperation(next, canonical); } catch { throw new Error(`${name}.${handle.field}.operated v14 replace operation is not applicable to prior state`); }
   }
-  if ((data.version === 13 && JSON.stringify(continuousTextFamilyCheckpoint(next)) !== JSON.stringify(f.family)) ||
-      JSON.stringify(data.after.frontier) !== JSON.stringify(next.checkpoint.frontier)) throw new Error(`${name}.${handle.field}.operated v${data.version} family does not match the replace`);
+  if (JSON.stringify(data.after.frontier) !== JSON.stringify(next.checkpoint.frontier)) throw new Error(`${name}.${handle.field}.operated v${data.version} family does not match the replace`);
   db.prepare(`UPDATE ${prefix}_state SET structure_version = ?, family_checkpoint = ? WHERE document_id = ?`).run(data.after.structuralRevision, serializeCompactTextFamilyCheckpoint(next), data.id);
   applyEmptiedAnnotationDispositions({ name, handle, db, prefix, data });
   applyAnnotationUpdateFacts({ name, handle, db, prefix, descriptor, data });
@@ -532,9 +528,9 @@ function projectBlocklessTextReplace({ name, handle, db, descriptor, data }: { n
 function applyEmptiedAnnotationDispositions({ name, handle, db, prefix, data }: { name: string; handle: NativeEventHandle; db: Db; prefix: string; data: OperatedEnvelope }) {
   for (const emptied of data.facts.emptiedAnnotations) {
     if (!emptied || typeof emptied !== 'object' || typeof emptied.annotationId !== 'string' || !emptied.disposition ||
-        typeof emptied.disposition !== 'object' || (emptied.disposition.kind !== 'orphaned' && emptied.disposition.kind !== 'deleted')) throw new Error(`${name}.${handle.field}.operated v13 emptied annotation is invalid`);
+        typeof emptied.disposition !== 'object' || (emptied.disposition.kind !== 'orphaned' && emptied.disposition.kind !== 'deleted')) throw new Error(`${name}.${handle.field}.operated v14 emptied annotation is invalid`);
     const annotation = db.prepare(`SELECT id FROM ${prefix}_annotation WHERE id = ? AND document_id = ?`).get(emptied.annotationId, data.id);
-    if (!annotation) throw new Error(`${name}.${handle.field}.operated v13 emptied annotation does not exist`);
+    if (!annotation) throw new Error(`${name}.${handle.field}.operated v14 emptied annotation does not exist`);
     if (emptied.disposition.kind === 'orphaned') {
       db.prepare(`DELETE FROM ${prefix}_membership WHERE annotation_id = ?`).run(emptied.annotationId);
       db.prepare(`INSERT INTO ${prefix}_annotation_orphan_state (annotation_id, saved_quote, last_range) VALUES (?, ?, ?)`)
@@ -638,7 +634,7 @@ function projectBlocklessAnnotationApplyRange({ name, handle, db, descriptor, da
   const operation = data.operation;
   const f = data.facts;
   if (!operation || operation.kind !== 'annotation.apply-range' || !operation.annotation || !operation.selection ||
-      !f.annotation || !f.selectedRange || !isTextRevision(data.before) || !isTextRevision(data.after)) throw new Error(`${name}.${handle.field}.operated v13 annotation.apply-range event has invalid data`);
+      !f.annotation || !f.selectedRange || !isTextRevision(data.before) || !isTextRevision(data.after)) throw new Error(`${name}.${handle.field}.operated v14 annotation.apply-range event has invalid data`);
   const annOp = operation.annotation;
   const annFact = f.annotation;
   if (JSON.stringify(Object.keys(annOp).sort()) !== JSON.stringify(Object.keys(annFact).sort()) ||
@@ -646,62 +642,61 @@ function projectBlocklessAnnotationApplyRange({ name, handle, db, descriptor, da
       JSON.stringify(annOp.fields) !== JSON.stringify(annFact.fields) ||
       JSON.stringify(annOp.protectedTargetIds ?? []) !== JSON.stringify(annFact.protectedTargetIds ?? []) ||
       typeof annOp.id !== 'string' || typeof annOp.family !== 'string' ||
-      !annOp.fields || typeof annOp.fields !== 'object' || Array.isArray(annOp.fields)) throw new Error(`${name}.${handle.field}.operated v13 annotation facts do not match the operation`);
-  if (f.selectedRange.annotationId !== annOp.id) throw new Error(`${name}.${handle.field}.operated v13 selected range does not match the annotation`);
+      !annOp.fields || typeof annOp.fields !== 'object' || Array.isArray(annOp.fields)) throw new Error(`${name}.${handle.field}.operated v14 annotation facts do not match the operation`);
+  if (f.selectedRange.annotationId !== annOp.id) throw new Error(`${name}.${handle.field}.operated v14 selected range does not match the annotation`);
   const selection = operation.selection as { startOffset?: unknown; endOffset?: unknown };
   for (const entry of f.ranges) {
     if (!entry || typeof entry !== 'object' || Array.isArray(entry) ||
         typeof entry.annotationId !== 'string' || !entry.annotationId ||
         !entry.start || typeof entry.start !== 'object' || Array.isArray(entry.start) ||
         !entry.end || typeof entry.end !== 'object' || Array.isArray(entry.end)) {
-      throw new Error(`${name}.${handle.field}.operated v13 annotation range is invalid`);
+      throw new Error(`${name}.${handle.field}.operated v14 annotation range is invalid`);
     }
   }
   const appliedRanges = f.ranges.filter((entry: any) => entry.annotationId === annOp.id);
   if (appliedRanges.length !== 1 ||
       JSON.stringify(appliedRanges[0].start) !== JSON.stringify(f.selectedRange.start) ||
       JSON.stringify(appliedRanges[0].end) !== JSON.stringify(f.selectedRange.end)) {
-    throw new Error(`${name}.${handle.field}.operated v13 selected range does not match the annotation`);
+    throw new Error(`${name}.${handle.field}.operated v14 selected range does not match the annotation`);
   }
   const currentRow = db.prepare(`SELECT structure_version, family_checkpoint FROM ${prefix}_state WHERE document_id = ?`).get(data.id);
-  if (!currentRow) throw new Error(`${name}.${handle.field}.operated v13 document does not exist`);
+  if (!currentRow) throw new Error(`${name}.${handle.field}.operated v14 document does not exist`);
   const current = restoreTextFamilySerialized(currentRow.family_checkpoint as string);
   if (currentRow.structure_version !== data.before.structuralRevision ||
-      JSON.stringify(current.checkpoint.frontier) !== JSON.stringify(data.before.frontier)) throw new Error(`${name}.${handle.field}.operated v13 event conflicts with projection state`);
+      JSON.stringify(current.checkpoint.frontier) !== JSON.stringify(data.before.frontier)) throw new Error(`${name}.${handle.field}.operated v14 event conflicts with projection state`);
   if (JSON.stringify(current.checkpoint.frontier) !== JSON.stringify(data.after.frontier) ||
-      data.after.structuralRevision !== data.before.structuralRevision) throw new Error(`${name}.${handle.field}.operated v13 annotation apply must not change the text family`);
-  if (data.version === 13 && JSON.stringify(continuousTextFamilyCheckpoint(current)) !== JSON.stringify(f.family)) throw new Error(`${name}.${handle.field}.operated v13 annotation family does not match the document`);
+      data.after.structuralRevision !== data.before.structuralRevision) throw new Error(`${name}.${handle.field}.operated v14 annotation apply must not change the text family`);
   const row = rawRow(db, name, data.id);
-  if (!row) throw new Error(`${name}.${handle.field}.operated v13 document row is missing`);
+  if (!row) throw new Error(`${name}.${handle.field}.operated v14 document row is missing`);
   const declared = descriptor.annotations!.find((entry) => entry.annotationName === annOp.family);
-  if (!declared) throw new Error(`${name}.${handle.field}.operated v13 annotation family is not declared`);
+  if (!declared) throw new Error(`${name}.${handle.field}.operated v14 annotation family is not declared`);
   const declaredCardinality = 'cardinality' in declared ? declared.cardinality : undefined;
   const targetIds = (annOp.protectedTargetIds ?? []) as string[];
-  if (Array.isArray(targetIds) && targetIds.some((id, index, ids) => typeof id !== 'string' || (index > 0 && ids[index - 1] >= id))) throw new Error(`${name}.${handle.field}.operated v13 protected targets are invalid`);
+  if (Array.isArray(targetIds) && targetIds.some((id, index, ids) => typeof id !== 'string' || (index > 0 && ids[index - 1] >= id))) throw new Error(`${name}.${handle.field}.operated v14 protected targets are invalid`);
   for (const targetId of targetIds) {
     const target = db.prepare(`SELECT id FROM ${prefix}_annotation WHERE id = ? AND document_id = ?`).get(targetId, data.id);
-    if (!target) throw new Error(`${name}.${handle.field}.operated v13 protected target does not exist`);
+    if (!target) throw new Error(`${name}.${handle.field}.operated v14 protected target does not exist`);
   }
   const existingAnnotation = db.prepare(`SELECT family FROM ${prefix}_annotation WHERE id = ? AND document_id = ?`).get(annOp.id, data.id);
-  if (existingAnnotation && existingAnnotation.family !== annOp.family) throw new Error(`${name}.${handle.field}.operated v13 annotation family cannot change`);
+  if (existingAnnotation && existingAnnotation.family !== annOp.family) throw new Error(`${name}.${handle.field}.operated v14 annotation family cannot change`);
   const fieldNames = Object.keys(declared.fields);
   const suppliedFieldNames = Object.keys(annOp.fields).sort();
   if (suppliedFieldNames.length !== fieldNames.length || [...fieldNames].sort().some((fieldName, index) => suppliedFieldNames[index] !== fieldName)) {
-    throw new Error(`${name}.${handle.field}.operated v13 annotation fields disagree with declaration`);
+    throw new Error(`${name}.${handle.field}.operated v14 annotation fields disagree with declaration`);
   }
   const stored = db.prepare(`SELECT * FROM ${prefix}_annotation_${annOp.family} WHERE annotation_id = ?`).get(annOp.id);
   const values = fieldNames.map((fieldName) => {
-    if (!Object.hasOwn(annOp.fields!, fieldName)) throw new Error(`${name}.${handle.field}.operated v13 annotation is missing field '${fieldName}'`);
+    if (!Object.hasOwn(annOp.fields!, fieldName)) throw new Error(`${name}.${handle.field}.operated v14 annotation is missing field '${fieldName}'`);
     const field = declared.fields[fieldName];
     const strategy = resolveStrategy(field.kind);
     const validation = strategy.validate(annOp.fields![fieldName], field);
-    if (validation !== true || (typeof field.validate === 'function' && field.validate(annOp.fields![fieldName]) !== true)) throw new Error(`${name}.${handle.field}.operated v13 annotation field '${fieldName}' failed validation`);
+    if (validation !== true || (typeof field.validate === 'function' && field.validate(annOp.fields![fieldName]) !== true)) throw new Error(`${name}.${handle.field}.operated v14 annotation field '${fieldName}' failed validation`);
     return serializeField(field, annOp.fields![fieldName]);
   });
   for (const entry of f.ranges) {
     if (entry.annotationId !== annOp.id &&
         !db.prepare(`SELECT id FROM ${prefix}_annotation WHERE id = ? AND document_id = ?`).get(entry.annotationId, data.id)) {
-      throw new Error(`${name}.${handle.field}.operated v13 annotation range names an unknown annotation`);
+      throw new Error(`${name}.${handle.field}.operated v14 annotation range names an unknown annotation`);
     }
   }
   const familyByAnnotationId = new Map<string, string>();
@@ -710,7 +705,7 @@ function projectBlocklessAnnotationApplyRange({ name, handle, db, descriptor, da
   }
   if (!existingAnnotation) familyByAnnotationId.set(annOp.id, annOp.family);
   if (!Number.isSafeInteger(selection.startOffset) || !Number.isSafeInteger(selection.endOffset)) {
-    throw new Error(`${name}.${handle.field}.operated v13 annotation selection is invalid`);
+    throw new Error(`${name}.${handle.field}.operated v14 annotation selection is invalid`);
   }
   const startOffset = selection.startOffset as number;
   const endOffset = selection.endOffset as number;
@@ -723,9 +718,9 @@ function projectBlocklessAnnotationApplyRange({ name, handle, db, descriptor, da
       start = projectEndpointToOffset(current, entry.start);
       end = projectEndpointToOffset(current, entry.end);
     } catch {
-      throw new Error(`${name}.${handle.field}.operated v13 annotation range is not projectable`);
+      throw new Error(`${name}.${handle.field}.operated v14 annotation range is not projectable`);
     }
-    if (start >= end) throw new Error(`${name}.${handle.field}.operated v13 annotation range must be forward and non-empty`);
+    if (start >= end) throw new Error(`${name}.${handle.field}.operated v14 annotation range must be forward and non-empty`);
   }
   const currentRangeRows = annotationRangeRows(db, prefix, data.id);
   const currentRanges = currentRangeRows.map((entry) => ({
@@ -736,7 +731,7 @@ function projectBlocklessAnnotationApplyRange({ name, handle, db, descriptor, da
   const selectedStart = projectEndpointToOffset(current, selectedRange.start);
   const selectedEnd = projectEndpointToOffset(current, selectedRange.end);
   if (selectedStart !== startOffset || selectedEnd !== endOffset || selectedStart >= selectedEnd) {
-    throw new Error(`${name}.${handle.field}.operated v13 selected range disagrees with the semantic operation`);
+    throw new Error(`${name}.${handle.field}.operated v14 selected range disagrees with the semantic operation`);
   }
   const expectedRanges = [];
   for (const entry of currentRanges) {
@@ -767,7 +762,7 @@ function projectBlocklessAnnotationApplyRange({ name, handle, db, descriptor, da
     canonicalEndpointJSON(entry.end),
   ]));
   if (JSON.stringify(rangeSignatures(postimageRanges)) !== JSON.stringify(rangeSignatures(expectedRanges))) {
-    throw new Error(`${name}.${handle.field}.operated v13 annotation range postimage disagrees with the semantic operation`);
+    throw new Error(`${name}.${handle.field}.operated v14 annotation range postimage disagrees with the semantic operation`);
   }
   if (!existingAnnotation) db.prepare(`INSERT INTO ${prefix}_annotation (id, document_id, project_id, owner_id, family) VALUES (?, ?, ?, ?, ?)`)
     .run(annOp.id, data.id, row[descriptor.project as string], row[descriptor.owner as string], annOp.family);
@@ -798,7 +793,7 @@ function projectBlocklessAnnotationUpdate({ name, handle, db, descriptor, data }
       (!operation.selection || typeof operation.selection !== 'object' ||
        !Number.isSafeInteger((operation.selection as { startOffset?: unknown }).startOffset) ||
        !Number.isSafeInteger((operation.selection as { endOffset?: unknown }).endOffset))) {
-    throw new Error(`${name}.${handle.field}.operated v13 annotation selection is invalid`);
+    throw new Error(`${name}.${handle.field}.operated v14 annotation selection is invalid`);
   }
   const annOp = operation.annotation;
   const annFact = f.annotation;
@@ -807,54 +802,54 @@ function projectBlocklessAnnotationUpdate({ name, handle, db, descriptor, data }
       JSON.stringify(annOp.fields) !== JSON.stringify(annFact.fields) ||
       JSON.stringify(annOp.protectedTargetIds ?? []) !== JSON.stringify(annFact.protectedTargetIds ?? []) ||
       typeof annOp.id !== 'string' || typeof annOp.family !== 'string' ||
-      !annOp.fields || typeof annOp.fields !== 'object' || Array.isArray(annOp.fields)) throw new Error(`${name}.${handle.field}.operated v13 annotation facts do not match the operation`);
+      !annOp.fields || typeof annOp.fields !== 'object' || Array.isArray(annOp.fields)) throw new Error(`${name}.${handle.field}.operated v14 annotation facts do not match the operation`);
   for (const entry of f.ranges) {
     if (!entry || typeof entry !== 'object' || Array.isArray(entry) ||
         typeof entry.annotationId !== 'string' || !entry.annotationId ||
         !entry.start || typeof entry.start !== 'object' || Array.isArray(entry.start) ||
         !entry.end || typeof entry.end !== 'object' || Array.isArray(entry.end)) {
-      throw new Error(`${name}.${handle.field}.operated v13 annotation range is invalid`);
+      throw new Error(`${name}.${handle.field}.operated v14 annotation range is invalid`);
     }
   }
   const currentRow = db.prepare(`SELECT structure_version, family_checkpoint FROM ${prefix}_state WHERE document_id = ?`).get(data.id);
-  if (!currentRow) throw new Error(`${name}.${handle.field}.operated v13 document does not exist`);
+  if (!currentRow) throw new Error(`${name}.${handle.field}.operated v14 document does not exist`);
   const current = restoreTextFamilySerialized(currentRow.family_checkpoint as string);
   if (currentRow.structure_version !== data.before.structuralRevision ||
-      JSON.stringify(current.checkpoint.frontier) !== JSON.stringify(data.before.frontier)) throw new Error(`${name}.${handle.field}.operated v13 event conflicts with projection state`);
+      JSON.stringify(current.checkpoint.frontier) !== JSON.stringify(data.before.frontier)) throw new Error(`${name}.${handle.field}.operated v14 event conflicts with projection state`);
   if (JSON.stringify(current.checkpoint.frontier) !== JSON.stringify(data.after.frontier) ||
-      data.after.structuralRevision !== data.before.structuralRevision) throw new Error(`${name}.${handle.field}.operated v13 annotation update must not change the text family`);
+      data.after.structuralRevision !== data.before.structuralRevision) throw new Error(`${name}.${handle.field}.operated v14 annotation update must not change the text family`);
   const row = rawRow(db, name, data.id);
-  if (!row) throw new Error(`${name}.${handle.field}.operated v13 document row is missing`);
+  if (!row) throw new Error(`${name}.${handle.field}.operated v14 document row is missing`);
   const existingAnnotation = db.prepare(`SELECT id, family FROM ${prefix}_annotation WHERE id = ? AND document_id = ?`).get(annOp.id, data.id);
-  if (!existingAnnotation) throw new Error(`${name}.${handle.field}.operated v13 annotation to update does not exist`);
-  if (existingAnnotation.family !== annOp.family) throw new Error(`${name}.${handle.field}.operated v13 annotation family cannot change`);
+  if (!existingAnnotation) throw new Error(`${name}.${handle.field}.operated v14 annotation to update does not exist`);
+  if (existingAnnotation.family !== annOp.family) throw new Error(`${name}.${handle.field}.operated v14 annotation family cannot change`);
   const declared = descriptor.annotations!.find((entry) => entry.annotationName === annOp.family);
-  if (!declared) throw new Error(`${name}.${handle.field}.operated v13 annotation family is not declared`);
+  if (!declared) throw new Error(`${name}.${handle.field}.operated v14 annotation family is not declared`);
   const fieldNames = Object.keys(declared.fields);
   const suppliedFieldNames = Object.keys(annOp.fields).sort();
   if (suppliedFieldNames.length !== fieldNames.length || [...fieldNames].sort().some((fieldName, index) => suppliedFieldNames[index] !== fieldName)) {
-    throw new Error(`${name}.${handle.field}.operated v13 annotation fields disagree with declaration`);
+    throw new Error(`${name}.${handle.field}.operated v14 annotation fields disagree with declaration`);
   }
   const targetIds = (annOp.protectedTargetIds ?? []) as string[];
-  if (Array.isArray(targetIds) && targetIds.some((id, index, ids) => typeof id !== 'string' || (index > 0 && ids[index - 1] >= id))) throw new Error(`${name}.${handle.field}.operated v13 protected targets are invalid`);
+  if (Array.isArray(targetIds) && targetIds.some((id, index, ids) => typeof id !== 'string' || (index > 0 && ids[index - 1] >= id))) throw new Error(`${name}.${handle.field}.operated v14 protected targets are invalid`);
   const liveEdges = (db.prepare(`SELECT target_annotation_id FROM ${prefix}_annotation_protected_target WHERE annotation_id = ? ORDER BY target_annotation_id`).all(annOp.id) as Array<{ target_annotation_id: string }>).map((edge) => edge.target_annotation_id);
-  if (JSON.stringify(liveEdges) !== JSON.stringify(targetIds)) throw new Error(`${name}.${handle.field}.operated v13 annotation update must not change protected targets`);
+  if (JSON.stringify(liveEdges) !== JSON.stringify(targetIds)) throw new Error(`${name}.${handle.field}.operated v14 annotation update must not change protected targets`);
   const values = fieldNames.map((fieldName) => {
-    if (!Object.hasOwn(annOp.fields!, fieldName)) throw new Error(`${name}.${handle.field}.operated v13 annotation is missing field '${fieldName}'`);
+    if (!Object.hasOwn(annOp.fields!, fieldName)) throw new Error(`${name}.${handle.field}.operated v14 annotation is missing field '${fieldName}'`);
     const field = declared.fields[fieldName];
     const strategy = resolveStrategy(field.kind);
     const validation = strategy.validate(annOp.fields![fieldName], field);
-    if (validation !== true || (typeof field.validate === 'function' && field.validate(annOp.fields![fieldName]) !== true)) throw new Error(`${name}.${handle.field}.operated v13 annotation field '${fieldName}' failed validation`);
+    if (validation !== true || (typeof field.validate === 'function' && field.validate(annOp.fields![fieldName]) !== true)) throw new Error(`${name}.${handle.field}.operated v14 annotation field '${fieldName}' failed validation`);
     return serializeField(field, annOp.fields![fieldName]);
   });
   for (const entry of f.ranges) {
     if (!db.prepare(`SELECT id FROM ${prefix}_annotation WHERE id = ? AND document_id = ?`).get(entry.annotationId, data.id)) {
-      throw new Error(`${name}.${handle.field}.operated v13 annotation range names an unknown annotation`);
+      throw new Error(`${name}.${handle.field}.operated v14 annotation range names an unknown annotation`);
     }
   }
   const postimageRanges = f.ranges as Array<{ annotationId: string; start: ReturnType<typeof resolveOffsetToEndpoint>; end: ReturnType<typeof resolveOffsetToEndpoint> }>;
   const appliedRanges = postimageRanges.filter((entry) => entry.annotationId === annOp.id);
-  if (appliedRanges.length !== 1) throw new Error(`${name}.${handle.field}.operated v13 updated annotation must keep exactly one range`);
+  if (appliedRanges.length !== 1) throw new Error(`${name}.${handle.field}.operated v14 updated annotation must keep exactly one range`);
   for (const entry of postimageRanges) {
     let start: number;
     let end: number;
@@ -862,9 +857,9 @@ function projectBlocklessAnnotationUpdate({ name, handle, db, descriptor, data }
       start = projectEndpointToOffset(current, entry.start);
       end = projectEndpointToOffset(current, entry.end);
     } catch {
-      throw new Error(`${name}.${handle.field}.operated v13 annotation range is not projectable`);
+      throw new Error(`${name}.${handle.field}.operated v14 annotation range is not projectable`);
     }
-    if (start >= end) throw new Error(`${name}.${handle.field}.operated v13 annotation range must be forward and non-empty`);
+    if (start >= end) throw new Error(`${name}.${handle.field}.operated v14 annotation range must be forward and non-empty`);
   }
   const currentRangeRows = annotationRangeRows(db, prefix, data.id);
   const currentRanges = currentRangeRows.map((entry) => ({
@@ -881,7 +876,7 @@ function projectBlocklessAnnotationUpdate({ name, handle, db, descriptor, data }
     const selectedStart = projectEndpointToOffset(current, selectedRange.start);
     const selectedEnd = projectEndpointToOffset(current, selectedRange.end);
     if (selectedStart !== selection.startOffset || selectedEnd !== selection.endOffset || selectedStart >= selectedEnd) {
-      throw new Error(`${name}.${handle.field}.operated v13 selected range disagrees with the semantic operation`);
+      throw new Error(`${name}.${handle.field}.operated v14 selected range disagrees with the semantic operation`);
     }
     const declaredCardinality = 'cardinality' in declared ? declared.cardinality : undefined;
     const familyByAnnotationId = declaredCardinality === 'one'
@@ -919,7 +914,7 @@ function projectBlocklessAnnotationUpdate({ name, handle, db, descriptor, data }
       canonicalEndpointJSON(entry.end),
     ]));
     if (JSON.stringify(rangeSignatures(postimageRanges)) !== JSON.stringify(rangeSignatures(expectedRanges))) {
-      throw new Error(`${name}.${handle.field}.operated v13 annotation range postimage disagrees with the semantic operation`);
+      throw new Error(`${name}.${handle.field}.operated v14 annotation range postimage disagrees with the semantic operation`);
     }
   } else {
     const rangeSignatures = (entries: any[]) => entries.map((entry) => JSON.stringify([
@@ -928,13 +923,13 @@ function projectBlocklessAnnotationUpdate({ name, handle, db, descriptor, data }
       canonicalEndpointJSON(entry.end),
     ]));
     if (JSON.stringify(rangeSignatures(postimageRanges)) !== JSON.stringify(rangeSignatures(currentRanges))) {
-      throw new Error(`${name}.${handle.field}.operated v13 fields-only update must not move ranges`);
+      throw new Error(`${name}.${handle.field}.operated v14 fields-only update must not move ranges`);
     }
     fieldsOnlyUnchanged = true;
   }
   if (fieldNames.length) {
     const stored = db.prepare(`SELECT * FROM ${prefix}_annotation_${annOp.family} WHERE annotation_id = ?`).get(annOp.id);
-    if (!stored) throw new Error(`${name}.${handle.field}.operated v13 annotation typed row is missing`);
+    if (!stored) throw new Error(`${name}.${handle.field}.operated v14 annotation typed row is missing`);
     db.prepare(`UPDATE ${prefix}_annotation_${annOp.family} SET ${fieldNames.map((fieldName) => `${fieldName} = ?`).join(', ')} WHERE annotation_id = ?`).run(...values, annOp.id);
   }
   if (!fieldsOnlyUnchanged) {
@@ -949,17 +944,16 @@ function projectBlocklessAnnotationRemove({ name, handle, db, data }: { name: st
   const f = data.facts;
   if (!operation || operation.kind !== 'annotation.remove' || typeof operation.annotationId !== 'string' ||
       !Array.isArray(f.removedAnnotationIds) || f.removedAnnotationIds.length !== 1 || f.removedAnnotationIds[0] !== operation.annotationId ||
-      !isTextRevision(data.before) || !isTextRevision(data.after)) throw new Error(`${name}.${handle.field}.operated v13 annotation.remove event has invalid data`);
+      !isTextRevision(data.before) || !isTextRevision(data.after)) throw new Error(`${name}.${handle.field}.operated v14 annotation.remove event has invalid data`);
   const currentRow = db.prepare(`SELECT structure_version, family_checkpoint FROM ${prefix}_state WHERE document_id = ?`).get(data.id);
-  if (!currentRow) throw new Error(`${name}.${handle.field}.operated v13 document does not exist`);
+  if (!currentRow) throw new Error(`${name}.${handle.field}.operated v14 document does not exist`);
   const current = restoreTextFamilySerialized(currentRow.family_checkpoint as string);
   if (currentRow.structure_version !== data.before.structuralRevision ||
-      JSON.stringify(current.checkpoint.frontier) !== JSON.stringify(data.before.frontier)) throw new Error(`${name}.${handle.field}.operated v13 event conflicts with projection state`);
+      JSON.stringify(current.checkpoint.frontier) !== JSON.stringify(data.before.frontier)) throw new Error(`${name}.${handle.field}.operated v14 event conflicts with projection state`);
   if (JSON.stringify(current.checkpoint.frontier) !== JSON.stringify(data.after.frontier) ||
-      data.after.structuralRevision !== data.before.structuralRevision) throw new Error(`${name}.${handle.field}.operated v13 annotation remove must not change the text family`);
-  if (data.version === 13 && JSON.stringify(continuousTextFamilyCheckpoint(current)) !== JSON.stringify(f.family)) throw new Error(`${name}.${handle.field}.operated v13 annotation family does not match the document`);
+      data.after.structuralRevision !== data.before.structuralRevision) throw new Error(`${name}.${handle.field}.operated v14 annotation remove must not change the text family`);
   const annotation = db.prepare(`SELECT id FROM ${prefix}_annotation WHERE id = ? AND document_id = ?`).get(operation.annotationId, data.id);
-  if (!annotation) throw new Error(`${name}.${handle.field}.operated v13 annotation to remove does not exist`);
+  if (!annotation) throw new Error(`${name}.${handle.field}.operated v14 annotation to remove does not exist`);
   deleteAnnotatedTextAnnotation(db, prefix, operation.annotationId);
   db.prepare(`UPDATE ${prefix}_state SET structure_version = ? WHERE document_id = ?`).run(data.after.structuralRevision, data.id);
 }
@@ -1015,11 +1009,11 @@ function projectRegionEdit({ name, handle, db, descriptor, canonical }: {
 }) {
   const prefix = `${name}_${handle.field}`;
   const currentRow = db.prepare(`SELECT structure_version, family_checkpoint FROM ${prefix}_state WHERE document_id = ?`).get(canonical.id);
-  if (!currentRow) throw new Error(`${name}.${handle.field}.operated v15 document does not exist`);
+  if (!currentRow) throw new Error(`${name}.${handle.field}.operated v16 document does not exist`);
   const current = restoreTextFamilySerialized(currentRow.family_checkpoint as string);
   if (currentRow.structure_version !== canonical.before.structuralRevision
     || JSON.stringify(current.checkpoint.frontier) !== JSON.stringify(canonical.before.frontier)) {
-    throw new Error(`${name}.${handle.field}.operated v15 event conflicts with projection state`);
+    throw new Error(`${name}.${handle.field}.operated v16 event conflicts with projection state`);
   }
   const declarations = regionDeclarations(descriptor);
   const stored = loadAnnotationImages(db, { prefix, documentId: canonical.id, declarations });
@@ -1040,23 +1034,18 @@ function projectRegionEdit({ name, handle, db, descriptor, canonical }: {
     || JSON.stringify(closure.map((image) => image.id)) !== JSON.stringify(canonical.affectedIds)) {
     throw new Error(REGION_POSTIMAGE_DISAGREES);
   }
-  if (canonical.wireVersion === 16
-    && canonical.declarationFingerprint !== regionDeclarationFingerprint(declarations)) {
+  if (canonical.declarationFingerprint !== regionDeclarationFingerprint(declarations)
+    || JSON.stringify(closure) !== JSON.stringify(canonical.witnessBefore)) {
     throw new Error('region witness disagrees with operated event');
-  }
-  if (canonical.wireVersion === 16) {
-    if (JSON.stringify(closure) !== JSON.stringify(canonical.witnessBefore)) {
-      throw new Error('region witness disagrees with operated event');
-    }
   }
   let afterFamily;
   try {
     afterFamily = applyRegionTextOperations(current, canonical.text);
   } catch {
-    throw new Error(`${name}.${handle.field}.operated v15 text operation is not applicable to prior state`);
+    throw new Error(`${name}.${handle.field}.operated v16 text operation is not applicable to prior state`);
   }
   if (JSON.stringify(afterFamily.checkpoint.frontier) !== JSON.stringify(canonical.after.frontier)) {
-    throw new Error(`${name}.${handle.field}.operated v15 family does not match the operation`);
+    throw new Error(`${name}.${handle.field}.operated v16 family does not match the operation`);
   }
   let postimage;
   try {
@@ -1068,35 +1057,31 @@ function projectRegionEdit({ name, handle, db, descriptor, canonical }: {
       transitions: canonical.transitions,
       declarations,
       expectedBeforeDigest: canonical.beforeDigest,
-      ...(canonical.wireVersion === 16
-        ? { declarationFingerprint: regionDeclarationFingerprint(declarations) }
-        : {}),
+      declarationFingerprint: regionDeclarationFingerprint(declarations),
     });
   } catch {
     throw new Error(REGION_POSTIMAGE_DISAGREES);
   }
   if (postimage.afterDigest !== canonical.afterDigest) throw new Error(REGION_POSTIMAGE_DISAGREES);
-  if (canonical.wireVersion === 16) {
-    const emptiedFromFacts = (canonical.facts.emptiedAnnotations as unknown[]).map((entry) => JSON.stringify(entry));
-    const emptiedFromWitness = postimage.emptied.map((entry) => JSON.stringify({
-      annotationId: entry.annotationId,
-      disposition: {
-        kind: entry.disposition.kind,
-        family: entry.disposition.family,
-        savedQuote: entry.disposition.savedQuote,
-        lastRange: entry.disposition.lastRange,
-      },
-    }));
-    if (JSON.stringify(postimage.annotations) !== JSON.stringify(canonical.witnessAfter)
-      || JSON.stringify(emptiedFromFacts.slice().sort()) !== JSON.stringify(emptiedFromWitness.slice().sort())) {
-      throw new Error('region witness disagrees with operated event');
-    }
+  const emptiedFromFacts = (canonical.facts.emptiedAnnotations as unknown[]).map((entry) => JSON.stringify(entry));
+  const emptiedFromWitness = postimage.emptied.map((entry) => JSON.stringify({
+    annotationId: entry.annotationId,
+    disposition: {
+      kind: entry.disposition.kind,
+      family: entry.disposition.family,
+      savedQuote: entry.disposition.savedQuote,
+      lastRange: entry.disposition.lastRange,
+    },
+  }));
+  if (JSON.stringify(postimage.annotations) !== JSON.stringify(canonical.witnessAfter)
+    || JSON.stringify(emptiedFromFacts.slice().sort()) !== JSON.stringify(emptiedFromWitness.slice().sort())) {
+    throw new Error('region witness disagrees with operated event');
   }
 
   const beforeById = new Map(closure.map((image) => [image.id, image]));
   const afterById = new Map(postimage.annotations.map((image) => [image.id, image]));
   const row = rawRow(db, name, canonical.id);
-  if (!row) throw new Error(`${name}.${handle.field}.operated v15 document row is missing`);
+  if (!row) throw new Error(`${name}.${handle.field}.operated v16 document row is missing`);
 
   db.prepare(`UPDATE ${prefix}_state SET structure_version = ?, family_checkpoint = ? WHERE document_id = ?`)
     .run(canonical.after.structuralRevision, serializeCompactTextFamilyCheckpoint(afterFamily), canonical.id);

@@ -11,7 +11,7 @@ import workbench, {
 } from '../build/internal.mjs';
 import { defineSqliteSchema } from '../build/server.mjs';
 import {
-  constructV15RegionEvent,
+  constructV16RegionEvent,
   normalizeOperatedEvent,
 } from '../build/annotated-text-operated-event.mjs';
 import {
@@ -48,15 +48,12 @@ function unwrapFixture(raw) {
   return { event: raw, preimage: null };
 }
 
-test('v13 fixture maps family to a checkpoint proof and preserves facts', () => {
+test('retired v13 fixture rejects fail-closed at the single version gate', () => {
   const { event: raw } = unwrapFixture(loadJson('v13/text-apply.json'));
-  const canonical = normalizeOperatedEvent(raw, { entity: 'ReplayDoc', field: 'body' });
-  assert.equal(canonical.kind, 'text.apply');
-  assert.equal(canonical.wireVersion, 13);
-  assert.equal(canonical.familyProof.kind, 'checkpoint');
-  assert.deepEqual(canonical.familyProof.checkpoint, raw.facts.family);
-  assert.deepEqual(canonical.facts.emptiedAnnotations, raw.facts.emptiedAnnotations);
-  assert.equal(canonical.facts.actorId, raw.facts.actorId);
+  assert.throws(
+    () => normalizeOperatedEvent(raw, { entity: 'ReplayDoc', field: 'body' }),
+    /only operated versions 14 and 16 are replayable/,
+  );
 });
 
 test('v14 fixture maps absent family to derive-and-check-frontier', () => {
@@ -74,7 +71,7 @@ test('malformed cross-version fixtures reject before any write', () => {
     assert.throws(
       () => normalizeOperatedEvent(raw, { entity: 'ReplayDoc', field: 'body' }),
       (error) => {
-        assert.match(error.message, /ReplayDoc\.body\.operated v\d+ event has invalid envelope/);
+        assert.match(error.message, /invalid envelope|only operated versions 14 and 16 are replayable/);
         return true;
       },
       name,
@@ -103,7 +100,7 @@ function stored(family, id, start, end) {
   };
 }
 
-function v15Envelope() {
+function v16Envelope() {
   const family = importTextToFamily('doc-1', ACTOR, 'hello world');
   const annotations = [stored(family, 'note-1', 0, 5)];
   const images = annotations.map((image) => ({ ...image, orphan: null }));
@@ -136,21 +133,26 @@ function v15Envelope() {
     actor: EDIT_ACTOR,
     lamport: 2,
   });
-  return { family, annotations, envelope: constructV15RegionEvent(plan), plan };
+  const envelope = constructV16RegionEvent(plan, {
+    owningScope: 'Project:p1', entity: 'ReplayDoc', field: 'body',
+    documentId: plan.descriptor.id, actionId: 'a',
+  }).event;
+  return { family, annotations, envelope, plan };
 }
 
-test('v15 fixture file normalizes through the production constructor', () => {
+test('retired v15 fixture rejects fail-closed at the single version gate', () => {
   const { event: raw } = unwrapFixture(loadJson('v15/region-edit.json'));
-  const canonical = normalizeOperatedEvent(raw, { entity: 'ReplayDoc', field: 'body' });
-  assert.equal(canonical.kind, 'region.edit');
-  assert.equal(canonical.wireVersion, 15);
+  assert.throws(
+    () => normalizeOperatedEvent(raw, { entity: 'ReplayDoc', field: 'body' }),
+    /only operated versions 14 and 16 are replayable/,
+  );
 });
 
-test('v15 region.edit normalizes through the production constructor', () => {
-  const { envelope, plan } = v15Envelope();
+test('v16 region.edit normalizes through the production constructor', () => {
+  const { envelope, plan } = v16Envelope();
   const canonical = normalizeOperatedEvent(envelope, { entity: 'ReplayDoc', field: 'body' });
   assert.equal(canonical.kind, 'region.edit');
-  assert.equal(canonical.wireVersion, 15);
+  assert.equal(canonical.wireVersion, 16);
   assert.deepEqual(canonical.familyProof, { kind: 'derive-and-check-frontier' });
   assert.equal(canonical.beforeDigest, plan.postimage.beforeDigest);
   assert.equal(canonical.afterDigest, plan.postimage.afterDigest);
@@ -242,8 +244,7 @@ function applyOperated(db, event) {
   }, db);
 }
 
-function projectFixture(rel) {
-  const { event, preimage } = unwrapFixture(loadJson(rel));
+function projectEnvelope(event, preimage) {
   const db = new DatabaseSync(':memory:');
   installSchema(db);
   if (preimage) seedPreimage(db, preimage);
@@ -253,18 +254,25 @@ function projectFixture(rel) {
   return dump;
 }
 
-test('v13 and v14 fixtures project to the same canonical dump', () => {
-  const v13 = projectFixture('v13/text-apply.json');
-  const v14 = projectFixture('v14/text-apply.json');
-  assert.deepEqual(v13, v14, 'operated normalization fixture mismatch: family');
+function projectFixture(rel) {
+  const { event, preimage } = unwrapFixture(loadJson(rel));
+  return projectEnvelope(event, preimage);
+}
+
+test('v14 fixture replays deterministically to a canonical dump', () => {
+  const first = projectFixture('v14/text-apply.json');
   const rebuilt = projectFixture('v14/text-apply.json');
-  assert.deepEqual(rebuilt, v14, 'operated normalization fixture mismatch: replay');
+  assert.deepEqual(rebuilt, first, 'operated normalization fixture mismatch: replay');
 });
 
-test('v15 fixture projects through the production reducer to a stable dump', () => {
-  const first = projectFixture('v15/region-edit.json');
-  const second = projectFixture('v15/region-edit.json');
-  assert.deepEqual(first, second, 'operated normalization fixture mismatch: v15');
+test('v16 region.edit projects through the production reducer to a stable dump', () => {
+  // The retired v15 fixture supplies only the seed preimage; the event itself
+  // is minted at the one active region version (v16).
+  const { preimage } = unwrapFixture(loadJson('v15/region-edit.json'));
+  const { envelope } = v16Envelope();
+  const first = projectEnvelope(envelope, preimage);
+  const second = projectEnvelope(envelope, preimage);
+  assert.deepEqual(first, second, 'operated normalization fixture mismatch: v16');
   const annotationRows = JSON.parse(first.ReplayDoc_body_annotation);
   assert.equal(annotationRows.length, 1);
 });
@@ -282,7 +290,7 @@ test('malformed operated events write nothing through the production projector',
         type: 'ReplayDoc.body.operated',
         data,
       }, db),
-      /invalid envelope/,
+      /invalid envelope|only operated versions 14 and 16 are replayable/,
       name,
     );
     assert.deepEqual(projectedDump(db), before, `malformed ${name} performed a write`);
@@ -290,20 +298,14 @@ test('malformed operated events write nothing through the production projector',
   db.close();
 });
 
-test('v15 fixture reaches the canonical reducer', () => {
-  let canonical;
-  try {
-    const { event } = unwrapFixture(loadJson('v15/region-edit.json'));
-    canonical = normalizeOperatedEvent(event, { entity: 'ReplayDoc', field: 'body' });
-  } catch {
-    throw new Error('v15 fixture did not reach canonical reducer');
-  }
-  if (canonical.kind !== 'region.edit') throw new Error('v15 fixture did not reach canonical reducer');
+test('v16 envelope reaches the canonical reducer', () => {
+  const canonical = normalizeOperatedEvent(v16Envelope().envelope, { entity: 'ReplayDoc', field: 'body' });
+  assert.equal(canonical.kind, 'region.edit');
 });
 
 test('forged region postimage performs zero writes', () => {
-  const { event, preimage } = unwrapFixture(loadJson('v15/region-edit.json'));
-  const forged = structuredClone(event);
+  const { preimage } = unwrapFixture(loadJson('v15/region-edit.json'));
+  const forged = structuredClone(v16Envelope().envelope);
   forged.operation.afterDigest = '0'.repeat(64);
   const db = new DatabaseSync(':memory:');
   installSchema(db);
@@ -328,8 +330,8 @@ test('forged region postimage performs zero writes', () => {
   db.close();
 });
 
-test('forged v15 transitions reject through the closed grammar with zero writes', () => {
-  const fixture = unwrapFixture(loadJson('v15/region-edit.json'));
+test('forged v16 transitions reject through the closed grammar with zero writes', () => {
+  const fixture = { event: v16Envelope().envelope, preimage: unwrapFixture(loadJson('v15/region-edit.json')).preimage };
   // Each forged transition is rejected by normalizeOperatedEvent's transition
   // grammar (unknown kind, missing annotationId, malformed create fields,
   // unknown range.set target, duplicate naming) BEFORE any reducer work, so a
@@ -378,8 +380,8 @@ test('forged v15 transitions reject through the closed grammar with zero writes'
   }
 });
 
-test('forged v15 transitions reject with the canonical invalid-envelope signature', () => {
-  const fixture = unwrapFixture(loadJson('v15/region-edit.json'));
+test('forged v16 transitions reject with the canonical invalid-envelope signature', () => {
+  const fixture = { event: v16Envelope().envelope };
   const cases = [
     ['unknown-transition-kind', (event) => { event.operation.transitions = [{ kind: 'dodge', annotationId: 'note-1' }]; }],
     ['range-set-missing-annotation-id', (event) => { event.operation.transitions = [{ kind: 'range.set', ranges: [{ start: 0, end: 5 }] }]; }],
@@ -397,14 +399,14 @@ test('forged v15 transitions reject with the canonical invalid-envelope signatur
     mutate(event);
     assert.throws(
       () => normalizeOperatedEvent(event, { entity: 'ReplayDoc', field: 'body' }),
-      (error) => /ReplayDoc\.body\.operated v15 event has invalid envelope/.test(error.message),
+      (error) => /ReplayDoc\.body\.operated v16 event has invalid envelope/.test(error.message),
       name,
     );
   }
 });
 
-test('oversized direct v15 replay payloads fail with the region limit and write nothing', () => {
-  const fixture = unwrapFixture(loadJson('v15/region-edit.json'));
+test('oversized direct v16 replay payloads fail with the region limit and write nothing', () => {
+  const fixture = { event: v16Envelope().envelope, preimage: unwrapFixture(loadJson('v15/region-edit.json')).preimage };
   const cases = [
     ['text-operation', (event) => { event.operation.text.operations[1][5][2] = 'x'.repeat((1024 * 1024) + 1); }],
     ['memberships', (event) => { event.operation.transitions[0].ranges = Array.from({ length: 8193 }, () => ({ start: 0, end: 1 })); }],

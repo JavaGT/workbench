@@ -293,3 +293,20 @@ test('plain inherit(Parent, { via }) keeps its original shape (no refinement)', 
   assert.match(Child.readScope.sql, /EXISTS \(SELECT 1 FROM PlainProject/);
   assert.doesNotMatch(Child.readScope.sql, /1 = 1 AND/);
 });
+
+test('#246: distinct UNIQUE constraints whose field names collide on underscore still emit separate SQLite indexes', () => {
+  const Colliding = entity('UniqueCollide', {
+    a: text(),
+    b: text(),
+    a_b: text(),
+    indexes: [{ fields: ['a', 'b'], unique: true }],
+    unique: ['a_b'],
+    grant: () => [scope(() => everyone()).can(() => grant(read))],
+  });
+  const uniqueStmts = Colliding.generateDDL().filter((s) => s.includes('CREATE UNIQUE INDEX'));
+  assert.equal(uniqueStmts.length, 2, 'both (a, b) and (a_b) unique indexes must be emitted');
+  assert.ok(uniqueStmts.some((s) => s.includes('("a", "b")')), 'composite (a, b) unique index present');
+  assert.ok(uniqueStmts.some((s) => s.includes('("a_b")')), 'single-column (a_b) unique index present');
+  const names = uniqueStmts.map((s) => /INDEX IF NOT EXISTS "([^"]+)"/.exec(s)?.[1]);
+  assert.equal(new Set(names).size, 2, 'emitted unique index names must be distinct');
+});

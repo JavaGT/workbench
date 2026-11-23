@@ -1,14 +1,18 @@
 // fts5-plugin.ts — a declared, durable SQLite FTS5 search plugin.
 
+import { createHash } from 'node:crypto';
 import {
   SUPPORTED_SEARCH_PLUGIN_CONTRACT_VERSION,
 
 
 
 
+
+
 } from './search-plugin.mjs';
-import { censusOfRows,                                                  } from './search-reconcile.mjs';
+import { censusOfRows,                                                                           } from './search-reconcile.mjs';
 import { admitSearchHits } from './search-auth.mjs';
+import { searchStalenessOf } from './search-response.mjs';
 
 
 
@@ -53,9 +57,16 @@ export class Fts5QueryValidationError extends Error {
 
 
 
+
+
+
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const TOKENIZERS = new Set               (['unicode61', 'porter', 'trigram']);
 const MAX_WRITE_STATEMENTS = 128;
+const SOURCE_PAGE_SIZE = 512;
+const DELETE_CHUNK_SIZE = 500;
+const CENSUS_BOUNDARY_SAMPLE = 32;
+const SCOPE_COLUMN = 'scope_id';
 
 function assertIdentifier(value        , label        )       {
   if (!IDENTIFIER.test(value)) throw new TypeError(`FTS5 ${label} must be a SQLite identifier`);
@@ -91,6 +102,12 @@ function stringValues(row                                   , fields            
   return fields.map((field) => typeof row[field] === 'string' ? row[field] : '');
 }
 
+function scopeValueOf(row                                   , scopeField                    )         {
+  if (scopeField === undefined) return '';
+  const value = row[scopeField];
+  return value === null || value === undefined ? '' : String(value);
+}
+
 function asNumber(value         )         {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }
@@ -108,20 +125,97 @@ function indexedRows(rows                                              , fields 
   ]));
 }
 
+function boundaryCensus(
+  count        ,
+  head                                    ,
+  tail                                    ,
+)                     {
+  if (count === 0) return { count: 0, digest: censusOfRows([]).digest };
+  const byId = new Map                                 ();
+  for (const row of head) byId.set(String(row.id), row);
+  for (const row of tail) byId.set(String(row.id), row);
+  const sample = censusOfRows([...byId.values()]);
+  if (count <= CENSUS_BOUNDARY_SAMPLE * 2 && byId.size === count) {
+    return { count, digest: sample.digest };
+  }
+  const digest = createHash('sha256').update(`${count}:${sample.digest ?? ''}`).digest('hex');
+  return { count, digest };
+}
+
 function countOf(ctx                     , table        )         {
-  // count() is intentionally outside the owned-index SQL function allowlist.
-  // The bounded capability already caps query rows, so count concrete rowids.
-  return ctx.index.query({ sql: `SELECT rowid FROM ${table}` }).length;
+  const row = ctx.index.query({ sql: `SELECT COUNT(*) AS count FROM ${table}` })[0];
+  return Number(row?.count ?? 0);
 }
 
 function ftsShadowNames(table        )                    {
   return Object.freeze(['data', 'idx', 'content', 'docsize', 'config'].map((suffix) => `${table}_${suffix}`));
 }
 
+function extractScopeId(
+  rawScope         ,
+  rawScopeId         ,
+  scopeField                    ,
+)                     {
+  if (rawScopeId !== undefined) {
+    if (scopeField === undefined) {
+      throw new Fts5QueryValidationError('FTS5 plugin is not configured with a scopeField for scoped search');
+    }
+    if (typeof rawScopeId !== 'string' || rawScopeId.length === 0) {
+      throw new Fts5QueryValidationError('FTS5 scopeId must be a non-empty string');
+    }
+    return rawScopeId;
+  }
+  if (rawScope === undefined) return undefined;
+  if (scopeField === undefined) {
+    throw new Fts5QueryValidationError('FTS5 plugin is not configured with a scopeField for scoped search');
+  }
+  if (typeof rawScope === 'string') {
+    if (rawScope.length === 0) throw new Fts5QueryValidationError('FTS5 scope must be a non-empty string');
+    return rawScope;
+  }
+  if (rawScope === null || typeof rawScope !== 'object' || Array.isArray(rawScope)) {
+    throw new Fts5QueryValidationError('FTS5 scope must be a string or single-field scope predicate object');
+  }
+  const entries = Object.entries(rawScope                           );
+  if (entries.length !== 1) {
+    throw new Fts5QueryValidationError(`FTS5 scope object must specify exactly '${scopeField}'`);
+  }
+  const [key, value] = entries[0];
+  if (key !== scopeField && key !== SCOPE_COLUMN) {
+    throw new Fts5QueryValidationError(`FTS5 scope field '${key}' does not match configured scopeField '${scopeField}'`);
+  }
+  if (value === null || value === undefined) {
+    throw new Fts5QueryValidationError(`FTS5 scope value for '${key}' must not be null or undefined`);
+  }
+  return String(value);
+}
+
+function resolveFtsQuery(
+  request               ,
+  scopeField                    ,
+)                                                                       {
+  let queryText          = request.query;
+  let queryScope         ;
+  let queryScopeId         ;
+  if (request.query !== null && typeof request.query === 'object' && !Array.isArray(request.query)) {
+    const obj = request.query                                                                           ;
+    queryText = obj.text ?? obj.query;
+    queryScope = obj.scope;
+    queryScopeId = obj.scopeId;
+  }
+  if (typeof queryText !== 'string' || queryText.trim().length === 0) {
+    throw new Fts5QueryValidationError('FTS5 query must be a non-empty string');
+  }
+  const scopeId = extractScopeId(request.scope ?? queryScope, request.scopeId ?? queryScopeId, scopeField);
+  return { queryText, scopeId };
+}
+
 export function createFts5Plugin(options                   )             {
   assertIdentifier(options.source.entity, 'entity');
   if (!Array.isArray(options.source.fields) || options.source.fields.length === 0) throw new TypeError('FTS5 plugin requires at least one source field');
   for (const field of options.source.fields) assertIdentifier(field, 'field');
+  const scopeField = options.source.scopeField;
+  if (scopeField !== undefined) assertIdentifier(scopeField, 'scopeField');
   const tokenizer = options.tokenizer ?? 'unicode61';
   if (!TOKENIZERS.has(tokenizer)) throw new TypeError(`unsupported FTS5 tokenizer '${tokenizer}'`);
   const snippetLength = options.snippetLength ?? 24;
@@ -132,8 +226,12 @@ export function createFts5Plugin(options                   )             {
   const stateTable = `${base}_state`;
   const tables = [`${base}_g0`, `${base}_g1`]         ;
   const idColumn = `${options.source.entity}_id`;
+  const insertColumns = [...options.source.fields, idColumn, SCOPE_COLUMN];
+  const insertSql = `INSERT INTO %TABLE% (${insertColumns.join(', ')}) VALUES (${insertColumns.map(() => '?').join(', ')})`;
   let building               = null;
   let promoted               = null;
+  // Monotonic generation watermark for overlapping same-identity writes (#243).
+  let activeWriteGeneration = 0;
 
   function activeGeneration(ctx                     )        {
     const value = ctx.index.query({ sql: `SELECT active FROM ${stateTable} WHERE slot = 'active'` })[0]?.active;
@@ -144,20 +242,47 @@ export function createFts5Plugin(options                   )             {
     return tables[building ?? activeGeneration(ctx)];
   }
 
+  function isSuperseded(ctx                     )          {
+    return ctx.generation < activeWriteGeneration;
+  }
+
+  function claimGeneration(ctx                     )          {
+    if (ctx.generation < activeWriteGeneration) return false;
+    activeWriteGeneration = ctx.generation;
+    return true;
+  }
+
+  async function clearTable(ctx                     , table        , allowSuperseded = false)                {
+    if (!allowSuperseded && isSuperseded(ctx)) return;
+    if (typeof ctx.index.clear === 'function') {
+      await ctx.index.clear({ expectedFence: ctx.fence, table });
+      return;
+    }
+    // Fallback for custom SearchOwnedIndex implementations without bulk clear:
+    // delete in bounded chunks so total_changes() stays well below maxRows.
+    while (allowSuperseded || !isSuperseded(ctx)) {
+      const result = await ctx.index.write({
+        expectedFence: ctx.fence,
+        statements: [{ sql: `DELETE FROM ${table} WHERE rowid IN (SELECT rowid FROM ${table} LIMIT ${DELETE_CHUNK_SIZE})` }],
+      });
+      if (result.changes === 0) break;
+    }
+  }
+
   async function writeRows(ctx                     , table        , rows                                              )                {
-    const columns = [...options.source.fields, idColumn, 'payload'];
-    const placeholders = columns.map(() => '?').join(', ');
-    const sql = `INSERT INTO ${table} (${columns.join(', ')}) VALUES (${placeholders})`;
+    const sql = insertSql.replace('%TABLE%', table);
     for (let offset = 0; offset < rows.length; offset += MAX_WRITE_STATEMENTS) {
+      if (isSuperseded(ctx)) return;
       const statements = rows.slice(offset, offset + MAX_WRITE_STATEMENTS).map((row) => ({
         sql,
-        params: [...stringValues(row, options.source.fields), rowId(row), JSON.stringify(row)],
+        params: [...stringValues(row, options.source.fields), rowId(row), scopeValueOf(row, scopeField)],
       }));
       if (statements.length > 0) await ctx.index.write({ expectedFence: ctx.fence, statements });
     }
   }
 
   async function replaceRows(ctx                     , table        , changes                         )                {
+    const sql = insertSql.replace('%TABLE%', table);
     const statements                                                                   = [];
     for (const change of changes) {
       if (change.entity !== options.source.entity) continue;
@@ -165,15 +290,15 @@ export function createFts5Plugin(options                   )             {
       if (change.kind !== 'removed') {
         const row = ctx.reader.row(options.source.entity, change.rowId);
         if (row !== undefined) {
-          const columns = [...options.source.fields, idColumn, 'payload'];
           statements.push({
-            sql: `INSERT INTO ${table} (${columns.join(', ')}) VALUES (${columns.map(() => '?').join(', ')})`,
-            params: [...stringValues(row, options.source.fields), rowId(row), JSON.stringify(row)],
+            sql,
+            params: [...stringValues(row, options.source.fields), rowId(row), scopeValueOf(row, scopeField)],
           });
         }
       }
     }
     for (let offset = 0; offset < statements.length; offset += MAX_WRITE_STATEMENTS) {
+      if (isSuperseded(ctx)) return;
       await ctx.index.write({ expectedFence: ctx.fence, statements: statements.slice(offset, offset + MAX_WRITE_STATEMENTS) });
     }
   }
@@ -188,10 +313,10 @@ export function createFts5Plugin(options                   )             {
       ...tables.map((name) => ({
         kind: 'virtual-table'         ,
         name,
-        // payload is retained only for exact index/source census comparison. Search
-        // queries never select it, so indexed source data cannot leak in a hit.
+        // Stores only indexed fields plus UNINDEXED source id and scope_id for
+        // SQL-level pre-filtering before LIMIT (no full-row JSON payload copy).
         disposition: { kind: 'retained'         , reason: 'FTS index is derived and rebuilt from the source census' },
-        ddl: [`CREATE VIRTUAL TABLE IF NOT EXISTS ${name} USING fts5(${[...options.source.fields, `${idColumn} UNINDEXED`, 'payload UNINDEXED'].join(', ')}, tokenize='${tokenizer}');`],
+        ddl: [`CREATE VIRTUAL TABLE IF NOT EXISTS ${name} USING fts5(${[...options.source.fields, `${idColumn} UNINDEXED`, `${SCOPE_COLUMN} UNINDEXED`].join(', ')}, tokenize='${tokenizer}');`],
       })),
       // FTS5 creates these physical tables with its virtual table. They are
       // declared individually so the census authorizes FTS's internal writes.
@@ -218,43 +343,92 @@ export function createFts5Plugin(options                   )             {
       countOf(ctx, tables[1]);
     },
     async reconcile(ctx, changes) {
+      if (!claimGeneration(ctx)) return { counts: { documents: countOf(ctx, targetTable(ctx)) } };
       await replaceRows(ctx, targetTable(ctx), changes);
       return { counts: { documents: countOf(ctx, targetTable(ctx)) } };
     },
+    async revoke(ctx, target                        ) {
+      const table = targetTable(ctx);
+      if (target.entity !== options.source.entity || !claimGeneration(ctx)) {
+        return { counts: { documents: countOf(ctx, table) } };
+      }
+      if (target.scopeId !== undefined) {
+        while (!isSuperseded(ctx)) {
+          const result = await ctx.index.write({
+            expectedFence: ctx.fence,
+            statements: [{
+              sql: `DELETE FROM ${table} WHERE rowid IN (SELECT rowid FROM ${table} WHERE ${SCOPE_COLUMN} = ? LIMIT ${DELETE_CHUNK_SIZE})`,
+              params: [target.scopeId],
+            }],
+          });
+          if (result.changes === 0) break;
+        }
+      } else if (target.rowId !== undefined) {
+        await ctx.index.write({
+          expectedFence: ctx.fence,
+          statements: [{ sql: `DELETE FROM ${table} WHERE ${idColumn} = ?`, params: [target.rowId] }],
+        });
+      }
+      return { counts: { documents: countOf(ctx, table) } };
+    },
     async rebuild(ctx) {
       const table = targetTable(ctx);
-      await ctx.index.write({ expectedFence: ctx.fence, statements: [{ sql: `DELETE FROM ${table}` }] });
-      const rows = ctx.reader.rows(options.source.entity);
-      await writeRows(ctx, table, rows);
+      if (!claimGeneration(ctx)) return { counts: { documents: countOf(ctx, table) } };
+      await clearTable(ctx, table);
+      // Stream source rows in bounded keyset pages so >10k rebuilds never
+      // materialize the entire corpus in JS RAM at once.
+      let afterId                    ;
+      while (!isSuperseded(ctx)) {
+        const page = ctx.reader.rows(options.source.entity, {
+          afterId,
+          limit: SOURCE_PAGE_SIZE,
+          order: 'asc',
+        });
+        if (page.length === 0) break;
+        await writeRows(ctx, table, page);
+        if (page.length < SOURCE_PAGE_SIZE) break;
+        const lastId = rowId(page[page.length - 1]);
+        if (afterId !== undefined && lastId <= afterId) break;
+        afterId = lastId;
+      }
       return { counts: { documents: countOf(ctx, table) } };
     },
     async search(ctx, request)                                    {
-      if (typeof request.query !== 'string' || request.query.trim().length === 0) {
-        throw new Fts5QueryValidationError('FTS5 query must be a non-empty string');
-      }
+      const { queryText, scopeId } = resolveFtsQuery(request, scopeField);
       if (request.principal === undefined) throw new Fts5QueryValidationError('FTS5 search requires a principal for result admission');
       const table = tables[activeGeneration(ctx)];
       try {
-        // This deliberately uses the SQLite FTS5 parser. There is no parallel
-        // JavaScript grammar whose acceptance could diverge from MATCH.
-        ctx.index.query({ sql: `SELECT rowid FROM ${table} WHERE ${table} MATCH ? LIMIT 0`, params: [request.query] });
-        const snippets = options.source.fields.map((_, index) => `snippet(${table}, ${index}, '[', ']', '...', ?) AS excerpt_${index}`).join(', ');
+        // Single-query FTS5 projection: uses SQLite's parser directly, filters
+        // by `scope_id = ?` BEFORE `LIMIT`, and determines per-column match
+        // attribution via `highlight(...) IS NOT <field>` without N*F extra
+        // MATCH queries.
+        const matchExprs = options.source.fields
+          .map((field, index) => `(highlight(${table}, ${index}, '[', ']') IS NOT ${field}) AS matched_${index}`)
+          .join(', ');
+        const snippetExprs = options.source.fields
+          .map((_, index) => `snippet(${table}, ${index}, '[', ']', '...', ?) AS excerpt_${index}`)
+          .join(', ');
+        const whereClause = scopeId === undefined
+          ? `${table} MATCH ?`
+          : `${table} MATCH ? AND ${SCOPE_COLUMN} = ?`;
+        const whereParams            = scopeId === undefined
+          ? [queryText]
+          : [queryText, scopeId];
+        const limit = Math.max(0, Math.floor(request.limit ?? 100));
+        const snippetTokens = Math.min(64, snippetLength);
         const rows = ctx.index.query({
-          sql: `SELECT ${idColumn} AS id, bm25(${table}) AS score, ${snippets} FROM ${table} WHERE ${table} MATCH ? ORDER BY score ASC, ${idColumn} ASC LIMIT ?`,
-          params: [...options.source.fields.map(() => snippetLength), request.query, Math.max(0, Math.floor(request.limit ?? 100))],
+          sql: `SELECT ${idColumn} AS id, bm25(${table}) AS score, ${matchExprs}, ${snippetExprs} FROM ${table} WHERE ${whereClause} ORDER BY score ASC, ${idColumn} ASC LIMIT ?`,
+          params: [...options.source.fields.map(() => snippetTokens), ...whereParams, limit],
         });
         const greatest = Math.max(0, ...rows.map((row) => -asNumber(row.score)));
         const candidates = rows.map((row) => {
           const id = String(row.id);
-          // A snippet from an unmatched field may contain the highlight marker in
-          // its source text. Ask FTS5 which fields matched instead. Cross-field
-          // expressions are ambiguous, so never attribute an excerpt to one.
-          const matchingFieldIndexes = options.source.fields.flatMap((field, index) =>
-            ctx.index.query({
-              sql: `SELECT rowid FROM ${table} WHERE ${idColumn} = ? AND ${table} MATCH ? LIMIT 1`,
-              params: [id, `${field} : (${request.query})`],
-            }).length > 0 ? [index] : [],
-          );
+          // Cross-field matches are ambiguous, so only attribute an excerpt
+          // when exactly one indexed column matched the FTS5 query.
+          const matchingFieldIndexes           = [];
+          for (let index = 0; index < options.source.fields.length; index += 1) {
+            if (Number(row[`matched_${index}`]) === 1) matchingFieldIndexes.push(index);
+          }
           const fieldIndex = matchingFieldIndexes.length === 1 ? matchingFieldIndexes[0] : undefined;
           const excerpt = fieldIndex === undefined ? undefined : row[`excerpt_${fieldIndex}`];
           const hit = Object.freeze({
@@ -276,10 +450,11 @@ export function createFts5Plugin(options                   )             {
             } : {}),
           };
         });
+        const staleness = ctx.state !== undefined ? searchStalenessOf(ctx.state) : 'stale';
         const admitted = await admitSearchHits(options.admission.adapter, {
           pluginId: options.id,
           generation: ctx.generation,
-          staleness: 'stale',
+          staleness,
           principal: request.principal,
           candidates,
         });
@@ -295,20 +470,54 @@ export function createFts5Plugin(options                   )             {
       }
     },
     async beginShadow(ctx) {
+      claimGeneration(ctx);
       building = activeGeneration(ctx) === 0 ? 1 : 0;
-      await ctx.index.write({ expectedFence: ctx.fence, statements: [{ sql: `DELETE FROM ${tables[building]}` }] });
+      await clearTable(ctx, tables[building]);
     },
     indexCensus(ctx)               {
-      const rows = ctx.index.query({ sql: `SELECT ${idColumn} AS id, ${options.source.fields.join(', ')} FROM ${targetTable(ctx)} ORDER BY ${idColumn} ASC` });
-      return Object.freeze({ [options.source.entity]: censusOfRows(rows) });
+      const table = targetTable(ctx);
+      const count = countOf(ctx, table);
+      if (count === 0) return Object.freeze({ [options.source.entity]: boundaryCensus(0, [], []) });
+      const selectCols = `${idColumn} AS id, ${options.source.fields.join(', ')}`;
+      if (count <= CENSUS_BOUNDARY_SAMPLE * 2) {
+        const rows = ctx.index.query({
+          sql: `SELECT ${selectCols} FROM ${table} ORDER BY ${idColumn} ASC LIMIT ${CENSUS_BOUNDARY_SAMPLE * 2}`,
+        });
+        return Object.freeze({ [options.source.entity]: boundaryCensus(count, rows, []) });
+      }
+      const head = ctx.index.query({
+        sql: `SELECT ${selectCols} FROM ${table} ORDER BY ${idColumn} ASC LIMIT ${CENSUS_BOUNDARY_SAMPLE}`,
+      });
+      const tail = ctx.index.query({
+        sql: `SELECT ${selectCols} FROM ${table} ORDER BY ${idColumn} DESC LIMIT ${CENSUS_BOUNDARY_SAMPLE}`,
+      });
+      return Object.freeze({ [options.source.entity]: boundaryCensus(count, head, tail) });
     },
     sourceCensus(ctx)               {
-      return Object.freeze({
-        [options.source.entity]: censusOfRows(indexedRows(ctx.reader.rows(options.source.entity), options.source.fields)),
-      });
+      const count = typeof ctx.reader.count === 'function'
+        ? ctx.reader.count(options.source.entity)
+        : ctx.reader.rows(options.source.entity).length;
+      if (count === 0) return Object.freeze({ [options.source.entity]: boundaryCensus(0, [], []) });
+      if (count <= CENSUS_BOUNDARY_SAMPLE * 2) {
+        const rows = indexedRows(
+          ctx.reader.rows(options.source.entity, { limit: CENSUS_BOUNDARY_SAMPLE * 2, order: 'asc' }),
+          options.source.fields,
+        );
+        return Object.freeze({ [options.source.entity]: boundaryCensus(count, rows, []) });
+      }
+      const head = indexedRows(
+        ctx.reader.rows(options.source.entity, { limit: CENSUS_BOUNDARY_SAMPLE, order: 'asc' }),
+        options.source.fields,
+      );
+      const tail = indexedRows(
+        ctx.reader.rows(options.source.entity, { limit: CENSUS_BOUNDARY_SAMPLE, order: 'desc' }),
+        options.source.fields,
+      );
+      return Object.freeze({ [options.source.entity]: boundaryCensus(count, head, tail) });
     },
     async commitShadow(ctx) {
       if (building === null) throw new Error('FTS5 plugin has no shadow generation to commit');
+      if (isSuperseded(ctx)) throw new Error('FTS5 shadow generation superseded by a newer materialization');
       const next = building;
       await ctx.index.write({
         expectedFence: ctx.fence,
@@ -326,14 +535,13 @@ export function createFts5Plugin(options                   )             {
       if (building === null) return;
       const discarded = building;
       building = null;
-      await ctx.index.write({ expectedFence: ctx.fence, statements: [{ sql: `DELETE FROM ${tables[discarded]}` }] });
+      await clearTable(ctx, tables[discarded], true);
     },
     health(ctx) {
       try {
-        const source = indexedRows(ctx.reader.rows(options.source.entity), options.source.fields);
         const active = activeGeneration(ctx);
         const index = plugin.indexCensus(ctx)[options.source.entity];
-        const sourceCensus = censusOfRows(source);
+        const sourceCensus = plugin.sourceCensus (ctx)[options.source.entity];
         const shadowCounts = tables.map((table) => countOf(ctx, table));
         return Object.freeze({
           tokenizer,

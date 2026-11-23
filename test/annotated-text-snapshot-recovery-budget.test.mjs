@@ -209,3 +209,51 @@ test('close cancels an in-flight recovery cycle', async () => {
   await ready;
   assert.notEqual(session.status, 'unavailable');
 });
+
+test('a lease-capacity retry reason survives recovery into the session status surface (#252)', async () => {
+  const { session, bootstraps } = createBudgetClient({
+    bootstrapImpl: async () => ({ kind: 'retry', reason: 'lease-budget-exhausted' }),
+  });
+  await session.ready.catch(() => {});
+  await flush();
+  // The reason is diagnostic only: retry behavior and the terminal status stay
+  // exactly as before, but the host can now name WHY authoring is blocked.
+  assert.equal(session.status, 'unavailable');
+  assert.equal(bootstraps(), 4);
+  assert.equal(session.recoveryReason, 'lease-budget-exhausted');
+  session.close();
+});
+
+test('a bare retry does not erase an already-observed capacity reason (#252)', async () => {
+  let count = 0;
+  const { session } = createBudgetClient({
+    bootstrapImpl: async () => {
+      count += 1;
+      return count === 1
+        ? { kind: 'retry', reason: 'lease-budget-exhausted' }
+        : { kind: 'retry' };
+    },
+  });
+  await session.ready.catch(() => {});
+  await flush();
+  assert.equal(session.recoveryReason, 'lease-budget-exhausted');
+  session.close();
+});
+
+test('installing a replacement snapshot clears the last retry reason (#252)', async () => {
+  let first = true;
+  const { session } = createBudgetClient({
+    bootstrapImpl: async () => {
+      if (first) {
+        first = false;
+        return { kind: 'retry', reason: 'snapshot-contention' };
+      }
+      return { kind: 'snapshot', snapshot: { id: 'n1', title: 'recovered' }, cursor: 0 };
+    },
+  });
+  await session.ready;
+  await flush();
+  assert.equal(session.status, 'live');
+  assert.equal(session.recoveryReason, null);
+  session.close();
+});

@@ -95,6 +95,108 @@ test('document session bootstraps recipient snapshot and derives typed insert fr
   session.close();
 });
 
+test('document session forwards its optimistic pending count to the host surface (#228)', async () => {
+  const pendingResponses = [];
+  let cursor = 0;
+  const session = createAnnotatedTextHttpSession({
+    typingBurstIdleMs: 0,
+    baseUrl: 'https://example.test/live-delivery',
+    context: { entity: Document, field: Document.body, documentId: 'pending-count' },
+    historySession: 'tab-a', createActionId: () => 'action-pending',
+    fetchImpl: async (url, options) => {
+      if (options?.method === 'POST') {
+        if (url.includes('/authoring/ack')) return { ok: true, status: 200, json: async () => ({ ok: true, acknowledgedThrough: cursor }) };
+        return new Promise((resolve) => pendingResponses.push(resolve));
+      }
+      cursor += 1;
+      return { ok: true, status: 200, json: async () => ({ kind: 'snapshot', snapshot: snapshot(), cursor, authoring: authoringEnvelope(cursor) }) };
+    },
+    eventSourceFactory: () => ({ close() {}, onmessage: null, onerror: null }),
+  });
+  await session.ready;
+  // Declared on AnnotatedTextHttpSession in client.d.ts; hosts fence document
+  // history on it (Scope #3126). It must exist at runtime, not only in types.
+  assert.equal(typeof session.pendingCount, 'function');
+  assert.equal(session.pendingCount(), 0);
+  const insert = session.insert({ mutationId: 'm1', at: { offset: 5, affinity: 'right' }, text: '!' });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(session.pendingCount(), 1, 'the in-flight optimistic insert is visible to the host');
+  pendingResponses.shift()({ ok: true, status: 200, json: async () => ({ ok: true, actionId: 'action-pending', confirmedThrough: 1 }) });
+  await insert;
+  // The receipt without an echo still snapshot-recovers; wait for the covering
+  // snapshot before asserting the counter drained.
+  for (let i = 0; i < 8; i += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(session.pendingCount(), 0);
+  session.close();
+});
+
+test('an applied sensitive annotation settles into document.ranges from its authoritative state echo (#234)', async () => {
+  const SensitiveDocument = entity('SensitiveLiveDocument', {
+    project: ref('Project'), owner: ref('User'),
+    body: annotatedText({
+      project: 'project', owner: 'owner',
+      annotations: [annotation('note', { fields: {} }), annotation('sensitive', { fields: {} })],
+    }),
+  });
+  const sensitiveId = 'sensitive-1';
+  const sources = [];
+  let number = 0;
+  let actionNumber = 0;
+  const session = createAnnotatedTextHttpSession({
+    baseUrl: 'https://example.test/live-delivery',
+    context: { entity: SensitiveDocument, field: SensitiveDocument.body, documentId: 'd-sensitive' },
+    historySession: 'tab-a', createActionId: () => `sensitive-${++actionNumber}`,
+    fetchImpl: async (url, options) => {
+      if (options?.method === 'POST') {
+        if (url.includes('/authoring/ack')) return { ok: true, status: 200, json: async () => ({ ok: true, acknowledgedThrough: number }) };
+        const body = JSON.parse(options.body);
+        const confirmedThrough = number;
+        return { ok: true, status: 200, json: async () => ({ ok: true, actionId: body.actionId, confirmedThrough }) };
+      }
+      const cursor = ++number;
+      return { ok: true, status: 200, json: async () => ({ kind: 'snapshot', snapshot: snapshot(), cursor, authoring: authoringEnvelope(cursor) }) };
+    },
+    eventSourceFactory: () => {
+      const source = { close() {}, onmessage: null, onerror: null };
+      sources.push(source);
+      return source;
+    },
+  });
+  await session.ready;
+  const pending = session.applyAnnotation({
+    mutationId: 'sensitive-m',
+    annotation: { id: sensitiveId, family: 'sensitive', fields: {} },
+    from: { offset: 0, affinity: 'left' },
+    to: { offset: 5, affinity: 'right' },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  // The optimistic placeholder is visible before the authoritative echo.
+  assert.deepEqual(session.document.ranges, [{ annotationId: sensitiveId, start: 0, end: 5 }]);
+  // `annotation.apply-range` does not fold (no text change): the live `state`
+  // replacement is its one reconciliation path. Deliver the owner's authorized
+  // snapshot carrying the sensitive span.
+  sources[0].onmessage({ data: JSON.stringify([{
+    type: 'state', entity: 'LiveDocument', id: 'd-sensitive', seq: 2,
+    state: {
+      body: {
+        ...snapshot().body,
+        ranges: [{ annotationId: sensitiveId, start: 0, end: 5 }],
+        annotations: [{ id: sensitiveId, family: 'sensitive', fields: {} }],
+      },
+    },
+    authoring: authoringEnvelope(2),
+  }]) });
+  const result = await pending;
+  assert.equal(result.ok, true);
+  assert.deepEqual(await result.settlement.wait(), { opId: result.opId, status: 'reconciled' });
+  // Exactly the assertion the confidential-span browser journey makes after
+  // settlement: the span must have settled into a visible range.
+  const settled = (session.document?.ranges ?? []).find((range) => range.annotationId === sensitiveId);
+  assert.ok(settled, 'applied sensitive span must settle into session.document.ranges');
+  assert.deepEqual(settled, { annotationId: sensitiveId, start: 0, end: 5 });
+  session.close();
+});
+
 test('document session reuses its tab-scoped authoring client across reloads', async (t) => {
   const previous = globalThis.sessionStorage;
   const values = new Map();

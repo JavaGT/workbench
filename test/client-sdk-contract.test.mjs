@@ -74,6 +74,92 @@ test('every declared value export exists at runtime', () => {
   }
 });
 
+// --- ScopeDispatchResult.settlement contract (#239) ------------------------
+//
+// The optional `settlement` field must describe the real runtime producers:
+// the legacy scope engine never mints one, while the document-path producers
+// (the annotated-text session) always return the live-delivery settlement.
+// Both directions are pinned so the declaration cannot drift either way.
+test('ScopeDispatchResult.settlement optionality matches its runtime producers', async () => {
+  const dts = readFileSync(dtsPath, 'utf8');
+  const scopeResult = dts.slice(
+    dts.indexOf('export type ScopeDispatchResult'),
+    dts.indexOf('export interface ScopeLiveStoreConfig'),
+  );
+  assert.match(scopeResult, /settlement\?:\s*LiveDeliverySettlement/,
+    'client.d.ts must declare settlement as optional (legacy scope engine omits it)');
+
+  // Legacy scope engine: a bare receipt/value result, no settlement key.
+  const channel = {
+    subscribeScope: async () => ({ currentSeq: 0 }),
+    subscribe: async () => ({ currentSeq: 0 }),
+    unsubscribe: async () => {},
+    unsubscribeScope: async () => {},
+    updateCaret: () => true,
+    clearCaret: () => true,
+    close() {},
+    onConnectionChange: () => () => {},
+  };
+  const scopeStore = client.createScopeLiveStore({
+    baseUrl: 'https://example.test',
+    scope: 'Project:p1',
+    channel,
+    fetchImpl: async () => ({ ok: true, json: async () => ({ snapshot: { id: 'n1' }, seq: 0 }) }),
+    validateSnapshot: (snapshot) => snapshot,
+    fold: (snapshot) => snapshot,
+    sendAction: async () => ({ ok: true, cursor: 1 }),
+  });
+  await scopeStore.ready;
+  const legacy = await scopeStore.dispatch('Note.update', { title: 'x' });
+  assert.equal(Object.hasOwn(legacy, 'settlement'), false,
+    'createScopeLiveStore().dispatch must not mint a settlement');
+  scopeStore.close();
+
+  // Document-path producer: applyAnnotation returns the live-delivery result,
+  // which always carries the operation's settlement.
+  const { annotatedText, annotation, entity, ref } = await import('../build/index.mjs');
+  const Doc = entity('ContractDoc', {
+    project: ref('Project'), owner: ref('User'),
+    body: annotatedText({ project: 'project', owner: 'owner', annotations: [annotation('note', { fields: {} })] }),
+  });
+  const token = (label) => `${label}${'x'.repeat(43)}`.slice(0, 43);
+  let cursor = 0;
+  let actionNumber = 0;
+  const docSession = client.createAnnotatedTextHttpSession({
+    baseUrl: 'https://example.test/live-delivery',
+    context: { entity: Doc, field: Doc.body, documentId: 'contract-d1' },
+    historySession: 'contract-tab', createActionId: () => `contract-${++actionNumber}`,
+    fetchImpl: async (url, options) => {
+      if (options?.method === 'POST') {
+        if (url.includes('/authoring/ack')) return { ok: true, status: 200, json: async () => ({ ok: true, acknowledgedThrough: cursor }) };
+        const body = JSON.parse(options.body);
+        const confirmedThrough = cursor;
+        return { ok: true, status: 200, json: async () => ({ ok: true, actionId: body.actionId, confirmedThrough }) };
+      }
+      cursor += 1;
+      const body = {
+        kind: 'workbench.annotatedText.recipient', version: 1, text: 'Hello',
+        ranges: [], annotations: [], orphans: [], measurements: [],
+      };
+      return { ok: true, status: 200, json: async () => ({ kind: 'snapshot', snapshot: { body }, cursor, authoring: {
+        version: 1, stream: token('s'), lease: token('l'), snapshot: token(`snap${cursor}`),
+        acknowledgementFence: cursor, positionFrames: [{ positionToken: token(`p${cursor}`) }],
+      } }) };
+    },
+    eventSourceFactory: () => ({ close() {}, onmessage: null, onerror: null }),
+  });
+  await docSession.ready;
+  const applied = docSession.applyAnnotation({
+    mutationId: 'contract-ann',
+    annotation: { id: 'a1', family: 'note', fields: {} },
+    from: { offset: 0, affinity: 'left' },
+    to: { offset: 2, affinity: 'right' },
+  });
+  assert.equal(Object.hasOwn(await applied, 'settlement'), true,
+    'document-path applyAnnotation must carry the live-delivery settlement');
+  docSession.close();
+});
+
 // --- decideReplay / normalizeSeqSpan parity -------------------------------
 
 const BEGIN_MARKER = '// --- BEGIN GENERATED from src/replay-decision.ts';

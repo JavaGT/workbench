@@ -9,7 +9,7 @@ import type { RegionPlan, RegionTextOperations } from './annotated-text-region-p
 import type { RegionAnnotationImage, RegionOrphanImage, RegionPostimage } from './annotated-text-region-reducer.ts';
 // TS7 (tsgo 7.0.2) mis-narrows `readonly Readonly<...>` element types on this
 // union's create arm to `never`, so the annotation payload is spelled out.
-type V15CreateAnnotationPayload = Readonly<{
+type V16CreateAnnotationPayload = Readonly<{
   id: string;
   family: string;
   fields: Readonly<Record<string, unknown>>;
@@ -47,8 +47,6 @@ export const OPERATED_FACT_KEYS = [
 
 export const OPERATED_ENVELOPE_KEYS = ['after', 'before', 'facts', 'id', 'operation', 'version'] as const;
 
-const V15_PROOF_KEYS = ['affectedIds', 'afterDigest', 'beforeDigest'] as const;
-
 export type FamilyProof =
   | Readonly<{ kind: 'checkpoint'; checkpoint: unknown }>
   | Readonly<{ kind: 'derive-and-check-frontier' }>;
@@ -80,7 +78,7 @@ export type CanonicalTextApply = Readonly<{
   operation: unknown[];
   facts: OperatedFacts;
   familyProof: FamilyProof;
-  wireVersion: 13 | 14;
+  wireVersion: 14;
 }>;
 
 export type CanonicalTextReplace = Readonly<{
@@ -91,7 +89,7 @@ export type CanonicalTextReplace = Readonly<{
   operations: readonly unknown[];
   facts: OperatedFacts;
   familyProof: FamilyProof;
-  wireVersion: 13 | 14;
+  wireVersion: 14;
 }>;
 
 export type CanonicalAnnotationApplyRange = Readonly<{
@@ -103,7 +101,7 @@ export type CanonicalAnnotationApplyRange = Readonly<{
   selection: unknown;
   facts: OperatedFacts;
   familyProof: FamilyProof;
-  wireVersion: 13 | 14;
+  wireVersion: 14;
 }>;
 
 export type CanonicalAnnotationRemove = Readonly<{
@@ -114,7 +112,7 @@ export type CanonicalAnnotationRemove = Readonly<{
   annotationId: string;
   facts: OperatedFacts;
   familyProof: FamilyProof;
-  wireVersion: 13 | 14;
+  wireVersion: 14;
 }>;
 
 // Semantic atomic annotation update (#174): fields (and optionally the range)
@@ -132,7 +130,7 @@ export type CanonicalAnnotationUpdate = Readonly<{
   historyAuthored: boolean;
   facts: OperatedFacts;
   familyProof: FamilyProof;
-  wireVersion: 13 | 14;
+  wireVersion: 14;
 }>;
 
 export type CanonicalRegionEdit = Readonly<{
@@ -152,7 +150,7 @@ export type CanonicalRegionEdit = Readonly<{
   witnessAfter: readonly RegionAnnotationImage[] | null;
   facts: OperatedFacts;
   familyProof: FamilyProof;
-  wireVersion: 15 | 16;
+  wireVersion: 16;
 }>;
 
 export type CanonicalOperatedEvent =
@@ -163,7 +161,7 @@ export type CanonicalOperatedEvent =
   | CanonicalAnnotationUpdate
   | CanonicalRegionEdit;
 export type OperatedWireEnvelope = Readonly<{
-  version: 13 | 14 | 15 | 16;
+  version: 14 | 16;
   id: string;
   before: TextRevision;
   after: TextRevision;
@@ -212,7 +210,7 @@ function isTextRevision(value: unknown): value is TextRevision {
 function parseFacts(facts: unknown, entity: string, field: string, version: unknown): OperatedFacts {
   if (!isPlainObject(facts)) invalidEnvelope(entity, field, version);
   const f = facts as Record<string, unknown>;
-  // Accept both the legacy 10-key set (v13/v14 events stored before
+  // Accept both the legacy 10-key set (v14 events stored before
   // annotationUpdates was added) and the current 11-key set. The new key
   // must be an array when present.
   const hasAnnotationUpdates = Object.hasOwn(f, 'annotationUpdates');
@@ -228,25 +226,12 @@ function parseFacts(facts: unknown, entity: string, field: string, version: unkn
     || (f.selectedRange !== null && (!f.selectedRange || typeof f.selectedRange !== 'object'))) {
     invalidEnvelope(entity, field, version);
   }
-  for (const key of V15_PROOF_KEYS) {
-    if (Object.hasOwn(f, key)) invalidEnvelope(entity, field, version);
-  }
   return packOperatedFacts(f);
 }
 
-function familyProofFor(version: 13 | 14 | 15 | 16, family: unknown, entity: string, field: string): FamilyProof {
-  if (version === 13) {
-    if (!family || typeof family !== 'object' || Array.isArray(family)) invalidEnvelope(entity, field, version);
-    return Object.freeze({ kind: 'checkpoint', checkpoint: family });
-  }
+function familyProofFor(family: unknown, entity: string, field: string, version: unknown): FamilyProof {
   if (family !== null) invalidEnvelope(entity, field, version);
   return Object.freeze({ kind: 'derive-and-check-frontier' });
-}
-
-function assertNoV15Proof(operation: Record<string, unknown>, entity: string, field: string, version: unknown): void {
-  for (const key of V15_PROOF_KEYS) {
-    if (Object.hasOwn(operation, key)) invalidEnvelope(entity, field, version);
-  }
 }
 
 function serializedUtf8Bytes(value: unknown, label: string): number {
@@ -259,8 +244,8 @@ function serializedUtf8Bytes(value: unknown, label: string): number {
   return utf8ByteLength(serialized);
 }
 
-function preflightV15Payload(raw: Record<string, unknown>, operation: Record<string, unknown>, entity: string, field: string): void {
-  const label = `${entity}.${field}.operated v15`;
+function preflightV16Payload(raw: Record<string, unknown>, operation: Record<string, unknown>, entity: string, field: string): void {
+  const label = `${entity}.${field}.operated v16`;
   if (serializedUtf8Bytes(operation, `${label} operation`) > REGION_DESCRIPTOR_MAX_UTF8_BYTES) {
     throw regionLimitError(`${label} operation exceeds ${REGION_DESCRIPTOR_MAX_UTF8_BYTES} UTF-8 bytes`);
   }
@@ -295,7 +280,7 @@ function preflightV15Payload(raw: Record<string, unknown>, operation: Record<str
 }
 
 function parseRegionText(value: unknown, entity: string, field: string): RegionTextOperations {
-  if (!isPlainObject(value) || typeof value.kind !== 'string') invalidEnvelope(entity, field, 15);
+  if (!isPlainObject(value) || typeof value.kind !== 'string') invalidEnvelope(entity, field, 16);
   if (value.kind === 'none' && exactKeys(value, ['kind'])) return Object.freeze({ kind: 'none' });
   if (value.kind === 'delete' && exactKeys(value, ['kind', 'operation']) && Array.isArray(value.operation)) {
     return Object.freeze({ kind: 'delete', operation: value.operation });
@@ -306,7 +291,7 @@ function parseRegionText(value: unknown, entity: string, field: string): RegionT
   if (value.kind === 'replace' && exactKeys(value, ['kind', 'operations']) && Array.isArray(value.operations) && value.operations.length === 2) {
     return Object.freeze({ kind: 'replace', operations: Object.freeze([...value.operations]) as readonly [unknown, unknown] });
   }
-  invalidEnvelope(entity, field, 15);
+  invalidEnvelope(entity, field, 16);
 }
 
 const RANGE_KEYS = ['end', 'start'] as const;
@@ -315,18 +300,18 @@ const REMOVE_KEYS = ['annotationId', 'kind'] as const;
 const CREATE_KEYS = ['annotation', 'kind', 'ranges'] as const;
 const CREATE_ANNOTATION_KEYS = ['family', 'fields', 'id', 'protectedTargetIds'] as const;
 
-function parseV15Range(value: unknown, entity: string, field: string): Readonly<{ start: number; end: number }> {
-  if (!isPlainObject(value) || !exactKeys(value, RANGE_KEYS)) invalidEnvelope(entity, field, 15);
+function parseV16Range(value: unknown, entity: string, field: string): Readonly<{ start: number; end: number }> {
+  if (!isPlainObject(value) || !exactKeys(value, RANGE_KEYS)) invalidEnvelope(entity, field, 16);
   const { start, end } = value as { start: unknown; end: unknown };
   if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || (end as number) <= (start as number)) {
-    invalidEnvelope(entity, field, 15);
+    invalidEnvelope(entity, field, 16);
   }
   return Object.freeze({ start: start as number, end: end as number });
 }
 
-function parseV15Ranges(value: unknown, entity: string, field: string): readonly Readonly<{ start: number; end: number }>[] {
-  if (!Array.isArray(value)) invalidEnvelope(entity, field, 15);
-  return Object.freeze(value.map((entry) => parseV15Range(entry, entity, field)));
+function parseV16Ranges(value: unknown, entity: string, field: string): readonly Readonly<{ start: number; end: number }>[] {
+  if (!Array.isArray(value)) invalidEnvelope(entity, field, 16);
+  return Object.freeze(value.map((entry) => parseV16Range(entry, entity, field)));
 }
 
 function isStrictlySortedNonEmptyStrings(value: unknown): value is string[] {
@@ -347,92 +332,92 @@ function parseOptionalLastRange(value: unknown, entity: string, field: string): 
   return value as unknown as readonly [number, number];
 }
 
-function parseV15CreateAnnotation(value: unknown, entity: string, field: string): V15CreateAnnotationPayload {
-  if (!isPlainObject(value) || !exactKeys(value, CREATE_ANNOTATION_KEYS)) invalidEnvelope(entity, field, 15);
+function parseV16CreateAnnotation(value: unknown, entity: string, field: string): V16CreateAnnotationPayload {
+  if (!isPlainObject(value) || !exactKeys(value, CREATE_ANNOTATION_KEYS)) invalidEnvelope(entity, field, 16);
   const { id, family, fields, protectedTargetIds } = value as {
     id: unknown; family: unknown; fields: unknown; protectedTargetIds: unknown;
   };
   if (typeof id !== 'string' || id.length === 0 || typeof family !== 'string' || family.length === 0) {
-    invalidEnvelope(entity, field, 15);
+    invalidEnvelope(entity, field, 16);
   }
-  if (!isPlainObject(fields)) invalidEnvelope(entity, field, 15);
+  if (!isPlainObject(fields)) invalidEnvelope(entity, field, 16);
   const fieldNames = Object.keys(fields);
-  if (fieldNames.some((name, index) => index > 0 && fieldNames[index - 1] >= name)) invalidEnvelope(entity, field, 15);
+  if (fieldNames.some((name, index) => index > 0 && fieldNames[index - 1] >= name)) invalidEnvelope(entity, field, 16);
   if (!isStrictlySortedNonEmptyStrings(protectedTargetIds)) {
-    invalidEnvelope(entity, field, 15);
+    invalidEnvelope(entity, field, 16);
   }
   return Object.freeze({
     id,
     family,
     fields: Object.freeze({ ...fields }),
     protectedTargetIds: Object.freeze([...protectedTargetIds]),
-  }) as V15CreateAnnotationPayload;
+  }) as V16CreateAnnotationPayload;
 }
 
 // Every wire transition is validated through the same closed grammar as
 // planning's descriptor parser (region-descriptor.ts) before the reducer sees
 // it. A forged range.set naming a missing/unknown annotation, a malformed
 // create payload, or an unknown kind is rejected below with the canonical
-// `<entity>.<field>.operated v15 event has invalid envelope` signature, so the
+// `<entity>.<field>.operated v16 event has invalid envelope` signature, so the
 // reducer can never silently drop a transition while text still commits.
-function parseV15Transition(value: unknown, entity: string, field: string, seenIds: Set<string>): RegionEditTransition {
-  if (!isPlainObject(value) || typeof value.kind !== 'string') invalidEnvelope(entity, field, 15);
+function parseV16Transition(value: unknown, entity: string, field: string, seenIds: Set<string>): RegionEditTransition {
+  if (!isPlainObject(value) || typeof value.kind !== 'string') invalidEnvelope(entity, field, 16);
   const kind = value.kind;
   if (kind === 'range.set') {
-    if (!exactKeys(value, RANGE_SET_KEYS)) invalidEnvelope(entity, field, 15);
+    if (!exactKeys(value, RANGE_SET_KEYS)) invalidEnvelope(entity, field, 16);
     const annotationId = value.annotationId;
-    if (typeof annotationId !== 'string' || annotationId.length === 0) invalidEnvelope(entity, field, 15);
-    if (seenIds.has(annotationId)) invalidEnvelope(entity, field, 15);
+    if (typeof annotationId !== 'string' || annotationId.length === 0) invalidEnvelope(entity, field, 16);
+    if (seenIds.has(annotationId)) invalidEnvelope(entity, field, 16);
     seenIds.add(annotationId);
-    return Object.freeze({ kind: 'range.set', annotationId, ranges: parseV15Ranges(value.ranges, entity, field) });
+    return Object.freeze({ kind: 'range.set', annotationId, ranges: parseV16Ranges(value.ranges, entity, field) });
   }
   if (kind === 'remove') {
-    if (!exactKeys(value, REMOVE_KEYS)) invalidEnvelope(entity, field, 15);
+    if (!exactKeys(value, REMOVE_KEYS)) invalidEnvelope(entity, field, 16);
     const annotationId = value.annotationId;
-    if (typeof annotationId !== 'string' || annotationId.length === 0) invalidEnvelope(entity, field, 15);
-    if (seenIds.has(annotationId)) invalidEnvelope(entity, field, 15);
+    if (typeof annotationId !== 'string' || annotationId.length === 0) invalidEnvelope(entity, field, 16);
+    if (seenIds.has(annotationId)) invalidEnvelope(entity, field, 16);
     seenIds.add(annotationId);
     return Object.freeze({ kind: 'remove', annotationId });
   }
   if (kind === 'create') {
-    if (!exactKeys(value, CREATE_KEYS)) invalidEnvelope(entity, field, 15);
-    const annotation = parseV15CreateAnnotation(value.annotation, entity, field);
-    if (seenIds.has(annotation.id)) invalidEnvelope(entity, field, 15);
+    if (!exactKeys(value, CREATE_KEYS)) invalidEnvelope(entity, field, 16);
+    const annotation = parseV16CreateAnnotation(value.annotation, entity, field);
+    if (seenIds.has(annotation.id)) invalidEnvelope(entity, field, 16);
     seenIds.add(annotation.id);
-    return Object.freeze({ kind: 'create', annotation, ranges: parseV15Ranges(value.ranges, entity, field) });
+    return Object.freeze({ kind: 'create', annotation, ranges: parseV16Ranges(value.ranges, entity, field) });
   }
-  invalidEnvelope(entity, field, 15);
+  invalidEnvelope(entity, field, 16);
 }
 
-function parseV15Operation(operation: Record<string, unknown>, entity: string, field: string): Omit<CanonicalRegionEdit, 'id' | 'before' | 'after' | 'facts' | 'familyProof' | 'wireVersion'> {
+function parseV16RegionOperation(operation: Record<string, unknown>, entity: string, field: string): Omit<CanonicalRegionEdit, 'id' | 'before' | 'after' | 'facts' | 'familyProof' | 'wireVersion'> {
   const keys = ['affectedIds', 'afterDigest', 'beforeDigest', 'from', 'kind', 'text', 'to', 'transitions'];
-  if (!exactKeys(operation, keys) || operation.kind !== 'region.edit') invalidEnvelope(entity, field, 15);
+  if (!exactKeys(operation, keys) || operation.kind !== 'region.edit') invalidEnvelope(entity, field, 16);
   if (!Number.isSafeInteger(operation.from) || !Number.isSafeInteger(operation.to) || (operation.to as number) < (operation.from as number)) {
-    invalidEnvelope(entity, field, 15);
+    invalidEnvelope(entity, field, 16);
   }
   if (typeof operation.beforeDigest !== 'string' || !SHA256_HEX.test(operation.beforeDigest)) {
-    throw regionLimitError(`${entity}.${field}.operated v15 beforeDigest is not a SHA-256 digest`);
+    throw regionLimitError(`${entity}.${field}.operated v16 beforeDigest is not a SHA-256 digest`);
   }
   if (typeof operation.afterDigest !== 'string' || !SHA256_HEX.test(operation.afterDigest)) {
-    throw regionLimitError(`${entity}.${field}.operated v15 afterDigest is not a SHA-256 digest`);
+    throw regionLimitError(`${entity}.${field}.operated v16 afterDigest is not a SHA-256 digest`);
   }
   if (!Array.isArray(operation.affectedIds) || operation.affectedIds.some((id) => typeof id !== 'string' || id.length === 0)) {
-    invalidEnvelope(entity, field, 15);
+    invalidEnvelope(entity, field, 16);
   }
   if (operation.affectedIds.length > REGION_AFFECTED_ANNOTATION_MAX) {
-    throw regionLimitError(`${entity}.${field}.operated v15 affectedIds exceed ${REGION_AFFECTED_ANNOTATION_MAX}`);
+    throw regionLimitError(`${entity}.${field}.operated v16 affectedIds exceed ${REGION_AFFECTED_ANNOTATION_MAX}`);
   }
   const ids = operation.affectedIds as string[];
-  if (ids.some((id, index) => index > 0 && ids[index - 1] >= id)) invalidEnvelope(entity, field, 15);
+  if (ids.some((id, index) => index > 0 && ids[index - 1] >= id)) invalidEnvelope(entity, field, 16);
   if (!Array.isArray(operation.transitions) || operation.transitions.length > REGION_TRANSITION_MAX) {
     if (Array.isArray(operation.transitions) && operation.transitions.length > REGION_TRANSITION_MAX) {
-      throw regionLimitError(`${entity}.${field}.operated v15 transitions exceed ${REGION_TRANSITION_MAX}`);
+      throw regionLimitError(`${entity}.${field}.operated v16 transitions exceed ${REGION_TRANSITION_MAX}`);
     }
-    invalidEnvelope(entity, field, 15);
+    invalidEnvelope(entity, field, 16);
   }
   const seenIds = new Set<string>();
   const transitions = Object.freeze(
-    (operation.transitions as readonly unknown[]).map((entry) => parseV15Transition(entry, entity, field, seenIds)),
+    (operation.transitions as readonly unknown[]).map((entry) => parseV16Transition(entry, entity, field, seenIds)),
   );
   return Object.freeze({
     kind: 'region.edit',
@@ -449,7 +434,7 @@ function parseV15Operation(operation: Record<string, unknown>, entity: string, f
   });
 }
 
-// V16 closed operation grammar: the v15 region.edit surface plus the complete
+// V16 closed operation grammar: the v16 region.edit surface plus the complete
 // bounded before/after witness (declarationFingerprint, emptied, witnessBefore,
 // witnessAfter). Unknown keys reject; every nested value passes the same
 // canonical checks the constructor applied before the bytes were stored.
@@ -469,7 +454,7 @@ function parseV16Operation(operation: Record<string, unknown>, entity: string, f
     'witnessBefore',
   ];
   if (!exactKeys(operation, keys) || operation.kind !== 'region.edit') invalidEnvelope(entity, field, 16);
-  const base = parseV15Operation({
+  const base = parseV16RegionOperation({
     affectedIds: operation.affectedIds,
     afterDigest: operation.afterDigest,
     beforeDigest: operation.beforeDigest,
@@ -622,8 +607,8 @@ function normalizeOperatedEventInternal(
 ): CanonicalOperatedEvent {
   const { entity, field } = context;
   const version = isPlainObject(raw) ? raw.version : undefined;
-  if (version !== 13 && version !== 14 && version !== 15 && version !== 16) {
-    throw new Error(`${entity}.${field}.operated event version ${version} is not supported: only operated versions 13, 14, 15, and 16 are replayable; pre-13 lattice rows were retired (issue #23)`);
+  if (version !== 14 && version !== 16) {
+    throw new Error(`${entity}.${field}.operated event version ${version} is not supported: only operated versions 14 and 16 are replayable; retired versions 13 and 15 and pre-13 lattice rows are rejected (issue #315)`);
   }
   if (!isPlainObject(raw) || !exactKeys(raw, OPERATED_ENVELOPE_KEYS)) {
     invalidEnvelope(entity, field, version);
@@ -632,19 +617,19 @@ function normalizeOperatedEventInternal(
     || !isPlainObject(raw.operation)) {
     invalidEnvelope(entity, field, version);
   }
-  if (version === 15 || version === 16) preflightV15Payload(raw, raw.operation, entity, field);
-  if (version === 16 && !skipV16CanonicalCheck) {
-    // The complete persisted text must itself be canonically bounded before it
-    // is trusted for parse; parseStoredV16OperatedEvent already verified it.
-    canonicalV16Json(raw, REGION_V16_MAX_EVENT_BYTES, `${entity}.${field}.operated v16`);
+  if (version === 16) {
+    preflightV16Payload(raw, raw.operation, entity, field);
+    if (!skipV16CanonicalCheck) {
+      // The complete persisted text must itself be canonically bounded before it
+      // is trusted for parse; parseStoredV16OperatedEvent already verified it.
+      canonicalV16Json(raw, REGION_V16_MAX_EVENT_BYTES, `${entity}.${field}.operated v16`);
+    }
   }
   const facts = parseFacts(raw.facts, entity, field, version);
-  const familyProof = familyProofFor(version === 16 ? 15 : version, facts.family, entity, field);
+  const familyProof = familyProofFor(facts.family, entity, field, version);
   const operation = raw.operation;
-  if (version === 15 || version === 16) {
-    const region = version === 16
-      ? parseV16Operation(operation, entity, field)
-      : parseV15Operation(operation, entity, field);
+  if (version === 16) {
+    const region = parseV16Operation(operation, entity, field);
     return Object.freeze({
       ...region,
       id: raw.id,
@@ -652,10 +637,9 @@ function normalizeOperatedEventInternal(
       after: raw.after,
       facts,
       familyProof,
-      wireVersion: version,
+      wireVersion: 16,
     });
   }
-  assertNoV15Proof(operation, entity, field, version);
   const kind = operation.kind;
   if (kind === 'text.apply' && exactKeys(operation, ['kind', 'operation']) && Array.isArray(operation.operation)) {
     return Object.freeze({
@@ -738,10 +722,11 @@ function normalizeOperatedEventInternal(
 }
 
 /**
- * The ONLY parser for persisted v16 `_Log.eventData` text. Scans the raw text
- * BEFORE JSON.parse (rejecting duplicate keys at any depth, noncanonical key
- * order/encoding, trailing bytes, and invalid UTF-8/JSON), then requires the
- * parsed value to canonically reserialize byte-equal to the stored text.
+ * The ONLY parser for persisted v16 `_Log.eventData` text. Uses standard
+ * JSON.parse, then structural validation and a canonical byte-for-byte
+ * reserialize check. Duplicate keys, noncanonical key order/encoding, trailing
+ * bytes, and over-limit payloads all fail that equality check — there is no
+ * separate in-process JSON scanner to keep in sync (#315).
  * Returns the same canonical boundary as `normalizeOperatedEvent`.
  */
 export function parseStoredV16OperatedEvent(eventDataText: string, context: { entity: string; field: string }): CanonicalRegionEdit {
@@ -750,124 +735,25 @@ export function parseStoredV16OperatedEvent(eventDataText: string, context: { en
     throw new Error(`${entity}.${field}.operated v16 stored envelope is not canonical: shape`);
   }
   let parsed: unknown;
+  const raw = eventDataText;
   try {
-    parsed = parseCanonicalJsonText(eventDataText);
+    parsed = JSON.parse(raw);
   } catch (error) {
     throw new Error(`${entity}.${field}.operated v16 stored envelope is not canonical: ${(error as Error).message}`);
   }
+  // jsonCanonical enforces depth, byte, and string bounds and rejects any
+  // value outside the closed JSON grammar before the equality check below.
   const reserialized = canonicalV16Json(parsed, REGION_V16_MAX_EVENT_BYTES, `${entity}.${field}.operated v16`);
-  if (reserialized !== eventDataText) {
+  if (reserialized !== raw) {
     throw new Error(`${entity}.${field}.operated v16 stored envelope is not canonical: order`);
   }
   const version = isPlainObject(parsed) ? parsed.version : undefined;
   if (version !== 16) {
-    throw new Error(`${entity}.${field}.operated event version ${version} is not supported: only operated versions 13, 14, 15, and 16 are replayable; pre-13 lattice rows were retired (issue #23)`);
+    throw new Error(`${entity}.${field}.operated event version ${version} is not supported: only operated versions 14 and 16 are replayable; retired versions 13 and 15 are rejected (issue #315)`);
   }
   return normalizeOperatedEventInternal(parsed as OperatedWireEnvelope, context, true) as CanonicalRegionEdit;
 }
 
-// Escape-aware JSON string-literal scanner. Returns the complete literal
-// INCLUDING quotes, advancing over backslash escapes: `\"` never terminates,
-// `\\` is a literal backslash, and `\uXXXX` must carry exactly four hex digits.
-// A raw control character (< 0x20) inside the literal is invalid JSON. The
-// scanner returns the raw source slice so JSON.parse owns value decoding.
-function scanJsonStringLiteral(text: string, start: number): string {
-  if (text[start] !== '"') throw new Error('expected string');
-  let cursor = start + 1;
-  for (;;) {
-    if (cursor >= text.length) throw new Error('unterminated string');
-    const ch = text[cursor];
-    if (ch === '"') return text.slice(start, cursor + 1);
-    if (ch === '\\') {
-      const escape = text[cursor + 1];
-      if (escape === 'u') {
-        const hex = text.slice(cursor + 2, cursor + 6);
-        if (!/^[0-9a-fA-F]{4}$/.test(hex)) throw new Error('invalid unicode escape');
-        cursor += 6;
-        continue;
-      }
-      if (!'"\\/bfnrt'.includes(escape)) throw new Error('invalid escape');
-      cursor += 2;
-      continue;
-    }
-    if (ch < ' ') throw new Error('raw control character in string');
-    cursor += 1;
-  }
-}
-
-// Strict JSON text scanner: duplicate keys at any depth are rejected before a
-// value is ever produced, so a tampered row cannot rely on last-key-wins.
-function parseCanonicalJsonText(text: string): unknown {
-  let index = 0;
-  const fail = (why: string): never => { throw new Error(why); };
-  const skipWhitespace = () => { while (index < text.length && /[\t\n\r ]/.test(text[index])) index += 1; };
-  const parseValue = (depth: number): unknown => {
-    if (depth > REGION_V16_MAX_DEPTH) fail(`depth exceeds ${REGION_V16_MAX_DEPTH}`);
-    skipWhitespace();
-    if (index >= text.length) fail('unexpected end');
-    const ch = text[index];
-    if (ch === '{') {
-      index += 1;
-      const seen = new Set<string>();
-      skipWhitespace();
-      if (text[index] === '}') { index += 1; return {}; }
-      const result: Record<string, unknown> = {};
-      for (;;) {
-        skipWhitespace();
-        if (text[index] !== '"') fail('expected object key');
-        const keyLiteral = scanJsonStringLiteral(text, index);
-        index += keyLiteral.length;
-        let key: string;
-        try {
-          key = JSON.parse(keyLiteral) as string;
-        } catch {
-          return fail('invalid string encoding');
-        }
-        if (seen.has(key)) fail('duplicate-key');
-        seen.add(key);
-        skipWhitespace();
-        if (text[index] !== ':') fail('expected colon');
-        index += 1;
-        result[key] = parseValue(depth + 1);
-        skipWhitespace();
-        if (text[index] === ',') { index += 1; continue; }
-        if (text[index] === '}') { index += 1; return result; }
-        fail('expected , or }');
-      }
-    }
-    if (ch === '[') {
-      index += 1;
-      const result: unknown[] = [];
-      skipWhitespace();
-      if (text[index] === ']') { index += 1; return result; }
-      for (;;) {
-        result.push(parseValue(depth + 1));
-        skipWhitespace();
-        if (text[index] === ',') { index += 1; continue; }
-        if (text[index] === ']') { index += 1; return result; }
-        fail('expected , or ]');
-      }
-    }
-    if (ch === '"') {
-      const literal = scanJsonStringLiteral(text, index);
-      index += literal.length;
-      try {
-        return JSON.parse(literal);
-      } catch {
-        return fail('invalid string encoding');
-      }
-    }
-    const rest = text.slice(index);
-    const literalMatch: string = /^(true|false|null|-?\d+(\.\d+)?([eE][+-]?\d+)?)/.exec(rest)?.[0] ?? '';
-    if (literalMatch.length === 0) fail('invalid literal');
-    index += literalMatch.length;
-    return JSON.parse(literalMatch);
-  };
-  const value = parseValue(1);
-  skipWhitespace();
-  if (index !== text.length) fail('trailing bytes');
-  return value;
-}
 
 interface LegacyOperatedEventInput {
   id: string;
@@ -886,17 +772,6 @@ interface LegacyOperatedEventInput {
   removedAnnotationIds?: unknown;
 }
 
-export function constructV13OperatedEvent(data: LegacyOperatedEventInput & { family: unknown }): OperatedWireEnvelope {
-  return Object.freeze({
-    version: 13,
-    id: data.id,
-    before: data.before,
-    after: data.after,
-    operation: data.operation,
-    facts: packOperatedFacts({ ...data, family: data.family }),
-  });
-}
-
 export function constructV14OperatedEvent(data: LegacyOperatedEventInput): OperatedWireEnvelope {
   return Object.freeze({
     version: 14,
@@ -911,30 +786,12 @@ export function constructV14OperatedEvent(data: LegacyOperatedEventInput): Opera
 /** Loose revision shape shared by legacy constructors (TS7-safe element type). */
 type LegacyTextRevision = Readonly<{ structuralRevision: number; frontier: ReadonlyArray<unknown> }>;
 
-export function constructV15RegionEvent(plan: RegionPlan): { version: 15; id: string; before: LegacyTextRevision; after: LegacyTextRevision; operation: Record<string, unknown>; facts: OperatedFacts } {
-  return {
-    version: 15,
-    id: plan.descriptor.id,
-    before: plan.before,
-    after: plan.after,
-    operation: Object.freeze({
-      kind: 'region.edit',
-      from: plan.descriptor.from,
-      to: plan.descriptor.to,
-      text: plan.textOperations,
-      transitions: plan.descriptor.transitions,
-      beforeDigest: plan.postimage.beforeDigest,
-      afterDigest: plan.postimage.afterDigest,
-      affectedIds: plan.postimage.affectedIds,
-    }),
-    facts: packOperatedFacts({
-      family: null,
-      emptiedAnnotations: plan.postimage.emptied,
-      removedAnnotationIds: plan.postimage.emptied
-        .filter((entry) => entry.disposition.kind === 'deleted')
-        .map((entry) => entry.annotationId),
-    }),
-  };
+// Retired v15 constructor. The symbol remains only because a non-owned test
+// still imports the name (#315); every call fails closed. New region writes go
+// through constructV16RegionEvent below.
+export function constructV15RegionEvent(plan: RegionPlan): never {
+  void plan;
+  throw new Error('operated v15 is retired: use constructV16RegionEvent');
 }
 
 // ---- V16 durable grammar (#148 rev 2 "V16 durable grammar") ----

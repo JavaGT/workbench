@@ -1,4 +1,4 @@
-// Closed cardinality and payload limits for v10 region.edit / v15-v16 replay
+// Closed cardinality and payload limits for v10 region.edit / v16 replay
 // (scope#992 rev 2 Finding 10; #148 rev 2 V16 grammar). Checked before hashing
 // or allocation, then re-checked by the operated-event normalizer. Exceeding a
 // limit throws ValidationError with code `annotated-text-region-limit` and

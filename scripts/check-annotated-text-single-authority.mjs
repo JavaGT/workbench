@@ -94,7 +94,7 @@ function hasDirectOperatedEnvelope(source) {
     const object = stack.at(-1);
     if (!object || words[index + 1] !== ':') continue;
     if (word === 'facts') object.facts = true;
-    if (word === 'version' && ['13', '14', '15'].includes(words[index + 2]) && words[index + 3] !== ';') object.version = true;
+    if (word === 'version' && ['14', '16'].includes(words[index + 2]) && words[index + 3] !== ';') object.version = true;
   }
   return false;
 }
@@ -121,7 +121,7 @@ if (declarationV10Owners.length !== 1 || declarationV10Owners[0] !== 'index.d.ts
   fail('declared v10 descriptor grammar', declarationV10Owners.length ? declarationV10Owners : ['<missing>']);
 }
 
-const ENVELOPE_CONSTRUCTOR = /export\s+function\s+(constructV13OperatedEvent|constructV14OperatedEvent|constructV15RegionEvent|constructV16RegionEvent|serializeV16OperatedEvent|parseStoredV16OperatedEvent)\b/;
+const ENVELOPE_CONSTRUCTOR = /export\s+function\s+(constructV14OperatedEvent|constructV15RegionEvent|constructV16RegionEvent|serializeV16OperatedEvent|parseStoredV16OperatedEvent)\b/;
 const envelopeOwners = [];
 for (const [path, source] of byRel) {
   if (path.startsWith('src/') && ENVELOPE_CONSTRUCTOR.test(source)) envelopeOwners.push(path);
@@ -131,7 +131,6 @@ if (envelopeOwners.length !== 1 || envelopeOwners[0] !== 'src/annotated-text-ope
 }
 
 const constructorNames = new Set([
-  'constructV13OperatedEvent',
   'constructV14OperatedEvent',
   'constructV15RegionEvent',
   'constructV16RegionEvent',
@@ -208,7 +207,7 @@ const REGION_EMITTER_FILES = [
 for (const path of REGION_EMITTER_FILES) {
   const source = byRel.get(path);
   if (!source) continue;
-  if (/\bconstructV1[345][A-Za-z]*\b/.test(source)) {
+  if (/\bconstructV1[45][A-Za-z]*\b/.test(source)) {
     fail('new region emitter version', [path]);
   }
 }
@@ -238,9 +237,10 @@ for (const [path, source] of byRel) {
   }
 }
 
-// W1 region path is v15-only: no region module may lower a region to the v13/v14
-// envelope constructors. The live authoring path (annotated-text-plan.ts /
-// crud.ts) still emits v14 until W3's engine flip and is not covered here.
+// The region path emits only v16: no region module may lower a region to the
+// live-authoring v14 envelope constructor. The live authoring path
+// (annotated-text-plan.ts / crud.ts) legitimately emits v14 and is not covered
+// by this region-only rule.
 const regionOnly = new Set([
   'src/annotated-text-region-descriptor.ts',
   'src/annotated-text-region-limits.ts',
@@ -251,7 +251,7 @@ const legacyRegionEmitters = [];
 for (const path of regionOnly) {
   const source = byRel.get(path);
   if (!source) continue;
-  if (/\bconstructV1[34]OperatedEvent\b/.test(source)) legacyRegionEmitters.push(path);
+  if (/\bconstructV14OperatedEvent\b/.test(source)) legacyRegionEmitters.push(path);
 }
 if (legacyRegionEmitters.length > 0) {
   fail('region v13/v14 emitter', legacyRegionEmitters);
@@ -312,6 +312,38 @@ if (w3Retired) {
     if (!path.endsWith('.ts') && !path.endsWith('.mjs') && !path.endsWith('.d.ts')) continue;
     if (/\bannotatedHistory\b/.test(source)) retiredAnnotatedHistory(path);
   }
+}
+
+// #315 clean break: the retired operated versions must have no grammar path,
+// and the single version gate must reject them fail-closed at runtime.
+function retiredOperatedVersion(version) {
+  throw new Error(`retired operated version ${version} still has a live grammar path`);
+}
+const operatedSource = byRel.get('src/annotated-text-operated-event.ts') ?? '';
+if (/\bconstructV13OperatedEvent\b/.test(operatedSource)) retiredOperatedVersion(13);
+if (/\bversion:\s*13\b/.test(operatedSource)) retiredOperatedVersion(13);
+if (byRel.has('build/annotated-text-operated-event.mjs')) {
+  const emitted = byRel.get('build/annotated-text-operated-event.mjs');
+  if (/\bconstructV13OperatedEvent\b/.test(emitted)) retiredOperatedVersion(13);
+}
+
+const { normalizeOperatedEvent } = await import('../build/annotated-text-operated-event.mjs');
+for (const version of [13, 15]) {
+  const envelope = {
+    version,
+    id: 'x',
+    before: { structuralRevision: 1, frontier: [] },
+    after: { structuralRevision: 1, frontier: [] },
+    operation: { kind: 'text.apply', operation: [] },
+    facts: {},
+  };
+  let rejected = false;
+  try {
+    normalizeOperatedEvent(envelope, { entity: 'E', field: 'f' });
+  } catch (error) {
+    rejected = /only operated versions 14 and 16 are replayable/.test(error.message);
+  }
+  if (!rejected) retiredOperatedVersion(version);
 }
 
 console.log('annotated-text single authority: ok');

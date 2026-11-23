@@ -1,5 +1,5 @@
 // Planner/replay agreement and focused region.edit laws (scope#992 W1).
-// A plan is serialized as one v15 event, independently seeded, then replayed
+// A plan is serialized as one v16 event, independently seeded, then replayed
 // through the production projector. Forged proofs must write nothing.
 
 import assert from 'node:assert/strict';
@@ -20,7 +20,7 @@ import {
   textFamilyBasis,
 } from '../build/annotated-text-continuous.mjs';
 import { attachAnnotationRange } from '../build/annotated-text-storage.mjs';
-import { constructV15RegionEvent } from '../build/annotated-text-operated-event.mjs';
+import { constructV16RegionEvent } from '../build/annotated-text-operated-event.mjs';
 import { planRegionEdit } from '../build/annotated-text-region-plan.mjs';
 import { parseRegionEditDescriptor } from '../build/annotated-text-region-descriptor.mjs';
 import {
@@ -33,10 +33,17 @@ import { sha256Utf8 } from '../build/annotated-text-region-limits.mjs';
 
 const ACTOR = 'a'.repeat(32);
 const EDIT_ACTOR = 'b'.repeat(32);
-const DECLARATIONS = [
-  { annotationName: 'note', fields: {}, empty: 'delete', cardinality: 'many' },
-  { annotationName: 'timing', fields: { source: { kind: 'value', type: 'text' } }, empty: 'delete', cardinality: 'many' },
-];
+// v16 binds the witness to the declaration fingerprint, so the planner must
+// see the exact descriptors the projector derives from the entity (including
+// field-shape identity), not a hand-written stand-in.
+function declarations() {
+  return declaredEntity().fields.body.annotations.map((entry) => ({
+    annotationName: entry.annotationName,
+    fields: entry.fields,
+    empty: entry.empty,
+    cardinality: entry.cardinality,
+  }));
+}
 
 const externalReferences = defineSqliteSchema({
   name: 'annotated-text-region-postimage',
@@ -157,7 +164,7 @@ function planOf(family, annotations, args) {
     family,
     structureVersion: 1,
     annotations,
-    declarations: DECLARATIONS,
+    declarations: declarations(),
     actor: EDIT_ACTOR,
     lamport: 2,
   });
@@ -212,11 +219,18 @@ function applyOperated(db, event) {
   }, db);
 }
 
+function mintedEvent(plan) {
+  return constructV16RegionEvent(plan, {
+    owningScope: 'Project:p1', entity: 'ReplayDoc', field: 'body',
+    documentId: plan.descriptor.id, actionId: 'a',
+  }).event;
+}
+
 function replayPlan(plan, family, annotations) {
   const db = new DatabaseSync(':memory:');
   installSchema(db);
   seedPreimage(db, family, annotations);
-  applyOperated(db, constructV15RegionEvent(plan));
+  applyOperated(db, mintedEvent(plan));
   const dump = projectedDump(db);
   const text = materializeText(family);
   void text;
@@ -225,7 +239,7 @@ function replayPlan(plan, family, annotations) {
   return { dump, familyCheckpoint: afterText.family_checkpoint };
 }
 
-test('one region.edit produces one replayable v15 event', () => {
+test('one region.edit produces one replayable v16 event', () => {
   const family = importTextToFamily('doc-1', ACTOR, 'hello world');
   const annotations = [stored(family, { id: 'note-1', start: 0, end: 5 })];
   const plan = planOf(family, annotations, {
@@ -234,8 +248,8 @@ test('one region.edit produces one replayable v15 event', () => {
     replacement: 'hallo',
     transitions: [{ kind: 'range.set', annotationId: 'note-1', ranges: [{ start: 0, end: 5 }] }],
   });
-  const event = constructV15RegionEvent(plan);
-  assert.equal(event.version, 15);
+  const event = mintedEvent(plan);
+  assert.equal(event.version, 16);
   assert.equal(event.operation.kind, 'region.edit');
   const replayed = replayPlan(plan, family, annotations);
   assert.ok(replayed.familyCheckpoint);
@@ -268,7 +282,7 @@ test('no-text-change region keeps the frontier and emits one operated event', ()
   });
   assert.equal(plan.textOperations.kind, 'none');
   assert.deepEqual(plan.after.frontier, family.checkpoint.frontier);
-  const event = constructV15RegionEvent(plan);
+  const event = mintedEvent(plan);
   assert.equal(event.operation.text.kind, 'none');
   replayPlan(plan, family, annotations);
 });
@@ -323,7 +337,7 @@ test('insert-only and delete-only replacements share the reducer', () => {
     beforeAnnotations: asImages(annotations),
     region: { from: 6, to: 11 },
     transitions: [],
-    declarations: DECLARATIONS,
+    declarations: declarations(),
     expectedBeforeDigest: deleted.postimage.beforeDigest,
   });
   assert.equal(replayDeleted.afterDigest, deleted.postimage.afterDigest);
@@ -426,7 +440,7 @@ function forgeAndReplay(mutator) {
     replacement: 'hallo',
     transitions: [{ kind: 'range.set', annotationId: 'note-1', ranges: [{ start: 0, end: 5 }] }],
   });
-  const event = structuredClone(constructV15RegionEvent(plan));
+  const event = structuredClone(mintedEvent(plan));
   mutator(event);
   const db = new DatabaseSync(':memory:');
   installSchema(db);

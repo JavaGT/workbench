@@ -92,23 +92,36 @@ test('res.status(n).stream(...) carries the pending status code', async () => {
   }
 });
 
-test('res.stream opts out of X-Accel-Buffering with { buffering: false }', async () => {
+test('res.stream sets X-Accel-Buffering: no with { buffering: false } and omits it with { buffering: true }', async () => {
   const r = router();
-  r.get('/raw', allowAnonymous(), (req, res) => {
+  r.get('/unbuffered', allowAnonymous(), (req, res) => {
     const stream = new ReadableStream({
       start(controller) {
-        controller.enqueue(new TextEncoder().encode('ok'));
+        controller.enqueue(new TextEncoder().encode('unbuffered'));
         controller.close();
       },
     });
     return res.stream(stream, { buffering: false });
   });
+  r.get('/buffered', allowAnonymous(), (req, res) => {
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('buffered'));
+        controller.close();
+      },
+    });
+    return res.stream(stream, { buffering: true });
+  });
   const app = workbench().mount('/api', r);
   const { origin, close } = await listen(app);
   try {
-    const res = await fetch(`${origin}/api/raw`);
-    assert.equal(res.headers.get('x-accel-buffering'), null);
-    assert.equal(await res.text(), 'ok');
+    const unbuffered = await fetch(`${origin}/api/unbuffered`);
+    assert.equal(unbuffered.headers.get('x-accel-buffering'), 'no');
+    assert.equal(await unbuffered.text(), 'unbuffered');
+
+    const buffered = await fetch(`${origin}/api/buffered`);
+    assert.equal(buffered.headers.get('x-accel-buffering'), null);
+    assert.equal(await buffered.text(), 'buffered');
   } finally {
     await close();
   }

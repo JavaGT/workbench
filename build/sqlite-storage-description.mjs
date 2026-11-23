@@ -1,7 +1,6 @@
-import { DatabaseSync } from 'node:sqlite';
-
 import { generateDDL } from './ddl.mjs';
 import { collectTableNamesFromDdl } from './schema-table-census.mjs';
+import { openSqliteDatabase,                     } from './sqlite-driver.mjs';
 
 function quoteIdent(name         )         {
   if (typeof name !== 'string' || name.length === 0 || name.includes('\0')) {
@@ -107,7 +106,7 @@ function deepFreeze   (value   )    {
 
 
 
-function describeIndexes(db              , tableName        )                           {
+function describeIndexes(db                , tableName        )                           {
   const rows = db.prepare(`PRAGMA index_list(${quoteIdent(tableName)})`).all()                             ;
   return rows
     .map((row) => {
@@ -141,7 +140,7 @@ function describeIndexes(db              , tableName        )                   
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
-function describeForeignKeys(db              , tableName        )                                {
+function describeForeignKeys(db                , tableName        )                                {
   const groups = new Map                                     ();
   for (const row of db.prepare(`PRAGMA foreign_key_list(${quoteIdent(tableName)})`).all()                              ) {
     let group = groups.get(row.id);
@@ -166,7 +165,7 @@ function describeForeignKeys(db              , tableName        )               
   });
 }
 
-function describeTable(db              , tableName        )                         {
+function describeTable(db                , tableName        )                         {
   const schema = db
     .prepare("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?")
     .get(tableName)                                      ;
@@ -201,7 +200,7 @@ function describeTable(db              , tableName        )                     
   };
 }
 
-export function describeSqliteStorage(db              , tableNames                   )                           {
+export function describeSqliteStorage(db                , tableNames                   )                           {
   if (!Array.isArray(tableNames)) throw new Error('tableNames must be an array');
   if (!tableNames.every((name) => typeof name === 'string' && name.length > 0)) {
     throw new Error('tableNames must contain only non-empty strings');
@@ -221,7 +220,7 @@ export function describeEntityStorage(entity                                    
   const tableNames = collectTableNamesFromDdl(
     ddl.map((sql        ) => ({ source: `entity ${entity.name}`, sql })),
   );
-  const db = new DatabaseSync(':memory:');
+  const db = openSqliteDatabase(':memory:');
   try {
     for (const sql of ddl) db.exec(sql);
     return describeSqliteStorage(db, tableNames);

@@ -19,6 +19,7 @@ import { createTextFamily, materializeText, restoreTextFamily, textFamilyCheckpo
 import { defineSqliteSchema } from '../build/server.mjs';
 
 const prefix = 'Doc_body';
+const LATEST_WORKBENCH_VERSION = WORKBENCH_MIGRATIONS.at(-1).version;
 
 // The parent entity table the A10 legacy-schema test pre-creates alongside the
 // Transcript entity; declared through the externalTables seam so the settled
@@ -382,11 +383,12 @@ test('A8: migration — legacy schema upgrades atomically, preserves durable dat
   db.exec(`CREATE TABLE durable_marker (id TEXT PRIMARY KEY, value TEXT NOT NULL)`);
   db.prepare('INSERT INTO durable_marker (id, value) VALUES (?, ?)').run('m1', 'keep');
 
-  // Run the built-in Workbench migration (fresh apply). The lane is v1–v6; v6
-  // (membership-range-schema-repair) is a no-op here — this legacy family has no
-  // annotated-text `_membership` tables.
+  // Run the built-in Workbench migration (fresh apply). v6
+  // (membership-range-schema-repair) and v7 (framework-legacy-column-upgrades)
+  // are no-ops here — this legacy family has no annotated-text `_membership` or
+  // framework ledger tables.
   await runWorkbenchMigrations(db);
-  assert.equal(appliedWorkbenchVersion(db), 6);
+  assert.equal(appliedWorkbenchVersion(db), LATEST_WORKBENCH_VERSION);
 
   // Canonical shape: position has checkpoint_id NOT NULL, no family_checkpoint.
   const positionColumns = new Set(db.prepare(`PRAGMA table_info(${prefix}_authoring_position)`).all().map((r) => r.name));
@@ -407,7 +409,7 @@ test('A8: migration — legacy schema upgrades atomically, preserves durable dat
 
   // Second startup is a no-op.
   await runWorkbenchMigrations(db);
-  assert.equal(appliedWorkbenchVersion(db), 6);
+  assert.equal(appliedWorkbenchVersion(db), LATEST_WORKBENCH_VERSION);
 });
 
 test('A8-rollback: induced migration failure rolls back and leaves legacy schema intact', async () => {
@@ -436,7 +438,7 @@ test('A8-rollback: induced migration failure rolls back and leaves legacy schema
   // With the trigger removed, the same run succeeds (idempotent re-apply after rollback).
   db.exec(`DROP TRIGGER fail_migration`);
   await runWorkbenchMigrations(db);
-  assert.equal(appliedWorkbenchVersion(db), 6);
+  assert.equal(appliedWorkbenchVersion(db), LATEST_WORKBENCH_VERSION);
 });
 
 test('A8-v2: migration invalidates defective ephemeral state and preserves durable state', async () => {
@@ -457,7 +459,7 @@ test('A8-v2: migration invalidates defective ephemeral state and preserves durab
   // Upgrade from the deployed v1 build invalidates every opaque authoring token.
   await runWorkbenchMigrations(db);
   await runWorkbenchMigrations(db);
-  assert.equal(appliedWorkbenchVersion(db), 6);
+  assert.equal(appliedWorkbenchVersion(db), LATEST_WORKBENCH_VERSION);
   assert.equal(count(db, `${prefix}_authoring_stream`), 0, 'streams from the defective build are invalidated');
   assert.equal(count(db, `${prefix}_authoring_lease`), 0, 'leases from the defective build are invalidated');
   assert.equal(count(db, `${prefix}_authoring_position`), 0, 'defective position tokens are removed');
@@ -591,7 +593,7 @@ test('A10: app.prepareSchema upgrades a legacy authoring schema via the built-in
   assert.ok(positionColumns.has('checkpoint_id'), 'position has checkpoint_id after app boot');
   assert.ok(positionColumns.has('family_checkpoint') === false, 'legacy family_checkpoint column removed after app boot');
   const applied = db.prepare("SELECT MAX(version) AS v FROM _SchemaMigration WHERE namespace = 'workbench'").get();
-  assert.equal(applied.v, 6, 'Workbench migrations v1–v6 recorded');
+  assert.equal(applied.v, LATEST_WORKBENCH_VERSION, `Workbench migrations v1–v${LATEST_WORKBENCH_VERSION} recorded`);
   assert.equal(count(db, `${legacyPrefix}_authoring_position`), 0, 'pre-migration legacy positions cleared');
   app.db.close();
 });
@@ -615,7 +617,7 @@ test('A11: the migration lane upgrades a legacy annotated-text membership table 
   db.exec(`INSERT INTO ${prefix}_membership (annotation_id, start_point, end_point) VALUES ('a1', '{"p":1}', '{"p":2}')`);
 
   await runWorkbenchMigrations(db);
-  assert.equal(appliedWorkbenchVersion(db), 6);
+  assert.equal(appliedWorkbenchVersion(db), LATEST_WORKBENCH_VERSION);
 
   // Canonical shape today is the range/document/ordinal schema: v4 moves the
   // legacy table to the (annotation_id, start_point) composite key and v6
@@ -686,7 +688,7 @@ test('A11b: v6 leaves a fresh canonical-shape membership table untouched', async
   db.exec(`INSERT INTO ${prefix}_membership (annotation_id, range_id, document_id, ordinal) VALUES ('a1', 1, 'd1', 0)`);
 
   await runWorkbenchMigrations(db);
-  assert.equal(appliedWorkbenchVersion(db), 6);
+  assert.equal(appliedWorkbenchVersion(db), LATEST_WORKBENCH_VERSION);
   const columns = db.prepare(`PRAGMA table_info(${prefix}_membership)`).all();
   assert.deepEqual(columns.filter((column) => column.pk > 0).map((column) => column.name), ['annotation_id', 'range_id']);
   assert.equal(count(db, `${prefix}_membership`), 1, 'canonical membership rows survive the migration untouched');

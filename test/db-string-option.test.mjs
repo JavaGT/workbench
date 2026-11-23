@@ -50,6 +50,7 @@ test('a file-path db string opens an owned directory with the derived physical l
     assert.ok(existsSync(path.join(dir, 'sub', 'data.sqlite')), 'the derived data.sqlite exists');
     assert.ok(existsSync(path.join(dir, 'sub', 'lock.sqlite')), 'the lock sidecar exists');
     // The installed handle supports SQL on either runtime.
+    if (typeof globalThis.Bun === 'undefined') assert.ok(app.db instanceof DatabaseSync);
     assert.equal(app.db.prepare('SELECT 1 AS value').get().value, 1);
     const row = app.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='Note'").get();
     assert.ok(row, 'the entity table exists in the adapter-owned db');

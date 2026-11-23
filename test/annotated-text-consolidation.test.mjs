@@ -2,12 +2,10 @@
 // 1. Incremental `_membership` updates on `annotation.update` (zero membership
 //    writes on fields-only update; only affected annotation(s) touched on range
 //    move, never wiping all document memberships).
-// 2. Folded `planAnnotationPaste` single authority (`annotated-text-plan.mjs`
-//    and compat shim `annotation-paste-plan.mjs` share the same function).
-// 3. Authoring lease lifecycle (#229): explicit `releaseLease`,
+// 2. Authoring lease lifecycle (#229): explicit `releaseLease`,
 //    `releaseLeaseByNonce`, `supersedeLeaseId`/`supersedeNonceHash`, LRU
 //    `evictOldest: true` & `evictOldestLease`, and reduced quota query churn.
-// 4. Thin core boundaries: `kernel.ts` forwards `app.writeQueue` to
+// 3. Thin core boundaries: `kernel.ts` forwards `app.writeQueue` to
 //    `createServer`, and `pipeline.ts` delegates annotatedText compound logic
 //    via `commitHook` without importing annotated-text modules directly.
 
@@ -32,8 +30,6 @@ import workbench, {
   write,
 } from '../build/index.mjs';
 import { executeDDL, executeFrameworkDDL } from '../build/internal.mjs';
-import { planAnnotationPaste } from '../build/annotated-text-plan.mjs';
-import { planAnnotationPaste as shimPlanAnnotationPaste } from '../build/annotation-paste-plan.mjs';
 import {
   AUTHORING_STREAM_LIMITS,
   countLiveLeases,
@@ -62,10 +58,6 @@ function setupAuthoringDb(prefix = 'Doc_body') {
   `);
   return { db, prefix };
 }
-
-test('planAnnotationPaste is consolidated into annotated-text-plan with a thin shim', () => {
-  assert.strictEqual(planAnnotationPaste, shimPlanAnnotationPaste);
-});
 
 test('annotation.update writes _membership incrementally (0 writes for fields-only, affected-only on range move)', async (t) => {
   const db = new DatabaseSync(':memory:');

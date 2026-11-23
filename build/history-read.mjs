@@ -4,10 +4,6 @@ import { mayRow, mayVerb as rowGrantMayVerb,                                    
 import { tryParseScopeKey,                  } from './scope-handle.mjs';
 import { publicEvent } from './event-delivery.mjs';
 
-// scope#992 rev 3 §3: the legacy annotated read-privacy scanner is imported
-// ONLY here (the history actions()/events() read boundary) and used ONLY from
-// the authorize step. Movement code must not import it.
-import { assertLegacyAnnotatedHistoryReadable } from './legacy-annotated-history-read-privacy.mjs';
 import { forbidden } from './outcome.mjs';
 
 
@@ -117,12 +113,12 @@ export function createHistoryReader({
   const denyScopes = privateHistoryScopes ?? new Set        ();
 
   async function authorize(scope        , principal                        )                                                                            {
-    // scope#992 rev 3 §3: the legacy annotated read-privacy scanner is the
-    // ONLY annotated denial here; it returns void or throws forbidden(). It
-    // has no eligibility/barrier/target/retry/compensation role.
-    assertLegacyAnnotatedHistoryReadable(database, scope, denyScopes);
+    // #315 clean break: read privacy is the declaration-derived
+    // privateHistoryScopes set only. The retired legacy action-type/receipt
+    // scanner is gone; an unparseable or private scope denies before anything
+    // materializes.
     const handle = tryParseScopeKey(scope);
-    if (!handle) throw forbidden('history.forbidden', 'history.forbidden');
+    if (!handle || denyScopes.has(handle.entity)) throw forbidden('history.forbidden', 'history.forbidden');
     const entityRec = resolveEntity(handle.entity);
     if (!entityRec) throw forbidden('history.forbidden', 'history.forbidden');
     const auth = reauthFor(entityRec, principal, handle, database, scopeVisible);

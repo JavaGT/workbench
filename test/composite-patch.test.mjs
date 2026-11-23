@@ -328,6 +328,56 @@ test('unselected-field member updates produce no journal entry', async (t) => {
   assert.ok(after > before, 'note create is journalled');
 });
 
+// #236 regression: entity + phase classification must come from the exported
+// Event-type grammar authority, not a local suffix/regex re-derivation. A dotted
+// field event (Note.title.set, kind 'fieldSet') is a field mutation; treating it
+// as an unclassifiable event instead silently degrades a precise patch to a
+// declaration-wide invalidation.
+test('REGRESSION #236: composite routing classifies event types in parity with parseEventType', async (t) => {
+  const { db } = await setup(t);
+  const { routeCompositeEvent } = await import('../build/composite-journal.mjs');
+  const { compilePatchPlans } = await import('../build/composite-patch-plan.mjs');
+  const { parseEventType } = await import('../build/event-handle.mjs');
+
+  const plans = compilePatchPlans(new Map([['Note', {
+    anchor: { name: 'Note' },
+    output: { entity: { name: 'Note' }, entries: [{ key: 'title', kind: 'select', fields: ['title'] }] },
+    tombstone: null,
+  }]]));
+  const evidence = {
+    before: new Map([['Note', new Map([['n1', { id: 'n1', title: 'Old' }]])]]),
+    after: new Map([['Note', new Map([['n1', { id: 'n1', title: 'New' }]])]]),
+  };
+
+  const cases = [
+    ['Note.created', 'create'],
+    ['Note.updated', 'update'],
+    ['Note.removed', 'remove'],
+    ['Note.title.set', 'update'],      // dotted fieldSet: a field mutation, not a lifecycle event
+    ['Note.body.operated', 'update'],  // native field op
+  ];
+  for (const [type, reason] of cases) {
+    const handle = parseEventType(type);
+    const out = routeCompositeEvent(db, plans, {
+      type, scope: 'Note:n1', seq: 1, actionId: `parity-${type}`,
+      data: { id: 'n1', title: 'New' },
+    }, evidence);
+    assert.equal(handle.entity, 'Note', `${type} entity agrees with the grammar authority`);
+    const routed = out.find((entry) => entry.scope === 'Note:n1' && entry.declaration === 'Note');
+    assert.ok(routed, `${type} (kind ${handle.kind}) routes precisely, not as an unclassifiable event`);
+    assert.ok(!routed.invalidating, `${type} is classified, never declaration-wide invalidation`);
+    assert.equal(routed.affected[0].reason, reason, `${type} routes as ${reason}`);
+  }
+
+  // A type the grammar authority rejects has no classification; the router
+  // must still fail closed with an invalidation instead of going silent.
+  assert.throws(() => parseEventType('Note.custom'), /invalid event type/);
+  const custom = routeCompositeEvent(db, plans, {
+    type: 'Note.custom', scope: 'Note:n1', seq: 1, actionId: 'parity-custom',
+  }, { before: new Map(), after: new Map() });
+  assert.ok(custom.some((entry) => entry.invalidating), 'unparseable custom event invalidates rather than going silent');
+});
+
 // ---- bootstrap + parity oracle ----------------------------------------------
 
 test('patch-capable bootstrap returns composite cursor + token; legacy clients get aggregate cursors and never receive patches', async (t) => {

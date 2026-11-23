@@ -14,7 +14,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
-import { createSearchStalenessBridge, SEARCH_STALENESS_PRIORITY_HIGH, SEARCH_STALENESS_PRIORITY_ORDINARY } from '../build/search-staleness.mjs';
+import { createSearchStalenessBridge, createSearchStalenessConsumer, SEARCH_STALENESS_PRIORITY_HIGH, SEARCH_STALENESS_PRIORITY_ORDINARY } from '../build/search-staleness.mjs';
 import { createSearchPluginRegistry, SUPPORTED_SEARCH_PLUGIN_CONTRACT_VERSION, SEARCH_STALENESS_LEDGER_TABLE } from '../build/search-plugin.mjs';
 import { createServer, durableMutationVariant } from '../build/pipeline.mjs';
 import { executeFrameworkDDL } from '../build/ddl.mjs';
@@ -233,6 +233,51 @@ describe('staleness bridge — uncommitted-state guard', () => {
     assert.equal(bridge.pending().length, 0);
     const logRows = db.prepare('SELECT * FROM _Log').all();
     assert.equal(logRows.length, 0);
+  });
+});
+
+// #236 regression: the post-commit consumer must derive entity + kind from the
+// exported Event-type grammar authority. A dotted field event (Note.title.set,
+// kind 'fieldSet') is an update to an existing row, exactly like a native field
+// mutation — never a fabricated kind from a bare split('.').
+describe('staleness bridge — committed-event classification parity', () => {
+  test('event types map to the same source-change kind as parseEventType, including dotted field events', async () => {
+    const db = freshNoteDb();
+    const { bridge } = setupBridge(db);
+    const consumer = createSearchStalenessConsumer(bridge);
+    const { parseEventType } = await import('../build/event-handle.mjs');
+
+    const kindOf = (handle) => handle.kind === 'created' ? 'created'
+      : handle.kind === 'removed' ? 'removed'
+        : 'updated'; // updated / fieldSet / native all change an existing row
+    const cases = [
+      ['Note.created', 'n1'],
+      ['Note.updated', 'n2'],
+      ['Note.removed', 'n3'],
+      ['Note.title.set', 'n4'],      // dotted fieldSet
+      ['Note.body.operated', 'n5'],  // native field op
+    ];
+    for (const [type, rowId] of cases) {
+      const handle = parseEventType(type);
+      assert.equal(handle.entity, 'Note', `${type} entity agrees with the grammar authority`);
+      await consumer([{ type, scope: `Note:${rowId}`, data: { id: rowId }, committedAt: 't0' }]);
+      const row = db.prepare('SELECT payload FROM _SearchStaleness WHERE sourceKey = ?').get(rowId);
+      assert.ok(row, `${type} recorded a source change`);
+      assert.equal(JSON.parse(row.payload).change.kind, kindOf(handle), `${type} maps to ${kindOf(handle)}`);
+    }
+
+    // A type outside the grammar has no authority handle: the consumer skips it
+    // rather than fabricating an 'updated' change from a split('.') fallback.
+    assert.throws(() => parseEventType('Note.custom'), /invalid event type/);
+    assert.throws(() => parseEventType('Note.a.b.c'), /invalid event type/);
+    await consumer([
+      { type: 'Note.custom', scope: 'Note:nc', data: { id: 'nc' }, committedAt: 't0' },
+      { type: 'Note.a.b.c', scope: 'Note:n4p', data: { id: 'n4p' }, committedAt: 't0' },
+    ]);
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM _SearchStaleness WHERE sourceKey = ?').get('nc').n, 0);
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM _SearchStaleness WHERE sourceKey = ?').get('n4p').n, 0,
+      'a bare split(\'.\') would have fabricated an update from a 4-part type');
+    db.close();
   });
 });
 

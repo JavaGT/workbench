@@ -28,7 +28,7 @@ import { anonymous, collapseForAdmission, type Principal } from './principal.ts'
 import { mayVerb } from './row-grant.ts';
 import { createAuthorizationAdapter, type AuthorizationAdapter } from './authorization-adapter.ts';
 import { config } from './config.ts';
-import { applySecurityHeaders, renderError, isSameOriginRequest } from './middleware.ts';
+import { applySecurityHeaders, renderError, isSameOriginRequest, resolveClientIp, type TrustedProxies } from './middleware.ts';
 import { sessionPrincipalOf, sessionTokenOf, apiKeyPrincipalOf } from './auth/session.ts';
 import { createWebSocketLiveDelivery } from './live-delivery.ts';
 import { getLog, withLog } from './log.ts';
@@ -36,7 +36,16 @@ import { createRateLimiter } from './rate-limit.ts';
 import { BodyError, readRequestBody } from './http-body.ts';
 import { runChain } from './http-handler-chain.ts';
 import { matchRoute } from './http-route-match.ts';
-import { committedEventHeaders, responseHasStarted, warnLateResponse, sendJson } from './http-response.ts';
+import {
+  canWriteResponse,
+  committedEventHeaders,
+  compressPayloadSync,
+  mergeVaryHeader,
+  pumpWebStreamToResponse,
+  responseHasStarted,
+  warnLateResponse,
+  sendJson,
+} from './http-response.ts';
 import { createResponseFacade } from './http-response-factory.ts';
 import { dispatchCrud } from './http-crud-dispatch.ts';
 import { failure } from './outcome.ts';
@@ -55,34 +64,71 @@ const sendJsonCompat: SendJson = sendJson as any;
 // `onEnd` flips the intercept's handled flag so a handler that ended the
 // response short-circuits the dispatch and one that did not write falls through
 // to the next handler.
-function makeHandlerRes(nodeRes: any, onEnd: any) {
+function makeHandlerRes(nodeReq: any, nodeRes: any, onEnd: any) {
   const res: any = createResponseFacade(nodeRes, { onEnd });
 
-  // serve-specific: stream pipes a Web Response (or a bare ReadableStream) to
-  // the Node response and calls onEnd() so the intercept short-circuits.
-  res.stream = async function (webResponse: any, options: any = {}) {
-    const source = webResponse instanceof ReadableStream
-      ? new Response(webResponse)
-      : webResponse;
-    const headers = Object.fromEntries(source.headers);
-    if (options.buffering === false) {
-      headers['X-Accel-Buffering'] = 'no';
-    }
-    nodeRes.writeHead(source.status, headers);
-    if (source.body) {
-      const reader = source.body.getReader();
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        nodeRes.write(value);
+  // Compression-aware text send for mounted prefix handlers.
+  res.send = function (value?: unknown) {
+    if (!canWriteResponse(nodeRes, 'res.send')) return this;
+    const payload = typeof value === 'string' ? value : String(value);
+    const status = this._pendingStatus;
+    const allowCompress = status >= 200
+      && status !== 204
+      && status !== 304
+      && nodeReq?.method !== 'HEAD'
+      && !nodeRes.getHeader?.('content-encoding');
+    if (allowCompress) {
+      const compressed = compressPayloadSync(payload, nodeReq?.headers?.['accept-encoding']);
+      if (compressed.encoding) {
+        nodeRes.writeHead(status, {
+          'content-type': 'text/plain; charset=utf-8',
+          'content-encoding': compressed.encoding,
+          'content-length': compressed.body.length,
+          'vary': mergeVaryHeader(nodeRes.getHeader?.('vary'), 'Accept-Encoding'),
+        });
+        nodeRes.end(compressed.body);
+        onEnd();
+        return this;
       }
     }
-    nodeRes.end();
+    nodeRes.writeHead(status, {
+      'content-type': 'text/plain; charset=utf-8',
+      'content-length': Buffer.byteLength(payload),
+    });
+    nodeRes.end(payload);
     onEnd();
     return this;
   };
 
+  // serve-specific: backpressure-safe stream pump piping a Web Response (or a
+  // bare ReadableStream) to the Node response and calling onEnd() so the
+  // intercept short-circuits. Sets X-Accel-Buffering: no when buffering === false.
+  res.stream = async function (webResponse: any, options: any = {}) {
+    await pumpWebStreamToResponse(nodeRes, webResponse, {
+      buffering: options.buffering ?? false,
+      defaultStatus: this._pendingStatus,
+      defaultContentType: 'text/event-stream; charset=utf-8',
+      onEnd,
+    });
+    return this;
+  };
+
   return res;
+}
+
+const CORS_ALLOW_METHODS = 'GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS';
+const CORS_ALLOW_HEADERS = 'content-type, Authorization, Range, X-Workbench-Action-Id';
+const CORS_EXPOSE_HEADERS = 'x-workbench-seq, x-workbench-action-id, Content-Range, Accept-Ranges, Content-Length, ETag';
+
+function resolveCorsPolicy(cors: any, origin: string | undefined): { allowOrigin: string; allowCredentials: boolean } | null {
+  if (!cors || !Array.isArray(cors.origins) || !origin) return null;
+  if (cors.origins.includes(origin) && origin !== '*') {
+    return { allowOrigin: origin, allowCredentials: true };
+  }
+  if (cors.origins.includes('*')) {
+    return { allowOrigin: '*', allowCredentials: false };
+  }
+  return null;
 }
 
 // Framework-owned routes — handleResyncRoute, handleBlobUploadRoute, handleJobRoute
@@ -101,7 +147,8 @@ const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 // Returns true when the mutation is allowed, false when it is foreign (→ 403).
 // Safe methods carry no state change; the same-origin verdict (shared with the
 // WS upgrade handshake, middleware.mjs) gates every other method.
-const csrfGuard = (req: any) => SAFE_METHODS.has(req.method) || isSameOriginRequest(req);
+const csrfGuard = (req: any, trustedProxies: TrustedProxies = false) =>
+  SAFE_METHODS.has(req.method) || isSameOriginRequest(req, { trustedProxies });
 
 // Build the node:http request handler that serves a routing table. `principalOf`
 // derives the request's principal; it defaults to a function returning anonymous
@@ -115,7 +162,7 @@ const csrfGuard = (req: any) => SAFE_METHODS.has(req.method) || isSameOriginRequ
 // resolver; the request handler is deliberately not re-architected here.
 const anonymousPrincipalOf: () => Principal = () => anonymous;
 
-export function makeRequestHandler(source: any, { principalOf = anonymousPrincipalOf, db, env = config.env, rateLimiter = null, csp, hsts, cors, requestLog = false, authorization }: {
+export function makeRequestHandler(source: any, { principalOf = anonymousPrincipalOf, db, env = config.env, rateLimiter = null, csp, hsts, cors, requestLog = false, authorization, trustedProxies = false }: {
   principalOf?: (req: any) => Principal;
   db?: any;
   env?: string;
@@ -125,6 +172,7 @@ export function makeRequestHandler(source: any, { principalOf = anonymousPrincip
   cors?: any;
   requestLog?: boolean;
   authorization?: AuthorizationAdapter;
+  trustedProxies?: TrustedProxies;
 } = {}) {
   // `source` is either a plain resolved routing table (an array) or an app whose
   // table resolves asynchronously (two-phase boot). When it is an app, every
@@ -163,8 +211,10 @@ export function makeRequestHandler(source: any, { principalOf = anonymousPrincip
     if (route.verb && route.verb !== 'fieldApply') return route.verb;
     if (route.verb === 'fieldApply') return 'update';
     switch (route.method) {
-      case 'GET': return 'read';
+      case 'GET':
+      case 'HEAD': return 'read';
       case 'POST': return 'create';
+      case 'PUT':
       case 'PATCH': return 'update';
       case 'DELETE': return 'remove';
       default: return 'read';
@@ -263,12 +313,15 @@ export function makeRequestHandler(source: any, { principalOf = anonymousPrincip
     {
       match: (req: any, _url: URL) => isApp && req.method === 'OPTIONS' && cors && cors.origins && Array.isArray(cors.origins),
       handle: (req: any, res: any) => {
-        const origin = req.headers.origin;
-        if (origin && cors.origins.includes(origin)) {
-          res.setHeader('access-control-allow-origin', origin);
-          res.setHeader('vary', 'Origin');
-          res.setHeader('access-control-allow-methods', 'GET, POST, PATCH, DELETE, OPTIONS');
-          res.setHeader('access-control-allow-headers', 'content-type');
+        const matched = resolveCorsPolicy(cors, req.headers.origin);
+        if (matched) {
+          res.setHeader('access-control-allow-origin', matched.allowOrigin);
+          if (matched.allowCredentials) {
+            res.setHeader('access-control-allow-credentials', 'true');
+            res.setHeader('vary', mergeVaryHeader(res.getHeader('vary'), 'Origin'));
+          }
+          res.setHeader('access-control-allow-methods', CORS_ALLOW_METHODS);
+          res.setHeader('access-control-allow-headers', CORS_ALLOW_HEADERS);
           res.writeHead(204);
           res.end();
           return true;
@@ -342,7 +395,7 @@ export function makeRequestHandler(source: any, { principalOf = anonymousPrincip
             url: req.url,
           };
           let handled = false;
-          const ctxRes = makeHandlerRes(res, () => { handled = true; });
+          const ctxRes = makeHandlerRes(req, res, () => { handled = true; });
           try {
             await fn(ctxReq, ctxRes, () => {});
           } catch (err) {
@@ -382,13 +435,14 @@ export function makeRequestHandler(source: any, { principalOf = anonymousPrincip
     if (csp) res.setHeader('content-security-policy', csp);
     if (hsts) res.setHeader('strict-transport-security', 'max-age=31536000');
     // CORS: check Origin and set headers if configured (allowlist over denylist)
-    const origin = req.headers.origin;
-    if (cors && cors.origins && Array.isArray(cors.origins) && origin) {
-      if (cors.origins.includes(origin)) {
-        res.setHeader('access-control-allow-origin', origin);
-        res.setHeader('access-control-expose-headers', 'x-workbench-seq, x-workbench-action-id');
-        res.setHeader('vary', 'Origin');
+    const corsMatch = resolveCorsPolicy(cors, req.headers.origin);
+    if (corsMatch) {
+      res.setHeader('access-control-allow-origin', corsMatch.allowOrigin);
+      if (corsMatch.allowCredentials) {
+        res.setHeader('access-control-allow-credentials', 'true');
+        res.setHeader('vary', mergeVaryHeader(res.getHeader('vary'), 'Origin'));
       }
+      res.setHeader('access-control-expose-headers', CORS_EXPOSE_HEADERS);
     }
     try {
       if (isApp) await source.ready;
@@ -404,7 +458,7 @@ export function makeRequestHandler(source: any, { principalOf = anonymousPrincip
       // cheaply with no DB lookup, before principal hydration; the IP gate is the
       // non-spoofable base that holds when no cookie is present.
       if (rateLimiter) {
-        const r = rateLimiter.check({ ip: req.socket?.remoteAddress, sessionId: sessionTokenOf(req) });
+        const r = rateLimiter.check({ ip: resolveClientIp(req, trustedProxies), sessionId: sessionTokenOf(req) });
         if (!r.allowed) {
           res.setHeader('Retry-After', String(Math.ceil(r.retryAfterMs / 1000)));
           sendFailure(
@@ -420,7 +474,7 @@ export function makeRequestHandler(source: any, { principalOf = anonymousPrincip
       // CSRF origin guard (eng-review #13) — a foreign-origin mutation is
       // rejected before it reaches the route gate or any state change. Bare
       // non-browser requests (no Origin/Referer — Node fetch, curl) pass.
-      if (isApp && !csrfGuard(req)) {
+      if (isApp && !csrfGuard(req, trustedProxies)) {
         sendFailure(sendJsonCompat, res, failure('denied', 'forbidden'));
         return;
       }
@@ -520,7 +574,8 @@ export function listen(app: any, port: any, optionsOrCallback: any = {}) {
     app,
     { ...options, principalOf, db: app.db, env: options.env ?? app.config?.env ?? config.env,
       rateLimiter: options.rateLimit ? createRateLimiter(options.rateLimit) : null,
-      csp: options.csp, hsts: options.hsts, cors: options.cors, requestLog: options.requestLog },
+      csp: options.csp, hsts: options.hsts, cors: options.cors, requestLog: options.requestLog,
+      trustedProxies: options.trustedProxies ?? false },
   );
 
   const httpServer = createHttpServer(resolved);

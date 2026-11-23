@@ -2,12 +2,17 @@ import { resolve } from 'node:path';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import { config } from './config.ts';
-import { getLog } from './log.ts';
 import { renderError } from './middleware.ts';
 import { authorizeRow, type CrudAppLike, type CrudEntity } from './http-crud-dispatch.ts';
 import type { AuthorizationAdapter } from './authorization-adapter.ts';
 import { resolveTemplate } from './views.ts';
 import { createResponseFacade, type ResponseFacade } from './http-response-factory.ts';
+import {
+  canWriteResponse,
+  compressPayloadSync,
+  mergeVaryHeader,
+  pumpWebStreamToResponse,
+} from './http-response.ts';
 import type { Principal } from './principal.ts';
 import type { AutoLoad, RouteHandler } from './router.ts';
 
@@ -28,12 +33,6 @@ interface ChainRequest {
   [key: string]: unknown;
 }
 
-interface StreamSource {
-  body?: { getReader(): { read(): Promise<{ done: boolean; value?: Uint8Array }>; cancel(reason?: unknown): Promise<void> } } | null;
-  headers?: { entries(): Iterable<[string, string]> };
-  status?: number;
-}
-
 interface ChainResponse extends ResponseFacade {
   render(name: string, data?: Record<string, unknown>): ChainResponse;
   stream(webResponse: unknown, options?: { buffering?: boolean }): Promise<ChainResponse>;
@@ -51,6 +50,38 @@ export interface RunChainOptions {
 
 export interface RunChainEnv {
   env: string;
+}
+
+function writeCompressedText(
+  nodeReq: IncomingMessage,
+  nodeRes: ServerResponse,
+  status: number,
+  contentType: string,
+  payload: string,
+): void {
+  const allowCompress = status >= 200
+    && status !== 204
+    && status !== 304
+    && nodeReq.method !== 'HEAD'
+    && !nodeRes.getHeader('content-encoding');
+  if (allowCompress) {
+    const compressed = compressPayloadSync(payload, nodeReq.headers['accept-encoding']);
+    if (compressed.encoding) {
+      nodeRes.writeHead(status, {
+        'content-type': contentType,
+        'content-encoding': compressed.encoding,
+        'content-length': compressed.body.length,
+        'vary': mergeVaryHeader(nodeRes.getHeader('vary'), 'Accept-Encoding'),
+      });
+      nodeRes.end(compressed.body);
+      return;
+    }
+  }
+  nodeRes.writeHead(status, {
+    'content-type': contentType,
+    'content-length': Buffer.byteLength(payload),
+  });
+  nodeRes.end(payload);
 }
 
 export async function runChain(
@@ -86,17 +117,23 @@ export async function runChain(
 
   const res: ChainResponse = createResponseFacade(nodeRes, {}) as ChainResponse;
 
+  // Compression-aware text send on imperative routes.
+  res.send = function (this: ChainResponse, value?: unknown) {
+    if (!canWriteResponse(nodeRes, 'res.send')) return this;
+    const payload = typeof value === 'string' ? value : String(value);
+    writeCompressedText(nodeReq, nodeRes, this._pendingStatus, 'text/plain; charset=utf-8', payload);
+    return this;
+  };
+
   // chain-specific: template rendering via the views engine.
   res.render = function (this: ChainResponse, name: string, data: Record<string, unknown> = {}) {
     try {
       const html = resolveTemplate((app as ChainApp | null | undefined)?.config?.viewsDir ?? config.viewsDir ?? resolve(process.cwd(), 'views'), name, data);
       if (!nodeRes.headersSent) {
-        nodeRes.writeHead(this._pendingStatus, {
-          'content-type': 'text/html; charset=utf-8',
-          'content-length': Buffer.byteLength(html),
-        });
+        writeCompressedText(nodeReq, nodeRes, this._pendingStatus, 'text/html; charset=utf-8', html);
+      } else {
+        nodeRes.end(html);
       }
-      nodeRes.end(html);
     } catch (err) {
       const e = err as { code?: unknown; message?: unknown };
       const status = e.code === 'ENOENT' ? 404 : 500;
@@ -105,46 +142,14 @@ export async function runChain(
     return this;
   };
 
-  // chain-specific: streaming with SSE defaults, buffering toggle, destroyed
-  // guard, and cancellation on error.
-  res.stream = async function (this: ChainResponse, webResponse: unknown, { buffering = true }: { buffering?: boolean } = {}) {
-    const source = webResponse as StreamSource | null | undefined;
-    const isResponse = typeof source?.body?.getReader === 'function'
-      || (webResponse && typeof source?.body === 'object');
-    const body = source?.body ?? webResponse;
-    const headers: Record<string, string> = isResponse && source?.headers
-      ? Object.fromEntries(source.headers.entries())
-      : {};
-    if (!('content-type' in headers) && !isResponse) {
-      headers['content-type'] = 'text/event-stream; charset=utf-8';
-    }
-    if (buffering) headers['x-accel-buffering'] = 'no';
-    if (!nodeRes.headersSent) {
-      nodeRes.writeHead(
-        isResponse && Number.isFinite(source?.status as number) ? (source?.status as number) : this._pendingStatus,
-        headers,
-      );
-    }
-    const streamBody = body as StreamSource['body'] | null | undefined;
-    if (!streamBody || typeof streamBody.getReader !== 'function') {
-      nodeRes.end();
-      return this;
-    }
-    const reader = streamBody.getReader();
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (nodeRes.destroyed) break;
-        nodeRes.write(Buffer.isBuffer(value) ? value : Buffer.from(value as Uint8Array));
-      }
-      if (!nodeRes.writableEnded) nodeRes.end();
-    } catch (err) {
-      getLog().warn('system', 'res.stream pump failed', { err });
-      if (!nodeRes.destroyed) nodeRes.destroy(err as Error);
-    } finally {
-      try { await reader.cancel(); } catch { /* reader already released */ }
-    }
+  // chain-specific: backpressure-safe streaming with SSE defaults and unified
+  // X-Accel-Buffering: no when buffering === false (the default).
+  res.stream = async function (this: ChainResponse, webResponse: unknown, { buffering = false }: { buffering?: boolean } = {}) {
+    await pumpWebStreamToResponse(nodeRes, webResponse, {
+      buffering,
+      defaultStatus: this._pendingStatus,
+      defaultContentType: 'text/event-stream; charset=utf-8',
+    });
     return this;
   };
 

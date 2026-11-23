@@ -8,11 +8,13 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 
 import { requireUser, isGate } from './route-gate.mjs';
 
-// The HTTP methods an imperative router verb maps to. `r.get/post/patch/delete`
+// The HTTP methods an imperative router verb maps to. `r.get/head/post/put/patch/delete`
 // build a hand-written route (a handler chain) rather than entity CRUD.
 const IMPERATIVE_VERBS = Object.freeze({
   get: 'GET',
+  head: 'HEAD',
   post: 'POST',
+  put: 'PUT',
   patch: 'PATCH',
   delete: 'DELETE',
 }         );
@@ -161,6 +163,8 @@ function rebaseRoute(route             , parentBase        )              {
 
 // One ordered declaration recorded by the fluent mount/use/verb calls. Resolution
 // drains these into the concrete `routes` table.
+
+
 
 
 

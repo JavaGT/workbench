@@ -20,8 +20,13 @@
 import type { Server, IncomingMessage } from 'node:http';
 import type { Duplex } from 'node:stream';
 
-import { upgradeWebSocket } from './websocket.ts';
-import { isSameOriginRequest } from './middleware.ts';
+import {
+  createWebSocketServer,
+  DEFAULT_WS_HEARTBEAT_INTERVAL_MS,
+  DEFAULT_WS_MAX_PAYLOAD,
+  type PerMessageDeflateOptions,
+} from './websocket.ts';
+import { isSameOriginRequest, type TrustedProxies } from './middleware.ts';
 import { createLiveFanout } from './live-fanout.ts';
 import type { LiveEntityRecord, LiveFanoutHandle, MayVerb } from './live-fanout.ts';
 import type { LiveDeliveryCore } from './live-delivery-core.ts';
@@ -45,6 +50,10 @@ export interface LiveDeliveryWebSocketOptions {
   db?: LiveDatabase | null;
   ready?: () => Promise<unknown>;
   log?: FrameworkLog | null;
+  maxPayload?: number;
+  perMessageDeflate?: boolean | PerMessageDeflateOptions;
+  heartbeatIntervalMs?: number | false;
+  trustedProxies?: TrustedProxies;
 }
 
 export interface LiveDeliveryWebSocket {
@@ -62,18 +71,56 @@ export function createLiveDeliveryWebSocket(httpServer: Server, {
   db = null,
   ready = () => Promise.resolve(),
   log = null,
+  maxPayload = DEFAULT_WS_MAX_PAYLOAD,
+  perMessageDeflate = true,
+  heartbeatIntervalMs = DEFAULT_WS_HEARTBEAT_INTERVAL_MS,
+  trustedProxies = false,
 }: LiveDeliveryWebSocketOptions = {}): LiveDeliveryWebSocket {
+  const wss = createWebSocketServer({ maxPayload, perMessageDeflate });
   const fanout: LiveFanoutHandle = createLiveFanout({ mayVerb, authorization });
   const carets = createAnnotatedTextCaretLive({ db: db as never, resolveEntity: resolveEntity as never, mayVerb: mayVerb as never, fanout });
   const connections = new Set<LiveConnection>();
   const pendingUpgrades = new Set<Duplex>();
   let closed = false;
   let closePromise: Promise<void> | null = null;
+  let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
   const currentSeq = (scope: string) => {
     const liveScope = resolveEntity && classifyLiveScope(scope, resolveEntity);
     return liveScope ? readRevision(db as never, scope) : readSeq(db, scope);
   };
+
+  function stopHeartbeat(): void {
+    if (heartbeatTimer !== null) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+    }
+  }
+
+  // Server-initiated Ping/Pong heartbeat & idle reaper: ping every open socket
+  // on each interval; any socket that missed the previous pong is terminated so
+  // half-open TCP peers do not leak subscriptions or descriptors.
+  if (typeof heartbeatIntervalMs === 'number' && Number.isFinite(heartbeatIntervalMs) && heartbeatIntervalMs > 0) {
+    heartbeatTimer = setInterval(() => {
+      if (closed) {
+        stopHeartbeat();
+        return;
+      }
+      for (const conn of [...connections]) {
+        if (!conn.isAlive) {
+          void conn.terminate();
+        } else {
+          conn.ping();
+        }
+      }
+    }, heartbeatIntervalMs);
+    heartbeatTimer.unref?.();
+  }
+
+  const onServerClose = () => {
+    stopHeartbeat();
+  };
+  httpServer.once('close', onServerClose);
 
   async function close(): Promise<void> {
     if (closePromise) return closePromise;
@@ -83,14 +130,18 @@ export function createLiveDeliveryWebSocket(httpServer: Server, {
 
   async function closeImpl(): Promise<void> {
     closed = true;
+    stopHeartbeat();
+    httpServer.off('upgrade', onUpgrade);
+    httpServer.off('close', onServerClose);
     for (const socket of pendingUpgrades) socket.destroy();
     pendingUpgrades.clear();
     await Promise.all([...connections].map((conn) => conn.close?.().catch(() => {})));
     connections.clear();
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
     fanout.close();
   }
 
-  httpServer.on('upgrade', (req, socket, _head) => {
+  const onUpgrade = (req: IncomingMessage, socket: Duplex, head: Buffer) => {
     const url = req.url ? new URL(req.url, 'http://localhost') : { pathname: '' };
     if (url.pathname !== path) {
       socket.destroy();
@@ -98,7 +149,7 @@ export function createLiveDeliveryWebSocket(httpServer: Server, {
     }
 
     // CSWSH defense — same same-origin verdict as REST CSRF (middleware.mjs).
-    if (!isSameOriginRequest(req)) {
+    if (!isSameOriginRequest(req, { trustedProxies })) {
       socket.destroy();
       return;
     }
@@ -112,54 +163,68 @@ export function createLiveDeliveryWebSocket(httpServer: Server, {
     // barrier. Keep the raw socket outside the connection registry until the
     // schema, Kernel, recovery, and admission engine are ready. A failed start
     // fails closed; shutdown destroys sockets waiting at this barrier.
+    const onPendingError = () => {
+      pendingUpgrades.delete(socket);
+    };
+    socket.on('error', onPendingError);
     pendingUpgrades.add(socket);
+
     Promise.resolve()
       .then(() => ready())
       .then(async () => {
-        pendingUpgrades.delete(socket);
         if (closed || socket.destroyed) {
-          socket.destroy();
-          return;
-        }
-
-        const result = upgradeWebSocket(req, socket);
-        if (!result) {
+          pendingUpgrades.delete(socket);
+          socket.off('error', onPendingError);
           socket.destroy();
           return;
         }
 
         // principalOf may be asynchronous (a session lookup). Resolve it BEFORE
-        // wiring the connection so admission never observes a pending promise
-        // standing in for a principal. The browser cannot send frames before the
-        // 101 handshake, and any bytes buffered before the connection is wired
-        // are flushed to the 'data' listener once it attaches.
+        // completing the 101 handshake so admission never observes a pending
+        // promise standing in for a principal AND so LiveConnection attaches
+        // its `message` listener synchronously inside `wss.handleUpgrade` before
+        // any frames (including bytes in `head`) are emitted.
         const principal = await principalOf(req);
+        pendingUpgrades.delete(socket);
+        socket.off('error', onPendingError);
         if (closed || socket.destroyed) {
           socket.destroy();
           return;
         }
 
-        const id = `ws:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`;
-        const conn = new LiveConnection(socket, id, {
-          fanout,
-          core,
-          resolveEntity,
-          mayVerb,
-          authorization,
-          db,
-          currentSeq,
-          log,
-          carets,
-          onClose: () => connections.delete(conn),
+        wss.handleUpgrade(req, socket, head, (ws) => {
+          if (closed) {
+            try { ws.close(1001, 'Server shutting down'); } catch { /* ignore */ }
+            try { ws.terminate(); } catch { /* ignore */ }
+            return;
+          }
+
+          const id = `ws:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`;
+          const conn = new LiveConnection(ws, id, {
+            fanout,
+            core,
+            resolveEntity,
+            mayVerb,
+            authorization,
+            db,
+            currentSeq,
+            log,
+            carets,
+            maxPayload,
+            onClose: () => connections.delete(conn),
+          });
+          conn.setPrincipal(principal);
+          connections.add(conn);
         });
-        conn.setPrincipal(principal);
-        connections.add(conn);
       })
       .catch(() => {
         pendingUpgrades.delete(socket);
+        socket.off('error', onPendingError);
         socket.destroy();
       });
-  });
+  };
+
+  httpServer.on('upgrade', onUpgrade);
 
   return { count: () => connections.size, close };
 }

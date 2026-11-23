@@ -8,11 +8,13 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import type { Gate, RouteVerb } from './route-gate.ts';
 import { requireUser, isGate } from './route-gate.ts';
 
-// The HTTP methods an imperative router verb maps to. `r.get/post/patch/delete`
+// The HTTP methods an imperative router verb maps to. `r.get/head/post/put/patch/delete`
 // build a hand-written route (a handler chain) rather than entity CRUD.
 const IMPERATIVE_VERBS = Object.freeze({
   get: 'GET',
+  head: 'HEAD',
   post: 'POST',
+  put: 'PUT',
   patch: 'PATCH',
   delete: 'DELETE',
 } as const);
@@ -175,7 +177,9 @@ export interface Mountable {
   use(path: string, target: unknown): Mountable;
   resource?(): Mountable;
   get(path: string, ...rest: unknown[]): Mountable;
+  head(path: string, ...rest: unknown[]): Mountable;
   post(path: string, ...rest: unknown[]): Mountable;
+  put(path: string, ...rest: unknown[]): Mountable;
   patch(path: string, ...rest: unknown[]): Mountable;
   delete(path: string, ...rest: unknown[]): Mountable;
   resolveRoutes(): Promise<RouteRecord[]>;

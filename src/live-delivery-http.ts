@@ -7,8 +7,10 @@ import type { Principal } from './principal.ts';
 import type { FrameworkLog } from './log.ts';
 import type { PublicCursor, AnnotatedTextDocument, OwnedLiveDelivery } from './live-delivery-public.ts';
 import { envelopeDiagnostics } from './event-delivery.ts';
+import { compressPayloadAsync, mergeVaryHeader } from './http-response.ts';
 
 const JSON_LIMIT = 1024 * 1024;
+export const DEFAULT_BOOTSTRAP_LIMIT = 64 * 1024 * 1024;
 
 function requestUrl(req: IncomingMessage): URL {
   return new URL(req.url ?? '/', 'http://workbench.local');
@@ -70,15 +72,28 @@ function ruleFrom(url: URL): unknown {
 
 // Bootstraps and catch-ups are one-time page-load responses: a document's
 // recipient view plus (for unredacted recipients) its family checkpoint seed.
-// Those legitimately reach several MB on large documents. Per-keystroke SSE
+// Those legitimately reach tens of MB on large transcripts. Per-keystroke SSE
 // frames stay at JSON_LIMIT so folds cannot silently demote to resync.
-const BOOTSTRAP_LIMIT = 16 * 1024 * 1024;
-
-function writeJson(res: ServerResponse, value: unknown, maxBytes = JSON_LIMIT): void {
+async function writeJson(
+  req: IncomingMessage,
+  res: ServerResponse,
+  value: unknown,
+  maxBytes = JSON_LIMIT,
+): Promise<void> {
   const body = JSON.stringify(value);
-  if (Buffer.byteLength(body) > maxBytes) throw new Error('live delivery response exceeds limit');
-  res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
-  res.end(body);
+  const compressed = await compressPayloadAsync(body, req.headers['accept-encoding']);
+  if (compressed.body.length > maxBytes) throw new Error('live delivery response exceeds limit');
+  const headers: Record<string, string | number> = {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'content-length': compressed.body.length,
+  };
+  if (compressed.encoding) {
+    headers['content-encoding'] = compressed.encoding;
+    headers['vary'] = mergeVaryHeader(res.getHeader('vary'), 'Accept-Encoding');
+  }
+  res.writeHead(200, headers);
+  res.end(compressed.body);
 }
 
 // Wait for an SSE frame to drain (backpressure) or the response to close.
@@ -99,11 +114,19 @@ function waitForDrain(res: ServerResponse): Promise<void> {
  * {path}/events?scope=<scope>&after=<cursor>` is an SSE stream whose data
  * frames are arrays of recipient envelopes. Return false for unrelated routes.
  */
-export function createLiveDeliveryHttpHandler({ delivery, principalOf, path = '/live-delivery', maxSubscriptions = 100, log = null }: {
+export function createLiveDeliveryHttpHandler({
+  delivery,
+  principalOf,
+  path = '/live-delivery',
+  maxSubscriptions = 100,
+  bootstrapLimit = DEFAULT_BOOTSTRAP_LIMIT,
+  log = null,
+}: {
   delivery: OwnedLiveDelivery;
   principalOf: (request: IncomingMessage, hint?: { viewAs?: unknown }) => Principal | Promise<Principal>;
   path?: string;
   maxSubscriptions?: number;
+  bootstrapLimit?: number;
   log?: FrameworkLog | null;
 }) {
   if (!delivery || typeof delivery.bootstrap !== 'function' || typeof delivery.catchup !== 'function' || typeof delivery.subscribe !== 'function') {
@@ -112,6 +135,7 @@ export function createLiveDeliveryHttpHandler({ delivery, principalOf, path = '/
   if (typeof principalOf !== 'function') throw new TypeError('principalOf is required');
   if (typeof path !== 'string' || !path.startsWith('/')) throw new TypeError('path must be an absolute path');
   if (!Number.isSafeInteger(maxSubscriptions) || maxSubscriptions < 1) throw new TypeError('maxSubscriptions must be a positive safe integer');
+  if (!Number.isSafeInteger(bootstrapLimit) || bootstrapLimit < 1) throw new TypeError('bootstrapLimit must be a positive safe integer');
 
   let subscriptions = 0;
 
@@ -199,15 +223,15 @@ export function createLiveDeliveryHttpHandler({ delivery, principalOf, path = '/
         if (mode === 'snapshot') {
           // The delivery seam creates the snapshot from its recipient-hydrated row.
           const result = await delivery.bootstrap({ principal, scope: effectiveScope, document, capabilities });
-          writeJson(res, result, BOOTSTRAP_LIMIT);
+          await writeJson(req, res, result, bootstrapLimit);
         } else if (mode === 'catchup') {
           const result = await delivery.catchup({ principal, scope: effectiveScope, after, document, capabilities, projectionToken });
           // A small event count can still contain a large recipient envelope.
           // Replace oversized replay with the same paired opaque recovery.
           const encoded = JSON.stringify(result);
-          writeJson(res, Buffer.byteLength(encoded) > JSON_LIMIT
+          await writeJson(req, res, Buffer.byteLength(encoded) > JSON_LIMIT
             ? await delivery.bootstrap({ principal, scope: effectiveScope, document, capabilities })
-            : result, BOOTSTRAP_LIMIT);
+            : result, bootstrapLimit);
         } else {
           reject(res, 400, 'invalid live delivery mode');
         }

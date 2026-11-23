@@ -39,26 +39,10 @@ The current outbox behavior is covered by [local-outbox.test.mjs](../test/local-
 value replacement, map merge, ordered coexistence, stale live revision rejection,
 and the separation between CRUD outbox entries and native CRDT text operations.
 
-## CRUD codegen boundary (#182, current)
+## CRUD handler authority (current)
 
-`src/entity/codegen-crud.ts` is opt-in. The normal `src/entity/compile.ts`
-compiler and `src/entity/crud.ts` handlers remain the canonical/default CRUD
-implementation. Codegen derives actions, lifecycle events, handlers, and
-inverses over the same pipeline; it does not introduce a second mutation or
-write authority.
-
-The currently admitted assignment-shaped kinds are `value`, `hash`, `state`,
-and `struct` (`state` still enforces its transition graph, and `struct` keeps
-per-cell replacement). `annotatedText`, `crdt`, `store` (including map/log),
-and `ordered` (including list) remain hand-written because their merge or
-coexistence semantics are not assignment-shaped. `computed`, `projected`, and
-`ephemeral` are framework-owned and reject client payloads. Unknown kinds fail
-closed as hand-written. A CRUD payload touching a refused kind is rejected
-before any event is emitted; it is not partially applied.
-
-Codegen also refuses lifecycle cases it does not derive: `onRemove` cascades
-keep removal hand-written, and live or conditional-history entities keep their
-hand-written lifecycle actions. The parity kill switch is
-[entity-codegen-crud-parity.test.mjs](../test/entity-codegen-crud-parity.test.mjs),
-which covers byte-identical lifecycle events, access denial with zero events,
-and the merge/stub refusal boundary.
+`src/entity/compile.ts` and `src/entity/crud.ts` are the single CRUD
+implementation. The former opt-in `codegen-crud` generator was retired in #283
+because a working second path is still a second path (see AGENTS.md,
+"Prefer a singular system"). annotatedText CRUD lives in
+`src/annotated-text-crud.ts` behind `entity/crud.ts`.

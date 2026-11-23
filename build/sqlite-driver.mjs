@@ -32,6 +32,7 @@
 
 import { existsSync, rmSync, statSync } from 'node:fs';
 
+import { setForeignKeys,               } from './driver.mjs';
 
 
 
@@ -221,7 +222,7 @@ class BunSqliteDatabase                           {
       this.#raw.exec(`PRAGMA busy_timeout = ${Math.floor(options.timeout)}`);
     }
     if (options?.enableForeignKeyConstraints === false) {
-      this.#raw.exec('PRAGMA foreign_keys = OFF');
+      setForeignKeys(this.#raw                       , false);
     }
     if (typeof this.#raw.setAuthorizer === 'function') {
       this.setAuthorizer = (callback) => {

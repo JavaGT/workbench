@@ -1,3 +1,4 @@
+import type { QueryFamilyRequest as ClientQueryFamilyRequest, QueryPage as ClientQueryPage } from 'workbench/client';
 import workbench, {
   action, event, entity, text, date, ref, number, projected, computed, ephemeral, inherit, log, state,
   schedule, tick,
@@ -968,3 +969,12 @@ const serverRetry: ServerOperationalRetry = {
 	nextAttemptAt: Date.now()
 };
 void [retryCode, serverRetry, invalidEventRetry, invariantRetry];
+
+const clientQuery: ClientQueryFamilyRequest = {
+  pageSize: 25,
+  where: { kind: 'not', child: { kind: 'term', field: 'status', op: 'eq', value: 'archived' } },
+  includeTotal: true,
+};
+declare const clientQueryPage: ClientQueryPage;
+const clientQueryTotal: number | undefined = clientQueryPage.total;
+void [clientQuery, clientQueryTotal];

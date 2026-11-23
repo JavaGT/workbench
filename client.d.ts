@@ -13,6 +13,17 @@ import type {
 } from './index.js';
 import type { AnnotatedTextRange, AnnotatedTextRedactionMarker } from './annotated-text-coords.js';
 
+// Browser query consumers share the server's query grammar and result types.
+export type {
+  QueryOperator, QueryFieldType, QueryFilter, QueryFilterTermNode,
+  QueryFilterAndNode, QueryFilterOrNode, QueryFilterNotNode, QueryFilterExpression,
+  QuerySort, QueryContract, QueryCursor, QueryPage, QueryPageDecision,
+  QueryInvalidationKind, QueryInvalidationSignal, QueryDynamicFilter,
+  QueryDynamicSort, QueryFamilySort, QueryFamilyDynamicTermNode,
+  QueryFamilyAndNode, QueryFamilyOrNode, QueryFamilyNotNode,
+  QueryFamilyFilterExpression, QueryFamilyRequest,
+} from './index.js';
+
 // ---------------------------------------------------------------------------
 // LiveChannel — WebSocket transport layer
 // ---------------------------------------------------------------------------

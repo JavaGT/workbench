@@ -3,6 +3,25 @@ import { projectEndpointToOffset, resolveOffsetToEndpoint } from './workbench-an
 
 const deeplyFrozen = new WeakSet();
 
+// A 36k-word transcript can carry ~200k materialized objects (points,
+// frontiers, ranges, annotations). Recursively freezing every one of them is a
+// 50–90 ms client stall, so deep freezing is reserved for small envelopes.
+// Above this estimate only the document shell and its top-level collection
+// arrays are frozen: the O(n) validation above stays byte-identical, but the
+// recursive `Object.freeze` + WeakSet walk over every tuple is skipped.
+const DEEP_FREEZE_OBJECT_BUDGET = 4096;
+
+function shouldDeepFreezeSnapshot(snapshot) {
+  const estimate = (Array.isArray(snapshot.ranges) ? snapshot.ranges.length : 0)
+    + (Array.isArray(snapshot.annotations) ? snapshot.annotations.length * 2 : 0)
+    + (Array.isArray(snapshot.measurements) ? snapshot.measurements.length * 2 : 0)
+    + (Array.isArray(snapshot.orphans) ? snapshot.orphans.length * 2 : 0)
+    + (Array.isArray(snapshot.points) ? snapshot.points.length * 3 : 0)
+    + (Array.isArray(snapshot.frontiers) ? snapshot.frontiers.length * 2 : 0)
+    + (Array.isArray(snapshot.redactions) ? snapshot.redactions.length : 0);
+  return estimate <= DEEP_FREEZE_OBJECT_BUDGET;
+}
+
 function deepFreeze(value, track = false) {
   if (value === null || typeof value !== 'object') return value;
   const wasFrozen = Object.isFrozen(value);
@@ -17,6 +36,17 @@ function deepFreeze(value, track = false) {
   if (!wasFrozen) Object.freeze(value);
   if (track || wasFrozen) deeplyFrozen.add(value);
   return value;
+}
+
+// Fast shallow freeze for large envelopes: freeze the document and its
+// top-level collection arrays, never recursing into per-point / per-frontier /
+// per-range tuples. Validation has already run before this is called.
+function freezeSnapshotCollections(document) {
+  for (const key of ['ranges', 'annotations', 'orphans', 'measurements', 'capabilities', 'redactions']) {
+    const collection = document[key];
+    if (Array.isArray(collection)) Object.freeze(collection);
+  }
+  return Object.freeze(document);
 }
 
 function isStructuralEndpoint(value) {
@@ -41,27 +71,27 @@ function hasStrictExactKeys(value, keys) {
 
 // Strict-closed-array check on the hot v3 materialization path (every point,
 // frontier, and endpoint table pays it), so the walk avoids per-key regular
-// expressions and property descriptors. Acceptance is byte-identical to the
-// descriptor walk it replaces: a real array's own string keys are ordered
-// canonical integer indices ascending then string keys in insertion order, and
-// 'length' is always an own non-index, non-enumerable name. So the table is
-// strict-closed iff there are exactly `length` index names followed by
-// 'length', and every index is an enumerable own property. Non-enumerable
-// string extras shorten nothing but show up in the own-name list (rejected by
-// position), and a non-enumerable index shows up in Object.keys (rejected by
-// count) — the two lists together see exactly what the per-key descriptor
-// walk saw.
+// expressions and property descriptors. A real array's own keys are ordered
+// canonical integer indices ascending, then string keys in insertion order
+// ('length' first for an array), then symbols. So the table is strict-closed
+// iff there are exactly `length` index keys followed by 'length', no symbols,
+// and every index is enumerable. One Reflect.ownKeys walk sees planted symbols
+// and extra (even non-enumerable) string keys; the Object.keys count rejects a
+// non-enumerable index.
 function isStrictClosedArray(value, length) {
-  if (!Array.isArray(value) || value.length !== length || Object.getOwnPropertySymbols(value).length !== 0) return false;
-  const names = Object.getOwnPropertyNames(value);
-  if (names.length !== length + 1 || names[length] !== 'length') return false;
-  const enumerableNames = Object.keys(value);
-  if (enumerableNames.length !== length) return false;
+  if (!Array.isArray(value) || value.length !== length) return false;
+  // One own-key walk replaces the former getOwnPropertySymbols +
+  // getOwnPropertyNames + per-index compare: Reflect.ownKeys yields ascending
+  // integer indices, then insertion-ordered string keys (always `length` first
+  // for an array), then symbols. Exact count + `length` position rejects any
+  // planted symbol or extra string key; the Object.keys count catches a
+  // non-enumerable index (visible to Reflect, absent from Object.keys).
+  const ownKeys = Reflect.ownKeys(value);
+  if (ownKeys.length !== length + 1 || ownKeys[length] !== 'length') return false;
   for (let index = 0; index < length; index += 1) {
-    const expected = `${index}`;
-    if (names[index] !== expected || enumerableNames[index] !== expected) return false;
+    if (ownKeys[index] !== `${index}`) return false;
   }
-  return true;
+  return Object.keys(value).length === length;
 }
 
 function compactPointKey(point) {
@@ -97,7 +127,7 @@ function compactFrontierKey(frontier) {
   return key;
 }
 
-function materializeCompactRecipientRanges(snapshot, family, consume) {
+function materializeCompactRecipientRanges(snapshot, family, consume, deep) {
   if (!family) throw new Error('annotatedText snapshot: v3 endpoints require a family replica');
   if (!Array.isArray(snapshot.points) || !isStrictClosedArray(snapshot.points, snapshot.points.length)
     || !Array.isArray(snapshot.frontiers) || !isStrictClosedArray(snapshot.frontiers, snapshot.frontiers.length)
@@ -144,14 +174,20 @@ function materializeCompactRecipientRanges(snapshot, family, consume) {
   }
 
   const ranges = consume && !Object.isFrozen(snapshot.ranges) ? snapshot.ranges : new Array(snapshot.ranges.length);
-  for (const point of snapshot.points) deepFreeze(point, true);
-  for (const frontier of snapshot.frontiers) deepFreeze(frontier, true);
+  if (deep) {
+    for (const point of snapshot.points) deepFreeze(point, true);
+    for (const frontier of snapshot.frontiers) deepFreeze(frontier, true);
+  } else {
+    Object.freeze(snapshot.points);
+    Object.freeze(snapshot.frontiers);
+  }
   const endpointByReference = new Map();
   const endpoint = (point, frontier) => {
     const key = point * snapshot.frontiers.length + frontier;
     let value = endpointByReference.get(key);
     if (!value) {
-      value = deepFreeze({ point: snapshot.points[point], basisFrontier: snapshot.frontiers[frontier] }, true);
+      const candidate = { point: snapshot.points[point], basisFrontier: snapshot.frontiers[frontier] };
+      value = deep ? deepFreeze(candidate, true) : Object.freeze(candidate);
       endpointByReference.set(key, value);
     }
     return value;
@@ -167,7 +203,7 @@ function materializeCompactRecipientRanges(snapshot, family, consume) {
   return ranges;
 }
 
-function materializeRecipientRanges(snapshot, family, consume) {
+function materializeRecipientRanges(snapshot, family, consume, deep) {
   if (snapshot.version === 1) {
     for (const range of snapshot.ranges) {
       if (!range || typeof range !== 'object' || Array.isArray(range)
@@ -182,7 +218,7 @@ function materializeRecipientRanges(snapshot, family, consume) {
     }
     return snapshot.ranges;
   }
-  if (snapshot.version === 3) return materializeCompactRecipientRanges(snapshot, family, consume);
+  if (snapshot.version === 3) return materializeCompactRecipientRanges(snapshot, family, consume, deep);
   if (snapshot.version !== 2) {
     throw new Error('annotatedText snapshot: snapshot must be a complete blockless recipient envelope');
   }
@@ -361,10 +397,11 @@ export function materializeAnnotatedTextSnapshot(snapshot, handle, options = {})
     }
     capabilities = names;
   }
-  const document = deepFreeze({
+  const deep = shouldDeepFreezeSnapshot(snapshot);
+  const unfrozen = {
     kind: 'workbench.annotatedText.recipient', version: snapshot.version,
     text: snapshot.text,
-    ranges: materializeRecipientRanges(snapshot, options.family, suppliedBinding !== null || options.consume === true),
+    ranges: materializeRecipientRanges(snapshot, options.family, suppliedBinding !== null || options.consume === true, deep),
     annotations: snapshot.annotations,
     orphans,
     measurements: snapshot.measurements,
@@ -375,7 +412,8 @@ export function materializeAnnotatedTextSnapshot(snapshot, handle, options = {})
     capabilities: snapshot.restricted ? null : capabilities,
     ...(snapshot.restricted ? { restricted: true } : {}),
     ...(snapshot.redactions?.length ? { redactions: snapshot.redactions } : {}),
-  });
+  };
+  const document = deep ? deepFreeze(unfrozen) : freezeSnapshotCollections(unfrozen);
   binding.document = document;
   binding.generation = (binding.generation ?? 0) + 1;
   return document;

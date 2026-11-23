@@ -39,7 +39,8 @@ export function applicationTable(
   }
   const stored = db.prepare("SELECT type FROM sqlite_master WHERE name = ? COLLATE NOCASE AND type IN ('table', 'view')").get(table);
   if (stored?.type !== 'table') fail(`application ${operation} require table '${table}'`);
-  const canonical         = db.prepare("SELECT name FROM sqlite_master WHERE name = ? COLLATE NOCASE AND type = 'table'").get(table)?.name           ?? '';
+  const tableRow = db.prepare("SELECT name, sql FROM sqlite_master WHERE name = ? COLLATE NOCASE AND type = 'table'").get(table)                                                 ;
+  const canonical         = typeof tableRow?.name === 'string' ? tableRow.name : '';
   if (canonical !== table
     || (canonical.startsWith('_') && !/^_[A-Za-z][A-Za-z0-9_]*$/.test(canonical))
     || canonical.toLowerCase().startsWith('sqlite_')
@@ -47,6 +48,16 @@ export function applicationTable(
     fail(`application ${operation} cannot access undeclared table '${table}'`);
   }
   const name = identifier(canonical);
+  // SQLite classifies a VIRTUAL TABLE as `type = 'table'`, but writing one runs
+  // the virtual-table module and fans out to its UNDECLARED shadow tables
+  // (FTS5 _data/_idx/_content/... are the common case). The bounded-write
+  // authority names ONE table; a virtual table is never a valid target for it.
+  // Reads are unaffected (this guard's write contract is the boundary).
+  if (operation === 'writes'
+    && typeof tableRow?.sql === 'string'
+    && /^\s*CREATE\s+VIRTUAL\s+TABLE\b/i.test(tableRow.sql)) {
+    fail(`application ${operation} cannot access virtual table '${table}'`);
+  }
   if (operation === 'writes' && (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ? COLLATE NOCASE").get(canonical)
     || db.prepare("SELECT 1 FROM sqlite_temp_master WHERE type = 'trigger' AND tbl_name = ? COLLATE NOCASE").get(canonical))) {
     fail(`application ${operation} cannot access triggered table '${table}'`);

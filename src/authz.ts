@@ -11,6 +11,8 @@ import type { ReadScopeTemplate } from './scope-sql.ts';
 interface InheritDirective {
   readonly inherit: unknown;
   readonly via?: unknown;
+  readonly childWhere?: (ctx: { is: unknown; fields: unknown }) => unknown;
+  readonly childCan?: (ctx: { is: unknown; entity: unknown }, defaults?: unknown) => unknown;
 }
 
 interface EntityAuthzInput {
@@ -100,7 +102,24 @@ export function compileEntityAuthz(name: string, { fields, grant, declaredChecks
       });
     }
   } else if (clauses && (clauses as InheritDirective).inherit) {
-    readScope = compileInheritScope(clauses as InheritDirective, { where: `inherit on entity('${name}')` });
+    const directive = clauses as InheritDirective;
+    // A child `.can` is a runtime capability body, so it gets the SAME load-time
+    // await guard as an own grant `.can`. `.where` is a scope predicate: it
+    // compiles to SQL and is harvested by compileInheritScope instead.
+    if (directive.childCan !== undefined) {
+      if (typeof directive.childCan !== 'function') {
+        throw new Error(`entity('${name}') inherit .can must be a function`);
+      }
+      assertGuarded(directive.childCan as (...args: unknown[]) => unknown, {
+        where: `entity('${name}') inherit .can`,
+      });
+    }
+    readScope = compileInheritScope(directive, {
+      where: `inherit on entity('${name}')`,
+      fields,
+      registry,
+      entityName: name,
+    });
   }
 
   // The harvested scope AST is retained (not just the SQL) so a child entity's

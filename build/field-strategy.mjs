@@ -677,7 +677,12 @@ function validateFieldValue(entityName        , key        , descriptor         
       `${entityName}.${key} is required and may not be cleared (set to null).`,
     );
   }
-  if (value === null && descriptor.nullable === true) return value;
+  // Absence (`undefined`) and explicit `null` are separate concepts. `optional`
+  // permits absence; only an explicit opt-in permits a client to write a NULL
+  // cell. `nullable: true` is that opt-in; `default: null` declares the field's
+  // materialized value IS null, so a client may reaffirm that value too. A plain
+  // optional scalar stays non-nullable (fail closed — see #237).
+  if (value === null && (descriptor.nullable === true || descriptor.default === null)) return value;
 
   const { validate } = resolveStrategy(descriptor.kind);
   const structural = validate(value, descriptor);

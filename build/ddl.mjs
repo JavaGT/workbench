@@ -82,6 +82,8 @@ const SUPPORTED_FIELD_TYPES                                      = Object.freeze
 
 
 
+
+
 function fieldsOf(entity           )                                                            {
   return entity.fields                                                             ;
 }
@@ -205,7 +207,25 @@ function declaredIndexes(entity           , unique         )                    
 }
 
 function uniqueIndexes(entity           )                                                     {
-  return declaredIndexes(entity, true);
+  // Composite unique indexes come from the `indexes` slot; single-column
+  // constraints (including field-level `unique: true`) come from `unique`.
+  // Both emit the same `CREATE UNIQUE INDEX IF NOT EXISTS` statement shape;
+  // dedupe by name so an author declaring the same constraint twice gets one
+  // index, not a duplicate generated-index claim at app assembly.
+  const seen = new Set        ();
+  const result                                                     = [];
+  const add = (fields                   ) => {
+    const name = `idx_${entity.name}_unique_${fields.join('_')}`;
+    const key = name.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    result.push({ name, fields });
+  };
+  for (const index of entity.indexes ?? []) {
+    if (index.unique === true) add(index.fields);
+  }
+  for (const fields of entity.unique ?? []) add(fields);
+  return result;
 }
 
 function nonUniqueIndexes(entity           )                                                     {

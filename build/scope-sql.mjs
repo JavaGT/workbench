@@ -102,7 +102,30 @@ export function makeNode(props                         )          {
 // the parent must be defined above the child. The directive is a plain frozen
 // record the entity compiler recognizes; it carries the parent's harvested scope
 // AST (so the child can re-lower it under a join alias) and the FK column name.
-export function inherit(parent         , { via }                    = {})                                     {
+//
+// Optional child refinement: `.where(predicate)` ANDs a child scope predicate
+// with the inherited parent EXISTS; `.can(fn)` intersects a child capability
+// body with the parent's capabilities. Both are chainable and return a NEW
+// frozen directive, so plain `inherit(Parent, { via })` is byte-for-byte the
+// same grant shape it always was (backwards compatible).
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+export function inherit(parent         , { via }                    = {})                {
   if (parent === undefined || parent === null || typeof parent !== 'object' || !(parent                      ).name) {
     throw new NonCompilableError(
       'inherit(Parent, { via }) requires the compiled parent entity object, ' +
@@ -114,7 +137,35 @@ export function inherit(parent         , { via }                    = {})       
       `inherit(${(parent                     ).name}, { via }) requires a 'via' FK column name (string).`,
     );
   }
-  return Object.freeze({ inherit: parent, via });
+
+  // Methods are NON-enumerable so spreading `data` inside a refinement never
+  // copies a method over the data field it is about to replace.
+  function makeHandle(data                  )                {
+    const handle = { ...data }                           ;
+    Object.defineProperties(handle, {
+      where: {
+        enumerable: false,
+        value(predicate                  )                {
+          if (typeof predicate !== 'function') {
+            throw new NonCompilableError('inherit(...).where() requires a scope predicate function');
+          }
+          return makeHandle({ ...data, childWhere: predicate });
+        },
+      },
+      can: {
+        enumerable: false,
+        value(fn            )                {
+          if (typeof fn !== 'function') {
+            throw new NonCompilableError('inherit(...).can() requires a capability function');
+          }
+          return makeHandle({ ...data, childCan: fn });
+        },
+      },
+    });
+    return Object.freeze(handle)                            ;
+  }
+
+  return makeHandle(Object.freeze({ inherit: parent, via }));
 }
 
 // ---- top-level combinators (imported by the developer) ----------------------
@@ -782,8 +833,13 @@ export function compileReadScope(
 // EXISTS over the parent's compiled scope AST, joined through the `via` FK. The
 // parent must carry its harvested scope AST (entity() stores it as `scopeAst`).
 export function compileInheritScope(
-  directive                                     ,
-  { where }                   ,
+  directive                  ,
+  { where, fields = {}, registry = {}, entityName }
+
+
+
+
+   ,
 )                    {
   const parent = directive.inherit                                        ;
   if (!parent.scopeAst) {
@@ -798,8 +854,26 @@ export function compileInheritScope(
     parentName: parent.name,
     parentAst: parent.scopeAst,
     via: directive.via,
-  });
-  return { ...lowerToSql(joinAst                      , { where }), ast: joinAst                       };
+  })                      ;
+
+  // A child refinement is a SECOND read restriction, never an alternative:
+  // harvest its predicate against the CHILD's own field/registry surface, then
+  // AND it with the inherited parent EXISTS in one AST. One lowered scope, one
+  // param space, one bindReadScope call — no second reconciliation path.
+  let ast = joinAst;
+  if (directive.childWhere !== undefined) {
+    if (typeof directive.childWhere !== 'function') {
+      throw new NonCompilableError('inherit(...).where() requires a scope predicate function', { where });
+    }
+    const childAst = harvest(directive.childWhere, {
+      fields,
+      where: `${where} child predicate`,
+      registry,
+      entityName,
+    });
+    ast = makeNode({ node: 'and', operands: [joinAst, childAst] });
+  }
+  return { ...lowerToSql(ast, { where }), ast };
 }
 
 // The request-time bridge: bind a principal into a compiled read-scope template.

@@ -17,6 +17,8 @@ export interface ClockRunnerOptions {
   intervalMs: number;
   fn: (now: number) => unknown;
   name: string;
+  /** Error sink shared by both driver paths. Defaults to a named system warning. */
+  onError?: ((err: unknown) => void) | null;
 }
 
 export interface RunnerHandle {
@@ -30,13 +32,38 @@ export interface RunnerHandle {
  * setTimeout with nearest-deadline scheduling). Otherwise starts its own
  * setInterval with `timer.unref()` so the test process exits without leaks.
  *
- * `fn` may be sync or async — errors are caught and logged identically either
- * way (the setInterval path uses an async wrapper; the clock path delegates to
- * the clock's own error swallowing).
+ * `fn` may be sync or async — errors are caught and forwarded to `onError`
+ * (or logged with the runner name) IDENTICALLY on both paths. The shared clock
+ * is not trusted to report errors: the runner wraps the callback itself, so a
+ * synchronous throw is never silently swallowed and an async rejection never
+ * escapes as an unhandled promise (#240).
  */
-export function createClockRunner({ clock, intervalMs, fn, name }: ClockRunnerOptions): RunnerHandle {
+export function createClockRunner({ clock, intervalMs, fn, name, onError }: ClockRunnerOptions): RunnerHandle {
+  const report = (err: unknown): void => {
+    if (typeof onError === 'function') onError(err);
+    else getLog().warn('system', `${name} tick failed`, { err });
+  };
+
   if (clock) {
-    const watcher = clock.add({ name, intervalMs, fn });
+    const watcher = clock.add({
+      name,
+      intervalMs,
+      fn(now: number): void {
+        let result: unknown;
+        try {
+          result = fn(now);
+        } catch (err) {
+          report(err);
+          return;
+        }
+        if (result !== null && typeof result === 'object' && typeof (result as { then?: unknown }).then === 'function') {
+          // Absorb the rejection after forwarding it: an unhandled rejection
+          // would escape the clock's own try/catch (which only covers sync
+          // throws) and surface without the runner's identity.
+          void Promise.resolve(result).then(undefined, report);
+        }
+      },
+    });
     return { stop() { watcher?.remove(); } };
   }
 
@@ -45,7 +72,7 @@ export function createClockRunner({ clock, intervalMs, fn, name }: ClockRunnerOp
       try {
         await fn(Date.now());
       } catch (err) {
-        getLog().warn('system', `${name} tick failed`, { err });
+        report(err);
       }
     })();
   }, intervalMs);

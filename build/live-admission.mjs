@@ -197,7 +197,11 @@ export async function authorizeSubscription(
     return { admitted: false, failure: failure('conflict', 'Too many subscriptions are active.') };
   }
   const collectionCount = fanout.collectionSubscriptionCount(conn);
-  if (isCollection && collectionCount >= MAX_COLLECTION_SUBS_PER_CONN) {
+  // A collection scope already held is a REPLACE, not a new subscription — the
+  // entity path already exempts same-scope replacement from its cap (above) and
+  // fan-out replaces in place. Direct-WS clients must not be forced to
+  // unsubscribe first just to refresh a rule at the cap (#253).
+  if (isCollection && collectionCount >= MAX_COLLECTION_SUBS_PER_CONN && !fanout.hasSubscription(conn, scope)) {
     return { admitted: false, failure: failure('conflict', 'Too many collection subscriptions are active.') };
   }
   if (!resolveEntity || !mayVerb || !db) {

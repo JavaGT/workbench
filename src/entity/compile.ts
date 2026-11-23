@@ -53,7 +53,7 @@ import { normalizeTierDeclaration } from '../live-tier.ts';
 // compiler owns, which silently drops the field (fail closed).
 const RESERVED_DECLARATION_SLOTS = new Set([
   'fields', 'grant', 'checks', 'routes', 'create', 'effects', 'admitsEffects',
-  'schedule', 'simulation', 'gate', 'on', 'membership', 'field', 'history', 'indexes',
+  'schedule', 'simulation', 'gate', 'on', 'membership', 'field', 'history', 'indexes', 'unique',
   'applicationHttpActions', 'live', 'tier',
 ]);
 const APPLICATION_HTTP_CRUD_VERBS = Object.freeze(['create', 'update', 'remove']);
@@ -74,7 +74,7 @@ function looksLikeFieldDescriptor(value: any) {
 export type ReservedDeclarationSlot =
   | 'fields' | 'grant' | 'checks' | 'routes' | 'create' | 'effects' | 'admitsEffects'
   | 'schedule' | 'simulation' | 'gate' | 'on' | 'membership' | 'field' | 'history'
-  | 'indexes' | 'applicationHttpActions' | 'live' | 'tier';
+  | 'indexes' | 'unique' | 'applicationHttpActions' | 'live' | 'tier';
 
 /** The row value one declared field descriptor projects: optional descriptors may be absent/null. */
 type DescriptorRowValue<Descriptor> = Descriptor extends { readonly __value?: infer Value; readonly __mode?: infer Mode }
@@ -127,7 +127,7 @@ export function entity<const Name extends string, const Declaration extends Reco
     }
   }
 
-  const { grant, checks: declaredChecksIn = {}, membership: membershipDecl, routes, create: createPolicy, effects = null, admitsEffects = null, schedule = {}, simulation = null, gate: declaredGate = {}, history: historyDecl, live: liveDecl, tier: tierDecl, indexes: indexesDecl, applicationHttpActions: declaredApplicationHttpActions } = decl;
+  const { grant, checks: declaredChecksIn = {}, membership: membershipDecl, routes, create: createPolicy, effects = null, admitsEffects = null, schedule = {}, simulation = null, gate: declaredGate = {}, history: historyDecl, live: liveDecl, tier: tierDecl, indexes: indexesDecl, unique: uniqueDecl, applicationHttpActions: declaredApplicationHttpActions } = decl;
   // S3/A1 — the tier declaration: `history`/`live`/`tier` normalize into a
   // resolved live-data tier (default `history`/full — zero behavior change for
   // existing declarations). Validation fails HERE at declaration compile, never
@@ -258,6 +258,19 @@ export function entity<const Name extends string, const Declaration extends Reco
     }
   }
 
+  // Index constraints may only name stored main-table columns. One validation
+  // authority for the composite `indexes` slot and the single-column `unique`
+  // slot — they converge on the same DDL seam (fail closed on either path).
+  function assertIndexableField(fieldName: any, where: string) {
+    const descriptor = fields[fieldName];
+    if (typeof fieldName !== 'string' || !descriptor || !(
+      descriptor.kind === 'value' || descriptor.kind === 'crdt' ||
+      descriptor.kind === 'hash' || descriptor.kind === 'state'
+    )) {
+      throw new Error(`entity('${name}') ${where} field '${fieldName}' must be a stored main-table field`);
+    }
+  }
+
   const indexes: any[] = [];
   if (indexesDecl !== undefined) {
     if (!Array.isArray(indexesDecl)) throw new Error(`entity('${name}') indexes must be an array`);
@@ -278,17 +291,44 @@ export function entity<const Name extends string, const Declaration extends Reco
         throw new Error(`entity('${name}') duplicate index declaration for fields [${index.fields.join(', ')}]`);
       }
       seenIndexes.add(fieldsKey);
-      for (const fieldName of index.fields) {
-        const descriptor = fields[fieldName];
-        if (!descriptor || !(
-          descriptor.kind === 'value' || descriptor.kind === 'crdt' ||
-          descriptor.kind === 'hash' || descriptor.kind === 'state'
-        )) {
-          throw new Error(`entity('${name}') index field '${fieldName}' must be a stored main-table field`);
-        }
-      }
+      for (const fieldName of index.fields) assertIndexableField(fieldName, 'index');
       indexes.push(Object.freeze({ fields: Object.freeze([...index.fields]), unique: index.unique }));
     }
+  }
+
+  // Single-column UNIQUE constraints. Two equivalent declaration forms, one
+  // normalized representation (`unique` on the compiled record) consumed by the
+  // DDL generator:
+  //   unique: ['email']            — one constraint per named field
+  //   unique: [['tenant', 'email']] — one constraint per tuple (a 1-tuple is
+  //                                  the explicit spelling of a single column)
+  // Field-level `unique: true` is normalized into the same list. The explicit
+  // `indexes` slot keeps its composite-only contract unchanged.
+  const unique: string[][] = [];
+  const seenUnique = new Set<string>(indexes.filter((index) => index.unique).map((index) => [...index.fields].sort().join('\u0000')));
+  const addUnique = (fieldNames: any, where: string) => {
+    if (!Array.isArray(fieldNames) || fieldNames.length === 0 || fieldNames.some((fieldName) => typeof fieldName !== 'string')) {
+      throw new Error(`entity('${name}') ${where} must be a non-empty array of field names (or an array of such arrays)`);
+    }
+    if (new Set(fieldNames).size !== fieldNames.length) {
+      throw new Error(`entity('${name}') ${where} must not contain duplicate fields`);
+    }
+    for (const fieldName of fieldNames) assertIndexableField(fieldName, 'unique');
+    const key = [...fieldNames].sort().join('\u0000');
+    if (seenUnique.has(key)) return;
+    seenUnique.add(key);
+    unique.push([...fieldNames]);
+  };
+  if (uniqueDecl !== undefined) {
+    if (!Array.isArray(uniqueDecl) || uniqueDecl.length === 0) {
+      throw new Error(`entity('${name}') unique must be a non-empty array of field names`);
+    }
+    for (const entry of uniqueDecl) {
+      addUnique(typeof entry === 'string' ? [entry] : entry, 'unique');
+    }
+  }
+  for (const [fieldName, descriptor] of Object.entries(fields)) {
+    if (descriptor?.unique === true) addUnique([fieldName], `field '${fieldName}' unique`);
   }
 
   const annotatedOwningRefs = new Set(Object.values(fields)
@@ -496,6 +536,7 @@ export function entity<const Name extends string, const Declaration extends Reco
     tier: resolvedTier.tier,
     historyMode: resolvedTier.historyMode,
     indexes: Object.freeze(indexes),
+    unique: Object.freeze(unique.map((fieldNames) => Object.freeze(fieldNames))),
   };
 
   const sideTableStrategyEntries = collectSideTableStrategies(fields);

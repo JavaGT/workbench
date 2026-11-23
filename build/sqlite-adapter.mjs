@@ -14,7 +14,12 @@
 // and a teardown that removes ONLY the db file, -wal/-shm, and lock sidecar —
 // backups/, quarantine/, and recycle/ are owned by S1/A3/A4/A6 and survive.
 
-import { backup, DatabaseSync } from 'node:sqlite';
+import {
+  backupDatabase,
+  openSqliteDatabase,
+
+
+} from './sqlite-driver.mjs';
 import { chmodSync, mkdirSync, realpathSync, rmSync, statSync } from 'node:fs';
 import path from 'node:path';
 import {
@@ -85,11 +90,6 @@ export const WAL_GUARD_SIZE_THRESHOLD_BYTES = 8 * 1024 * 1024;
 
 
 
-
-
-
-
-
                                                                       
 
 
@@ -136,9 +136,9 @@ export function openSqliteAdapter(config                  = {})                 
   const dbFile = path.join(root, SQLITE_DATA_FILENAME);
   const lock = acquireDirectoryLock(path.join(root, SQLITE_LOCK_FILENAME));
 
-  let db              ;
+  let db                ;
   try {
-    db = new DatabaseSync(dbFile);
+    db = openSqliteDatabase(dbFile);
   } catch (err) {
     lock.release();
     throw err;
@@ -164,7 +164,7 @@ export function openSqliteAdapter(config                  = {})                 
 }
 
 export function openMemoryAdapter()                       {
-  const db = new DatabaseSync(':memory:');
+  const db = openSqliteDatabase(':memory:');
   try {
     applyConnectionPragmas(db);
     quickCheck(db);
@@ -241,7 +241,7 @@ function ensurePrivateDirectory(dir        )       {
 // Fail-closed integrity gate at open. A fresh or healthy database answers the
 // quick scan with a single 'ok' row; any other answer means the file is
 // corrupt and the open must not proceed.
-function quickCheck(db              )       {
+function quickCheck(db                )       {
   const row = db.prepare('PRAGMA quick_check').get()                                        ;
   if (!row || row.quick_check !== 'ok') {
     throw new Error('database failed quick_check integrity verification at open');
@@ -255,7 +255,7 @@ function quickCheck(db              )       {
 // no retry loop. The checkpoint runs with busy_timeout 0 so a pinned WAL can
 // never stall the shared connection's event loop (driver.ts). Best-effort by
 // design: a guard tick must never crash its host.
-function walGuardTick(db              , walFile        )       {
+function walGuardTick(db                , walFile        )       {
   let walBytes        ;
   try {
     walBytes = statSync(walFile).size;
@@ -301,7 +301,7 @@ function isUnderRoot(realRoot               , p        )          {
 }
 
 function makeOpenedSqliteDatabase(
-  db              ,
+  db                ,
   lock                      ,
   root               ,
   mode                   ,
@@ -325,12 +325,11 @@ function makeOpenedSqliteDatabase(
 
   // Online WAL-safe snapshot (S1/A3) — additive wiring only. The S1/A3 backup
   // manager runs this inside its single write-coordinator turn (the capture
-  // barrier); the hook itself is a plain node:sqlite backup() call, never a
-  // raw main-file copy, and works for file and memory sources alike. An
-  // explicit `options: undefined` would be refused by node:sqlite, so the
-  // third argument is passed only when the caller supplied options.
+  // barrier); the hook delegates to the cross-runtime sqlite driver (node:sqlite
+  // backup() on Node, VACUUM INTO on Bun), never a raw main-file copy, and works
+  // for file and memory sources alike.
   const backupTo = (destPath        , options                      )                  =>
-    options === undefined ? backup(db, destPath) : backup(db, destPath, options);
+    backupDatabase(db, destPath, options);
 
   // Starvation-guard wiring (scope#2727): one interval, file mode only (memory
   // has no -wal sidecar). unref'd so a maintenance timer never holds the

@@ -117,6 +117,13 @@ interface WorkbenchOptions {
   blobLifecycle?: unknown;
   blobRecycle?: { root: string };
   annotatedTextAdmission?: import('./annotated-text-admission.ts').AnnotatedTextAdmissionDeclaration;
+  /**
+   * Run full per-table `PRAGMA integrity_check(table)` over every settled
+   * census relation during cold boot. Defaults to `false` to avoid O(DB size)
+   * full-table scans on every startup; `PRAGMA foreign_key_check` and the
+   * adapter's fail-closed `PRAGMA quick_check` at open still run by default.
+   */
+  verifyIntegrityOnBoot?: boolean;
 }
 
 type PublicWorkbenchOptionsAreCovered = Exclude<keyof PublicWorkbenchOptions, keyof WorkbenchOptions> extends never ? true : false;
@@ -314,6 +321,7 @@ export default function workbench({
   blobLifecycle,
   blobRecycle,
   annotatedTextAdmission,
+  verifyIntegrityOnBoot = false,
 }: WorkbenchOptions = {}) {
   // envGate (cso #15): fail-closed at app construction — required env vars must be set.
   for (const v of requireEnv) {
@@ -429,15 +437,23 @@ export default function workbench({
       }
       db = db.handle;
     } else if (db && typeof (db as unknown as { location?: unknown }).location === 'function') {
-      // A raw DatabaseSync handle: classify memory vs file by its location()
-      // (:memory: → null). A raw FILE handle has no adapter-owned directory, so
-      // the default root sits beside the db file (a relative location makes that
-      // dirname cwd-relative). A raw MEMORY handle keeps only an explicit
-      // blobs.root (blobRoot is already null otherwise) — the in-memory fake
-      // byte store (S6/A1).
+      // A raw DatabaseSync / SqliteDatabase handle: classify memory vs file by
+      // its location() (:memory: → null). A raw FILE handle has no adapter-owned
+      // directory, so the default root sits beside the db file (a relative
+      // location makes that dirname cwd-relative). A raw MEMORY handle keeps
+      // only an explicit blobs.root (blobRoot is already null otherwise) — the
+      // in-memory fake byte store (S6/A1).
       const location = (db as unknown as { location(): string | null }).location();
-      if (location != null) {
+      if (location != null && location !== '' && location !== ':memory:' && !location.startsWith('file::memory:')) {
         const owned = path.dirname(location);
+        blobRoot = resolveBlobRoot(owned, explicitBlobRoot);
+        blobStagingRoot = managedStagingRoot(owned, explicitBlobRoot);
+      }
+    } else if (db && typeof (db as unknown as { filename?: unknown }).filename === 'string') {
+      // A raw bun:sqlite Database handle exposes `.filename` rather than `.location()`.
+      const filename = (db as unknown as { filename: string }).filename;
+      if (filename !== '' && filename !== ':memory:' && !filename.startsWith('file::memory:')) {
+        const owned = path.dirname(filename);
         blobRoot = resolveBlobRoot(owned, explicitBlobRoot);
         blobStagingRoot = managedStagingRoot(owned, explicitBlobRoot);
       }
@@ -1093,21 +1109,23 @@ export default function workbench({
             const violation = foreignKeyErrors[0] as Record<string, unknown>;
               throw new Error(`${ownerDescription(settledCensus, String(violation.table))} has a foreign key violation`);
           }
-          // The global PRAGMA output names pages rather than schema objects. Run
-          // it once per census relation so a failure always has its declared
-          // owner, without exposing table data in the diagnostic. A declared
-          // but not-yet-materialized object (a lazily created operational ledger,
-          // e.g. _DerivedResource with no registered derived resources) is not
-          // present and has nothing to check — skip it, exactly like the census
-          // skips objects that predate the boot.
-          const presentObjects = new Set(observedSchemaObjects(app.db).map(schemaObjectKey));
-          for (const entry of settledCensus.values()) {
-            if (entry.objectKind !== 'table' && entry.objectKind !== 'virtual-table') continue;
-            if (!presentObjects.has(schemaObjectKey({ type: entry.objectKind, name: entry.name }))) continue;
-            const findings = app.db.prepare(`PRAGMA integrity_check(${quotedSqlLiteral(entry.name)})`).all()
-              .flatMap((row: Record<string, unknown>) => Object.values(row).filter((value): value is string => typeof value === 'string' && value !== 'ok'));
-            if (findings.length > 0) {
-              throw new Error(`${ownerDescription(settledOwnership.census, entry.name, entry.objectKind)} failed SQLite integrity_check: ${findings[0]}`);
+          // Full per-table `PRAGMA integrity_check(table)` is O(DB size) and
+          // therefore opt-in on cold boot (`verifyIntegrityOnBoot: true`); the
+          // fast `PRAGMA foreign_key_check` above and the adapter's fail-closed
+          // `PRAGMA quick_check` at open still run by default. When enabled, run
+          // it once per census relation so a failure always names its declared
+          // owner without exposing table data, skipping lazily created tables
+          // that have not been materialized yet.
+          if (verifyIntegrityOnBoot) {
+            const presentObjects = new Set(observedSchemaObjects(app.db).map(schemaObjectKey));
+            for (const entry of settledCensus.values()) {
+              if (entry.objectKind !== 'table' && entry.objectKind !== 'virtual-table') continue;
+              if (!presentObjects.has(schemaObjectKey({ type: entry.objectKind, name: entry.name }))) continue;
+              const findings = app.db.prepare(`PRAGMA integrity_check(${quotedSqlLiteral(entry.name)})`).all()
+                .flatMap((row: Record<string, unknown>) => Object.values(row).filter((value): value is string => typeof value === 'string' && value !== 'ok'));
+              if (findings.length > 0) {
+                throw new Error(`${ownerDescription(settledOwnership.census, entry.name, entry.objectKind)} failed SQLite integrity_check: ${findings[0]}`);
+              }
             }
           }
           return app;

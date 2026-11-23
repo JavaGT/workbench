@@ -18,7 +18,7 @@
 // the rejection is enforced, not merely documented. The mirror never exposes
 // write authority or a write path — no txn/begin/commit/upsert surface.
 
-import { DatabaseSync, type StatementSync } from 'node:sqlite';
+import { openSqliteDatabase, type SqliteStatement } from './sqlite-driver.ts';
 import type { ReadMirrorDescription } from './db-adapter.ts';
 
 export type ReadMirrorStatementKind = 'read' | 'write' | 'ddl' | 'pragma' | 'transaction' | 'refuse';
@@ -236,7 +236,7 @@ function assertReadOnlyStatement(sql: string): void {
 // `mode=ro` connectionString directly (a consumer that bypasses the rejector
 // is still read-only at the engine).
 export type ReadMirrorHandle = {
-  prepare(sql: string): StatementSync;
+  prepare(sql: string): SqliteStatement;
   exec(sql: string): unknown;
   close(): void;
 };
@@ -253,10 +253,10 @@ export function openReadMirror(description: ReadMirrorDescription): ReadMirrorHa
   // Engine layer 1: mode=ro via the connectionString plus the readOnly option.
   // Engine layer 2: query_only pins the connection so even a statement the
   // rejector does not recognize cannot write.
-  const raw = new DatabaseSync(description.connectionString, { readOnly: true });
+  const raw = openSqliteDatabase(description.connectionString, { readOnly: true });
   raw.exec('PRAGMA query_only = ON');
   const handle: ReadMirrorHandle = {
-    prepare(sql: string): StatementSync {
+    prepare(sql: string): SqliteStatement {
       assertReadOnlyStatement(sql);
       return raw.prepare(sql);
     },

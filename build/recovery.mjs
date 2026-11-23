@@ -63,7 +63,7 @@
 // the target's blob layout before the census runs, or the census would see
 // missing bytes (fresh target) or stale bytes (live restore).
 
-import { DatabaseSync } from 'node:sqlite';
+import { openSqliteDatabase,                     } from './sqlite-driver.mjs';
 import { createHash, randomBytes } from 'node:crypto';
 import {
   chmodSync,
@@ -366,9 +366,9 @@ export function probeDatabaseFile(dbFilePath        )                      {
   if (!existsSync(dbFilePath)) {
     return { ok: true, checkedAt: new Date().toISOString() };
   }
-  let db              ;
+  let db                ;
   try {
-    db = new DatabaseSync(dbFilePath);
+    db = openSqliteDatabase(dbFilePath);
   } catch (err) {
     return { ok: false, reason: 'the database file could not be opened — it is corrupt or damaged', findings: [sanitizeError(err)] };
   }
@@ -636,9 +636,9 @@ export function createRecoveryManager(options                        )          
     if (shapeFailures.length > 0) return { ok: false, failures: shapeFailures };
 
     const failures           = [];
-    let db              ;
+    let db                ;
     try {
-      db = new DatabaseSync(snapshotPath);
+      db = openSqliteDatabase(snapshotPath);
     } catch (err) {
       return { ok: false, failures: [`backup snapshot could not be opened: ${sanitizeError(err)}`] };
     }
@@ -1023,9 +1023,9 @@ export function createRecoveryManager(options                        )          
 
   function schemaCensusOf(dbFilePath        , manifest                )                           {
     const findings           = [];
-    let db              ;
+    let db                ;
     try {
-      db = new DatabaseSync(dbFilePath);
+      db = openSqliteDatabase(dbFilePath);
     } catch (err) {
       return { ok: false, findings: [`restored database could not be opened: ${sanitizeError(err)}`] };
     }
@@ -1072,9 +1072,9 @@ export function createRecoveryManager(options                        )          
   }
 
   function quickCheckFile(filePath        )                                               {
-    let db              ;
+    let db                ;
     try {
-      db = new DatabaseSync(filePath);
+      db = openSqliteDatabase(filePath);
     } catch (err) {
       return { ok: false, reason: sanitizeError(err) };
     }
@@ -1300,7 +1300,7 @@ export function createRecoveryManager(options                        )          
 // The SAME quick_check report the backup side records in the manifest
 // (backup.ts quickCheckOf) — the faithful recompute comparison for
 // integrityResult (review #83).
-function quickCheckOf(db              )                  {
+function quickCheckOf(db                )                  {
   try {
     const rows = db.prepare('PRAGMA quick_check').all()                                  ;
     const findings                     = [];
@@ -1373,7 +1373,7 @@ function verifyRestoreMaterialization(
   return { ok: true };
 }
 
-function integrityCheckOf(db              )                  {
+function integrityCheckOf(db                )                  {
   try {
     const rows = db.prepare('PRAGMA integrity_check').all()                                      ;
     const findings                     = [];
@@ -1395,7 +1395,7 @@ function integrityCheckOf(db              )                  {
 // Recompute the schema identity exactly the way the backup manager derived it
 // when the manifest was written (backup.ts schemaIdentityOf): one fingerprint
 // over every framework-owned table present, one per remaining app table.
-function schemaIdentityOf(db              )                                                                  {
+function schemaIdentityOf(db                )                                                                  {
   const rows = db
     .prepare("SELECT name, sql FROM sqlite_master WHERE type = 'table' AND sql IS NOT NULL")
     .all()                                        ;
@@ -1415,7 +1415,7 @@ function schemaIdentityOf(db              )                                     
 // #83): the manifest is untrusted input and this name is interpolated into
 // SQL, so the ONE DECLARED ledger table name is enforced before any statement
 // is built — a manifest-chosen table is a validation failure, never SQL.
-function migrationLedgerOf(db              , manifest                )                             {
+function migrationLedgerOf(db                , manifest                )                             {
   const declaredTable = manifest.migrationLedgerState?.table ?? MIGRATION_LEDGER;
   if (declaredTable !== MIGRATION_LEDGER) {
     throw new Error(

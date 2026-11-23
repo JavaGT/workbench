@@ -18,7 +18,7 @@
 // A PID-file-only design is explicitly rejected here (stale PID files on crash
 // require probing to recover); the held transaction needs no recovery.
 
-import { DatabaseSync } from 'node:sqlite';
+import { openSqliteDatabase } from './sqlite-driver.ts';
 
 export const DB_OWNED_ERROR_CODE = 'WB_DB_OWNED';
 
@@ -48,9 +48,12 @@ export interface DirectoryLock {
 // and propagates unchanged.
 function isContentionError(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
-  const sqlite = err as { code?: unknown; errcode?: unknown };
+  const sqlite = err as { code?: unknown; errcode?: unknown; errno?: unknown };
   if (typeof sqlite.errcode === 'number') {
     if (sqlite.errcode === 5 || sqlite.errcode === 6) return true;
+  }
+  if (typeof sqlite.errno === 'number') {
+    if (sqlite.errno === 5 || sqlite.errno === 6) return true;
   }
   if (sqlite.code === 'SQLITE_BUSY' || sqlite.code === 'SQLITE_LOCKED') return true;
   return /database is (locked|busy)/i.test(err.message);
@@ -61,7 +64,7 @@ function isContentionError(err: unknown): boolean {
 // EXCLUSIVE transaction for the process lifetime. Throws DirectoryOwnedError
 // when another live process already owns the directory.
 export function acquireDirectoryLock(lockFile: string): DirectoryLock {
-  const db = new DatabaseSync(lockFile);
+  const db = openSqliteDatabase(lockFile);
   const pid = process.pid;
   const startedAt = new Date().toISOString();
   try {

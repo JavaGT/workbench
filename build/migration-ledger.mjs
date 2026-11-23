@@ -32,6 +32,7 @@
 
 import { createHash } from 'node:crypto';
 import { begin, commit, rollback, exclusiveTxn,               } from './driver.mjs';
+import { getLog } from './log.mjs';
 import { foldedMigrationNamespace, migrationIdentityKey } from './migration-identity.mjs';
 
 export const MIGRATION_LEDGER_TABLE = '_SchemaMigration';
@@ -164,13 +165,27 @@ export function isReservedNamespace(namespace        )          {
 }
 
 /**
- * Immutable fingerprint of a migration's canonical source: its declared
- * identity plus the literal `up` function source. A migration that declares an
- * explicit `checksum` uses it verbatim (a bundler or transpiler that rewrites
- * function source can pin a stable fingerprint instead).
+ * Immutable fingerprint of a migration's canonical source.
+ *
+ * Prefer declaring an explicit `checksum` on every migration (e.g. a SHA-256
+ * of canonical SQL or a pinned content identifier): when `checksum` is omitted,
+ * this falls back to hashing `migration.up.toString()`, which can differ
+ * across runtimes (Node/V8 vs Bun/JavaScriptCore) or bundlers/minifiers.
  */
 export function checksumOf(migration           )         {
-  if (migration.checksum) return migration.checksum;
+  if (migration.checksum !== undefined) {
+    if (typeof migration.checksum !== 'string' || migration.checksum.trim().length === 0) {
+      throw new Error(
+        `migration "${migration.namespace}@${migration.version}" (${migration.name}) checksum must be a non-empty string`,
+      );
+    }
+    return migration.checksum;
+  }
+  getLog().debug(
+    'system',
+    'migration omits explicit checksum; falling back to Function.prototype.toString() (pin `checksum` for cross-runtime/bundler stability)',
+    { namespace: migration.namespace, version: migration.version, name: migration.name },
+  );
   return sha256hex(
     [migration.namespace, migration.name, String(migration.version), migration.up.toString()].join('\u0000'),
   );
@@ -267,6 +282,12 @@ export function validateMigrations(
     }
     if (typeof migration.up !== 'function') {
       throw new Error(`migration ${migration.namespace}@${migration.version} must declare an up function`);
+    }
+    if (
+      migration.checksum !== undefined
+      && (typeof migration.checksum !== 'string' || migration.checksum.trim().length === 0)
+    ) {
+      throw new Error(`migration "${migration.namespace}@${migration.version}" checksum must be a non-empty string`);
     }
 
     const identity = migrationIdentityKey(migration.namespace, migration.version);

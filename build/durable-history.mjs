@@ -552,7 +552,21 @@ export function createDurableHistoryRuntime({
           principal: args.principal,
         });
       }
-      const retried                                                                                  = { ok: true, deduped: true, events: Object.freeze(eventsFromReceipt(db, retry, parseEventType)) };
+      // A retried move must carry the same receipt the HTTP skin reconciles
+      // against, including the benign empty ($history.empty) no-op (#230). Prefer
+      // the confirmed-through stored with the original receipt.
+      const storedResult = retry.resultData && typeof retry.resultData === 'object'
+        ? retry.resultData
+        : null;
+      const confirmedThrough = storedResult && Number.isSafeInteger(storedResult.confirmedThrough)
+        ? storedResult.confirmedThrough
+        : readSeq(db, key.scope);
+      const retried                                                                                                                                                        = {
+        ok: true,
+        deduped: true,
+        events: Object.freeze(eventsFromReceipt(db, retry, parseEventType)),
+        resultData: Object.freeze({ actionId: retry.actionId, confirmedThrough }),
+      };
       if (retry.actionType === '$history.empty') retried.empty = true;
       return Object.freeze(retried);
     }
@@ -566,16 +580,22 @@ export function createDurableHistoryRuntime({
     const targetId = targetFrame?.headActionId;
     if (!targetFrame) {
       const now = new Date().toISOString();
+      // A no-op move still commits a $history.empty receipt. Give it the same
+      // { actionId, confirmedThrough } result every other receipt carries so the
+      // HTTP skin can answer "nothing to undo" with a clean 200 instead of a 500
+      // 'Action receipt is unavailable' (#230).
+      const confirmedThrough = readSeq(db, key.scope);
+      const resultData = Object.freeze({ actionId: operationId, confirmedThrough });
       await txn(db, async () => {
         await admitted(historyDescriptor, { operation, scope: key.scope, session: args.session, principal: args.principal });
         const current = currentCursor(db, key);
         if (!sameCursor(current, expected)) throw conflict('history cursor changed during dispatch');
         insertReceipt(db, key.scope, operationId, now, [], {
           actionType: '$history.empty', actionData: { version: 1 }, principalKey: key.principalKey,
-          sessionId: key.sessionId, operation,
+          sessionId: key.sessionId, operation, resultData,
         });
       });
-      return Object.freeze({ ok: true, deduped: false, events: [], empty: true });
+      return Object.freeze({ ok: true, deduped: false, events: [], empty: true, resultData });
     }
     const originReceipt = receiptFor(db, key.scope, targetFrame.rootActionId);
     const receipt = receiptFor(db, key.scope, targetId ?? '');
@@ -740,15 +760,18 @@ export function createDurableHistoryRuntime({
     }
     if (sourceActionIds.length === 0) {
       const now = new Date().toISOString();
+      // Same clean no-op receipt contract as an ordinary empty move (#230).
+      const confirmedThrough = readSeq(db, key.scope);
+      const resultData = Object.freeze({ actionId: operationId, confirmedThrough });
       await txn(db, async () => {
         await admitted(historyDescriptor, { operation: 'undo', scope: key.scope, session: args.session, principal: args.principal });
         if (!sameCursor(currentCursor(db, key), expected)) throw conflict('history cursor changed during dispatch');
         insertReceipt(db, key.scope, operationId, now, [], {
           actionType: '$history.empty', actionData: { version: 1, boundarySeq: seq, sourceActionIds }, principalKey: key.principalKey,
-          sessionId: key.sessionId, operation: 'undoToPoint',
+          sessionId: key.sessionId, operation: 'undoToPoint', resultData,
         });
       });
-      return Object.freeze({ ok: true, deduped: false, events: [], empty: true });
+      return Object.freeze({ ok: true, deduped: false, events: [], empty: true, resultData });
     }
     const translated                     = [];
     for (const sourceActionId of sourceActionIds) {

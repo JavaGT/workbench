@@ -251,6 +251,27 @@ test('annotated editor preserves the caret across a compatible foreign fold whil
   harness.binding.close();
 });
 
+test('annotated editor keeps the caret after a remote insert rebases a pending draft (#250)', async () => {
+  const harness = setup('abc');
+  harness.select(1);
+  harness.beforeinput('insertText', 'X');
+  assert.equal(harness.element.textContent, 'aXbc');
+  assert.deepEqual(harness.binding.getSelection(), {
+    from: { offset: 2, affinity: 'right' },
+    to: { offset: 2, affinity: 'right' },
+  });
+  // A remote insert lands at the same position, before the locally-typed text.
+  // The rebase must project the caret through the inserted run so it stays after
+  // 'X', rather than landing short by the draft's pending insertion.
+  harness.publish(visible('aZbc'));
+  assert.equal(harness.element.textContent, 'aZXbc');
+  assert.deepEqual(harness.binding.getSelection(), {
+    from: { offset: 3, affinity: 'right' },
+    to: { offset: 3, affinity: 'right' },
+  });
+  harness.binding.close();
+});
+
 test('annotated editor preserves later typing while the preceding replacement settles', async () => {
   const harness = setup('a');
   const settlements = [];

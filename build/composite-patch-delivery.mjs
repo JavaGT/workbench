@@ -9,7 +9,7 @@
 import { tryParseScopeKey } from './scope-handle.mjs';
 
 import { readSeq } from './committed-log.mjs';
-import { currentCompositeSeq, minCompositeSeq, readCompositeChangesSince, readDeclarationWideChangesSince } from './composite-journal.mjs';
+import { currentCompositeSeq, currentDeclarationWideSeq, minCompositeSeq, readCompositeChangesSince, readDeclarationWideChangesSince } from './composite-journal.mjs';
 import { compilePatchPlans } from './composite-patch-plan.mjs';
 
                                                                                                  import { createProjectionLedger } from './projection-token.mjs';
@@ -56,6 +56,9 @@ const COMPOSITE_PATCH_MAX_CHANGES = 500;
 const COMPOSITE_PATCH_ATTEMPTS = 3;
 // Sustained-failure threshold before the backpressure warning fires.
 const COMPOSITE_PATCH_BACKPRESSURE_THRESHOLD = 10;
+// Bounded alongside projection-token.ts's default ledger capacity so token
+// wide-change watermarks never leak across eviction cycles.
+const COMPOSITE_PATCH_MAX_WIDE_SEQ_ENTRIES = 5_000;
 
 export function createCompositePatchDelivery({ db, composites, mayVerb, authorization, includeActionId }                               )                                {
   const compiled = [...composites.entries()]                            ;
@@ -79,6 +82,8 @@ export class CompositePatchDelivery {
   /** Consecutive fallback outcomes — reset on any successful projection. */
           fallbackStreak = 0;
           backpressureWarned = false;
+  /** Declaration-wide invalidation watermark captured for each minted token (#282). */
+                   wideSeqByToken = new Map                ();
 
   constructor(db          , composites                              , plans                                      , ledger                  , mayVerb         , authorization         , includeActionId         , maxCatchupChanges = COMPOSITE_PATCH_MAX_CHANGES) {
     this.db = db;
@@ -89,6 +94,14 @@ export class CompositePatchDelivery {
     this.authorization = authorization;
     this.includeActionId = includeActionId;
     this.maxCatchupChanges = maxCatchupChanges;
+  }
+
+          recordWideSeq(token        , wideSeq        )       {
+    this.wideSeqByToken.delete(token);
+    this.wideSeqByToken.set(token, wideSeq);
+    while (this.wideSeqByToken.size > COMPOSITE_PATCH_MAX_WIDE_SEQ_ENTRIES) {
+      this.wideSeqByToken.delete(this.wideSeqByToken.keys().next().value          );
+    }
   }
 
   planFor(scopeHandle             )                         {
@@ -117,8 +130,10 @@ export class CompositePatchDelivery {
     // itself — one walk against the plan (#157); the patch lane updates both
     // incrementally afterwards, so bootstrap is their only full derivation.
     const { visible, addresses } = deriveVisibilityExtendedExport(plan, snapshotValue);
+    const wideSeq = currentDeclarationWideSeq(this.db);
     const cursor                    = Object.freeze({ anchor: anchorCursor, composite: currentCompositeSeq(this.db, scope) });
     const { projectionToken } = this.ledger.register({ principal, scope, planVersion: plan.version, cursor, visible, addresses });
+    this.recordWideSeq(projectionToken, wideSeq);
     return {
       kind: 'snapshot',
       snapshot: snapshotValue,
@@ -155,15 +170,14 @@ export class CompositePatchDelivery {
     });
     if (!entry) return { kind: 'snapshot-fallback', reason: 'projection-token-missing-or-mismatched' };
 
-    // The effective journal head for this recipient is the MAX of its scope's
-    // own sequence and the declaration-wide invalidation sequence (FIX 2):
-    // a wide invalidation must pull every lagging recipient into recovery even
-    // though their own scope counter did not move. Because the two sequences
-    // are independent counters, presence (not magnitude) is what matters: ANY
-    // declaration-wide invalidating entry forces this catch-up to snapshot —
-    // invalidations are rare, so the conservative cost is one resnapshot per
-    // invalidation event across subscribers.
-    const wideChanges = readDeclarationWideChangesSince(this.db, plan.declaration, 0);
+    // Declaration-wide invalidation watermark (#282): each registered token
+    // records the global wide-change sequence absorbed by its bootstrap or
+    // prior patch. Only declaration-wide invalidations strictly AFTER that
+    // watermark force a fallback snapshot; once one fallback bootstrap absorbs
+    // the wide change, subsequent catch-ups resume incremental snapshot-patch/v1
+    // delivery instead of falling back permanently until retention pruning.
+    const afterWideSeq = this.wideSeqByToken.get(entry.token) ?? 0;
+    const wideChanges = readDeclarationWideChangesSince(this.db, plan.declaration, afterWideSeq);
     if (wideChanges.length > 0) {
       return { kind: 'snapshot-fallback', reason: 'declaration-wide-invalidation' };
     }
@@ -173,14 +187,11 @@ export class CompositePatchDelivery {
       return { kind: 'catchup', envelopes: [], cursor: input.after };
     }
     // Bounded read (cross-exam 7): one row beyond the budget proves overflow.
-    // Declaration-wide invalidating entries (scope '') apply to EVERY scope of
-    // this declaration and must be merged into the slice.
-    const changes = [
-      ...readCompositeChangesSince(this.db, input.scope, input.after.composite, this.maxCatchupChanges + 1),
-      ...readDeclarationWideChangesSince(this.db, plan.declaration, input.after.composite),
-    ].sort((left, right) => left.seq - right.seq);
-    const scopedChanges = changes.filter((change) => change.scope === input.scope);
-    if (scopedChanges.length > this.maxCatchupChanges) {
+    // Declaration-wide invalidations were already checked on their own
+    // monotonic wide-seq axis above — do not compare them against the
+    // independent per-scope composite sequence.
+    const changes = readCompositeChangesSince(this.db, input.scope, input.after.composite, this.maxCatchupChanges + 1);
+    if (changes.length > this.maxCatchupChanges) {
       return { kind: 'snapshot-fallback', reason: 'catchup-budget-exceeded' };
     }
     // Internal contiguity (FIX 4): a retained slice with INTERNAL holes
@@ -188,7 +199,7 @@ export class CompositePatchDelivery {
     // gap. Every returned scoped seq must equal previous + 1 starting at the
     // cursor.
     let expected = input.after.composite + 1;
-    for (const change of scopedChanges) {
+    for (const change of changes) {
       if (change.seq !== expected) {
         return { kind: 'snapshot-fallback', reason: 'journal-gap' };
       }
@@ -208,6 +219,7 @@ export class CompositePatchDelivery {
     let projection                         = null;
     let lastError          = null;
     let capturedAnchorFence = input.after.anchor;
+    let capturedWideSeq = afterWideSeq;
     for (let attempt = 0; attempt < COMPOSITE_PATCH_ATTEMPTS; attempt += 1) {
       try {
         const declaration = this.composites.get(handle.entity) ;
@@ -218,7 +230,12 @@ export class CompositePatchDelivery {
         // further. The projector re-reads the fence after projection; any
         // movement throws into the retry below.
         const anchorFenceBeforeCapture = readSeq(this.db, input.scope);
+        const wideSeqBeforeCapture = Math.max(afterWideSeq, currentDeclarationWideSeq(this.db));
+        if (readDeclarationWideChangesSince(this.db, plan.declaration, afterWideSeq).length > 0) {
+          return { kind: 'snapshot-fallback', reason: 'declaration-wide-invalidation' };
+        }
         capturedAnchorFence = anchorFenceBeforeCapture;
+        capturedWideSeq = wideSeqBeforeCapture;
         projection = await projectCompositePatch({
           db: this.db,
           principal: input.principal,
@@ -236,6 +253,12 @@ export class CompositePatchDelivery {
           readCompositeSeq: () => currentCompositeSeq(this.db, input.scope),
           readAnchorSeq: () => readSeq(this.db, input.scope),
         });
+        // Re-check for any declaration-wide invalidation that committed while
+        // projection awaited authorization so we never advance wideSeq past an
+        // unabsorbed invalidation.
+        if (readDeclarationWideChangesSince(this.db, plan.declaration, afterWideSeq).length > 0) {
+          return { kind: 'snapshot-fallback', reason: 'declaration-wide-invalidation' };
+        }
         if (projection.revokedAnchor === false && projection.operations.length >= 0 && input.after.composite > toComposite) {
           throw new Error('journal moved during patch projection');
         }
@@ -272,6 +295,7 @@ export class CompositePatchDelivery {
         visible: projection.visibleAfter,
         addresses: projection.addressesAfter,
       });
+      this.recordWideSeq(projectionToken, capturedWideSeq);
       const envelope                           = {
         type: 'snapshot-patch',
         protocol: 'snapshot-patch/v1',
@@ -292,6 +316,7 @@ export class CompositePatchDelivery {
 
   close()       {
     this.ledger.clear();
+    this.wideSeqByToken.clear();
   }
 }
 

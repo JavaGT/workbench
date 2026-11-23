@@ -16,7 +16,7 @@ import { invalidationRecovery } from './invalidation-ledger.ts';
 import { readSnapshotTxn } from './driver.ts';
 import { compileSnapshots, captureSnapshot, authorizeSnapshot, projectSnapshot } from './snapshot-projection.ts';
 import { compilePatchPlans } from './composite-patch-plan.ts';
-import type { AnchorPatchPlan } from './composite-patch-plan.ts';
+import type { AnchorPatchPlan, PatchPlanRelation } from './composite-patch-plan.ts';
 import { createCompositePatchDelivery, parseRequestedCapabilities, SNAPSHOT_PATCH_CAPABILITY } from './composite-patch-delivery.ts';
 import { hasAnnotatedTextFields, projectEntitySnapshot } from './entity-snapshot-projection.ts';
 import { resolveAnnotatedTextOwningScope } from './annotated-text-field.ts';
@@ -672,16 +672,167 @@ export function createOwnedLiveDelivery({ db, entities, mayVerb, authorization, 
     },
   };
 
+  // Targeted composite resync resolution (#282): resolve the exact affected
+  // anchor scope(s) for a composite-touching event using the durable composite
+  // journal (which already captured in-txn pre/post-image evidence for deletes
+  // and reparents), falling back to the event scope / compiled patch plan, and
+  // only falling back to entity-wide resync when the anchor id genuinely cannot
+  // be determined.
+  const isSafeSqlIdent = (name: string): boolean => /^[A-Za-z_][A-Za-z0-9_]*$/.test(name);
+  const readTableRow = (table: string, id: string): Record<string, unknown> | null => {
+    if (!isSafeSqlIdent(table)) return null;
+    try {
+      const row = db.prepare(`SELECT * FROM ${table} WHERE id = ?`).get(id) as Record<string, unknown> | undefined;
+      return row ?? null;
+    } catch {
+      return null;
+    }
+  };
+  const findBranchesForEntity = (plan: AnchorPatchPlan, entityName: string): PatchPlanRelation[] => {
+    const found: PatchPlanRelation[] = [];
+    const visit = (relations: readonly PatchPlanRelation[]): void => {
+      for (const relation of relations) {
+        if (relation.entity === entityName) found.push(relation);
+        visit(relation.children);
+      }
+    };
+    visit(plan.relations);
+    return found;
+  };
+  const findBranchById = (plan: AnchorPatchPlan, branchId: string): PatchPlanRelation | null => {
+    const visit = (relations: readonly PatchPlanRelation[]): PatchPlanRelation | null => {
+      for (const relation of relations) {
+        if (relation.branchId === branchId) return relation;
+        const nested = visit(relation.children);
+        if (nested) return nested;
+      }
+      return null;
+    };
+    return visit(plan.relations);
+  };
+  const resolveBranchAnchorScopes = (plan: AnchorPatchPlan, branch: PatchPlanRelation, rowId: string, eventData: Record<string, unknown> | null): string[] | null => {
+    const chain: PatchPlanRelation[] = [];
+    const segments = branch.branchId.split('.');
+    for (let end = 1; end <= segments.length; end += 1) {
+      const found = findBranchById(plan, segments.slice(0, end).join('.'));
+      if (!found) return null;
+      chain.push(found);
+    }
+    let currentRow: Record<string, unknown> | null = eventData;
+    let currentId: string | null = rowId;
+    for (let index = chain.length - 1; index >= 0; index -= 1) {
+      const step = chain[index];
+      if (step.inverse) {
+        let parentId = currentRow ? currentRow[step.fk] : undefined;
+        if ((typeof parentId !== 'string' || parentId.length === 0) && currentId) {
+          const fetched = readTableRow(step.entity, currentId);
+          if (fetched) {
+            currentRow = fetched;
+            parentId = fetched[step.fk];
+          }
+        }
+        if (typeof parentId !== 'string' || parentId.length === 0) return null;
+        if (index === 0) return [`${plan.declaration}:${parentId}`];
+        const parentRow = readTableRow(step.parentEntity, parentId);
+        if (!parentRow) return null;
+        currentRow = parentRow;
+        currentId = parentId;
+      } else {
+        if (index !== 0 || !currentId || !isSafeSqlIdent(step.parentEntity) || !isSafeSqlIdent(step.fk)) return null;
+        try {
+          const parents = db.prepare(`SELECT id FROM ${step.parentEntity} WHERE ${step.fk} = ?`).all(currentId) as Array<{ id?: unknown }>;
+          const resolved: string[] = [];
+          for (const parent of parents) {
+            if (typeof parent.id === 'string' && parent.id.length > 0) resolved.push(`${plan.declaration}:${parent.id}`);
+          }
+          return resolved.length > 0 ? resolved : null;
+        } catch {
+          return null;
+        }
+      }
+    }
+    return null;
+  };
+  const resolveCompositeResyncScopes = (
+    anchorName: string,
+    event: LiveCommittedEvent,
+    handle: ScopeHandle,
+  ): { kind: 'scopes'; scopes: string[] } | { kind: 'entity-wide' } => {
+    // 1. Durable composite journal entries (written in-txn with pre/post-image
+    // evidence for deletes, reparents, nested paths, and wide invalidations).
+    if (typeof event.actionId === 'string' && event.actionId.length > 0) {
+      try {
+        const rows = db.prepare(
+          'SELECT DISTINCT scope FROM _CompositeChange WHERE actionId = :actionId AND declaration = :declaration',
+        ).all({ actionId: event.actionId, declaration: anchorName }) as Array<{ scope?: unknown }>;
+        if (rows.length > 0) {
+          const scopes = new Set<string>();
+          for (const row of rows) {
+            if (row.scope === '') return { kind: 'entity-wide' };
+            if (typeof row.scope === 'string' && row.scope.length > 0) scopes.add(row.scope);
+          }
+          if (handle.entity === anchorName && typeof event.scope === 'string') scopes.add(event.scope);
+          if (scopes.size > 0) return { kind: 'scopes', scopes: [...scopes] };
+        }
+      } catch {
+        // Standalone cores without _CompositeChange fall through to plan/event resolution.
+      }
+    }
+    const plan = patchPlans.get(anchorName);
+    const eventData = event.data && typeof event.data === 'object' ? event.data : null;
+    // 2. Event committed directly on the anchor's own scope (e.g. Project:p1).
+    if (handle.entity === anchorName) {
+      const scopes = new Set<string>([`${anchorName}:${handle.id}`]);
+      if (plan && eventData) {
+        for (const relation of plan.relations) {
+          if (relation.parentBranchId !== 'anchor' || !relation.inverse) continue;
+          const fkVal = eventData[relation.fk];
+          if (typeof fkVal === 'string' && fkVal.length > 0) scopes.add(`${anchorName}:${fkVal}`);
+        }
+      }
+      return { kind: 'scopes', scopes: [...scopes] };
+    }
+    // 3. Member or tombstone scope (e.g. Code:c1, Codebook:cb1): resolve owning
+    // anchor scope(s) via the compiled plan (event payload or current row).
+    if (!plan) return { kind: 'entity-wide' };
+    const scopes = new Set<string>();
+    let resolvedAny = false;
+    const rowId = typeof eventData?.id === 'string' && eventData.id.length > 0 ? eventData.id : handle.id;
+    if (plan.tombstone && plan.tombstone.entity === handle.entity) {
+      const idCol = plan.tombstone.scopeId ?? plan.tombstone.entityId;
+      let anchorId = eventData ? eventData[idCol] : undefined;
+      if (typeof anchorId !== 'string' || anchorId.length === 0) {
+        const fetched = readTableRow(plan.tombstone.entity, rowId);
+        if (fetched) anchorId = fetched[idCol];
+      }
+      if (typeof anchorId !== 'string' || anchorId.length === 0) return { kind: 'entity-wide' };
+      scopes.add(`${anchorName}:${anchorId}`);
+      resolvedAny = true;
+    }
+    const branches = findBranchesForEntity(plan, handle.entity);
+    for (const branch of branches) {
+      const resolved = resolveBranchAnchorScopes(plan, branch, rowId, eventData);
+      if (!resolved || resolved.length === 0) return { kind: 'entity-wide' };
+      for (const scope of resolved) scopes.add(scope);
+      resolvedAny = true;
+    }
+    return resolvedAny && scopes.size > 0
+      ? { kind: 'scopes', scopes: [...scopes] }
+      : { kind: 'entity-wide' };
+  };
+
   return {
     delivery,
     /** Compiled patch plans (#122) — the commit pipeline's journal router consumes these. */
     patchPlans,
-    consumer: async (events: readonly LiveCommittedEvent[]): Promise<void> => {      const scopes = new Set<string>();
+    consumer: async (events: readonly LiveCommittedEvent[]): Promise<void> => {
+      const scopes = new Set<string>();
       for (const event of events) {
         if (event?.scope) scopes.add(event.scope);
       }
       for (const scope of scopes) core.wake(scope);
-      const invalidatedAnchors = new Set<string>();
+      const entityWideAnchors = new Set<string>();
+      const targetedScopes = new Map<string, Set<string>>();
       for (const event of events) {
         const handle = tryParseScopeKey(event?.scope as string);
         if (!handle) continue;
@@ -690,19 +841,34 @@ export function createOwnedLiveDelivery({ db, entities, mayVerb, authorization, 
           // (anchor/tombstone identity, member presence, or a selected field).
           // This keeps per-keystroke annotated-text body edits from forcing a
           // full composite snapshot re-bootstrap for every shell subscriber.
-          if (declaration.output && eventTouchesComposite(declaration, event)) {
-            invalidatedAnchors.add(anchorName);
+          if (!declaration.output || !eventTouchesComposite(declaration, event)) continue;
+          if (entityWideAnchors.has(anchorName)) continue;
+          const resolution = resolveCompositeResyncScopes(anchorName, event, handle);
+          if (resolution.kind === 'entity-wide') {
+            entityWideAnchors.add(anchorName);
+            targetedScopes.delete(anchorName);
+          } else {
+            let bucket = targetedScopes.get(anchorName);
+            if (!bucket) {
+              bucket = new Set<string>();
+              targetedScopes.set(anchorName, bucket);
+            }
+            for (const scope of resolution.scopes) bucket.add(scope);
           }
         }
       }
-      // Member events invalidate every live aggregate of that declaration. The
-      // deliberate broad fan-out needs no pre-image cache, so deletion and both
-      // sides of a reparent are authoritative.
-      for (const anchorName of invalidatedAnchors) {
+      for (const anchorName of entityWideAnchors) {
         core.resyncEntity(anchorName, (scope) => {
           const anchor = tryParseScopeKey(scope);
           return { type: 'resync', entity: anchorName, id: anchor!.id, seq: 0, reason: 'recipient-snapshot-required' };
         });
+      }
+      for (const [anchorName, anchorScopes] of targetedScopes) {
+        for (const scope of anchorScopes) {
+          const anchor = tryParseScopeKey(scope);
+          if (!anchor) continue;
+          core.resyncScope(scope, { type: 'resync', entity: anchorName, id: anchor.id, seq: 0, reason: 'recipient-snapshot-required' });
+        }
       }
     },
     close(): void {
@@ -729,22 +895,25 @@ export function buildSnapshotResyncRelevance(composites: CompiledSnapshots): Map
   const resyncRelevance = new Map<string, Readonly<SnapshotResyncRelevance>>();
   for (const [anchorName, declaration] of composites) {
     const relevantFields = new Map<string, Set<string>>();
-    const collect = (branch: SnapshotBranch | null | undefined, isRoot: boolean): void => {
+    const collect = (branch: SnapshotBranch | null | undefined, ownerEntityName: string): void => {
       for (const entry of branch?.entries ?? []) {
         const entityName = entry.entity?.name;
         if (entityName) {
           const fields = relevantFields.get(entityName) ?? new Set<string>();
           for (const field of entry.selected ?? []) fields.add(field);
+          if (typeof entry.fk === 'string' && entry.fk.length > 0 && entry.inverse) fields.add(entry.fk);
+          const orderField = (entry.order as { field?: unknown } | null | undefined)?.field;
+          if (typeof orderField === 'string' && orderField.length > 0) fields.add(orderField);
           relevantFields.set(entityName, fields);
-        } else if (isRoot && entry.kind === 'select') {
-          const fields = relevantFields.get(anchorName) ?? new Set<string>();
+        } else if (entry.kind === 'select') {
+          const fields = relevantFields.get(ownerEntityName) ?? new Set<string>();
           for (const field of entry.fields ?? []) fields.add(field);
-          relevantFields.set(anchorName, fields);
+          relevantFields.set(ownerEntityName, fields);
         }
-        if (entry.nested) collect(entry.nested, false);
+        if (entry.nested) collect(entry.nested, entityName ?? ownerEntityName);
       }
     };
-    collect(declaration.output, true);
+    collect(declaration.output, anchorName);
     const tombstone = declaration.tombstone;
     // Tombstone identity events always resync; the anchor's own selected fields
     // are captured in relevantFields (its create/remove also resync via

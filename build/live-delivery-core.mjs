@@ -150,6 +150,7 @@ function deniedError(scope        )                            {
 
 
 
+
                                                                          
 
 
@@ -962,10 +963,26 @@ export function createLiveDeliveryCore({ db, entities, mayVerb, authorization, p
     }
   }
 
-  function resyncEntity(entityName        , envelopeForScope                            )       {
-    for (const sub of [...subs.values()]) {
-      if (sub.entityRec.name !== entityName) continue;
-      resync(sub.scope, envelopeForScope(sub.scope));
+  function resyncScope(scope        , envelopeOrFactory                                        )       {
+    if (closed) return;
+    const set = byScope.get(scope);
+    if (!set || set.size === 0) return;
+    const envelope = typeof envelopeOrFactory === 'function'
+      ? (envelopeOrFactory                              )(scope)
+      : envelopeOrFactory;
+    resync(scope, envelope);
+  }
+
+  function resyncEntity(entityName        , envelopeForScope                            , filter                             )       {
+    if (closed) return;
+    const matchedScopes = new Set        ();
+    for (const sub of subs.values()) {
+      if (!sub.active || sub.entityRec.name !== entityName) continue;
+      if (filter && !filter(sub.scope)) continue;
+      matchedScopes.add(sub.scope);
+    }
+    for (const scope of matchedScopes) {
+      resync(scope, envelopeForScope(scope));
     }
   }
 
@@ -1039,5 +1056,5 @@ export function createLiveDeliveryCore({ db, entities, mayVerb, authorization, p
     }
   }
 
-  return { bootstrap, catchup, subscribe, wake, resync, resyncEntity, onRevocation, revoke, close, snapshot, exceedsCatchupLimit };
+  return { bootstrap, catchup, subscribe, wake, resync, resyncScope, resyncEntity, onRevocation, revoke, close, snapshot, exceedsCatchupLimit };
 }

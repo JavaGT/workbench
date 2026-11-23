@@ -1,13 +1,18 @@
-// Query-scoped reads (#225, ADR-0009).
+// Query-scoped reads (#225, #289, ADR-0009).
 //
 // A typed, authorized page over one compiled Entity: allowlisted operators,
-// single-key sort with an `id ASC` tie-break (the readRows convention), keyset
-// pagination, optional count, and a revision token from `_CommittedRevision`.
-// Invalidation is a "changed since R" signal; the client refetches. This is
-// not a second write path, not a second auth engine, and not a row-patch fold.
+// composable boolean filter trees (AND/OR/NOT + flat filters), single-key sort
+// with an `id ASC` tie-break (the readRows convention), keyset and bounded
+// offset pagination, optional filteredTotal + authorized total counts, entity
+// row hydration, and a single atomic SQLite read snapshot with a revision token
+// from `_CommittedRevision`. Invalidation is a "changed since R" signal; the
+// client refetches. This is not a second write path, not a second auth engine,
+// and not a row-patch fold.
 
 import { canonicalStringify } from './canonical-json.ts';
+import { materializeStoredRow } from './entity/materialize-row.ts';
 import { parseEventType, EventKind, type EventIdentityHandle } from './event-handle.ts';
+import type { FieldDescriptor } from './field-strategy.ts';
 import { tryParseScopeKey } from './scope-handle.ts';
 
 export const QUERY_OPERATORS = Object.freeze(['eq', 'in', 'gt', 'gte', 'lt', 'lte', 'contains', 'isEmpty', 'isNotEmpty'] as const);
@@ -26,6 +31,10 @@ export type QueryFieldType = keyof typeof OPERATORS_BY_FIELD_TYPE;
 
 export const QUERY_PAGE_SIZE_MIN = 1;
 export const QUERY_PAGE_SIZE_MAX = 100;
+export const QUERY_PAGE_SIZE_CEILING = 500;
+export const QUERY_OFFSET_MAX = 100_000;
+export const QUERY_EXPRESSION_MAX_DEPTH = 8;
+export const QUERY_EXPRESSION_MAX_LEAVES = 32;
 export const QUERY_REGISTRATION_MAX = 32;
 const IN_VALUES_MAX = 100;
 const FILTERS_MAX = 16;
@@ -47,26 +56,57 @@ export class QueryContentionError extends Error {
 }
 
 type Statement = {
-  get(...args: unknown[]): Record<string, unknown> | undefined;
-  all(...args: unknown[]): Record<string, unknown>[];
+  get(...args: unknown[]): Record<string, unknown> | undefined | unknown;
+  all(...args: unknown[]): unknown[];
 };
 
 export type QueryDb = {
   prepare(sql: string): Statement;
+  exec?(sql: string): unknown;
+  readonly isTransaction?: boolean;
 };
 
 export interface QueryEntity {
-  name: string;
-  fields: Record<string, { kind?: string; type?: string; role?: unknown }>;
+  readonly name: string;
+  readonly fields: Readonly<Record<string, { readonly kind?: string; readonly type?: string; readonly role?: unknown; readonly [property: string]: unknown }>>;
   scopeFilter?(principal: unknown): { sql: string; params: Record<string, unknown> };
-  scopeAst?: unknown;
+  deserializeRow?(row: Record<string, unknown>): Record<string, unknown>;
+  readonly scopeAst?: unknown;
 }
 
 export interface QueryFilter {
   readonly field: string;
   readonly op: QueryOperator;
-  readonly value: unknown;
+  readonly value?: unknown;
 }
+
+export interface QueryFilterTermNode {
+  readonly kind: 'term';
+  readonly field: string;
+  readonly op?: QueryOperator;
+  readonly value?: unknown;
+}
+
+export interface QueryFilterAndNode {
+  readonly kind: 'and';
+  readonly children: readonly QueryFilterExpression[];
+}
+
+export interface QueryFilterOrNode {
+  readonly kind: 'or';
+  readonly children: readonly QueryFilterExpression[];
+}
+
+export interface QueryFilterNotNode {
+  readonly kind: 'not';
+  readonly child: QueryFilterExpression;
+}
+
+export type QueryFilterExpression =
+  | QueryFilterTermNode
+  | QueryFilterAndNode
+  | QueryFilterOrNode
+  | QueryFilterNotNode;
 
 export interface QuerySort {
   readonly field: string;
@@ -76,8 +116,14 @@ export interface QuerySort {
 export interface QueryContract {
   readonly entity: string;
   readonly filters?: readonly QueryFilter[];
+  readonly where?: QueryFilterExpression | null;
+  readonly expression?: QueryFilterExpression | null;
   readonly sort: QuerySort;
   readonly pageSize: number;
+}
+
+export interface CompileQueryContractOptions {
+  readonly maxPageSize?: number;
 }
 
 export interface QueryCursor {
@@ -90,17 +136,32 @@ export interface CompiledQuery {
   readonly entity: string;
   readonly identity: string;
   readonly filters: readonly QueryFilter[];
+  readonly where: QueryFilterExpression | null;
   readonly sort: QuerySort;
   readonly pageSize: number;
+  readonly maxPageSize: number;
   readonly dependencyFields: readonly string[];
+}
+
+export interface ExecuteQueryPageOptions {
+  readonly cursor?: QueryCursor | null;
+  readonly offset?: number;
+  readonly maxOffset?: number;
+  readonly includeCount?: boolean;
+  readonly includeTotal?: boolean;
+  readonly hydrate?: boolean;
 }
 
 export interface QueryPage {
   readonly rows: readonly Record<string, unknown>[];
   readonly revision: number;
+  readonly hasMore: boolean;
   readonly nextCursor: QueryCursor | null;
   readonly queryIdentity: string;
+  readonly offset?: number;
   readonly count?: number;
+  readonly filteredTotal?: number;
+  readonly total?: number;
 }
 
 export type QueryPageDecision = 'accept' | 'reject-stale';
@@ -131,8 +192,29 @@ export interface OptimisticQueryPage {
   readonly membershipUncertain: boolean;
 }
 
-const CONTRACT_KEYS = Object.freeze(['entity', 'filters', 'sort', 'pageSize']);
+export interface FilterExpressionCompileState {
+  leaves: number;
+  paramIndex: number;
+}
+
+export interface CompiledExpressionLeaf {
+  readonly sql: string;
+  readonly normalized: unknown;
+  readonly fields: readonly string[];
+}
+
+export interface CustomSortSpec {
+  readonly joinSql: string;
+  readonly sortColumn: string;
+  readonly direction: 'asc' | 'desc';
+  readonly params?: Record<string, unknown>;
+}
+
+const CONTRACT_KEYS = Object.freeze(['entity', 'filters', 'where', 'expression', 'sort', 'pageSize']);
 const FILTER_KEYS = Object.freeze(['field', 'op', 'value']);
+const TERM_KEYS = Object.freeze(['kind', 'field', 'op', 'value']);
+const GROUP_KEYS = Object.freeze(['kind', 'children']);
+const NOT_KEYS = Object.freeze(['kind', 'child']);
 const SORT_KEYS = Object.freeze(['field', 'direction']);
 
 function fail(message: string): never {
@@ -182,6 +264,41 @@ function freezeJsonValue(value: unknown): unknown {
 
 function detached(raw: Record<string, unknown>): Record<string, unknown> {
   return Object.freeze({ ...raw });
+}
+
+function materializeQueryRow(
+  raw: Record<string, unknown>,
+  entity: QueryEntity,
+  hydrate: boolean,
+): Record<string, unknown> {
+  if (!hydrate) return detached(raw);
+  if (typeof entity.deserializeRow === 'function') {
+    return Object.freeze(entity.deserializeRow({ ...raw }));
+  }
+  if (entity.fields && typeof entity.fields === 'object') {
+    return materializeStoredRow(
+      raw,
+      entity.fields as Record<string, FieldDescriptor>,
+      { freeze: true },
+    ) as Record<string, unknown>;
+  }
+  return detached(raw);
+}
+
+export function resolveMaxPageSize(maxPageSize?: number): number {
+  if (maxPageSize === undefined) return QUERY_PAGE_SIZE_MAX;
+  if (!Number.isSafeInteger(maxPageSize) || maxPageSize < QUERY_PAGE_SIZE_MIN || maxPageSize > QUERY_PAGE_SIZE_CEILING) {
+    fail(`maxPageSize must be an integer from ${QUERY_PAGE_SIZE_MIN} through ${QUERY_PAGE_SIZE_CEILING}.`);
+  }
+  return maxPageSize;
+}
+
+export function resolveMaxOffset(maxOffset?: number): number {
+  if (maxOffset === undefined) return QUERY_OFFSET_MAX;
+  if (!Number.isSafeInteger(maxOffset) || maxOffset < 0 || maxOffset > QUERY_OFFSET_MAX) {
+    fail(`maxOffset must be an integer from 0 through ${QUERY_OFFSET_MAX}.`);
+  }
+  return maxOffset;
 }
 
 function queryPrincipalKey(principal: unknown): string {
@@ -311,16 +428,18 @@ export function compileFilterPredicate(input: {
   return `${column} ${operator} :${name}`;
 }
 
-function compileFilter(
+export function compileHostFilter(
   filter: unknown,
-  declared: Set<string>,
   entity: QueryEntity,
   params: Record<string, unknown>,
   index: number,
+  options: { allowKind?: boolean; label?: string } = {},
 ): { sql: string; field: string; op: QueryOperator; value: unknown } {
-  if (!filter || typeof filter !== 'object' || Array.isArray(filter)) fail('filters must be objects.');
-  assertKeys(filter, FILTER_KEYS, 'filter');
+  const label = options.label ?? 'filter';
+  if (!filter || typeof filter !== 'object' || Array.isArray(filter)) fail(`${label}s must be objects.`);
+  assertKeys(filter, options.allowKind ? TERM_KEYS : FILTER_KEYS, label);
   const { field, op = 'eq', value } = filter as QueryFilter;
+  const declared = fieldsOf(entity);
   if (typeof field !== 'string' || !declared.has(field)) fail('a filter references an unknown field.');
   assertScalarField(entity, field, 'filter field');
   if (!(QUERY_OPERATORS as readonly string[]).includes(op)) fail('a filter uses an unsupported operator.');
@@ -331,7 +450,82 @@ function compileFilter(
   return { sql, field, op, value: freezeJsonValue(value) };
 }
 
-export function compileQueryContract(input: unknown, entity: QueryEntity): CompiledQuery {
+export function compileFilterExpression(
+  node: unknown,
+  compileLeaf: (node: Record<string, unknown>, state: FilterExpressionCompileState) => CompiledExpressionLeaf,
+  state: FilterExpressionCompileState = { leaves: 0, paramIndex: 0 },
+  depth = 1,
+): CompiledExpressionLeaf {
+  if (depth > QUERY_EXPRESSION_MAX_DEPTH) {
+    fail(`filter expression exceeds maximum nesting depth of ${QUERY_EXPRESSION_MAX_DEPTH}.`);
+  }
+  if (!node || typeof node !== 'object' || Array.isArray(node)) {
+    fail('filter expression node must be an object.');
+  }
+  const record = node as Record<string, unknown>;
+  const kind = record.kind;
+  if (kind === 'and' || kind === 'or') {
+    assertKeys(record, GROUP_KEYS, `${kind} expression`);
+    const children = record.children;
+    if (!Array.isArray(children) || children.length === 0) {
+      fail(`${kind} expression requires a non-empty children array.`);
+    }
+    const compiled = children.map((child) => compileFilterExpression(child, compileLeaf, state, depth + 1));
+    const joiner = kind === 'and' ? ' AND ' : ' OR ';
+    const fields = [...new Set(compiled.flatMap((child) => child.fields))];
+    return {
+      sql: `(${compiled.map((child) => child.sql).join(joiner)})`,
+      normalized: Object.freeze({
+        kind,
+        children: Object.freeze(compiled.map((child) => child.normalized)),
+      }),
+      fields,
+    };
+  }
+  if (kind === 'not') {
+    assertKeys(record, NOT_KEYS, 'not expression');
+    const compiled = compileFilterExpression(record.child, compileLeaf, state, depth + 1);
+    return {
+      // 2-valued complement: SQLite NULLs do not satisfy the inner predicate, so
+      // NOT matches them just like in-memory boolean filter semantics.
+      sql: `(NOT COALESCE((${compiled.sql}), 0))`,
+      normalized: Object.freeze({ kind: 'not', child: compiled.normalized }),
+      fields: compiled.fields,
+    };
+  }
+  state.leaves += 1;
+  if (state.leaves > QUERY_EXPRESSION_MAX_LEAVES) {
+    fail(`filter expression exceeds maximum leaf count of ${QUERY_EXPRESSION_MAX_LEAVES}.`);
+  }
+  return compileLeaf(record, state);
+}
+
+function compileHostTermLeaf(
+  node: Record<string, unknown>,
+  entity: QueryEntity,
+  params: Record<string, unknown>,
+  state: FilterExpressionCompileState,
+): CompiledExpressionLeaf {
+  if (node.kind !== 'term') fail('filter expression uses an unsupported node kind.');
+  const compiled = compileHostFilter(node, entity, params, state.paramIndex++, {
+    allowKind: true,
+    label: 'term expression',
+  });
+  const normalized: QueryFilterTermNode = compiled.op === 'isEmpty' || compiled.op === 'isNotEmpty'
+    ? Object.freeze({ kind: 'term', field: compiled.field, op: compiled.op })
+    : Object.freeze({ kind: 'term', field: compiled.field, op: compiled.op, value: compiled.value });
+  return {
+    sql: compiled.sql,
+    normalized,
+    fields: [compiled.field],
+  };
+}
+
+export function compileQueryContract(
+  input: unknown,
+  entity: QueryEntity,
+  options: CompileQueryContractOptions = {},
+): CompiledQuery {
   if (!input || typeof input !== 'object' || Array.isArray(input)) fail('contract must be an object.');
   assertKeys(input, CONTRACT_KEYS, 'contract');
   const contract = input as QueryContract;
@@ -340,21 +534,37 @@ export function compileQueryContract(input: unknown, entity: QueryEntity): Compi
   const declared = fieldsOf(entity);
   if (contract.filters !== undefined && !Array.isArray(contract.filters)) fail('filters must be an array.');
   if ((contract.filters?.length ?? 0) > FILTERS_MAX) fail('filters must contain at most 16 entries.');
+  const hasWhere = contract.where !== undefined && contract.where !== null;
+  const hasExpression = contract.expression !== undefined && contract.expression !== null;
+  if (hasWhere && hasExpression) fail('contract cannot specify both where and expression.');
+  const rawWhere = hasWhere ? contract.where : hasExpression ? contract.expression : null;
+
   const params: Record<string, unknown> = {};
-  const filters = (contract.filters ?? []).map((filter, index) => {
-    const compiled = compileFilter(filter, declared, entity, params, index);
+  const state: FilterExpressionCompileState = { leaves: 0, paramIndex: 0 };
+  const filters = (contract.filters ?? []).map((filter) => {
+    state.leaves += 1;
+    if (state.leaves > QUERY_EXPRESSION_MAX_LEAVES) {
+      fail(`filter expression exceeds maximum leaf count of ${QUERY_EXPRESSION_MAX_LEAVES}.`);
+    }
+    const compiled = compileHostFilter(filter, entity, params, state.paramIndex++);
     return Object.freeze({ field: compiled.field, op: compiled.op, value: compiled.value });
   });
+  const compiledWhere = rawWhere !== null
+    ? compileFilterExpression(rawWhere, (node, exprState) => compileHostTermLeaf(node, entity, params, exprState), state)
+    : null;
+
   if (!contract.sort || typeof contract.sort !== 'object' || Array.isArray(contract.sort)) fail('sort is required.');
   assertKeys(contract.sort, SORT_KEYS, 'sort');
   const { field: sortField, direction = 'asc' } = contract.sort;
   if (typeof sortField !== 'string' || !declared.has(sortField)) fail('sort references an unknown field.');
   assertScalarField(entity, sortField, 'sort field');
   if (direction !== 'asc' && direction !== 'desc') fail('sort direction must be asc or desc.');
+  const maxPageSize = resolveMaxPageSize(options.maxPageSize);
   const pageSize = contract.pageSize;
-  if (!Number.isSafeInteger(pageSize) || pageSize < QUERY_PAGE_SIZE_MIN || pageSize > QUERY_PAGE_SIZE_MAX) {
-    fail(`pageSize must be an integer from ${QUERY_PAGE_SIZE_MIN} through ${QUERY_PAGE_SIZE_MAX}.`);
+  if (!Number.isSafeInteger(pageSize) || pageSize < QUERY_PAGE_SIZE_MIN || pageSize > maxPageSize) {
+    fail(`pageSize must be an integer from ${QUERY_PAGE_SIZE_MIN} through ${maxPageSize}.`);
   }
+  const whereNode = (compiledWhere?.normalized as QueryFilterExpression | undefined) ?? null;
   const identity = canonicalStringify({
     entity: entity.name,
     filters: filters.map((filter) => (
@@ -362,18 +572,26 @@ export function compileQueryContract(input: unknown, entity: QueryEntity): Compi
         ? { field: filter.field, op: filter.op }
         : { field: filter.field, op: filter.op, value: filter.value }
     )),
+    ...(whereNode ? { where: whereNode } : {}),
     sort: { field: sortField, direction },
     pageSize,
   });
   const dependencyFields = Object.freeze([
-    ...new Set([...filters.map((filter) => filter.field), sortField, ...queryAuthorizationFields(entity)]),
+    ...new Set([
+      ...filters.map((filter) => filter.field),
+      ...(compiledWhere?.fields ?? []),
+      sortField,
+      ...queryAuthorizationFields(entity),
+    ]),
   ]);
   return Object.freeze({
     entity: entity.name,
     identity,
     filters: Object.freeze(filters),
+    where: whereNode,
     sort: Object.freeze({ field: sortField, direction }),
     pageSize,
+    maxPageSize,
     dependencyFields,
   });
 }
@@ -394,7 +612,7 @@ export function asSafeRevision(value: unknown, label: string): number {
 export function readCommittedRevision(db: QueryDb): number {
   let row: Record<string, unknown> | undefined;
   try {
-    row = db.prepare("SELECT revision FROM _CommittedRevision WHERE name = 'actions'").get();
+    row = db.prepare("SELECT revision FROM _CommittedRevision WHERE name = 'actions'").get() as Record<string, unknown> | undefined;
   } catch (err) {
     throw new QueryScopedReadError(`committed revision is unavailable (${err instanceof Error ? err.message : String(err)}).`);
   }
@@ -469,8 +687,22 @@ function resolveScopeField(entity: QueryEntity, scope: string, explicit: string 
 }
 
 function filterSql(compiled: CompiledQuery, entity: QueryEntity, params: Record<string, unknown>): string {
-  const declared = fieldsOf(entity);
-  return compiled.filters.map((filter, index) => compileFilter(filter, declared, entity, params, index).sql).join(' AND ');
+  const state: FilterExpressionCompileState = { leaves: 0, paramIndex: 0 };
+  const parts: string[] = [];
+  for (const filter of compiled.filters) {
+    state.leaves += 1;
+    parts.push(compileHostFilter(filter, entity, params, state.paramIndex++).sql);
+  }
+  if (compiled.where) {
+    parts.push(
+      compileFilterExpression(
+        compiled.where,
+        (node, exprState) => compileHostTermLeaf(node, entity, params, exprState),
+        state,
+      ).sql,
+    );
+  }
+  return parts.join(' AND ');
 }
 
 export function keysetSql(sortColumn: string, direction: 'asc' | 'desc', cursor: QueryCursor, params: Record<string, unknown>): string {
@@ -501,77 +733,168 @@ export function selectAuthorizedPage(
     identity: string;
     extraWhere?: string | null;
     extraParams?: Record<string, unknown>;
-    sort: QuerySort;
+    sort?: QuerySort;
+    customSort?: CustomSortSpec | null;
     pageSize: number;
+    maxPageSize?: number;
     cursor?: QueryCursor | null;
+    offset?: number;
+    maxOffset?: number;
     includeCount?: boolean;
+    includeTotal?: boolean;
+    hydrate?: boolean;
   },
 ): Omit<QueryPage, 'revision'> {
-  identifier(entity.name, 'entity name');
-  const sortField = input.sort?.field;
-  if (typeof sortField !== 'string') fail('sort is required.');
-  assertScalarField(entity, sortField, 'sort field');
-  if (input.sort.direction !== 'asc' && input.sort.direction !== 'desc') fail('sort direction must be asc or desc.');
-  if (!Number.isSafeInteger(input.pageSize) || input.pageSize < QUERY_PAGE_SIZE_MIN || input.pageSize > QUERY_PAGE_SIZE_MAX) {
-    fail(`pageSize must be an integer from ${QUERY_PAGE_SIZE_MIN} through ${QUERY_PAGE_SIZE_MAX}.`);
+  const table = identifier(entity.name, 'entity name');
+  const customSort = input.customSort ?? null;
+  let sortField: string | null = null;
+  let sortColumn: string;
+  let sortDirection: 'asc' | 'desc';
+  let joinClause = '';
+
+  if (customSort) {
+    if (customSort.direction !== 'asc' && customSort.direction !== 'desc') {
+      fail('sort direction must be asc or desc.');
+    }
+    sortColumn = customSort.sortColumn;
+    sortDirection = customSort.direction;
+    joinClause = customSort.joinSql ? ` ${customSort.joinSql}` : '';
+  } else {
+    sortField = input.sort?.field ?? null;
+    if (typeof sortField !== 'string') fail('sort is required.');
+    assertScalarField(entity, sortField, 'sort field');
+    if (input.sort!.direction !== 'asc' && input.sort!.direction !== 'desc') {
+      fail('sort direction must be asc or desc.');
+    }
+    sortColumn = `t0.${identifier(sortField, 'sort field')}`;
+    sortDirection = input.sort!.direction;
+  }
+
+  const maxPageSize = resolveMaxPageSize(input.maxPageSize);
+  if (!Number.isSafeInteger(input.pageSize) || input.pageSize < QUERY_PAGE_SIZE_MIN || input.pageSize > maxPageSize) {
+    fail(`pageSize must be an integer from ${QUERY_PAGE_SIZE_MIN} through ${maxPageSize}.`);
+  }
+  if (input.cursor && input.offset !== undefined) {
+    fail('cursor and offset cannot be combined.');
   }
   if (input.cursor) {
     if (input.cursor.queryIdentity !== input.identity) fail('page token does not match this query.');
     if (typeof input.cursor.id !== 'string' || input.cursor.id.length === 0) fail('page token id is required.');
   }
-  const params: Record<string, unknown> = { ...(input.extraParams ?? {}) };
+  if (input.offset !== undefined) {
+    const maxOffset = resolveMaxOffset(input.maxOffset);
+    if (!Number.isSafeInteger(input.offset) || input.offset < 0 || input.offset > maxOffset) {
+      fail(`offset must be an integer from 0 through ${maxOffset}.`);
+    }
+  }
+
+  const params: Record<string, unknown> = {
+    ...(input.extraParams ?? {}),
+    ...(customSort?.params ?? {}),
+  };
   const rawGrant = grantFilter(entity, principal);
   const grant = namespaceSqlParams(rawGrant.sql, rawGrant.params, 'qhost');
   Object.assign(params, grant.params);
   const parts = [grant.sql];
   if (input.extraWhere) parts.push(input.extraWhere);
   if (input.cursor) {
-    const sortColumn = `t0.${identifier(sortField, 'sort field')}`;
-    parts.push(keysetSql(sortColumn, input.sort.direction, input.cursor, params));
+    parts.push(keysetSql(sortColumn, sortDirection, input.cursor, params));
   }
   const where = parts.map((part) => `(${part})`).join(' AND ');
-  const sortColumn = `t0.${identifier(sortField, 'sort field')}`;
-  const direction = input.sort.direction === 'desc' ? 'DESC' : 'ASC';
+  const direction = sortDirection === 'desc' ? 'DESC' : 'ASC';
   params.query_limit = input.pageSize + 1;
-  const sql = `SELECT * FROM ${identifier(entity.name, 'entity name')} AS t0 WHERE ${where} ORDER BY ${sortColumn} ${direction}, t0.id ASC LIMIT :query_limit`;
-  const fetched = db.prepare(sql).all(params).map(detached);
-  const hasMore = fetched.length > input.pageSize;
-  const rows = hasMore ? fetched.slice(0, input.pageSize) : fetched;
-  const last = rows.at(-1);
-  const nextCursor = hasMore && last
+  let offsetClause = '';
+  if (input.offset !== undefined) {
+    params.query_offset = input.offset;
+    offsetClause = ' OFFSET :query_offset';
+  }
+  const selectClause = customSort ? `t0.*, ${sortColumn} AS __wb_sort_value` : 't0.*';
+  const sql = `SELECT ${selectClause} FROM ${table} AS t0${joinClause} WHERE ${where} ORDER BY ${sortColumn} ${direction}, t0.id ASC LIMIT :query_limit${offsetClause}`;
+  const rawFetched = db.prepare(sql).all(params) as Record<string, unknown>[];
+  const hasMore = rawFetched.length > input.pageSize;
+  const rawRows = hasMore ? rawFetched.slice(0, input.pageSize) : rawFetched;
+  const lastRaw = rawRows.at(-1);
+  const nextCursor = hasMore && lastRaw
     ? Object.freeze({
       queryIdentity: input.identity,
-      sortValue: last[sortField],
-      id: String(last.id),
+      sortValue: customSort ? lastRaw.__wb_sort_value : lastRaw[sortField!],
+      id: String(lastRaw.id),
     })
     : null;
-  let count: number | undefined;
+
+  const hydrate = input.hydrate !== false;
+  const rows = rawRows.map((raw) => {
+    if (customSort) {
+      const { __wb_sort_value: _sortValue, ...hostRow } = raw;
+      return materializeQueryRow(hostRow, entity, hydrate);
+    }
+    return materializeQueryRow(raw, entity, hydrate);
+  });
+
+  let filteredTotal: number | undefined;
   if (input.includeCount === true) {
     const countParams: Record<string, unknown> = { ...(input.extraParams ?? {}), ...grant.params };
     const countParts = [grant.sql];
     if (input.extraWhere) countParts.push(input.extraWhere);
     const countWhere = countParts.map((part) => `(${part})`).join(' AND ');
-    const countRow = db.prepare(`SELECT COUNT(*) AS n FROM ${identifier(entity.name, 'entity name')} AS t0 WHERE ${countWhere}`).get(countParams);
-    count = asSafeRevision(countRow?.n ?? 0, 'count');
+    const countRow = db.prepare(`SELECT COUNT(*) AS n FROM ${table} AS t0 WHERE ${countWhere}`).get(countParams) as Record<string, unknown> | undefined;
+    filteredTotal = asSafeRevision(countRow?.n ?? 0, 'count');
   }
+
+  let total: number | undefined;
+  if (input.includeTotal === true) {
+    const totalParams: Record<string, unknown> = { ...grant.params };
+    const totalRow = db.prepare(`SELECT COUNT(*) AS n FROM ${table} AS t0 WHERE (${grant.sql})`).get(totalParams) as Record<string, unknown> | undefined;
+    total = asSafeRevision(totalRow?.n ?? 0, 'total');
+  }
+
   return {
     rows: Object.freeze(rows),
+    hasMore,
     nextCursor,
     queryIdentity: input.identity,
-    ...(input.includeCount === true ? { count } : {}),
+    ...(input.offset !== undefined ? { offset: input.offset } : {}),
+    ...(input.includeCount === true ? { count: filteredTotal, filteredTotal } : {}),
+    ...(input.includeTotal === true ? { total } : {}),
   };
 }
 
-export function withRevisionFence(db: QueryDb, run: () => Omit<QueryPage, 'revision'>): QueryPage {
-  let lastContention: QueryContentionError | null = null;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    const before = readCommittedRevision(db);
-    const page = run();
-    const after = readCommittedRevision(db);
-    if (before === after) return Object.freeze({ ...page, revision: after });
-    lastContention = new QueryContentionError();
+let snapshotSeq = 0;
+
+/**
+ * Execute `run` inside a single SQLite read snapshot when not already inside a
+ * transaction. An outermost SQLite SAVEPOINT opens a deferred read transaction
+ * (identical snapshot semantics to BEGIN DEFERRED, taking no write lock), and
+ * nests cleanly if a caller already owns an open transaction without exposing
+ * `isTransaction`.
+ */
+export function withReadSnapshot<T>(db: QueryDb, run: () => T): T {
+  if (typeof db.exec !== 'function' || db.isTransaction === true) {
+    return run();
   }
-  throw lastContention ?? new QueryContentionError();
+  const name = `wb_qsnap_${++snapshotSeq}`;
+  db.exec(`SAVEPOINT ${name}`);
+  let failed = false;
+  try {
+    return run();
+  } catch (err) {
+    failed = true;
+    throw err;
+  } finally {
+    try {
+      db.exec(`RELEASE SAVEPOINT ${name}`);
+    } catch (releaseErr) {
+      if (!failed) throw releaseErr;
+    }
+  }
+}
+
+export function withRevisionFence(db: QueryDb, run: () => Omit<QueryPage, 'revision'>): QueryPage {
+  return withReadSnapshot(db, () => {
+    const revision = readCommittedRevision(db);
+    const page = run();
+    return Object.freeze({ ...page, revision });
+  });
 }
 
 function runPage(
@@ -579,8 +902,7 @@ function runPage(
   entity: QueryEntity,
   principal: unknown,
   compiled: CompiledQuery,
-  cursor: QueryCursor | null | undefined,
-  includeCount: boolean,
+  options: ExecuteQueryPageOptions,
 ): Omit<QueryPage, 'revision'> {
   const extraParams: Record<string, unknown> = {};
   const extra = filterSql(compiled, entity, extraParams);
@@ -590,8 +912,13 @@ function runPage(
     extraParams,
     sort: compiled.sort,
     pageSize: compiled.pageSize,
-    cursor,
-    includeCount,
+    maxPageSize: compiled.maxPageSize,
+    cursor: options.cursor,
+    offset: options.offset,
+    maxOffset: options.maxOffset,
+    includeCount: options.includeCount === true,
+    includeTotal: options.includeTotal === true,
+    hydrate: options.hydrate,
   });
 }
 
@@ -600,10 +927,10 @@ export function executeQueryPage(
   entity: QueryEntity,
   principal: unknown,
   compiled: CompiledQuery,
-  options: { cursor?: QueryCursor | null; includeCount?: boolean } = {},
+  options: ExecuteQueryPageOptions = {},
 ): QueryPage {
   if (compiled.entity !== entity.name) fail('compiled query does not match the entity.');
-  return withRevisionFence(db, () => runPage(db, entity, principal, compiled, options.cursor, options.includeCount === true));
+  return withRevisionFence(db, () => runPage(db, entity, principal, compiled, options));
 }
 
 export function acceptQueryPage(heldRevision: number, incomingRevision: number): QueryPageDecision {

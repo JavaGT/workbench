@@ -2530,4 +2530,367 @@ export interface LogRetentionReport {
 }
 export function logRetentionReport(db: WorkbenchDatabase, retentionDays: number, nowMs?: number): LogRetentionReport;
 
+// ── unified query-scoped reads & registered query families (#225, #289) ──────
+
+export const QUERY_OPERATORS: readonly ['eq', 'in', 'gt', 'gte', 'lt', 'lte', 'contains', 'isEmpty', 'isNotEmpty'];
+export type QueryOperator = (typeof QUERY_OPERATORS)[number];
+
+export const OPERATORS_BY_FIELD_TYPE: Readonly<{
+  readonly text: readonly ['eq', 'in', 'contains', 'isEmpty', 'isNotEmpty'];
+  readonly number: readonly ['eq', 'in', 'gt', 'gte', 'lt', 'lte', 'isEmpty', 'isNotEmpty'];
+  readonly date: readonly ['eq', 'in', 'gt', 'gte', 'lt', 'lte', 'isEmpty', 'isNotEmpty'];
+  readonly epoch: readonly ['eq', 'in', 'gt', 'gte', 'lt', 'lte', 'isEmpty', 'isNotEmpty'];
+  readonly boolean: readonly ['eq', 'isEmpty', 'isNotEmpty'];
+  readonly ref: readonly ['eq', 'in', 'isEmpty', 'isNotEmpty'];
+  readonly option: readonly ['eq', 'in', 'isEmpty', 'isNotEmpty'];
+}>;
+export type QueryFieldType = keyof typeof OPERATORS_BY_FIELD_TYPE;
+
+export const QUERY_PAGE_SIZE_MIN: 1;
+export const QUERY_PAGE_SIZE_MAX: 100;
+export const QUERY_PAGE_SIZE_CEILING: 500;
+export const QUERY_OFFSET_MAX: 100000;
+export const QUERY_EXPRESSION_MAX_DEPTH: 8;
+export const QUERY_EXPRESSION_MAX_LEAVES: 32;
+export const QUERY_REGISTRATION_MAX: 32;
+
+export class QueryScopedReadError extends Error {
+  constructor(message: string);
+}
+
+export class QueryContentionError extends Error {
+  constructor(message?: string);
+}
+
+export interface QueryStatement {
+  get(...args: unknown[]): unknown;
+  all(...args: unknown[]): unknown[];
+}
+
+export interface QueryDb {
+  prepare(sql: string): QueryStatement;
+  exec?(sql: string): unknown;
+  readonly isTransaction?: boolean;
+}
+
+export interface QueryEntity {
+  readonly name: string;
+  readonly fields: Readonly<Record<string, { readonly kind?: string; readonly type?: string; readonly role?: unknown; readonly [property: string]: unknown }>>;
+  scopeFilter?(principal: unknown): { sql: string; params: Record<string, unknown> };
+  deserializeRow?(row: Record<string, unknown>): Record<string, unknown>;
+  readonly scopeAst?: unknown;
+}
+
+export interface QueryFilter {
+  readonly field: string;
+  readonly op: QueryOperator;
+  readonly value?: unknown;
+}
+
+export interface QueryFilterTermNode {
+  readonly kind: 'term';
+  readonly field: string;
+  readonly op?: QueryOperator;
+  readonly value?: unknown;
+}
+
+export interface QueryFilterAndNode {
+  readonly kind: 'and';
+  readonly children: readonly QueryFilterExpression[];
+}
+
+export interface QueryFilterOrNode {
+  readonly kind: 'or';
+  readonly children: readonly QueryFilterExpression[];
+}
+
+export interface QueryFilterNotNode {
+  readonly kind: 'not';
+  readonly child: QueryFilterExpression;
+}
+
+export type QueryFilterExpression =
+  | QueryFilterTermNode
+  | QueryFilterAndNode
+  | QueryFilterOrNode
+  | QueryFilterNotNode;
+
+export interface QuerySort {
+  readonly field: string;
+  readonly direction: 'asc' | 'desc';
+}
+
+export interface QueryContract {
+  readonly entity: string;
+  readonly filters?: readonly QueryFilter[];
+  readonly where?: QueryFilterExpression | null;
+  readonly expression?: QueryFilterExpression | null;
+  readonly sort: QuerySort;
+  readonly pageSize: number;
+}
+
+export interface CompileQueryContractOptions {
+  readonly maxPageSize?: number;
+}
+
+export interface QueryCursor {
+  readonly queryIdentity: string;
+  readonly sortValue: unknown;
+  readonly id: string;
+}
+
+export interface CompiledQuery {
+  readonly entity: string;
+  readonly identity: string;
+  readonly filters: readonly QueryFilter[];
+  readonly where: QueryFilterExpression | null;
+  readonly sort: QuerySort;
+  readonly pageSize: number;
+  readonly maxPageSize: number;
+  readonly dependencyFields: readonly string[];
+}
+
+export interface ExecuteQueryPageOptions {
+  readonly cursor?: QueryCursor | null;
+  readonly offset?: number;
+  readonly maxOffset?: number;
+  readonly includeCount?: boolean;
+  readonly includeTotal?: boolean;
+  readonly hydrate?: boolean;
+}
+
+export interface QueryPage<Row extends Record<string, unknown> = Record<string, unknown>> {
+  readonly rows: readonly Row[];
+  readonly revision: number;
+  readonly hasMore: boolean;
+  readonly nextCursor: QueryCursor | null;
+  readonly queryIdentity: string;
+  readonly offset?: number;
+  readonly count?: number;
+  readonly filteredTotal?: number;
+  readonly total?: number;
+}
+
+export type QueryPageDecision = 'accept' | 'reject-stale';
+export type QueryInvalidationKind = 'unchanged' | 'changed' | 'resync' | 'denied';
+
+export interface QueryInvalidationSignal {
+  readonly kind: QueryInvalidationKind;
+  readonly revision: number;
+}
+
+export interface QueryDependency {
+  readonly entity: string;
+  readonly fields: readonly string[];
+  readonly scope: string;
+  readonly scopeField?: string;
+}
+
+export interface PendingQueryWrite {
+  readonly id: string;
+  readonly verb: 'create' | 'update' | 'remove';
+  readonly fields?: Readonly<Record<string, unknown>>;
+}
+
+export interface OptimisticQueryPage<Row extends Record<string, unknown> = Record<string, unknown>> {
+  readonly rows: readonly Row[];
+  readonly revision: number;
+  readonly membershipUncertain: boolean;
+}
+
+export interface QueryInvalidationRegistrationInput {
+  readonly id: string;
+  readonly dependency: QueryDependency;
+  readonly principal: unknown;
+  readonly entity: QueryEntity;
+  readonly db: QueryDb;
+  readonly revision: number;
+}
+
+export interface QueryInvalidationHub {
+  register(input: QueryInvalidationRegistrationInput): void;
+  registerMany(inputs: readonly QueryInvalidationRegistrationInput[]): void;
+  unregister(id: string, principal: unknown): void;
+  notice(events: readonly unknown[], revision: number): void;
+  changedSince(input: {
+    readonly id: string;
+    readonly principal: unknown;
+    readonly sinceRevision: number;
+    readonly revision: number;
+  }): QueryInvalidationSignal;
+  readonly size: number;
+}
+
+export function compileQueryContract(
+  input: QueryContract,
+  entity: QueryEntity,
+  options?: CompileQueryContractOptions,
+): CompiledQuery;
+export function executeQueryPage<Row extends Record<string, unknown> = Record<string, unknown>>(
+  db: QueryDb,
+  entity: QueryEntity,
+  principal: unknown,
+  compiled: CompiledQuery,
+  options?: ExecuteQueryPageOptions,
+): QueryPage<Row>;
+export function acceptQueryPage(heldRevision: number, incomingRevision: number): QueryPageDecision;
+export function overlayOptimisticQueryPage<Row extends Record<string, unknown> = Record<string, unknown>>(
+  page: QueryPage<Row>,
+  pending: readonly PendingQueryWrite[],
+  compiled: CompiledQuery,
+): OptimisticQueryPage<Row>;
+export function readCommittedRevision(db: QueryDb): number;
+export function queryAuthorizationFields(entity: QueryEntity): string[];
+export function withReadSnapshot<T>(db: QueryDb, run: () => T): T;
+export function createQueryInvalidationHub(options?: { readonly maxRegistrations?: number }): QueryInvalidationHub;
+export function createQueryInvalidationConsumer(
+  hub: QueryInvalidationHub,
+  db: QueryDb,
+): (events: readonly unknown[]) => Promise<void>;
+
+export const DYNAMIC_VALUE_TYPES: readonly ['text', 'number', 'epoch', 'boolean', 'option'];
+export type DynamicValueType = (typeof DYNAMIC_VALUE_TYPES)[number];
+
+export interface QueryFamilyDeclaration {
+  readonly name: string;
+  readonly host: QueryEntity;
+  readonly catalog: QueryEntity;
+  readonly elements: QueryEntity;
+  readonly hostKey: string;
+  readonly fieldKey: string;
+  readonly typeField: string;
+  readonly valueColumns: Readonly<Record<DynamicValueType, string>>;
+  readonly maxPageSize?: number;
+}
+
+export interface CompiledQueryFamily {
+  readonly name: string;
+  readonly host: QueryEntity;
+  readonly catalog: QueryEntity;
+  readonly elements: QueryEntity;
+  readonly hostKey: string;
+  readonly fieldKey: string;
+  readonly typeField: string;
+  readonly valueColumns: Readonly<Record<DynamicValueType, string>>;
+  readonly maxPageSize: number;
+}
+
+export interface QueryDynamicFilter {
+  readonly fieldId: string;
+  readonly op: QueryOperator;
+  readonly value?: unknown;
+}
+
+export interface QueryDynamicSort {
+  readonly dynamicFieldId: string;
+  readonly direction: 'asc' | 'desc';
+}
+
+export type QueryFamilySort = QuerySort | QueryDynamicSort;
+
+export interface QueryFamilyDynamicTermNode {
+  readonly kind: 'dynamic';
+  readonly fieldId: string;
+  readonly op?: QueryOperator;
+  readonly value?: unknown;
+}
+
+export interface QueryFamilyAndNode {
+  readonly kind: 'and';
+  readonly children: readonly QueryFamilyFilterExpression[];
+}
+
+export interface QueryFamilyOrNode {
+  readonly kind: 'or';
+  readonly children: readonly QueryFamilyFilterExpression[];
+}
+
+export interface QueryFamilyNotNode {
+  readonly kind: 'not';
+  readonly child: QueryFamilyFilterExpression;
+}
+
+export type QueryFamilyFilterExpression =
+  | QueryFilterTermNode
+  | QueryFamilyDynamicTermNode
+  | QueryFamilyAndNode
+  | QueryFamilyOrNode
+  | QueryFamilyNotNode;
+
+export interface QueryFamilyRequest {
+  readonly fieldId?: string;
+  readonly op?: QueryOperator;
+  readonly value?: unknown;
+  readonly filters?: readonly QueryFilter[];
+  readonly dynamicFilters?: readonly QueryDynamicFilter[];
+  readonly where?: QueryFamilyFilterExpression | null;
+  readonly expression?: QueryFamilyFilterExpression | null;
+  readonly sort?: QueryFamilySort;
+  readonly sortByDynamicField?:
+    | QueryDynamicSort
+    | { readonly fieldId: string; readonly direction?: 'asc' | 'desc' };
+  readonly pageSize: number;
+  readonly cursor?: QueryCursor | null;
+  readonly offset?: number;
+  readonly includeCount?: boolean;
+  readonly includeTotal?: boolean;
+  readonly hydrate?: boolean;
+}
+
+export interface ExecuteQueryFamilyOptions {
+  readonly maxPageSize?: number;
+  readonly maxOffset?: number;
+}
+
+export interface QueryFamilyRegistry {
+  register(declaration: QueryFamilyDeclaration): CompiledQueryFamily;
+  execute<Row extends Record<string, unknown> = Record<string, unknown>>(
+    name: string,
+    db: QueryDb,
+    principal: unknown,
+    request: QueryFamilyRequest,
+    options?: ExecuteQueryFamilyOptions,
+  ): QueryPage<Row>;
+  get(name: string): CompiledQueryFamily | undefined;
+}
+
+export function compileQueryFamily(input: QueryFamilyDeclaration): CompiledQueryFamily;
+export function executeQueryFamily<Row extends Record<string, unknown> = Record<string, unknown>>(
+  db: QueryDb,
+  family: CompiledQueryFamily,
+  principal: unknown,
+  request: QueryFamilyRequest,
+  options?: ExecuteQueryFamilyOptions,
+): QueryPage<Row>;
+export function createQueryFamilyRegistry(): QueryFamilyRegistry;
+export function queryFamilyDependencies(
+  family: CompiledQueryFamily,
+  scope: string,
+  scopeField?: string,
+  hostFields?: readonly string[],
+): readonly QueryDependency[];
+export function registerQueryFamilyInvalidation(
+  hub: QueryInvalidationHub,
+  input: {
+    readonly id: string;
+    readonly family: CompiledQueryFamily;
+    readonly principal: unknown;
+    readonly db: QueryDb;
+    readonly revision: number;
+    readonly scope: string;
+    readonly scopeField?: string;
+    readonly hostFields?: readonly string[];
+  },
+): void;
+export function queryFamilyChangedSince(
+  hub: QueryInvalidationHub,
+  input: {
+    readonly id: string;
+    readonly family: CompiledQueryFamily;
+    readonly principal: unknown;
+    readonly sinceRevision: number;
+    readonly revision: number;
+  },
+): QueryInvalidationSignal;
+
 export default function workbench(options?: WorkbenchOptions): WorkbenchApp;

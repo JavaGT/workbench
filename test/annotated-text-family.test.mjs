@@ -56,7 +56,7 @@ test('assertStructuralEndpoint accepts and freezes a valid endpoint', () => {
   assert.ok(Object.isFrozen(ep));
   assert.ok(Object.isFrozen(ep.point));
   assert.ok(Object.isFrozen(ep.basisFrontier));
-  assert.throws(() => { ep.point = null; }, /Cannot assign/);
+  assert.throws(() => { ep.point = null; }, TypeError);
 });
 
 test('assertStructuralEndpoint rejects unknown keys', () => {

@@ -19,6 +19,14 @@
 import { ValidationError } from './field-strategy.ts';
 import { loadAnnotationImages } from './annotated-text-storage.ts';
 import { canonicalStringify } from './canonical-json.ts';
+import { readAnnotatedTextFamilyCheckpoint } from './annotated-text-authoring-stream.ts';
+import {
+  materializeText,
+  projectEndpointToOffset,
+  restoreTextFamilySerialized,
+  type ContinuousTextFamily,
+} from './annotated-text-continuous.ts';
+import type { StructuralEndpoint } from './annotated-text-family.ts';
 import type { Principal } from './principal.ts';
 
 interface Statement {
@@ -46,6 +54,16 @@ interface AnnotatedField {
   readonly declarations: readonly CompiledAnnotationDeclaration[];
 }
 
+/** Exact UTF-16 wording of one projected active membership range. `text` is the
+ *  visible slice covered by the range, in membership-ordinal order.
+ *  Offsets are a snapshot and do not participate in change detection. */
+export interface AnnotationWording {
+  readonly ordinal: number;
+  readonly start: number;
+  readonly end: number;
+  readonly text: string;
+}
+
 interface AnnotationImage {
   readonly id: string;
   readonly family: string;
@@ -56,6 +74,9 @@ interface AnnotationImage {
   readonly empty?: 'delete' | 'orphan';
   readonly cardinality?: 'many' | 'one';
   readonly orphan?: { readonly savedQuote: string; readonly lastRange: readonly [number, number] | null } | null;
+  /** Present only when the registration opts in with `includeWording: true`.
+   *  Stored orphan state stays in `orphan`, never folded into this wording. */
+  readonly wording?: readonly AnnotationWording[];
 }
 
 interface AdmittedEvent {
@@ -93,6 +114,10 @@ export interface AnnotatedTextAdmissionDeclaration {
   /** Annotation families this application cares about. Other families are
    *  never loaded. Absent means every declared family. */
   readonly families?: readonly string[];
+  /** Off by default: keep the before/after images structural-only. Opt in to
+   *  also capture each annotation's projected active-range wording, so interior
+   *  text edits that leave structural memberships unchanged still reach `admit`. */
+  readonly includeWording?: boolean;
   readonly admit: AnnotatedTextAdmission;
 }
 
@@ -136,7 +161,8 @@ function annotationDeclarations(field: { annotations?: readonly unknown[] }): Co
 function indexAnnotatedFields(
   entities: ReadonlyMap<string, any>,
   families: ReadonlySet<string> | null,
-): Map<string, AnnotatedField[]> {  const byEntity = new Map<string, AnnotatedField[]>();
+): Map<string, AnnotatedField[]> {
+  const byEntity = new Map<string, AnnotatedField[]>();
   for (const entity of entities.values()) {
     if (!entity || typeof entity.name !== 'string' || !entity.fields) continue;
     const fields: AnnotatedField[] = [];
@@ -163,7 +189,43 @@ function documentIdOf(event: AdmittedEvent): string | null {
   return typeof candidate === 'string' && candidate.length > 0 ? candidate : null;
 }
 
-function loadImages(db: DbHandle, target: { field: AnnotatedField; documentId: string }): Map<string, Readonly<AnnotationImage>> {
+/**
+ * Project a membership's structural endpoints against the materialized family
+ * and return the exact visible UTF-16 slice. Unprojectable (stale-basis / lost
+ * anchor) and out-of-bounds ranges are not active and are omitted.
+ */
+function projectWording(
+  family: ContinuousTextFamily,
+  text: string,
+  memberships: readonly { ordinal: number; start: unknown; end: unknown }[],
+): readonly AnnotationWording[] {
+  const wording: AnnotationWording[] = [];
+  for (const membership of [...memberships].sort((left, right) => left.ordinal - right.ordinal)) {
+    let start: number;
+    let end: number;
+    try {
+      start = projectEndpointToOffset(family, membership.start as StructuralEndpoint);
+      end = projectEndpointToOffset(family, membership.end as StructuralEndpoint);
+    } catch {
+      continue; // not an active range
+    }
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end <= start || end > text.length) continue;
+    wording.push(Object.freeze({ ordinal: membership.ordinal, start, end, text: text.slice(start, end) }));
+  }
+  return Object.freeze(wording);
+}
+
+/**
+ * Materialize the document checkpoint at the moment this pass runs and attach
+ * exact UTF-16 wording to each captured image. A missing checkpoint (pre-create
+ * or post-retirement state) simply leaves images without wording — those images
+ * are null on the opposite side of the comparison anyway.
+ */
+function loadImages(
+  db: DbHandle,
+  target: { field: AnnotatedField; documentId: string },
+  includeWording: boolean,
+): Map<string, Readonly<AnnotationImage>> {
   const images = loadAnnotationImages(db, {
     prefix: target.field.prefix,
     documentId: target.documentId,
@@ -171,11 +233,29 @@ function loadImages(db: DbHandle, target: { field: AnnotatedField; documentId: s
     families: target.field.declarations.map((declaration) => declaration.annotationName),
     deserializeFields: true,
   });
-  return new Map(images.map((image) => [image.id, Object.freeze(image as AnnotationImage)]));
+  let textSource: { family: ContinuousTextFamily; text: string } | undefined;
+  if (includeWording && images.length > 0) {
+    const checkpoint = readAnnotatedTextFamilyCheckpoint(db, target.field.prefix, target.documentId);
+    if (checkpoint !== undefined) {
+      const family = restoreTextFamilySerialized(checkpoint);
+      textSource = { family, text: materializeText(family) };
+    }
+  }
+  return new Map(images.map((image) => {
+    const frozen: AnnotationImage = textSource
+      ? { ...(image as AnnotationImage), wording: projectWording(textSource.family, textSource.text, image.memberships) }
+      : { ...(image as AnnotationImage) };
+    return [image.id, Object.freeze(frozen)];
+  }));
 }
 
-function sameImage(left: unknown, right: unknown): boolean {
-  return canonicalStringify(left) === canonicalStringify(right);
+/** Absolute offset shifts do not change the annotation or its wording. */
+function sameImage(left: AnnotationImage | null, right: AnnotationImage | null): boolean {
+  const comparable = (image: AnnotationImage | null) => {
+    if (!image?.wording) return image;
+    return { ...image, wording: image.wording.map(({ ordinal, text }) => ({ ordinal, text })) };
+  };
+  return canonicalStringify(comparable(left)) === canonicalStringify(comparable(right));
 }
 
 function refusal(): never {
@@ -237,6 +317,10 @@ export function createAnnotatedTextMutationAdmission({
   if (typeof registration.admit !== 'function') {
     throw new Error('annotatedTextAdmission.admit must be a function');
   }
+  if (registration.includeWording !== undefined && typeof registration.includeWording !== 'boolean') {
+    throw new Error('annotatedTextAdmission.includeWording must be a boolean');
+  }
+  const includeWording = registration.includeWording === true;
   const families = registration.families === undefined
     ? null
     : new Set(registration.families.map((family) => {
@@ -278,7 +362,7 @@ export function createAnnotatedTextMutationAdmission({
             field: target.field,
             documentId: target.documentId,
             scope,
-            images: loadImages(db, target),
+            images: loadImages(db, target, includeWording),
           }));
         }
       }
@@ -287,7 +371,7 @@ export function createAnnotatedTextMutationAdmission({
     async after({ db, state, actionId, actionType, principal }: Parameters<AnnotatedTextMutationAdmission['after']>[0]) {
       if (!state) return;
       for (const target of state) {
-        const after = loadImages(db, target);
+        const after = loadImages(db, target, includeWording);
         const ids = new Set([...target.images.keys(), ...after.keys()]);
         for (const annotationId of ids) {
           const beforeImage = target.images.get(annotationId) ?? null;

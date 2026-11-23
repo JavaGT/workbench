@@ -121,6 +121,14 @@ Public wire vs internal durable versions:
 [`annotated-text-public-v9-operated-lattice.md`](./annotated-text-public-v9-operated-lattice.md).
 RGA grammar: [`adr/0005-annotated-text-kernel.md`](./adr/0005-annotated-text-kernel.md).
 
+| Module | Role |
+| --- | --- |
+| `annotated-text.mjs` / `annotated-text-family.mjs` / `annotated-text-continuous.mjs` | RGA grammar, run/piece-aware reducer, compact checkpoints, continuous endpoint projection |
+| `annotated-text-crud.mjs` | Compile/Commit-loop CRUD handlers for import, v9 operations, history compensation, retirement erasure, and declared annotation actions (extracted from `entity/crud.mjs`) |
+| `annotated-text-projection.mjs` | Commit-loop projection reducer for initialization, imported-range seeding, operated events, incremental membership sync, retirement, and removal cleanup (extracted from `entity/projection.mjs`) |
+| `annotated-text-admit.mjs` / `annotated-text-admission.mjs` | Commit-loop v9 authoring admission, stale visible plain-insert rebase, and application-owned annotation delta/wording admission |
+| `annotated-text-snapshot.mjs` / `annotated-text-recipient-projection.mjs` / `annotated-text-fold-envelope.mjs` | Deliver-loop protector-only visibility checks, shared visible snapshot projection cache, redaction projection, and live v5 fold envelopes |
+
 ## Structural rules of thumb
 
 1. Prefer navigating by **loop**, not by file prefix count.

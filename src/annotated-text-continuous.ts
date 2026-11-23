@@ -16,21 +16,24 @@ import {
   assertFrontier,
   assertStructuralPoint,
   assertUtf16Offset,
+  buildRgaPieces,
   canonicalTextOp,
-  compareOpId,
+  compareOpIdValidated,
   createTextState,
+  ensureRunUtf16Starts,
   frontierDominatesValidated,
+  hasTextElement,
   restoreTextCheckpoint,
-  textCheckpoint,
+  textStateElementCount,
+  textStateMaxLamport,
   applyTextOp,
   compactTextCheckpoint,
 } from './annotated-text.ts';
 import type {
-  Anchor, Frontier, OpId, TextElement, TextOp, TextState,
+  Anchor, Frontier, OpId, RgaPiece, TextOp, TextState,
 } from './annotated-text.ts';
 import {
   assertStructuralEndpoint,
-  rgaTraversal,
 } from './annotated-text-family.ts';
 import type { StructuralEndpoint } from './annotated-text-family.ts';
 
@@ -45,11 +48,20 @@ export interface ContinuousTextFamily {
   checkpoint: TextState;
 }
 
+interface IndexedPiece {
+  readonly piece: RgaPiece;
+  readonly startVirtualPos: number;
+  readonly endVirtualPos: number;
+  readonly visibleStart: number;
+  readonly visibleEnd: number;
+}
+
 interface ContinuousTextDerivedIndex {
-  readonly order: Array<[string, TextElement]>;
-  readonly positions: Map<string, number>;
-  /** Visible UTF-16 length before each traversal position. */
-  readonly visibleOffsets: number[];
+  readonly pieces: readonly IndexedPiece[];
+  readonly visiblePieces: readonly IndexedPiece[];
+  readonly piecesByOp: ReadonlyMap<string, readonly IndexedPiece[]>;
+  readonly rootPieces: readonly IndexedPiece[];
+  readonly totalVirtualLength: number;
   readonly text: string;
   readonly textLength: number;
 }
@@ -146,7 +158,10 @@ export function importTextToFamily(documentId: string, actor: string, text: stri
   if (text.length > 0) {
     state = applyTextOp(state, ['workbench.text', 1, [actor, 1], 1, [], ['insert', ['root'], text]]);
   }
-  return createTextFamily(documentId, textCheckpoint(state));
+  // `state` was just produced by the validated reducer (`createTextState` +
+  // `applyTextOp`), so trusting it directly avoids sorting/replaying every
+  // character through a v1 checkpoint round-trip.
+  return trustFamily({ id: documentId, checkpoint: state });
 }
 
 export function textFamilyCheckpoint(family: ContinuousTextFamily): ContinuousTextFamily {
@@ -171,10 +186,17 @@ export function textFamilyBasis(family: ContinuousTextFamily): { readonly versio
   return deepFreeze({ version: 1, id: family.id, frontier: family.checkpoint.frontier });
 }
 
+/** O(1) max element Lamport clock for a trusted continuous family. */
+export function textFamilyMaxLamport(family: ContinuousTextFamily): number {
+  return textStateMaxLamport(assertTrustedFamily(family).checkpoint);
+}
+
+/** O(1) total RGA element count (live + tombstones) for a trusted continuous family. */
+export function textFamilyElementCount(family: ContinuousTextFamily): number {
+  return textStateElementCount(assertTrustedFamily(family).checkpoint);
+}
+
 export function materializeText(family: ContinuousTextFamily): string {
-  // `restoreTextFamily` already validates and restores the checkpoint. Replaying
-  // the whole operation registry again here made every offset check and fold an
-  // accidental second O(document history) restore.
   return derivedIndex(assertTrustedFamily(family)).text;
 }
 
@@ -184,44 +206,71 @@ export function textFamilyVisibleLength(family: ContinuousTextFamily): number {
 }
 
 /**
- * Build the immutable traversal data needed by endpoint projection once per
- * checkpoint. Range projection resolves two endpoints and compares offsets for
- * every annotation; rebuilding the RGA traversal and materializing the document
- * in each of those calls turns a linear read into quadratic work.
+ * Build the immutable run-aware traversal index once per checkpoint.
+ * Operating on contiguous RGA pieces keeps index construction O(pieces)
+ * (~O(edits)) instead of O(chars), even on 200k-char transcripts.
  */
 function derivedIndex(family: ContinuousTextFamily): ContinuousTextDerivedIndex {
   assertTrustedFamily(family);
   const cached = derivedIndexCache.get(family);
   if (cached) return cached;
 
-  const order = rgaTraversal(family.checkpoint);
-  const positions = new Map<string, number>();
-  const visibleOffsets = [0];
+  const rawPieces = buildRgaPieces(family.checkpoint);
+  const pieces: IndexedPiece[] = new Array(rawPieces.length);
+  const visiblePieces: IndexedPiece[] = [];
+  const rootPieces: IndexedPiece[] = [];
+  const piecesByOpMutable = new Map<string, IndexedPiece[]>();
+  let virtualPos = 0;
   let visibleOffset = 0;
-  // Keep visible scalars as segments. Repeated `text += scalar` turns a
-  // checkpoint rebuild into repeated copying of the already-built document;
-  // callers that need the public string still get exactly one join, lazily.
-  const textChunks: string[] = [];
-  let textLength = 0;
-  for (let index = 0; index < order.length; index += 1) {
-    const [key, element] = order[index];
-    positions.set(key, index);
-    if (element.deletedBy.length === 0) {
-      textChunks.push(element.scalar);
-      visibleOffset += element.scalar.length;
-      textLength += element.scalar.length;
+
+  for (let i = 0; i < rawPieces.length; i += 1) {
+    const piece = rawPieces[i];
+    const startVirtualPos = virtualPos;
+    const endVirtualPos = startVirtualPos + piece.length;
+    const visibleStart = visibleOffset;
+    const visibleEnd = piece.deleted ? visibleStart : visibleStart + piece.text.length;
+    const indexed: IndexedPiece = {
+      piece,
+      startVirtualPos,
+      endVirtualPos,
+      visibleStart,
+      visibleEnd,
+    };
+    pieces[i] = indexed;
+    if (!piece.deleted) visiblePieces.push(indexed);
+    if (piece.startOrdinal === 0 && piece.parentKey === ROOT_ID) rootPieces.push(indexed);
+    let opList = piecesByOpMutable.get(piece.opKey);
+    if (!opList) {
+      opList = [];
+      piecesByOpMutable.set(piece.opKey, opList);
     }
-    visibleOffsets.push(visibleOffset);
+    opList.push(indexed);
+    virtualPos = endVirtualPos;
+    visibleOffset = visibleEnd;
+  }
+
+  for (const list of piecesByOpMutable.values()) {
+    if (list.length > 1) list.sort((a, b) => a.piece.startOrdinal - b.piece.startOrdinal);
   }
 
   let materializedText: string | undefined;
-  const derived = Object.freeze({
-    order,
-    positions,
-    visibleOffsets,
-    textLength,
+  const derived: ContinuousTextDerivedIndex = Object.freeze({
+    pieces,
+    visiblePieces,
+    piecesByOp: piecesByOpMutable,
+    rootPieces,
+    totalVirtualLength: virtualPos,
+    textLength: visibleOffset,
     get text() {
-      materializedText ??= textChunks.join('');
+      if (materializedText === undefined) {
+        if (visiblePieces.length === 0) materializedText = '';
+        else if (visiblePieces.length === 1) materializedText = visiblePieces[0].piece.text;
+        else {
+          const chunks = new Array<string>(visiblePieces.length);
+          for (let i = 0; i < visiblePieces.length; i += 1) chunks[i] = visiblePieces[i].piece.text;
+          materializedText = chunks.join('');
+        }
+      }
       return materializedText;
     },
   });
@@ -235,54 +284,123 @@ function deepFreeze<T>(value: T): T {
   return Object.freeze(value) as T;
 }
 
+function findPieceForElement(derived: ContinuousTextDerivedIndex, opKeyStr: string, ordinal: number): IndexedPiece | null {
+  const list = derived.piecesByOp.get(opKeyStr);
+  if (!list) return null;
+  if (list.length === 1) {
+    const only = list[0];
+    return ordinal >= only.piece.startOrdinal && ordinal < only.piece.startOrdinal + only.piece.length ? only : null;
+  }
+  let lo = 0;
+  let hi = list.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >>> 1;
+    const candidate = list[mid];
+    if (ordinal < candidate.piece.startOrdinal) hi = mid - 1;
+    else if (ordinal >= candidate.piece.startOrdinal + candidate.piece.length) lo = mid + 1;
+    else return candidate;
+  }
+  return null;
+}
+
+function findPieceAtVirtualPos(pieces: readonly IndexedPiece[], pos: number): number {
+  let lo = 0;
+  let hi = pieces.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (pieces[mid].endVirtualPos > pos) hi = mid;
+    else lo = mid + 1;
+  }
+  return lo;
+}
+
+function findVisiblePieceForOffset(visiblePieces: readonly IndexedPiece[], utf16Offset: number): number {
+  let lo = 0;
+  let hi = visiblePieces.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (visiblePieces[mid].visibleEnd >= utf16Offset) hi = mid;
+    else lo = mid + 1;
+  }
+  return lo;
+}
+
+function localOrdinalForOffsetInPiece(ip: IndexedPiece, utf16Offset: number): { localOrdinal: number; scalarEndOffset: number } {
+  const rel = utf16Offset - ip.visibleStart;
+  if (ip.piece.isBmp) {
+    const localOrdinal = Math.ceil(rel) - 1;
+    return { localOrdinal, scalarEndOffset: ip.visibleStart + localOrdinal + 1 };
+  }
+  const starts = ensureRunUtf16Starts(ip.piece.run);
+  const baseOrdinal = ip.piece.startOrdinal;
+  const baseUtf16 = starts[baseOrdinal];
+  let lo = 0;
+  let hi = ip.piece.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (starts[baseOrdinal + mid + 1] - baseUtf16 >= rel) hi = mid;
+    else lo = mid + 1;
+  }
+  return {
+    localOrdinal: lo,
+    scalarEndOffset: ip.visibleStart + (starts[baseOrdinal + lo + 1] - baseUtf16),
+  };
+}
+
+function visibleOffsetAtVirtualPos(derived: ContinuousTextDerivedIndex, virtualPos: number): number {
+  if (virtualPos <= 0) return 0;
+  if (virtualPos >= derived.totalVirtualLength) return derived.textLength;
+  const idx = findPieceAtVirtualPos(derived.pieces, virtualPos);
+  const ip = derived.pieces[idx];
+  if (ip.piece.deleted) return ip.visibleStart;
+  const localOrdinal = virtualPos - ip.startVirtualPos;
+  if (localOrdinal === 0) return ip.visibleStart;
+  if (ip.piece.isBmp) return ip.visibleStart + localOrdinal;
+  const starts = ensureRunUtf16Starts(ip.piece.run);
+  return ip.visibleStart + (starts[ip.piece.startOrdinal + localOrdinal] - starts[ip.piece.startOrdinal]);
+}
+
 /**
  * Absolute document-wide endpoint position: the index in the RGA traversal
  * order where this endpoint (with its HISTORICAL basis frontier + affinity)
  * sits against the CURRENT checkpoint.
  */
 function endpointVirtualPosition(family: ContinuousTextFamily, endpoint: StructuralEndpoint): number {
-  const { order, positions } = derivedIndex(family);
+  const derived = derivedIndex(family);
   const anchor = endpoint.point[1];
   const affinity = endpoint.point[2];
-  const anchorKey = anchorKeyStr(anchor);
   const basis = endpoint.basisFrontier;
 
-  if (anchorKey === ROOT_ID) {
+  if (anchor[0] === ROOT_ID) {
     if (affinity === 'left') return 0;
-    for (let i = 0; i < order.length; i += 1) {
-      const [, element] = order[i];
-      if (element.parent === ROOT_ID && frontierDominatesValidated(basis, [[...element.op]])) return i;
+    const { rootPieces, totalVirtualLength } = derived;
+    for (let i = 0; i < rootPieces.length; i += 1) {
+      const ip = rootPieces[i];
+      if (frontierDominatesValidated(basis, [ip.piece.op])) return ip.startVirtualPos;
     }
-    return order.length;
+    return totalVirtualLength;
   }
 
-  const anchorIdx = positions.get(anchorKey);
-  if (anchorIdx === undefined) fail('anchor element not found in checkpoint');
+  const [op, ordinal] = anchor[1];
+  const opKeyStr = `${op[0]}:${op[1]}`;
+  const ip = findPieceForElement(derived, opKeyStr, ordinal);
+  if (!ip) fail('anchor element not found in checkpoint');
+  const anchorIdx = ip.startVirtualPos + (ordinal - ip.piece.startOrdinal);
 
   // Clean boundary semantics for the continuous model:
   //   [element, left]  = the boundary BEFORE element K       (index of K)
   //   [element, right] = the boundary AFTER element K's own
   //                      scalar, BEFORE its children (old or
   //                      new)                                (index of K + 1)
-  // This keeps historical endpoints STABLE: a new child inserted at the
-  // boundary always lands after a right-affinity boundary (it joins the
-  // following region) regardless of lamport ordering, and never moves the
-  // boundary across unrelated text.
   return affinity === 'left' ? anchorIdx : anchorIdx + 1;
 }
 
 function assertDominatingBasis(family: ContinuousTextFamily, endpoint: StructuralEndpoint, label: string): void {
-  // The checkpoint frontier and endpoint basis are both validated at their
-  // trust boundaries (admission / assertStructuralEndpoint), so use the
-  // validated comparison here: `assertDominatingBasis` runs once per projected
-  // endpoint on every render/typing flush, and re-running assertFrontier (regex
-  // per actor + Object.freeze per entry) is the dominant per-keystroke cost in
-  // large transcripts.
   if (!frontierDominatesValidated(family.checkpoint.frontier, endpoint.basisFrontier)) {
     fail(`${label}: current frontier does not dominate endpoint basis — anchor is lost`);
   }
   const anchorKey = anchorKeyStr(endpoint.point[1]);
-  if (anchorKey !== ROOT_ID && !Object.hasOwn(family.checkpoint.elements, anchorKey)) {
+  if (anchorKey !== ROOT_ID && !hasTextElement(family.checkpoint, anchorKey)) {
     fail(`${label}: endpoint anchor element no longer exists`);
   }
 }
@@ -311,8 +429,6 @@ export function compareStructuralEndpoints(family: ContinuousTextFamily, left: S
   const leftPos = endpointVirtualPosition(family, left);
   const rightPos = endpointVirtualPosition(family, right);
   if (leftPos !== rightPos) return leftPos - rightPos;
-  // Same virtual position = the same boundary; do not fall back to an arbitrary
-  // key order (which would be unrelated to document position).
   return 0;
 }
 
@@ -322,25 +438,37 @@ export function materializeRange(family: ContinuousTextFamily, start: Structural
   assertDominatingBasis(family, start, 'materializeRange');
   assertDominatingBasis(family, end, 'materializeRange');
   if (compareStructuralEndpoints(family, start, end) > 0) fail('materializeRange: start must not be after end');
-  const { order } = derivedIndex(family);
+  const derived = derivedIndex(family);
   const startPos = endpointVirtualPosition(family, start);
   const endPos = endpointVirtualPosition(family, end);
-  let text = '';
-  for (let i = startPos; i < endPos; i += 1) {
-    const [, element] = order[i];
-    if (element.deletedBy.length === 0) text += element.scalar;
+  if (startPos >= endPos || derived.pieces.length === 0) return '';
+
+  const chunks: string[] = [];
+  let idx = findPieceAtVirtualPos(derived.pieces, startPos);
+  while (idx < derived.pieces.length) {
+    const ip = derived.pieces[idx];
+    if (ip.startVirtualPos >= endPos) break;
+    if (!ip.piece.deleted) {
+      const localFrom = Math.max(0, startPos - ip.startVirtualPos);
+      const localTo = Math.min(ip.piece.length, endPos - ip.startVirtualPos);
+      if (localFrom === 0 && localTo === ip.piece.length) {
+        chunks.push(ip.piece.text);
+      } else if (ip.piece.isBmp) {
+        chunks.push(ip.piece.text.slice(localFrom, localTo));
+      } else {
+        const starts = ensureRunUtf16Starts(ip.piece.run);
+        const base = starts[ip.piece.startOrdinal];
+        chunks.push(ip.piece.text.slice(
+          starts[ip.piece.startOrdinal + localFrom] - base,
+          starts[ip.piece.startOrdinal + localTo] - base,
+        ));
+      }
+    }
+    idx += 1;
   }
-  return text;
+  return chunks.length === 1 ? chunks[0] : chunks.join('');
 }
 
-/**
- * Value equality for frontiers that were already validated at their trust
- * boundaries (admission / assertStructuralEndpoint). Sorted, unique actor ids
- * make mutual domination + equal length exact: every entry of one frontier is
- * covered by the other and neither carries extra actors. This replaces a
- * double `JSON.stringify` per call — resolve runs once or twice per projected
- * annotation endpoint on every render/typing flush.
- */
 function frontierEqualsValidated(left: Frontier, right: Frontier): boolean {
   if (left === right) return true;
   return left.length === right.length
@@ -352,52 +480,34 @@ function frontierEqualsValidated(left: Frontier, right: Frontier): boolean {
  * Resolve an ABSOLUTE UTF-16 offset into the whole document to a structural
  * endpoint. The basis must equal the current frontier (offsets are always
  * resolved against the live document).
- *
- * At an exact character boundary the affinity chooses which side of the
- * boundary owns it: 'left' yields the boundary BEFORE the following visible
- * element, 'right' the boundary AFTER the preceding element's scalar (before
- * its children). This is what lets an insertion AT the boundary land OUTSIDE a
- * range whose start endpoint carries 'left' affinity — a redacted recipient's
- * edge typing attaches to the visible neighbor instead of being absorbed into
- * the hidden span.
  */
 export function resolveOffsetToEndpoint(family: ContinuousTextFamily, utf16Offset: number, basisFrontier: Frontier, affinity: 'left' | 'right'): StructuralEndpoint {
   assertTrustedFamily(family);
-  // Validate the caller-supplied basis at this boundary so a malformed value
-  // fails with the controlled frontier message instead of an incidental
-  // TypeError inside the comparator below; the checkpoint side was validated
-  // at admission/restoration.
   const trustedBasis = assertFrontier(basisFrontier);
   if (!frontierEqualsValidated(family.checkpoint.frontier, trustedBasis)) {
     fail('resolveOffsetToEndpoint requires basisFrontier equal to family checkpoint frontier');
   }
-  const { order, text, visibleOffsets } = derivedIndex(family);
-  assertUtf16Offset(text, utf16Offset);
+  const derived = derivedIndex(family);
+  assertUtf16Offset(derived.text, utf16Offset);
   if (affinity !== 'left' && affinity !== 'right') fail('resolveOffsetToEndpoint requires an explicit affinity');
 
   if (utf16Offset === 0) {
     return assertStructuralEndpoint({ point: ['point', ['root'], 'left'], basisFrontier });
   }
-  if (utf16Offset === text.length) {
-    return endpointAfterLastVisible(family, order, basisFrontier);
+  if (utf16Offset === derived.textLength) {
+    return endpointAfterLastVisible(derived, basisFrontier);
   }
 
-  // First traversal position whose cumulative visible offset reaches the
-  // request. `visibleOffsets[i]` is the visible offset after element i.
-  let lo = 1;
-  let hi = visibleOffsets.length - 1;
-  while (lo < hi) {
-    const mid = lo + ((hi - lo) >> 1);
-    if (visibleOffsets[mid] >= utf16Offset) hi = mid;
-    else lo = mid + 1;
-  }
+  const { visiblePieces } = derived;
+  const pieceIdx = findVisiblePieceForOffset(visiblePieces, utf16Offset);
+  const ip = visiblePieces[pieceIdx];
+  const { localOrdinal, scalarEndOffset } = localOrdinalForOffsetInPiece(ip, utf16Offset);
+  const ordinal = ip.piece.startOrdinal + localOrdinal;
+  const anchor: Anchor = ['element', [[...ip.piece.op], ordinal]];
 
-  const elementIndex = lo - 1;
-  const element = order[elementIndex][1];
-  const anchor = ['element', [[...element.op], element.ordinal]];
-  if (utf16Offset === visibleOffsets[lo]) {
+  if (utf16Offset === scalarEndOffset) {
     if (affinity === 'left') {
-      const nextAnchor = nextVisibleAnchorAfter(order, elementIndex);
+      const nextAnchor = nextVisibleAnchorAfter(visiblePieces, pieceIdx, localOrdinal);
       if (nextAnchor) {
         return assertStructuralEndpoint({ point: ['point', nextAnchor, 'left'], basisFrontier });
       }
@@ -407,57 +517,37 @@ export function resolveOffsetToEndpoint(family: ContinuousTextFamily, utf16Offse
   return assertStructuralEndpoint({ point: ['point', anchor, 'left'], basisFrontier });
 }
 
-/** The first visible element after a traversal index, or null when none follow. */
-function nextVisibleAnchorAfter(order: Array<[string, TextElement]>, index: number): Anchor | null {
-  for (let cursor = index + 1; cursor < order.length; cursor += 1) {
-    const [, element] = order[cursor];
-    if (element.deletedBy.length === 0) {
-      return ['element', [[...element.op], element.ordinal]];
-    }
+function nextVisibleAnchorAfter(visiblePieces: readonly IndexedPiece[], pieceIdx: number, localOrdinal: number): Anchor | null {
+  const ip = visiblePieces[pieceIdx];
+  if (localOrdinal + 1 < ip.piece.length) {
+    return ['element', [[...ip.piece.op], ip.piece.startOrdinal + localOrdinal + 1]];
+  }
+  if (pieceIdx + 1 < visiblePieces.length) {
+    const next = visiblePieces[pieceIdx + 1];
+    return ['element', [[...next.piece.op], next.piece.startOrdinal]];
   }
   return null;
 }
 
 /**
  * The RGA anchor element for an insert AT an absolute offset: the last visible
- * element whose scalar ends at or contains the offset. The anchor is a pure
- * function of the offset — affinity does not reposition an insertion point, it
- * only decides which side of the boundary an endpoint/range owns (see
- * `resolveOffsetToEndpoint`). An offset at an element boundary anchors to the
- * element BEFORE it, so the new text becomes its child and lands exactly at the
- * requested offset.
- *
- * Resolved through the cached `derivedIndex` with the same
- * first-position-that-reaches-the-offset binary search as endpoint projection:
- * `visibleOffsets[lo - 1] < offset <= visibleOffsets[lo]` names exactly the
- * visible element the raw per-call RGA walk used to land on (tombstone runs
- * carry zero width, so the search steps over them), without rebuilding the
- * traversal per call.
+ * element whose scalar ends at or contains the offset.
  */
 export function insertAnchorForOffset(family: ContinuousTextFamily, utf16Offset: number): Anchor {
-  const { order, visibleOffsets } = derivedIndex(family);
-  const textLength = visibleOffsets[visibleOffsets.length - 1];
-  // Same acceptance domain as the former per-call RGA walk: positive offsets up
-  // to the visible length resolve (fractional offsets name their containing
-  // element); anything else — zero, past-the-end, NaN — fails identically.
-  if (!(utf16Offset > 0 && utf16Offset <= textLength)) fail('failed to resolve insert anchor for offset');
-  let lo = 1;
-  let hi = visibleOffsets.length - 1;
-  while (lo < hi) {
-    const mid = lo + ((hi - lo) >> 1);
-    if (visibleOffsets[mid] >= utf16Offset) hi = mid;
-    else lo = mid + 1;
-  }
-  const [, element] = order[lo - 1];
-  return ['element', [[...element.op], element.ordinal]];
+  const derived = derivedIndex(family);
+  if (!(utf16Offset > 0 && utf16Offset <= derived.textLength)) fail('failed to resolve insert anchor for offset');
+  const { visiblePieces } = derived;
+  const pieceIdx = findVisiblePieceForOffset(visiblePieces, utf16Offset);
+  const ip = visiblePieces[pieceIdx];
+  const { localOrdinal } = localOrdinalForOffsetInPiece(ip, utf16Offset);
+  return ['element', [[...ip.piece.op], ip.piece.startOrdinal + localOrdinal]];
 }
 
-function endpointAfterLastVisible(_family: ContinuousTextFamily, order: Array<[string, TextElement]>, basisFrontier: Frontier): StructuralEndpoint {
-  for (let i = order.length - 1; i >= 0; i -= 1) {
-    const [, element] = order[i];
-    if (element.deletedBy.length === 0) {
-      return assertStructuralEndpoint({ point: ['point', ['element', [[...element.op], element.ordinal]], 'right'], basisFrontier });
-    }
+function endpointAfterLastVisible(derived: ContinuousTextDerivedIndex, basisFrontier: Frontier): StructuralEndpoint {
+  const last = derived.visiblePieces.at(-1);
+  if (last) {
+    const lastOrdinal = last.piece.startOrdinal + last.piece.length - 1;
+    return assertStructuralEndpoint({ point: ['point', ['element', [[...last.piece.op], lastOrdinal]], 'right'], basisFrontier });
   }
   return assertStructuralEndpoint({ point: ['point', ['root'], 'left'], basisFrontier });
 }
@@ -470,19 +560,20 @@ function endpointAfterLastVisible(_family: ContinuousTextFamily, order: Array<[s
 export function projectEndpointToOffset(family: ContinuousTextFamily, endpoint: StructuralEndpoint): number {
   assertTrustedFamily(family);
   assertDominatingBasis(family, endpoint, 'projectEndpointToOffset');
-  const { visibleOffsets } = derivedIndex(family);
+  const derived = derivedIndex(family);
   const pos = endpointVirtualPosition(family, endpoint);
-  return visibleOffsets[pos];
+  return visibleOffsetAtVirtualPos(derived, pos);
 }
 
 /** An absolute-offset insert/delete against the whole document (unique actor per edit). */
 export function textOperationForOffsetEdit(family: ContinuousTextFamily, edit: OffsetEdit, actor: string, lamport: number): TextOp {
   assertTrustedFamily(family);
   const basis = family.checkpoint.frontier;
-  const text = materializeText(family);
+  const derived = derivedIndex(family);
+  const text = derived.text;
   if (edit.kind === 'text.insert') {
     assertUtf16Offset(text, edit.at.offset);
-    const anchor = edit.at.offset === 0 || text.length === 0
+    const anchor = edit.at.offset === 0 || derived.textLength === 0
       ? ['root']
       : insertAnchorForOffset(family, edit.at.offset);
     return canonicalTextOp(['workbench.text', 1, [actor, 1], lamport, basis, ['insert', anchor, edit.text]]);
@@ -492,42 +583,69 @@ export function textOperationForOffsetEdit(family: ContinuousTextFamily, edit: O
   assertUtf16Offset(text, edit.from.offset);
   assertUtf16Offset(text, edit.to.offset);
 
-  const byOp = new Map<string, number[]>();
-  let offset = 0;
-  for (const [, element] of derivedIndex(family).order) {
-    if (element.deletedBy.length) continue;
-    const next = offset + element.scalar.length;
-    if (offset >= edit.from.offset && next <= edit.to.offset) {
-      const opKey = `${element.op[0]}:${element.op[1]}`;
-      const list = byOp.get(opKey);
-      if (list) list.push(element.ordinal);
-      else byOp.set(opKey, [element.ordinal]);
+  const rawSpans: Array<[OpId, number, number]> = [];
+  const { visiblePieces } = derived;
+  if (visiblePieces.length > 0) {
+    // First visible piece whose visibleEnd > edit.from.offset.
+    let lo = 0;
+    let hi = visiblePieces.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (visiblePieces[mid].visibleEnd > edit.from.offset) hi = mid;
+      else lo = mid + 1;
     }
-    offset = next;
-  }
-  if (offset !== text.length || byOp.size === 0) fail('delete range cannot be resolved');
-  const spans: Array<[OpId, number, number]> = [];
-  const sortedKeys = [...byOp.keys()].sort((a, b) => {
-    const [aActor, aCounter] = a.split(':');
-    const [bActor, bCounter] = b.split(':');
-    return compareOpId([aActor, Number(aCounter)], [bActor, Number(bCounter)]);
-  });
-  for (const key of sortedKeys) {
-    const [spActor, spCounterS] = key.split(':');
-    const spCounter = Number(spCounterS);
-    const ordinals = byOp.get(key)!.sort((a, b) => a - b);
-    let spanStart = ordinals[0];
-    let spanCount = 1;
-    for (let i = 1; i < ordinals.length; i += 1) {
-      if (ordinals[i] === ordinals[i - 1] + 1) {
-        spanCount += 1;
+    for (let idx = lo; idx < visiblePieces.length; idx += 1) {
+      const ip = visiblePieces[idx];
+      if (ip.visibleStart >= edit.to.offset) break;
+      const sliceFrom = Math.max(edit.from.offset, ip.visibleStart);
+      const sliceTo = Math.min(edit.to.offset, ip.visibleEnd);
+      if (sliceFrom >= sliceTo) continue;
+
+      let localStart: number;
+      let localEnd: number;
+      if (ip.piece.isBmp) {
+        localStart = sliceFrom - ip.visibleStart;
+        localEnd = sliceTo - ip.visibleStart;
       } else {
-        spans.push([[spActor, spCounter], spanStart, spanCount]);
-        spanStart = ordinals[i];
-        spanCount = 1;
+        const starts = ensureRunUtf16Starts(ip.piece.run);
+        const baseOrdinal = ip.piece.startOrdinal;
+        const baseUtf16 = starts[baseOrdinal];
+        const relFrom = sliceFrom - ip.visibleStart;
+        const relTo = sliceTo - ip.visibleStart;
+        let sLo = 0;
+        let sHi = ip.piece.length;
+        while (sLo < sHi) {
+          const mid = (sLo + sHi) >>> 1;
+          if (starts[baseOrdinal + mid] - baseUtf16 < relFrom) sLo = mid + 1;
+          else sHi = mid;
+        }
+        localStart = sLo;
+        let eLo = localStart;
+        let eHi = ip.piece.length;
+        while (eLo < eHi) {
+          const mid = (eLo + eHi) >>> 1;
+          if (starts[baseOrdinal + mid] - baseUtf16 < relTo) eLo = mid + 1;
+          else eHi = mid;
+        }
+        localEnd = eLo;
+      }
+      if (localEnd > localStart) {
+        rawSpans.push([[...ip.piece.op] as OpId, ip.piece.startOrdinal + localStart, localEnd - localStart]);
       }
     }
-    spans.push([[spActor, spCounter], spanStart, spanCount]);
+  }
+  if (rawSpans.length === 0) fail('delete range cannot be resolved');
+
+  rawSpans.sort((left, right) => compareOpIdValidated(left[0], right[0]) || left[1] - right[1]);
+  const spans: Array<[OpId, number, number]> = [];
+  for (let i = 0; i < rawSpans.length; i += 1) {
+    const [op, first, count] = rawSpans[i];
+    const prior = spans.at(-1);
+    if (prior && compareOpIdValidated(prior[0], op) === 0 && prior[1] + prior[2] === first) {
+      prior[2] += count;
+    } else {
+      spans.push([op, first, count]);
+    }
   }
   return canonicalTextOp(['workbench.text', 1, [actor, 1], lamport, basis, ['delete', spans]]);
 }
@@ -535,10 +653,6 @@ export function textOperationForOffsetEdit(family: ContinuousTextFamily, edit: O
 /** Apply a whole-document text operation, returning the next family. */
 export function applyTextOperation(family: ContinuousTextFamily, operation: unknown): ContinuousTextFamily {
   assertTrustedFamily(family);
-  // Families produced by this module already contain validated reducer state.
-  // `applyTextOp` performs the immutable clone and operation validation; a
-  // restore before it and another restore in `createTextFamily` replayed the
-  // complete registry twice for every character.
   const nextState = applyTextOp(family.checkpoint, operation);
   return trustFamily({ id: family.id, checkpoint: nextState });
 }

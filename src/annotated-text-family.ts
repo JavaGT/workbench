@@ -28,55 +28,71 @@ function deepFreeze<T>(value: T): T {
   return Object.freeze(value) as T;
 }
 
-function buildChildren(checkpoint: TextState): Map<string, Array<[string, TextElement]>> {
-  const children = new Map<string, Array<[string, TextElement]>>([[ROOT_ID, []]]);
-  // for-in avoids the per-element entry-tuple allocation of Object.entries on
-  // this per-keystroke traversal rebuild, and get-once avoids a second hash
-  // op per element; key order is identical.
-  for (const key in checkpoint.elements) {
-    const element = checkpoint.elements[key];
-    let list = children.get(element.parent);
-    if (list === undefined) {
-      list = [];
-      children.set(element.parent, list);
-    }
-    list.push([key, element]);
-  }
-  for (const [parent, list] of children) {
-    // Schwartzian transform: precompute the sort keys once instead of paying
-    // tuple destructuring plus op derefs on every comparison. Ordering is
-    // identical to the inline comparator (lamport desc, then op id desc).
-    const keyed = new Array(list.length);
-    for (let index = 0; index < list.length; index += 1) {
-      const entry = list[index];
-      keyed[index] = { lamport: entry[1].lamport, actor: entry[1].op[0], counter: entry[1].op[1], entry };
-    }
-    keyed.sort((left, right) => right.lamport - left.lamport
-      || (left.actor === right.actor ? right.counter - left.counter : left.actor < right.actor ? 1 : -1));
-    const sorted = new Array(list.length);
-    for (let index = 0; index < keyed.length; index += 1) sorted[index] = keyed[index].entry;
-    children.set(parent, sorted);
-  }
-  return children;
+function compareEntries(left: [string, TextElement], right: [string, TextElement]): number {
+  const leftEl = left[1];
+  const rightEl = right[1];
+  if (leftEl.lamport !== rightEl.lamport) return rightEl.lamport - leftEl.lamport;
+  const leftActor = leftEl.op[0];
+  const rightActor = rightEl.op[0];
+  return leftActor === rightActor
+    ? rightEl.op[1] - leftEl.op[1]
+    : (leftActor < rightActor ? 1 : -1);
 }
 
 export function rgaTraversal(checkpoint: TextState): Array<[string, TextElement]> {
-  const children = buildChildren(checkpoint);
+  // Fast single-child storage avoids allocating a 1-element array and running a
+  // Schwartzian sort for the 99.99% of elements in linear runs that have at
+  // most one child.
+  const singleChild = new Map<string, [string, TextElement]>();
+  const multiChildren = new Map<string, Array<[string, TextElement]>>();
+  for (const key in checkpoint.elements) {
+    const element = checkpoint.elements[key];
+    const entry: [string, TextElement] = [key, element];
+    const parent = element.parent;
+    const multi = multiChildren.get(parent);
+    if (multi !== undefined) {
+      multi.push(entry);
+    } else {
+      const existing = singleChild.get(parent);
+      if (existing !== undefined) {
+        singleChild.delete(parent);
+        multiChildren.set(parent, [existing, entry]);
+      } else {
+        singleChild.set(parent, entry);
+      }
+    }
+  }
+  for (const list of multiChildren.values()) {
+    list.sort(compareEntries);
+  }
+
   const order: Array<[string, TextElement]> = [];
-  const root = children.get(ROOT_ID);
   const stack: Array<[string, TextElement]> = [];
-  // Depth-first, first-child first: push each child list back-to-front instead
-  // of allocating slice/reverse/spread copies per parent (a large document's
-  // root run also approaches the spread argument limit).
-  if (root) {
-    for (let index = root.length - 1; index >= 0; index -= 1) stack.push(root[index]);
+  const rootSingle = singleChild.get(ROOT_ID);
+  if (rootSingle !== undefined) {
+    stack.push(rootSingle);
+  } else {
+    const rootMulti = multiChildren.get(ROOT_ID);
+    if (rootMulti !== undefined) {
+      for (let index = rootMulti.length - 1; index >= 0; index -= 1) stack.push(rootMulti[index]);
+    }
   }
   while (stack.length > 0) {
-    const entry = stack.pop() as [string, TextElement];
-    order.push(entry);
-    const descendants = children.get(entry[0]);
-    if (descendants) {
-      for (let index = descendants.length - 1; index >= 0; index -= 1) stack.push(descendants[index]);
+    let entry: [string, TextElement] | undefined = stack.pop();
+    while (entry !== undefined) {
+      order.push(entry);
+      const nextSingle = singleChild.get(entry[0]);
+      if (nextSingle !== undefined) {
+        entry = nextSingle;
+        continue;
+      }
+      const nextMulti = multiChildren.get(entry[0]);
+      if (nextMulti !== undefined) {
+        for (let index = nextMulti.length - 1; index >= 1; index -= 1) stack.push(nextMulti[index]);
+        entry = nextMulti[0];
+        continue;
+      }
+      entry = undefined;
     }
   }
   return order;

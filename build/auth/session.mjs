@@ -200,12 +200,50 @@ export function sessionPrincipalOf(db       , { durationMs = config.sessionDurat
   };
 }
 
+// Entity/role identifier patterns for ApiKey scope attributes. Kept strict so
+// neither HTTP creation nor Bearer hydration accepts malformed strings, and
+// framework auth entities can never be targeted by an ApiKey.
+const API_KEY_ENTITY_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const API_KEY_ROLE_RE = /^[A-Za-z_][A-Za-z0-9_-]*$/;
+const RESERVED_API_KEY_ENTITIES = new Set([
+  'User',
+  'Session',
+  'Inbox',
+  'Credential',
+  'Invitation',
+  'ApiKey',
+  'TwoFactor',
+]);
+
+export function isValidApiKeyEntityName(value         )                  {
+  return typeof value === 'string' && API_KEY_ENTITY_NAME_RE.test(value);
+}
+
+export function isReservedApiKeyEntityName(entityName        )          {
+  return RESERVED_API_KEY_ENTITIES.has(entityName);
+}
+
+export function isValidApiKeyRole(value         )                  {
+  return typeof value === 'string' && API_KEY_ROLE_RE.test(value);
+}
+
+function apiKeyExpiresAtMs(value         )                {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value === 'string') {
+    if (!/^-?\d+(?:\.\d+)?$/.test(value)) return null;
+    const timestamp = Number(value);
+    return Number.isFinite(timestamp) ? timestamp : null;
+  }
+  return null;
+}
+
 // Build an apiKey principal resolver from a Bearer token. Reads the
 // `Authorization: Bearer <token>` header, hashes the token, looks up the ApiKey
 // row by tokenHash, checks expiration, and returns an apiKey principal.
-// Any failure — no header, no matching row, expired — yields `anonymous`
-// (fail closed). The resolution runs through the SAME authorization engine as
-// session principals — no second auth path.
+// Any failure — no header, no matching row, expired, malformed timestamp, or
+// malformed/unscoped scope attributes — yields `anonymous` (fail closed). The
+// resolution runs through the SAME authorization engine as session principals
+// — no second auth path.
 export function apiKeyPrincipalOf(db       )                                  {
   return (req) => {
     const auth = (req.headers?.authorization ?? '').trim();
@@ -217,16 +255,39 @@ export function apiKeyPrincipalOf(db       )                                  {
     try {
       const tokenHash = sha256hex(token);
       const row = db.prepare('SELECT * FROM ApiKey WHERE tokenHash = ? LIMIT 1').get(tokenHash)                                ;
-      if (!row) return anonymous;
-      // Expiration: an expired key is anonymous.
-      const expiresAt = row.expiresAt                             ;
-      if (expiresAt != null && expiresAt <= Date.now()) return anonymous;
+      if (!row || typeof row.id !== 'string' || row.id.length === 0) return anonymous;
+      // Expiration: an expired or malformed expiresAt fails closed to anonymous
+      // (a non-numeric string would otherwise compare false against Date.now()).
+      if (row.expiresAt != null) {
+        const expiresAt = apiKeyExpiresAtMs(row.expiresAt);
+        const checkedAt = Date.now();
+        if (expiresAt === null || !Number.isFinite(checkedAt) || expiresAt <= checkedAt) {
+          return anonymous;
+        }
+      }
+      // Validate stored scope/role attributes fail-closed so corrupt or forged
+      // rows cannot inject malformed identifiers, framework entities, or an
+      // unscoped role onto principal.attributes.
+      let entityName                    ;
+      if (row.entityName != null) {
+        if (!isValidApiKeyEntityName(row.entityName) || isReservedApiKeyEntityName(row.entityName)) {
+          return anonymous;
+        }
+        entityName = row.entityName;
+      }
+      let role                    ;
+      if (row.role != null) {
+        if (!isValidApiKeyRole(row.role) || entityName === undefined) {
+          return anonymous;
+        }
+        role = row.role;
+      }
       return principal({
         type: 'apiKey',
         id: row.id,
         attributes: {
-          entityName: row.entityName ?? undefined,
-          role: row.role ?? undefined,
+          entityName,
+          role,
         },
       });
     } catch {

@@ -25,9 +25,18 @@
 // the UI (button, prompt, error display).
 
 import { router } from '../app.mjs';
+import { admin } from '../grant.mjs';
 import { allowAnonymous, requireUser } from '../route-gate.mjs';
+import { rowCapabilities } from '../row-grant.mjs';
 import { createInvitationApi } from './invitation.mjs';
-import { sessionCookie, sessionTokenOf, SESSION_COOKIE } from './session.mjs';
+import {
+  sessionCookie,
+  sessionTokenOf,
+  SESSION_COOKIE,
+  isValidApiKeyEntityName,
+  isReservedApiKeyEntityName,
+  isValidApiKeyRole,
+} from './session.mjs';
 import { config,                      } from '../config.mjs';
 import { verifyTotp, verifyBackupCode } from './totp.mjs';
 import { loginChallengeStore } from './login-challenge.mjs';
@@ -73,6 +82,91 @@ import {
 
 
 
+
+
+
+function declaredEntityRoles(target                    )              {
+  const roles = new Set        ();
+  for (const descriptor of Object.values(target.fields ?? {})) {
+    if (descriptor?.type === 'ref' && typeof descriptor.role === 'string') {
+      roles.add(descriptor.role);
+    }
+    if (descriptor?.kind === 'store' && descriptor.type === 'map' && Array.isArray(descriptor.roles)) {
+      for (const r of descriptor.roles) {
+        if (typeof r === 'string') roles.add(r);
+      }
+    }
+  }
+  for (const checkName of Object.keys(target.registry ?? {})) {
+    roles.add(checkName);
+  }
+  return roles;
+}
+
+async function authorizeScopedApiKey({
+  target,
+  role,
+  principal,
+  db,
+}
+
+
+
+
+ )                                                                            {
+  if (
+    !isValidApiKeyEntityName(target.name)
+    || typeof target.scopeFilter !== 'function'
+    || typeof target.deserializeRow !== 'function'
+  ) {
+    return { ok: false, status: 403, message: `not authorized to create an API key for entity '${target.name}'` };
+  }
+  let storedRows                           ;
+  try {
+    const { sql: where, params: scopeParams } = target.scopeFilter(principal);
+    storedRows = db.prepare(`SELECT * FROM ${target.name} AS t0 WHERE ${where}`).all(scopeParams)                             ;
+  } catch {
+    return { ok: false, status: 403, message: `not authorized to create an API key for entity '${target.name}'` };
+  }
+  let hasAdmin = false;
+  const adminCapabilities = new Set        ();
+  for (const storedRow of storedRows) {
+    try {
+      const row = target.deserializeRow({ ...storedRow });
+      const decision = await rowCapabilities(target                                         , row, principal);
+      if (decision.granted && decision.capabilities.includes(admin)) {
+        hasAdmin = true;
+        for (const cap of decision.capabilities) {
+          adminCapabilities.add(cap.capability);
+        }
+      }
+    } catch {
+      // Fail closed on any row whose grant evaluation throws.
+    }
+  }
+  if (!hasAdmin) {
+    return { ok: false, status: 403, message: `admin authority on '${target.name}' is required to create a scoped API key` };
+  }
+  if (role !== null) {
+    const allowedRoles = declaredEntityRoles(target);
+    if (!allowedRoles.has(role) && !adminCapabilities.has(role)) {
+      return { ok: false, status: 400, message: `role '${role}' is not valid on '${target.name}'` };
+    }
+  }
+  return { ok: true };
+}
+
+
+
+
+
+
+
+
+
+
+
+
 // A scrypt digest of a random password that was never stored anywhere: the
 // login route verifies a miss against it so an unknown identity costs the same
 // one scrypt a known identity's wrong password costs (see the login route).
@@ -92,7 +186,14 @@ const LOGIN_DECOY_HASH =
 // always travels in the body's `username` slot (kept for backward
 // compatibility); only the lookup columns change. Every named field MUST exist
 // on the User entity — a typo fails closed at first login with a thrown lookup.
-export function authRoutes({ secure = config.env === 'production', identifyBy = ['username'], minimumPasswordLength, entities, db: maybeDb }                    = {}) {
+export function authRoutes({
+  secure = config.env === 'production',
+  identifyBy = ['username'],
+  minimumPasswordLength,
+  authorizeApiKey,
+  entities,
+  db: maybeDb,
+}                    = {}) {
   if (!entities || !maybeDb) {
     throw new Error('authRoutes requires entities and db options');
   }
@@ -609,17 +710,92 @@ export function authRoutes({ secure = config.env === 'production', identifyBy = 
 
   // POST /auth/api-key/create — mint a new API key. The plain token is returned
   // ONCE in the response body and never stored. Only the SHA-256 hash is stored.
-  // requireUser: only an authenticated user may create keys.
-  s.post('/api-key/create', requireUser(), (req             , res              , next          ) => {
+  // requireUser: only an authenticated human user may create keys. Scoped or
+  // role-bearing keys fail closed unless the caller holds admin authority on
+  // the target entity (or an explicit server-configured authorizeApiKey policy
+  // admits the request).
+  s.post('/api-key/create', requireUser(), async (req             , res              , next          ) => {
+    if (req.principal.type !== 'user' || typeof req.principal.id !== 'string' || req.principal.id.length === 0) {
+      return next({ status: 403, message: 'a user principal is required to create an API key' });
+    }
     const { name, entityName, role, expiresAt } = req.body ?? {};
-    if (!name) {
+    if (name == null || name === '') {
       return next({ status: 400, message: 'name is required' });
     }
+    if (typeof name !== 'string' || name.trim().length === 0) {
+      return next({ status: 400, message: 'name must be a non-empty string' });
+    }
+    if (expiresAt !== undefined && expiresAt !== null) {
+      if (typeof expiresAt !== 'number' || !Number.isFinite(expiresAt) || expiresAt <= 0) {
+        return next({ status: 400, message: 'expiresAt must be a positive finite timestamp' });
+      }
+    }
+
+    let normalizedEntityName                = null;
+    if (entityName !== undefined && entityName !== null) {
+      if (!isValidApiKeyEntityName(entityName)) {
+        return next({ status: 400, message: 'entityName must be a valid entity identifier' });
+      }
+      normalizedEntityName = entityName;
+    }
+
+    let normalizedRole                = null;
+    if (role !== undefined && role !== null) {
+      if (!isValidApiKeyRole(role)) {
+        return next({ status: 400, message: 'role must be a valid role identifier' });
+      }
+      normalizedRole = role;
+    }
+
+    if (normalizedEntityName !== null || normalizedRole !== null) {
+      if (normalizedEntityName === null) {
+        return next({ status: 403, message: 'role requires an authorized entityName' });
+      }
+      if (isReservedApiKeyEntityName(normalizedEntityName)) {
+        return next({ status: 403, message: `not authorized to create an API key for entity '${normalizedEntityName}'` });
+      }
+      const runtime = ApiKey?.runtime;
+      if (!runtime || typeof runtime.entityOf !== 'function') {
+        return next({ status: 403, message: `not authorized to create an API key for entity '${normalizedEntityName}'` });
+      }
+      let target                    ;
+      try {
+        target = runtime.entityOf(normalizedEntityName)                      ;
+      } catch {
+        return next({ status: 400, message: `unknown entity '${normalizedEntityName}'` });
+      }
+      if (typeof authorizeApiKey === 'function') {
+        let allowed = false;
+        try {
+          allowed = Boolean(await authorizeApiKey({
+            principal: req.principal,
+            entityName: normalizedEntityName,
+            role: normalizedRole,
+          }));
+        } catch {
+          allowed = false;
+        }
+        if (!allowed) {
+          return next({ status: 403, message: `not authorized to create an API key for entity '${normalizedEntityName}'` });
+        }
+      } else {
+        const verdict = await authorizeScopedApiKey({
+          target,
+          role: normalizedRole,
+          principal: req.principal,
+          db,
+        });
+        if (!verdict.ok) {
+          return next({ status: verdict.status, message: verdict.message });
+        }
+      }
+    }
+
     try {
       const result = ApiKey.create({
         name,
-        entityName: entityName ?? null,
-        role: role ?? null,
+        entityName: normalizedEntityName,
+        role: normalizedRole,
         expiresAt: expiresAt ?? null,
         createdBy: req.principal.id,
       });
@@ -639,6 +815,9 @@ export function authRoutes({ secure = config.env === 'production', identifyBy = 
   // no hashes, no plain tokens).
   // requireUser: an anonymous caller cannot list keys.
   s.get('/api-key', requireUser(), (req             , res              , next          ) => {
+    if (req.principal.type !== 'user') {
+      return next({ status: 403, message: 'a user principal is required to list API keys' });
+    }
     try {
       const userId = req.principal.id;
       ApiKey.findAll(ApiKey.createdBy.is(userId))
@@ -664,6 +843,9 @@ export function authRoutes({ secure = config.env === 'production', identifyBy = 
   // creator may revoke it.
   // requireUser: an anonymous caller cannot revoke keys.
   s.delete('/api-key/:id', requireUser(), (req             , res              , next          ) => {
+    if (req.principal.type !== 'user') {
+      return next({ status: 403, message: 'a user principal is required to revoke an API key' });
+    }
     const { id } = req.params;
     try {
       const key = ApiKey.getOrFail(id);

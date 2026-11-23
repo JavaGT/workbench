@@ -12,7 +12,7 @@ import {
 
 } from './field-strategy.mjs';
 import * as eventHandles from './event-handle.mjs';
-import { assertUtf16Offset, assertUtf16Range, assertWellFormedText, canonicalTextOp, scalarCount } from './annotated-text.mjs';
+import { assertUtf16Offset, assertUtf16Range, assertWellFormedText, canonicalTextOp, isTextElementLive, scalarCount } from './annotated-text.mjs';
 import { getAnnotatedTextCompiledMetadata, resolveAnnotatedTextOwningScope, resolveDeclarationMeasurementExtension } from './annotated-text-field.mjs';
 import { frozenJsonSnapshot } from './frozen-json.mjs';
 import { erasureDirectivePreparation } from './erasure-directive.mjs';
@@ -33,10 +33,11 @@ import {
   resolveOffsetToEndpoint,
   restoreTextFamilySerialized,
   textFamilyBasis,
+  textFamilyMaxLamport,
 
 } from './annotated-text-continuous.mjs';
-import { projectAnnotatedTextSnapshot } from './annotated-text-snapshot.mjs';
-import { authoringRedactionsForRecipient, mapVisibleOffsetToCanonical } from './annotated-text-recipient-projection.mjs';
+import { evaluateAnnotatedTextVisibility, invalidateAnnotatedTextSnapshotCache } from './annotated-text-snapshot.mjs';
+import { mapVisibleOffsetToCanonical } from './annotated-text-recipient-projection.mjs';
 import { planAnnotationRemove, planTextRangeApply } from './annotated-text-plan.mjs';
 import { annotationRangeRows, attachAnnotationRange, loadAnnotationImages } from './annotated-text-storage.mjs';
 import { canonicalEndpointJSON } from './annotated-text-delete-history-shared.mjs';
@@ -499,6 +500,7 @@ function applyOverlapSideEffects(db     , { prefix, descriptor, payload, sourceF
       }
     }
   }
+  invalidateAnnotatedTextSnapshotCache(db, prefix, payload.id);
 }
 
 
@@ -1067,15 +1069,15 @@ export function registerAnnotatedTextCrudHandlers({
         if (!contribution || contribution.kind !== 'text.insert') throw new ValidationError('invalid annotated text compensation contribution');
         const originalOp = contribution.opId;
         const expectedKeys = Array.from({ length: contribution.scalarCount }, (_, ordinal) => `${originalOp[0]}:${originalOp[1]}:${ordinal}`);
-        const live = expectedKeys.filter((elementKey) => family.checkpoint.elements[elementKey]?.deletedBy.length === 0);
+        const live = expectedKeys.filter((elementKey) => isTextElementLive(family.checkpoint, elementKey));
         let operation = null;
         if (payload.history.direction === 'undo' && live.length === expectedKeys.length) {
           const actor = createHash('sha256').update(`${name}\u0000${fieldName}\u0000${payload.id}\u0000${actionId}`).digest('hex').slice(0, 32);
-          const lamport = Math.max(0, ...Object.values(family.checkpoint.elements).map((element) => element.lamport)) + 1;
+          const lamport = textFamilyMaxLamport(family) + 1;
           operation = canonicalTextOp(['workbench.text', 1, [actor, 1], lamport, family.checkpoint.frontier, ['delete', [[originalOp, 0, contribution.scalarCount]]]]);
         } else if (payload.history.direction === 'redo' && sourceFact.linkage?.outcome === 'applied') {
           const actor = createHash('sha256').update(`${name}\u0000${fieldName}\u0000${payload.id}\u0000${actionId}`).digest('hex').slice(0, 32);
-          const lamport = Math.max(0, ...Object.values(family.checkpoint.elements).map((element) => element.lamport)) + 1;
+          const lamport = textFamilyMaxLamport(family) + 1;
           operation = canonicalTextOp(['workbench.text', 1, [actor, 1], lamport, family.checkpoint.frontier, ['insert', contribution.anchor, contribution.text]]);
         }
         if (!operation) return { events: [], privateFact: { version: 2, kind: 'annotated-text.compensation', documentId: payload.id, linkage: { rootActionId: payload.history.rootActionId, targetActionId: payload.history.targetActionId, direction: payload.history.direction, outcome: 'noop' } }, historyOutcome: 'noop' };
@@ -1118,6 +1120,7 @@ export function registerAnnotatedTextCrudHandlers({
         }
         if (payload.history.direction === 'undo' && created) {
           deleteCreatedAnnotation(db, prefix, created.id, created.family);
+          invalidateAnnotatedTextSnapshotCache(db, prefix, payload.id);
         }
         if (payload.history.direction === 'redo' && created && recreatedRange) {
           const documentRow = rawRow(db, name, payload.id);
@@ -1137,6 +1140,7 @@ export function registerAnnotatedTextCrudHandlers({
               .run(created.id, targetId);
           }
           attachAnnotationRange(db, prefix, payload.id, created.id, (recreatedRange                      ).start, (recreatedRange                    ).end, 0);
+          invalidateAnnotatedTextSnapshotCache(db, prefix, payload.id);
         }
         const handle = eventHandles.native(name, fieldName, 'operated');
         const compensation                      = { version: 2, kind: 'annotated-text.compensation', documentId: payload.id, linkage: { rootActionId: payload.history.rootActionId, targetActionId: payload.history.targetActionId, direction: payload.history.direction, outcome: 'applied' }, contribution: { kind: 'text.insert', opId: operation[2], anchor: contribution.anchor, text: contribution.text, scalarCount: contribution.scalarCount, ...(created ? { createdAnnotation: created } : {}) } };
@@ -1236,11 +1240,11 @@ export function registerAnnotatedTextCrudHandlers({
             const postCheckpoint = readAnnotatedTextFamilyCheckpoint(receiptDb, prefix, command.id);
             if (postCheckpoint === undefined) throw new Error('annotated-text authoring: post-commit family checkpoint is missing');
             const postFamily = restoreTextFamilySerialized(postCheckpoint);
-            const receiptRecipient = await projectAnnotatedTextSnapshot({
+            const visibility = await evaluateAnnotatedTextVisibility({
               db: receiptDb, entity: record, row: rawRow(receiptDb, name, command.id),
-              principal, fieldName, descriptor, mintBasis: false,
+              principal, fieldName, descriptor, family: postFamily,
             });
-            const receiptRedactions = authoringRedactionsForRecipient(receiptRecipient);
+            const receiptRedactions = visibility.redactions;
             const issued = issueAuthoringSnapshot({
               db: receiptDb, prefix, leaseId: command.authoring.lease, fence: confirmedThrough,
               positions: [{ familyCheckpoint: textFamilyBasis(postFamily), visibleAtIssue: true, redactions: receiptRedactions }],
@@ -1252,7 +1256,7 @@ export function registerAnnotatedTextCrudHandlers({
               fence: confirmedThrough,
               positionFrames: issued .positionFrames,
             });
-            const fullyVisible = !receiptRecipient.restricted && !receiptRecipient.redactions?.length && receiptRedactions.length === 0;
+            const fullyVisible = visibility.fullyVisible && !visibility.restricted && receiptRedactions.length === 0;
             return Object.freeze({ version: 1, actionId, confirmedThrough, authoring: Object.freeze({
               ...envelope,
               ...(fullyVisible ? { family: compactTextFamilyCheckpoint(postFamily) } : {}),
@@ -1327,9 +1331,9 @@ export function registerAnnotatedTextCrudHandlers({
             const principalId = principal?.id ?? '';
             const position = db.prepare(`SELECT position.*, checkpoint.family_checkpoint AS basis_checkpoint FROM ${prefix}_authoring_position AS position JOIN ${prefix}_authoring_checkpoint AS checkpoint ON checkpoint.id = position.checkpoint_id JOIN ${prefix}_authoring_lease AS lease ON lease.id = position.lease_id JOIN ${prefix}_authoring_stream AS stream ON stream.id = lease.stream_id WHERE position.token = ? AND stream.document_id = ? AND stream.principal_type = ? AND stream.principal_id = ?`).get(payload.basis, payload.id, principalType, principalId);
             if (!position || !position.visible_at_issue || JSON.stringify(JSON.parse(position.basis_checkpoint)) !== JSON.stringify(textFamilyBasis(family))) throw new ValidationError(`${actionType} basis is unavailable or stale`);
-            const recipient = await projectAnnotatedTextSnapshot({ db, entity: record, row: documentRow, principal, fieldName, descriptor, mintBasis: false });
+            const visibility = await evaluateAnnotatedTextVisibility({ db, entity: record, row: documentRow, principal, fieldName, descriptor, family });
             const redactions = JSON.parse(position.redactions ?? '[]');
-            if (JSON.stringify(redactions) !== JSON.stringify(authoringRedactionsForRecipient(recipient))) throw new ValidationError(`${actionType} basis is stale`);
+            if (visibility.restricted || JSON.stringify(redactions) !== JSON.stringify(visibility.redactions)) throw new ValidationError(`${actionType} basis is stale`);
             const from = mapVisibleOffsetToCanonical(payload.from, 'right', redactions, 'right');
             const to = mapVisibleOffsetToCanonical(payload.to, 'left', redactions, 'left');
             const text = materializeText(family);
@@ -1543,8 +1547,8 @@ export function registerAnnotatedTextCrudHandlers({
           if (!position || !position.visible_at_issue) throw new ValidationError(`${actionType} basis is unavailable`);
           const basis = JSON.parse(position.basis_checkpoint);
           if (JSON.stringify(basis) !== JSON.stringify(textFamilyBasis(family))) throw new ValidationError(`${actionType} basis is stale`);
-          const recipient = await projectAnnotatedTextSnapshot({ db, entity: record, row: documentRow, principal, fieldName, descriptor, mintBasis: false });
-          if (JSON.stringify(JSON.parse(position.redactions ?? '[]')) !== JSON.stringify(authoringRedactionsForRecipient(recipient))) throw new ValidationError(`${actionType} basis is stale`);
+          const visibility = await evaluateAnnotatedTextVisibility({ db, entity: record, row: documentRow, principal, fieldName, descriptor, family });
+          if (visibility.restricted || JSON.stringify(JSON.parse(position.redactions ?? '[]')) !== JSON.stringify(visibility.redactions)) throw new ValidationError(`${actionType} basis is stale`);
           const redactions = JSON.parse(position.redactions ?? '[]');
           const from = mapVisibleOffsetToCanonical(payload.from, 'right', redactions, 'right');
           const to = mapVisibleOffsetToCanonical(payload.to, 'left', redactions, 'left');

@@ -31,6 +31,7 @@ import {
   type RegionDeclaration,
 } from './annotated-text-region-reducer.ts';
 import { assertStructuralEndpoint } from './annotated-text-family.ts';
+import { invalidateAnnotatedTextSnapshotCache } from './annotated-text-snapshot.ts';
 import { frozenJsonSnapshot } from './frozen-json.ts';
 import type { DbHandle } from './driver.ts';
 import { rawRow } from './entity/query.ts';
@@ -156,6 +157,7 @@ export function cleanupAnnotatedTextProtectedTargets(db: Db, name: string, field
        WHERE annotation_id IN (SELECT id FROM ${prefix}_annotation WHERE document_id = ?)
           OR target_annotation_id IN (SELECT id FROM ${prefix}_annotation WHERE document_id = ?)`,
     ).run(documentId, documentId);
+    if (typeof documentId === 'string') invalidateAnnotatedTextSnapshotCache(db, prefix, documentId);
   }
 }
 
@@ -228,10 +230,15 @@ export function initializeAnnotatedText({ name, fields, event, db, row, asyncSee
     if (imported.ranges !== undefined) {
       const ranges = imported.ranges;
       if (asyncSeed) {
-        return seedImportedAnnotationRangesAsync({ name, fieldName, prefix, descriptor, db, row, family, fullText, ranges });
+        return Promise.resolve(
+          seedImportedAnnotationRangesAsync({ name, fieldName, prefix, descriptor, db, row, family, fullText, ranges }),
+        ).then(() => {
+          invalidateAnnotatedTextSnapshotCache(db, prefix, row.id as string);
+        });
       }
       seedImportedAnnotationRanges({ name, fieldName, prefix, descriptor, db, row, family, fullText, ranges });
     }
+    invalidateAnnotatedTextSnapshotCache(db, prefix, row.id as string);
   }
 }
 
@@ -355,6 +362,7 @@ export function applyAnnotatedTextNativeEvent({ name, fields, handle, event, db 
     const existing = db.prepare(`SELECT generation FROM ${name}_${handle.field}_retired WHERE document_id = ?`).get(data.id);
     if (existing && existing.generation !== data.generation) throw new Error(`${name}.${handle.field}.retired generation conflicts`);
     db.prepare(`INSERT OR IGNORE INTO ${name}_${handle.field}_retired (document_id, generation, retired_at) VALUES (?, ?, ?)`).run(data.id, data.generation, data.retiredAt);
+    invalidateAnnotatedTextSnapshotCache(db, `${name}_${handle.field}`, data.id);
     return true;
   }
   if (handle.nativeName === 'operated') {
@@ -417,16 +425,23 @@ export function applyCanonicalAnnotatedTextOperation({ name, handle, db, descrip
   descriptor: AnnotatedTextFieldDescriptor;
   canonical: CanonicalOperatedEvent;
 }) {
+  const prefix = `${name}_${handle.field}`;
   switch (canonical.kind) {
     case 'text.apply':
     case 'text.replace':
     case 'annotation.apply-range':
     case 'annotation.remove':
-      return projectFromCanonical({ name, handle, db, descriptor, canonical });
-    case 'annotation.update': return projectBlocklessAnnotationUpdate({ name, handle, db, descriptor, data: canonicalToReplayPayload(canonical) });
-    case 'region.edit': return projectRegionEdit({ name, handle, db, descriptor, canonical });
+      projectFromCanonical({ name, handle, db, descriptor, canonical });
+      break;
+    case 'annotation.update':
+      projectBlocklessAnnotationUpdate({ name, handle, db, descriptor, data: canonicalToReplayPayload(canonical) });
+      break;
+    case 'region.edit':
+      projectRegionEdit({ name, handle, db, descriptor, canonical });
+      break;
     default: throw new Error(`${name}.${handle.field}.operated event has unknown operation kind`);
   }
+  invalidateAnnotatedTextSnapshotCache(db, prefix, canonical.id);
 }
 
 function projectFromCanonical({ name, handle, db, descriptor, canonical }: {

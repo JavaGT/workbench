@@ -11,13 +11,30 @@ import { ValidationError, deserializeField, type FieldDescriptor } from './field
 import * as eventHandles from './event-handle.ts';
 import { authorizeFieldOp } from './strategy/index.ts';
 import { write } from './grant.ts';
-import { restoreTextFamilySerialized, materializeText, textFamilyBasis, type ContinuousTextFamily } from './annotated-text-continuous.ts';
+import {
+  restoreTextFamilySerialized,
+  textFamilyBasis,
+  textFamilyMaxLamport,
+  textFamilyVisibleLength,
+  createTextFamily,
+  insertAnchorForOffset,
+  projectEndpointToOffset,
+  type ContinuousTextFamily,
+} from './annotated-text-continuous.ts';
+import { frontierDominates, hasTextElement } from './annotated-text.ts';
 import { resolveAnnotatedTextOwningScope } from './annotated-text-field.ts';
 import { resolveStream, resolveLease, resolvePosition } from './annotated-text-authoring-stream.ts';
 import { readSeq } from './committed-log.ts';
-import { planAnnotationPaste, planAnnotationRemove, planAnnotationUpdate, planTextOffsetEdit, planTextRangeApply, type EditOverlapBehavior } from './annotated-text-plan.ts';
-import { mapVisibleOffsetToCanonical, authoringRedactionsForRecipient, type AuthoringRedaction } from './annotated-text-recipient-projection.ts';
-import { projectAnnotatedTextSnapshot } from './annotated-text-snapshot.ts';
+import {
+  planAnnotationPaste,
+  planAnnotationRemove,
+  planAnnotationUpdate,
+  planTextOffsetEdit,
+  planTextRangeApply,
+  type EditOverlapBehavior,
+} from './annotated-text-plan.ts';
+import { mapVisibleOffsetToCanonical, type AuthoringRedaction } from './annotated-text-recipient-projection.ts';
+import { evaluateAnnotatedTextVisibility } from './annotated-text-snapshot.ts';
 import type { StructuralEndpoint } from './annotated-text-family.ts';
 import type { Principal } from './principal.ts';
 import { rawRow } from './entity/query.ts';
@@ -111,6 +128,8 @@ interface V9Prelude extends V9AdmitContext {
   family: ContinuousTextFamily;
   cursor: number;
   position: AuthoringPosition | null;
+  /** Rebased current-family offset for a stale, fully-visible plain insert. */
+  staleInsertOffset: number | null;
   actor: string;
   lamport: number;
 }
@@ -161,20 +180,45 @@ function loadAnnotations({ db, prefix, compiledMeta, documentId }: {
   documentId: string;
 }): LoadedAnnotation[] {
   const rows = db.prepare(`SELECT id, family FROM ${prefix}_annotation WHERE document_id = ? ORDER BY id`).all(documentId);
+  if (rows.length === 0) return [];
   const targets = db.prepare(
-    `SELECT annotation_id, target_annotation_id FROM ${prefix}_annotation_protected_target
-      WHERE annotation_id IN (SELECT id FROM ${prefix}_annotation WHERE document_id = ?)
-      ORDER BY annotation_id, target_annotation_id`,
+    `SELECT edge.annotation_id, edge.target_annotation_id FROM ${prefix}_annotation_protected_target AS edge
+      JOIN ${prefix}_annotation AS annotation ON annotation.id = edge.annotation_id
+     WHERE annotation.document_id = ?
+     ORDER BY edge.annotation_id, edge.target_annotation_id`,
   ).all(documentId);
-  const targetsByAnnotation = new Map();
-  for (const target of targets) targetsByAnnotation.set(target.annotation_id, [...(targetsByAnnotation.get(target.annotation_id) ?? []), target.target_annotation_id]);
+  const targetsByAnnotation = new Map<string, string[]>();
+  for (const target of targets) {
+    const existing = targetsByAnnotation.get(target.annotation_id);
+    if (existing) existing.push(target.target_annotation_id);
+    else targetsByAnnotation.set(target.annotation_id, [target.target_annotation_id]);
+  }
+  const presentFamilies = new Set<string>();
+  for (const row of rows) {
+    if (!compiledMeta.annotationHandles[row.family]) {
+      throw new ValidationError(`annotated-text unknown annotation family '${row.family}'`);
+    }
+    presentFamilies.add(row.family);
+  }
+  const storedByFamily = new Map<string, Map<string, Record<string, unknown>>>();
+  for (const familyName of presentFamilies) {
+    const declaration = compiledMeta.annotationFields?.[familyName]?.descriptor;
+    if (Object.keys(declaration?.fields ?? {}).length === 0) continue;
+    const familyRows = db.prepare(
+      `SELECT child.* FROM ${prefix}_annotation_${familyName} AS child
+        JOIN ${prefix}_annotation AS annotation ON annotation.id = child.annotation_id
+       WHERE annotation.document_id = ?`,
+    ).all(documentId) as Array<Record<string, unknown>>;
+    const byId = new Map<string, Record<string, unknown>>();
+    for (const stored of familyRows) byId.set(String(stored.annotation_id), stored);
+    storedByFamily.set(familyName, byId);
+  }
   const annotations: LoadedAnnotation[] = [];
   const orphanByAnnotation = annotationOrphanStates(db as any, prefix, documentId);
   for (const row of rows) {
     const metadata = compiledMeta.annotationHandles[row.family];
-    if (!metadata) throw new ValidationError(`annotated-text unknown annotation family '${row.family}'`);
     const declaration = compiledMeta.annotationFields?.[row.family]?.descriptor;
-    const stored = db.prepare(`SELECT * FROM ${prefix}_annotation_${row.family} WHERE annotation_id = ?`).get(row.id) as Record<string, unknown> | undefined;
+    const stored = storedByFamily.get(row.family)?.get(row.id);
     const fields: Record<string, unknown> = {};
     for (const [fieldName, field] of Object.entries(declaration?.fields ?? {})) {
       const value = stored?.[fieldName];
@@ -211,42 +255,22 @@ function loadRanges({ db, prefix, documentId }: {
 
 /**
  * Load stored annotation field values for families with field-patch editOverlap
- * behavior (Decision 0025 policy 4). Returns a Map from annotation id to its
- * deserialized field record. Families without a `{ kind: 'fields' }` overlap
- * declaration are skipped — their fields are never needed for overlap patching.
+ * behavior (Decision 0025 policy 4). Reuses the already-deserialized fields on
+ * `annotations` (no redundant N+1 queries).
  */
-function loadAnnotationFields({ db, prefix, compiledMeta, descriptor, annotations }: {
-  db: DbHandle;
-  prefix: string;
+function loadAnnotationFields({ compiledMeta, annotations }: {
   compiledMeta: any;
-  descriptor: FieldDescriptor;
   annotations: LoadedAnnotation[];
 }): Map<string, Record<string, unknown>> {
-  // Index families whose overlap behavior is a field patch.
   const fieldPatchFamilies = new Set<string>();
   for (const [family, meta] of Object.entries(compiledMeta.annotationHandles as Record<string, any>)) {
     if (meta.editOverlap?.kind === 'fields') fieldPatchFamilies.add(family);
   }
   if (fieldPatchFamilies.size === 0) return new Map();
-  // Build a field-descriptor lookup for deserialization.
-  const annDescriptors = new Map<string, Record<string, FieldDescriptor>>();
-  for (const ann of (descriptor.annotations ?? []) as Array<any>) {
-    if (fieldPatchFamilies.has(ann.annotationName)) {
-      annDescriptors.set(ann.annotationName, ann.fields ?? {});
-    }
-  }
   const fields = new Map<string, Record<string, unknown>>();
   for (const annotation of annotations) {
     if (!fieldPatchFamilies.has(annotation.family)) continue;
-    const row = db.prepare(`SELECT * FROM ${prefix}_annotation_${annotation.family} WHERE annotation_id = ?`).get(annotation.id) as Record<string, unknown> | undefined;
-    if (!row) continue;
-    const fieldDescs = annDescriptors.get(annotation.family);
-    if (!fieldDescs) continue;
-    const record: Record<string, unknown> = {};
-    for (const [key, fieldDesc] of Object.entries(fieldDescs)) {
-      record[key] = deserializeField(fieldDesc, (row as Record<string, unknown>)[key]);
-    }
-    fields.set(annotation.id, record);
+    fields.set(annotation.id, annotation.fields);
   }
   return fields;
 }
@@ -270,38 +294,39 @@ async function assertV9AuthoringPrelude(ctx: V9AdmitContext): Promise<V9Prelude>
     : null;
   if (token && !position) throw new ValidationError(`${name}.${fieldName}.operation position token unavailable`, { code: 'position-token-unavailable' });
   if (position && !position.visible_at_issue) throw new ValidationError(`${name}.${fieldName}.operation position no longer visible`, { code: 'position-no-longer-visible' });
+  let staleInsertOffset: number | null = null;
   if (position) {
-    // Fail closed on a stale authoring basis: the client's absolute offset is
-    // meaningful only against the family its position frame was issued for. If
-    // the current family frontier differs, the offset can land somewhere else;
-    // require the client to re-bootstrap instead of trusting the offset.
+    const issuedRedactions = parsedRedactions(position);
+    // Validate current visibility before inspecting anchors from a stale basis.
+    // A protection change can happen without a change to the text frontier.
+    // Uses the lightweight protector-only visibility evaluator instead of full
+    // snapshot projection so fully-visible edits never load unrelated annotations.
+    assertRedactionsBasesMatch(await currentAuthoringRedactions(ctx, row, family), issuedRedactions, 'position');
+    // A stale authoring basis normally means the client's absolute offset is
+    // no longer meaningful: require re-bootstrap instead of trusting the raw
+    // offset. The narrow exception is a plain insert at a FULLY-VISIBLE
+    // position: its original offset can be resolved to a structural anchor at
+    // the lease-scoped position checkpoint and re-projected into the current
+    // family (see rebaseStaleInsertOffset). Every other edit kind keeps the
+    // strict stale rejection.
     if (!samePositionBasis(position.family_checkpoint, family)) {
-      throw new ValidationError(`${name}.${fieldName}.operation authoring basis is stale; re-bootstrap the snapshot`, { code: 'position-stale' });
+      if (command.edit.kind === 'text.insert' && issuedRedactions.length === 0) {
+        staleInsertOffset = rebaseStaleInsertOffset(position, command.edit.at?.offset, family);
+      } else {
+        throw new ValidationError(`${name}.${fieldName}.operation authoring basis is stale; re-bootstrap the snapshot`, { code: 'position-stale' });
+      }
     }
-    // A protection applied WITHOUT a text change leaves the family frontier
-    // untouched, so the family check above cannot see it. The frame's
-    // redactions column carries the principal's wire→canonical basis at issue
-    // time; recompute the CURRENT basis through the principal's own recipient
-    // view and fail closed when the deny set moved under the frame.
-    assertRedactionsBasesMatch(await currentAuthoringRedactions(ctx, row), parsedRedactions(position), 'position');
   }
   const actor = createHash('sha256').update(`${name}\u0000${fieldName}\u0000${command.id}\u0000${principal?.id ?? ''}\u0000${command.authoring.mutationId}`).digest('hex').slice(0, 32);
-  // The max element lamport is the next lamport. Never spread the elements
-  // array into Math.max — a large document (100k+ elements) exceeds the call
-  // stack. The scan is O(elements) but bounded.
-  let maxLamport = 0;
-  for (const element of Object.values(family.checkpoint.elements)) {
-    if (element.lamport > maxLamport) maxLamport = element.lamport;
-  }
-  const lamport = maxLamport + 1;
+  const lamport = textFamilyMaxLamport(family) + 1;
   return Object.freeze({
     name, fieldName, prefix, descriptor, record, compiledMeta, command, row, db, scope, principal, actionId,
-    documentScope, stream, lease, state, family, cursor, position, actor, lamport,
+    documentScope, stream, lease, state, family, cursor, position, staleInsertOffset, actor, lamport,
   });
 }
 
 function assertOffsetInDocument(family: ContinuousTextFamily, offset: number, label: string): void {
-  const length = materializeText(family).length;
+  const length = textFamilyVisibleLength(family);
   if (!Number.isSafeInteger(offset) || offset < 0 || offset > length) {
     throw new ValidationError(`annotated-text ${label} offset ${offset} is outside the document`, { code: 'position-invalid' });
   }
@@ -319,28 +344,29 @@ function parsedRedactions(position: AuthoringPosition | null): AuthoringRedactio
 }
 
 function assertRedactionsBasesMatch(primary: AuthoringRedaction[], other: AuthoringRedaction[], label: string): void {
+  if (primary.length === 0 && other.length === 0) return;
   if (JSON.stringify(primary) !== JSON.stringify(other)) {
     throw new ValidationError(`annotated-text ${label} authoring redaction bases differ; re-bootstrap the snapshot`, { code: 'position-stale' });
   }
 }
 
-// The acting principal's CURRENT wire→canonical basis at admit time, projected
-// through the principal's own recipient view. The position frame the client
-// edits against carries the same basis at issue time (the receipt issues the
-// frame against the post-commit projection); a protection applied without a
-// text change shifts this basis while leaving the family frontier unchanged,
-// so the prelude compares the two and fails closed on a stale frame.
-async function currentAuthoringRedactions(ctx: V9AdmitContext, row: any): Promise<AuthoringRedaction[]> {
+// The acting principal's CURRENT wire→canonical basis at admit time. Uses the
+// lightweight protector-only visibility evaluator so fully-visible documents
+// skip loading/projecting unrelated annotations.
+async function currentAuthoringRedactions(ctx: V9AdmitContext, row: any, family: ContinuousTextFamily): Promise<AuthoringRedaction[]> {
   const { db, record, fieldName, descriptor, principal } = ctx;
-  let current;
+  let visibility;
   try {
-    current = await projectAnnotatedTextSnapshot({
-      db, entity: record, row, principal, fieldName, descriptor, mintBasis: false,
+    visibility = await evaluateAnnotatedTextVisibility({
+      db, entity: record, row, principal, fieldName, descriptor, family,
     });
   } catch {
     throw new ValidationError(`${ctx.name}.${ctx.fieldName}.operation cannot revalidate the authoring basis; re-bootstrap the snapshot`, { code: 'position-stale' });
   }
-  return authoringRedactionsForRecipient(current);
+  if (visibility.restricted) {
+    throw new ValidationError(`${ctx.name}.${ctx.fieldName}.operation authoring redaction bases differ; re-bootstrap the snapshot`, { code: 'position-stale' });
+  }
+  return visibility.redactions;
 }
 
 /**
@@ -390,16 +416,120 @@ function samePositionBasis(serialized: string, family: ContinuousTextFamily): bo
   return JSON.stringify(positionBasis(serialized)) === JSON.stringify(textFamilyBasis(family));
 }
 
+/**
+ * Rebase a STALE plain-insert offset into the current family. The raw offset is
+ * only meaningful against the family the position frame was issued for, so it
+ * is never reused directly. Reconstruct that family from the lease-scoped
+ * checkpoint basis by replaying only the operations the basis covers, resolve
+ * the original offset to a structural anchor there, then project that anchor
+ * into the current family. Fail closed on a missing or ambiguous anchor instead
+ * of silently landing the text somewhere else.
+ */
+function rebaseStaleInsertOffset(position: AuthoringPosition, rawOffset: number | undefined, family: ContinuousTextFamily): number {
+  const stale = (message: string): never => {
+    throw new ValidationError(`annotated-text authoring position is stale: ${message}; re-bootstrap the snapshot`, { code: 'position-stale' });
+  };
+  if (!Number.isSafeInteger(rawOffset) || rawOffset === undefined || rawOffset < 0) {
+    throw new ValidationError('annotated-text insert offset is invalid', { code: 'position-invalid' });
+  }
+
+  const basis = positionBasis(position.family_checkpoint) as { version?: number; id: string; frontier: Array<[string, number]> };
+  if (basis.id !== family.id) stale('checkpoint basis names another document');
+  const issueFrontier = basis.frontier;
+  let dominates = false;
+  try {
+    dominates = frontierDominates(family.checkpoint.frontier, issueFrontier);
+  } catch {
+    // malformed basis — fail closed below
+  }
+  if (!dominates) stale('checkpoint basis is not a prefix of the current family');
+
+  // Replay only the operations covered by the issue-time frontier. Every
+  // dependency of a covered operation is covered too, so the replay is exact.
+  const currentCheckpoint = family.checkpoint;
+  const countersAtIssue = new Map(issueFrontier);
+  const covered = ([actor, counter]: [string, number]): boolean => (countersAtIssue.get(actor) ?? 0) >= counter;
+  const operations: Record<string, any> = {};
+  for (const [key, entry] of Object.entries(currentCheckpoint.operations ?? {})) {
+    if (covered((entry as any).op[2])) operations[key] = entry;
+  }
+  for (const [, entry] of Object.entries(currentCheckpoint.pending ?? {})) {
+    if (covered((entry as any).op[2])) stale('checkpoint basis has unresolved operations');
+  }
+  const issueCheckpoint = {
+    version: 2,
+    frontier: issueFrontier,
+    operations,
+    pending: {},
+    maxPending: currentCheckpoint.maxPending,
+    rebootstrapRequired: false,
+  };
+  let issueFamily!: ContinuousTextFamily;
+  try {
+    issueFamily = createTextFamily(family.id, issueCheckpoint);
+  } catch {
+    stale('checkpoint basis cannot be reconstructed');
+  }
+  assertOffsetInDocument(issueFamily, rawOffset, 'position at issue');
+
+  // Resolve the original offset to a structural anchor AT ISSUE TIME.
+  let anchor: any;
+  try {
+    anchor = rawOffset === 0 ? ['root'] : insertAnchorForOffset(issueFamily, rawOffset);
+  } catch {
+    throw new ValidationError('annotated-text insert offset cannot be resolved at issue', { code: 'position-invalid' });
+  }
+  const anchorKey = anchorKeyOf(anchor);
+
+  // The anchor must still resolve in the CURRENT family.
+  if (anchorKey !== 'root' && !hasTextElement(family.checkpoint, anchorKey)) {
+    stale('structural anchor is gone');
+  }
+  let currentOffset!: number;
+  try {
+    currentOffset = anchorKey === 'root'
+      ? 0
+      : projectEndpointToOffset(family, {
+        point: ['point', anchor, 'right'],
+        basisFrontier: issueFrontier,
+      });
+  } catch {
+    stale('structural anchor does not resolve in the current family');
+  }
+  // No ambiguity: re-resolving the rebased offset in the current family must
+  // land on the very same anchor; a different anchor means the position is not
+  // faithfully rebaseable, so fail closed.
+  let resolvedKey!: string;
+  try {
+    const resolved = currentOffset === 0 ? ['root'] : insertAnchorForOffset(family, currentOffset);
+    resolvedKey = anchorKeyOf(resolved);
+  } catch {
+    stale('rebased offset is ambiguous');
+  }
+  if (resolvedKey !== anchorKey) stale('rebased offset is ambiguous');
+  assertOffsetInDocument(family, currentOffset, 'position');
+  return currentOffset;
+}
+
+function anchorKeyOf(anchor: any): string {
+  if (anchor[0] === 'root') return 'root';
+  const op = anchor[1][0];
+  return `${op[0]}:${op[1]}:${anchor[1][1]}`;
+}
+
 /** text.insert | text.delete | text.replace */
 async function admitTextEdit(ctx: V9Prelude & { edit: V9EditLoose }): Promise<unknown[]> {
   const { name, fieldName, command, db, prefix, documentScope, lease, family, state, actor, lamport, edit } = ctx;
-  // The position's family-basis equality with the current family is enforced in
-  // the prelude; the client's offset is absolute against that same basis. For a
-  // redacted recipient the offset is a WIRE offset (its frame's redactions are
-  // the wire→canonical table); it is mapped before planning so edits land in
+  // The prelude either confirms the position's family basis matches the
+  // current family, or (for a stale, fully-visible plain insert) rebases the
+  // offset to the current family through a structural anchor. For a redacted
+  // recipient the offset is a WIRE offset (its frame's redactions are the
+  // wire→canonical table); it is mapped before planning so edits land in
   // visible text only.
   const at = (edit.at ?? edit.from)!;
-  const offset = at.offset;
+  const offset = edit.kind === 'text.insert' && ctx.staleInsertOffset !== null
+    ? ctx.staleInsertOffset
+    : at.offset;
   const redactions = parsedRedactions(ctx.position);
   let toOffset = offset;
   let toAffinity: 'left' | 'right' = 'right';
@@ -431,7 +561,7 @@ async function admitTextEdit(ctx: V9Prelude & { edit: V9EditLoose }): Promise<un
   for (const [familyName, meta] of Object.entries(ctx.compiledMeta.annotationHandles as Record<string, any>)) {
     if (meta.editOverlap) editOverlapByFamily[familyName] = meta.editOverlap;
   }
-  const annotationFields = loadAnnotationFields({ db, prefix, compiledMeta: ctx.compiledMeta, descriptor: ctx.descriptor, annotations });
+  const annotationFields = loadAnnotationFields({ compiledMeta: ctx.compiledMeta, annotations });
   const plannerEdit = edit.kind === 'text.insert'
     ? { kind: 'text.insert', at: { offset: mapped.from, affinity: edit.at!.affinity }, text: edit.text }
     : { kind: edit.kind, from: { offset: mapped.from, affinity: edit.from!.affinity }, to: { offset: mapped.to, affinity: edit.to!.affinity }, text: edit.text };
@@ -616,7 +746,7 @@ async function admitAnnotationPaste(ctx: V9Prelude & { edit: V9EditLoose }): Pro
     id,
     family: pastedAnnotation.family,
     empty: familyMeta.empty,
-     cardinality: (familyMeta.cardinality === 'one' ? 'one' : 'many') as 'many' | 'one',
+    cardinality: (familyMeta.cardinality === 'one' ? 'one' : 'many') as 'many' | 'one',
     fields: { ...(pastedAnnotation.fields ?? {}) },
     // Protection edges point at document-local ids and cannot be copied by
     // reference; a paste copies annotation fields, not those relationships.

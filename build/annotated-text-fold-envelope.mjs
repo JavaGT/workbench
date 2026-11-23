@@ -18,8 +18,15 @@
 // emptied orphan.
 
 import { parseEventType, EventKind } from './event-handle.mjs';
-import { projectAnnotatedTextSnapshot } from './annotated-text-snapshot.mjs';
-import { restoreTextFamilySerialized, textFamilyBasis, textFamilyCheckpoint, materializeText,                           } from './annotated-text-continuous.mjs';
+import { evaluateAnnotatedTextVisibility } from './annotated-text-snapshot.mjs';
+import {
+  restoreTextFamilySerialized,
+  textFamilyBasis,
+  textFamilyCheckpoint,
+  textFamilyElementCount,
+  materializeText,
+
+} from './annotated-text-continuous.mjs';
 import { frontierDominates } from './annotated-text.mjs';
 import {
   ensureStream,
@@ -29,7 +36,6 @@ import {
   buildAuthoringEnvelope,
   readAnnotatedTextFamilyCheckpoint,
 } from './annotated-text-authoring-stream.mjs';
-import { authoringRedactionsForRecipient } from './annotated-text-recipient-projection.mjs';
 import { getAnnotatedTextCompiledMetadata } from './annotated-text-field.mjs';
 
 
@@ -244,16 +250,30 @@ export async function tryBuildAnnotatedTextFoldEnvelopes(ctx         , { db, doc
   const row = rawRow(db, document.entity.name, document.documentId);
   if (!row) return recovery(ctx, entityName, id, 'annotated-text-snapshot-required');
 
-  let recipient;
+  const prefix = `${document.entity.name}_${document.fieldName}`;
+  let committed;
   try {
-    recipient = await projectAnnotatedTextSnapshot({
+    const familyCheckpoint = readAnnotatedTextFamilyCheckpoint(db, prefix, document.documentId);
+    if (familyCheckpoint === undefined) return recovery(ctx, entityName, id, 'annotated-text-snapshot-required');
+    committed = restoreTextFamilySerialized(familyCheckpoint);
+  } catch {
+    return recovery(ctx, entityName, id, 'annotated-text-snapshot-required');
+  }
+
+  // Fast-path fully-visible live fold (#292): evaluate ONLY protecting
+  // annotations for this principal instead of running full
+  // projectAnnotatedTextSnapshot (which would load and project all unrelated
+  // annotations on every keystroke per recipient).
+  let visibility;
+  try {
+    visibility = await evaluateAnnotatedTextVisibility({
       db,
       entity: document.entity,
       row,
       principal: ctx.principal,
       fieldName: document.fieldName,
       descriptor: document.descriptor,
-      mintBasis: false,
+      family: committed,
     });
   } catch {
     return recovery(ctx, entityName, id, 'annotated-text-snapshot-required');
@@ -264,9 +284,7 @@ export async function tryBuildAnnotatedTextFoldEnvelopes(ctx         , { db, doc
   // own family copy, and its authoring position frame binds the canonical
   // family. Restricted or any-way redacted recipients never receive a family
   // seed, so they stay on snapshot recovery (fail closed).
-  if (recipient.restricted
-    || (recipient.redactions?.length ?? 0) > 0
-    || authoringRedactionsForRecipient(recipient).length > 0) {
+  if (!visibility.fullyVisible || visibility.restricted || visibility.redactions.length > 0) {
     return recovery(ctx, entityName, id, 'annotated-text-snapshot-required');
   }
 
@@ -276,15 +294,6 @@ export async function tryBuildAnnotatedTextFoldEnvelopes(ctx         , { db, doc
   // recipient sees the ENTIRE document unredacted, so an orphaned annotation's
   // historical saved quote discloses nothing the recipient could not already
   // read.
-  //
-  // An edit that empties a protecting-family annotation can CHANGE a
-  // recipient's visibility: a denied protector's redaction (or whole-document
-  // restriction) disappears with it, so a recipient who was redacted before the
-  // edit becomes fold-eligible after it. That recipient never received a family
-  // seed (redacted recipients never do), so it could not apply this fold anyway
-  // — and the fold would carry dispositions for annotations the recipient was
-  // never entitled to see. Such an edit falls back to snapshot recovery for
-  // every recipient (rare, and a fresh authorized snapshot is always safe).
   const emptiedAnnotations = (facts.emptiedAnnotations ?? [])                             ;
   if (!Array.isArray(emptiedAnnotations)) {
     return recovery(ctx, entityName, id, 'annotated-text-snapshot-required');
@@ -320,35 +329,19 @@ export async function tryBuildAnnotatedTextFoldEnvelopes(ctx         , { db, doc
     return recovery(ctx, entityName, id, 'annotated-text-snapshot-required');
   }
 
-  const prefix = `${document.entity.name}_${document.fieldName}`;
-  let committed;
-  try {
-    const familyCheckpoint = readAnnotatedTextFamilyCheckpoint(db, prefix, document.documentId);
-    if (familyCheckpoint === undefined) return recovery(ctx, entityName, id, 'annotated-text-snapshot-required');
-    committed = restoreTextFamilySerialized(familyCheckpoint);
-  } catch {
-    return recovery(ctx, entityName, id, 'annotated-text-snapshot-required');
-  }
-
-  // Verify the fold against the committed family. Live delivery runs after the
-  // in-txn projection, so `${prefix}_state.family_checkpoint` already holds the
-  // family THIS operated event produced — the same family facts.family names,
-  // and the projection itself replayed the operations into it (it throws when
-  // they do not reproduce facts.family / data.after). The client applies these
-  // operations to its own pre-commit copy; the checks below guarantee they are
-  // the exact transition the committed family records, the materialized text
-  // equals the recipient's projection, and the after frontier equals the
-  // applied (committed) family's frontier.
+  // Verify the fold against the committed family. Since this recipient is
+  // proven fully visible, its projected text equals `materializeText(committed)`.
+  let committedText        ;
   try {
     if ((data.version === 13 && (facts.family.id !== document.documentId
       || JSON.stringify(textFamilyCheckpoint(committed)) !== JSON.stringify(facts.family)))
       || JSON.stringify(committed.checkpoint.frontier) !== JSON.stringify(data.after.frontier)
       || JSON.stringify(committed.checkpoint.frontier) === JSON.stringify(data.before.frontier)
       || !frontierDominates(committed.checkpoint.frontier, data.before.frontier)
-      || !opsWellFormed(foldable.operations, data.before.frontier)
-      || materializeText(committed) !== recipient.text) {
+      || !opsWellFormed(foldable.operations, data.before.frontier)) {
       return recovery(ctx, entityName, id, 'annotated-text-snapshot-required');
     }
+    committedText = materializeText(committed);
   } catch {
     return recovery(ctx, entityName, id, 'annotated-text-snapshot-required');
   }
@@ -391,7 +384,7 @@ export async function tryBuildAnnotatedTextFoldEnvelopes(ctx         , { db, doc
       operations: Object.freeze(foldable.operations.map((operation) => deepFreeze(structuredClone(operation)))),
     }),
     projection: Object.freeze({
-      text: recipient.text,
+      text: committedText,
     }),
     // The authoritative emptied-annotation disposition (deleted vs orphaned)
     // this transition committed, restricted to annotations the recipient's
@@ -400,7 +393,7 @@ export async function tryBuildAnnotatedTextFoldEnvelopes(ctx         , { db, doc
     dispositions: Object.freeze(disclosures),
     // Compact cross-check the client can verify against its own post-apply
     // family without serializing the whole checkpoint.
-    familyElementCount: Object.keys(committed.checkpoint.elements).length,
+    familyElementCount: textFamilyElementCount(committed),
     authoring: Object.freeze({
       acknowledgementFence: fence,
       stream: authoring.stream,

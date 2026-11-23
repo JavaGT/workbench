@@ -15,8 +15,7 @@ import { restoreTextFamilySerialized, materializeText, textFamilyBasis, type Con
 import { resolveAnnotatedTextOwningScope } from './annotated-text-field.ts';
 import { resolveStream, resolveLease, resolvePosition } from './annotated-text-authoring-stream.ts';
 import { readSeq } from './committed-log.ts';
-import { planAnnotationRemove, planAnnotationUpdate, planTextOffsetEdit, planTextRangeApply, type EditOverlapBehavior } from './annotated-text-plan.ts';
-import { planAnnotationPaste } from './annotation-paste-plan.ts';
+import { planAnnotationPaste, planAnnotationRemove, planAnnotationUpdate, planTextOffsetEdit, planTextRangeApply, type EditOverlapBehavior } from './annotated-text-plan.ts';
 import { mapVisibleOffsetToCanonical, authoringRedactionsForRecipient, type AuthoringRedaction } from './annotated-text-recipient-projection.ts';
 import { projectAnnotatedTextSnapshot } from './annotated-text-snapshot.ts';
 import type { StructuralEndpoint } from './annotated-text-family.ts';

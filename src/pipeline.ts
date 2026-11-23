@@ -26,18 +26,7 @@ import { failure, failureFromError, failureOutcome, forbidden } from './outcome.
 import { principalKeyOf } from './principal.ts';
 import { applyErasureDirective, isErasureDirective, isErasureDirectivePreparation, prepareErasureDirective } from './erasure-directive.ts';
 import { declarePostCommitEffectsInTxn } from './post-commit-effects.ts';
-import {
-  applicationPrivateFactView,
-  canonicalJsonEqual,
-  constructCompoundCompensationEnvelope,
-  constructCompoundOriginEnvelope,
-  parseCompoundApplicationTransition,
-  parseCompoundApplicationTransitionInput,
-  validateApplicationTransition,
-} from './compound-contribution-fact.ts';
-import { readMoveCompensationTarget, planRegionCompensation, loadRegionCompensationContext } from './annotated-text-region-compensation.ts';
 import { canonicalStringify } from './canonical-json.ts';
-import * as eventHandles from './event-handle.ts';
 import { protectedArtefactCapability } from './protected-artefact-store.ts';
 import type { AuthorizationAdapter } from './authorization-adapter.ts';
 import type { DataTier } from './live-tier.ts';
@@ -45,8 +34,30 @@ import { executeAtomicOperations, isAtomicOperation, type AtomicExecution, type 
 import { admitRowTransition } from './field-admission.ts';
 import { writeInvalidationInTxn } from './invalidation-ledger.ts';
 import { ownedResourcesCapability } from './owned-resource-purge.ts';
-import { ANNOTATED_TEXT_STALE } from './annotated-text-region-limits.ts';
 import { createWriteQueue, type WriteQueue } from './write-queue.ts';
+
+/**
+ * Optional domain-kind commit hook wired by the kernel seam (e.g., composed
+ * annotated-text registered actions) so `pipeline.ts` stays free of field-kind
+ * specific commit/compensation logic.
+ */
+export interface PipelineCommitHook {
+  transformCommit?: (args: {
+    db: DbHandle;
+    handler: any;
+    commit: any;
+    type: unknown;
+    payload: unknown;
+    principal: unknown;
+    scope: string;
+    actionId: string;
+    historyCommit?: any;
+    contributionPolicies?: any;
+  }) => Promise<any>;
+  requiresPrivateFact?: (handler: any) => boolean;
+  projectionPrivateFactView?: (privateFact: Readonly<Record<string, unknown>>) => Readonly<Record<string, unknown>>;
+  isConflictCode?: (code: unknown) => boolean;
+}
 
 // `action(type)` — declare an imperative request type. The handler that turns it
 // into events is attached later by the entity/dispatch wiring.
@@ -752,12 +763,14 @@ function unknownActionOutcome(type: unknown, details?: unknown) {
   ));
 }
 
-function executionFailure(error: unknown, context: Record<string, unknown> = {}, details?: unknown) {
+function executionFailure(error: unknown, context: Record<string, unknown> = {}, details?: unknown, commitHook?: PipelineCommitHook | null) {
   const validationDetails = error instanceof ValidationError && isPlainObject((error as { failure?: unknown }).failure)
     ? (error as { failure: Record<string, unknown> }).failure
     : undefined;
+  const isConflict = validationDetails !== undefined
+    && (commitHook?.isConflictCode?.(validationDetails.code) === true || validationDetails.code === 'annotated-text-stale');
   const normalized = error instanceof ValidationError
-    ? failure(validationDetails?.code === ANNOTATED_TEXT_STALE ? 'conflict' : 'invalid-input', (error as Error).message, validationDetails)
+    ? failure(isConflict ? 'conflict' : 'invalid-input', (error as Error).message, validationDetails)
     : failureFromError(error);
   if (normalized.category === 'internal') {
     getLog().error('dispatch', 'dispatch failed', { err: error, ...context });
@@ -942,7 +955,7 @@ function handleOfEvent(event: any): any {
 // Post-commit delivery can no longer turn a committed mutation into a failure.
 async function commitEvents(db: any, events: any, {
   now, actionId, principal, payload, pipeline, livePipeline, tierOfEvent, scope, type, authorize, historyCommit, handler,
-  erasureActionContext, authorization, contributionPolicies = null, writeQueue = null,
+  erasureActionContext, authorization, contributionPolicies = null, writeQueue = null, commitHook = null,
 }: {
   now: string;
   actionId: string;
@@ -960,6 +973,7 @@ async function commitEvents(db: any, events: any, {
   authorization?: AuthorizationAdapter | null;
   contributionPolicies?: any;
   writeQueue?: WriteQueue | null;
+  commitHook?: PipelineCommitHook | null;
 }) {
   // A batch and any in-transaction effects share one sequence allocator. The
   // first event for a scope reads its committed cursor once; later events use
@@ -1059,181 +1073,24 @@ async function commitEvents(db: any, events: any, {
         throw new TypeError(`action '${type}' declares protected artefacts and must return a canonicalPayload without protected payloads`);
       }
 
-      // Registered-action composition adapter (scope#992 W2 / Finding 3): a
-      // composed action carries a compiled compoundContributionPolicy. Its
-      // handler returns a closed ComposedRegisteredActionCommit (events +
-      // annotatedText + applicationTransition) and never a top-level privateFact.
-      // Inside this coordinated transaction we admit+plan the declared region,
-      // append the operational v15 event, and construct the single compound
-      // private-fact envelope before any fact canonicalization.
-      const composedPolicy = handler?.compoundContributionPolicy;
-      if (composedPolicy) {
-        if (Array.isArray(payload) || type === '$batch') {
-          throw new TypeError(`composed action '${type}' is single-dispatch and batch-forbidden`);
-        }
-        // History moves (durable-history.move re-dispatches the outer composed
-        // action with handler-only compound input). W3 (#145) owns the applied
-        // document compensation: the contribution policy plans the inverse of
-        // the TARGET receipt's region against CURRENT state and, when safely
-        // applicable, emits a fresh v16 operated compensation event plus an
-        // `applied` compensation envelope with linkage. An unsafe target (or a
-        // target with nothing to compensate) commits the explicit whole-compound
-        // no-op compensation envelope (rev 2 Finding 3 outcome): zero document
-        // events, lineage preserved, cursor advanced. No snapshot restore is
-        // ever used. An application CAS failure (validator throw) rolls back
-        // the entire move.
-        if (historyCommit?.handlerInputs && historyCommit.apply) {
-          const moveInput = historyCommit.handlerInputs[0];
-          const applicationRaw = commit.applicationTransition;
-          if (!applicationRaw || typeof applicationRaw !== 'object'
-            || !Object.hasOwn(applicationRaw, 'before') || !Object.hasOwn(applicationRaw, 'after')) {
-            throw new TypeError(`composed action '${type}' history applicationTransition must be { before, after }`);
-          }
-          const metadata = historyCommit.metadata ?? {};
-          const direction = moveInput?.operation === 'redo' ? 'redo' : 'undo';
-          const rootActionId = metadata.historyRootActionId ?? actionId;
-          const targetActionId = metadata.historyTargetActionId ?? actionId;
-          const policy = contributionPolicies?.policyFor(type);
-          const fieldDeclaration = policy?.fieldDeclaration;
-
-          const target = readMoveCompensationTarget(db, {
-            scope, entity: composedPolicy.entity, field: composedPolicy.field,
-            rootActionId, targetActionId,
-          });
-          // A no-op target (its own linkage outcome is 'noop') or a target with
-          // no applied document event has nothing to compensate.
-          const targetLinkageNoop = 'linkage' in target.envelope && target.envelope.linkage.outcome === 'noop';
-          if (target.event && !targetLinkageNoop) {
-            const documentId = target.event.id;
-            const context = loadRegionCompensationContext(
-              db, { entity: composedPolicy.entity, field: composedPolicy.field }, documentId, fieldDeclaration, principal as { type?: string; id?: string }, scope, actionId,
-            );
-            const planned = planRegionCompensation({ target: target.event, contribution: target.contribution, context, actionId });
-            if (planned.outcome === 'applied') {
-              // rev 3 §1: validate the application transition against the head
-              // envelope before storing; a shape-valid but divergent fact throws
-              // and rolls back the whole move.
-              const originApplication = target.originApplication
-                ?? parseCompoundApplicationTransition({ before: null, after: null }, 'history origin application');
-              const targetApplication = parseCompoundApplicationTransition(
-                target.envelope.application, `composed action '${type}' history target application`,
-              );
-              const translatedInput = parseCompoundApplicationTransitionInput(moveInput.input);
-              const returned = validateApplicationTransition({
-                originApplication,
-                targetApplication,
-                translatedInput,
-                returnedApplication: applicationRaw,
-              });
-              const operatedHandle = eventHandles.native(composedPolicy.entity, composedPolicy.field, 'operated');
-              commit = {
-                events: [Object.freeze({
-                  handle: operatedHandle,
-                  type: operatedHandle.type,
-                  scope: context.owningScope,
-                  data: Object.freeze(planned.event),
-                  v16Capability: planned.capability,
-                })],
-                privateFact: constructCompoundCompensationEnvelope({
-                  application: returned,
-                  contributions: planned.contribution ? [planned.contribution] : [],
-                  linkage: {
-                    rootActionId,
-                    targetActionId,
-                    direction,
-                    outcome: 'applied',
-                  },
-                }),
-                historyOutcome: 'applied',
-              };
-            } else {
-              const application = parseCompoundApplicationTransition(applicationRaw, `composed action '${type}' history applicationTransition`);
-              commit = {
-                events: [],
-                privateFact: constructCompoundCompensationEnvelope({
-                  application,
-                  contributions: [],
-                  linkage: {
-                    rootActionId,
-                    targetActionId,
-                    direction,
-                    outcome: 'noop',
-                  },
-                }),
-                historyOutcome: 'noop',
-              };
-            }
-          } else {
-            const application = parseCompoundApplicationTransition(applicationRaw, `composed action '${type}' history applicationTransition`);
-            commit = {
-              events: [],
-              privateFact: constructCompoundCompensationEnvelope({
-                application,
-                contributions: [],
-                linkage: {
-                  rootActionId,
-                  targetActionId,
-                  direction,
-                  outcome: 'noop',
-                },
-              }),
-              historyOutcome: 'noop',
-            };
-          }
-        } else {
-          const composedKeys = ['events', 'annotatedText', 'applicationTransition'];
-          const ownKeys = Object.keys(commit).filter((key) => !['directive', 'canonicalPayload', 'effects', 'historyOutcome', 'claimedBlobs'].includes(key));
-          if (ownKeys.some((key) => !composedKeys.includes(key)) || !Array.isArray(commit.annotatedText) || commit.annotatedText.length !== 1) {
-            throw new TypeError(`composed action '${type}' must return exactly { events, annotatedText, applicationTransition }`);
-          }
-          if (Object.hasOwn(commit, 'privateFact') && commit.privateFact !== undefined) {
-            throw new TypeError(`composed action '${type}' cannot return a top-level privateFact`);
-          }
-          const applicationTransition = commit.applicationTransition;
-          if (!applicationTransition || typeof applicationTransition !== 'object'
-            || !Object.hasOwn(applicationTransition, 'before') || !Object.hasOwn(applicationTransition, 'after')) {
-            throw new TypeError(`composed action '${type}' applicationTransition must be { before, after }`);
-          }
-          // An applied origin transition must differ by canonical equality (rev 3
-          // rule 8); the full 8-rule semantic validator runs on history moves.
-          {
-            const { before, after } = applicationTransition as { before: unknown; after: unknown };
-            if (canonicalJsonEqual(before, after)) {
-              throw new ValidationError(`composed action '${type}' applicationTransition before and after must differ`);
-            }
-          }
-          const plan = await composedPolicy.admitAndPlan(db, commit.annotatedText[0], principal, { scope, actionId });
-          // Append the package-authored operated event to the handler's domain
-          // events; all commit together under one receipt.
-          const operatedHandle = eventHandles.native(composedPolicy.entity, composedPolicy.field, 'operated');
-          const { annotatedText: _annotatedText, applicationTransition: _transition, ...restCommit } = commit as Record<string, unknown>;
-          void _annotatedText;
-          void _transition;
-          commit = {
-            ...restCommit,
-            events: [...(Array.isArray(commit.events) ? commit.events : []), Object.freeze({
-              handle: operatedHandle,
-              type: operatedHandle.type,
-              scope: plan.owningScope,
-              data: Object.freeze(plan.envelope),
-              // W1b (#149 round 2): single-use v16 admission nonce. The
-              // NOW-token deep copy below strips the envelope's symbol brand,
-              // so the capability rides the event frame and is consumed
-              // exactly once by committed-log's append. Opaque; minted only
-              // by the v16 constructor inside admitAndPlan.
-              v16Capability: plan.v16Capability,
-            })],
-            privateFact: constructCompoundOriginEnvelope({
-              application: { before: applicationTransition.before, after: applicationTransition.after },
-              contributions: plan.contribution ? [plan.contribution] : [],
-            }),
-          };
-        }
-      } else if (Object.hasOwn(commit, 'annotatedText') || Object.hasOwn(commit, 'applicationTransition')) {
-        // scope#992 W2: a region descriptor is only lawful through a DECLARED
-        // annotated operation. Returning one from an undeclared handler would be
-        // ambient operation authority — fail closed, never silently drop it.
-        throw new TypeError(`undeclared annotated operation was admitted for action '${type}'`);
+      // Domain-kind commit hook (e.g., composed annotated-text registered
+      // actions): transforms the handler's commit inside this coordinated
+      // transaction and fails closed on undeclared ambient operations.
+      if (commitHook?.transformCommit) {
+        commit = await commitHook.transformCommit({
+          db,
+          handler,
+          commit,
+          type,
+          payload,
+          principal,
+          scope,
+          actionId,
+          historyCommit,
+          contributionPolicies,
+        });
+      } else if (handler?.compoundContributionPolicy) {
+        throw new TypeError(`composed action '${type}' requires a configured commit hook`);
       }
 
       // S3/A2 tier routing — split the commit's events by resolved entity tier.
@@ -1254,25 +1111,24 @@ async function commitEvents(db: any, events: any, {
         throw new TypeError(`action '${type}' returned an erasure directive for a live-tier entity — live entities have no undo history to erase`);
       }
 
+      const hookRequiresPrivateFact = commitHook?.requiresPrivateFact?.(handler) ?? false;
       const requirePrivateFact = (pipeline.requiresPrivateFact?.(commit.events, type) ?? false)
         || (livePipeline?.requiresPrivateFact?.(commit.events, type) ?? false)
-        || Boolean(handler?.compoundContributionPolicy);
+        || hookRequiresPrivateFact;
       // Canonicalize and persist before any opted-in projection can observe the
-      // fact. All writes remain inside this origin transaction. For a composed
-      // action the adapter has already assigned the package-constructed compound
-      // envelope to commit.privateFact; a missing envelope fails closed even for
-      // a zero-event compensation no-op (scope#992 rev 4).
+      // fact. All writes remain inside this origin transaction.
       const privateFact = declarePostCommitEffectsInTxn(db, {
         scope, actionId, committedAt: now, privateFact: commit.privateFact,
         effects: commit.effects, requirePrivateFact,
       });
-      if (handler?.compoundContributionPolicy && commit.privateFact === undefined) {
+      if (hookRequiresPrivateFact && commit.privateFact === undefined) {
         throw new TypeError('compound registered action requires a canonical private fact');
       }
       // Application projections observe only the narrow application view of a
-      // compound envelope (scope#992 rev 4); the full canonical envelope stays
-      // for storage and the package contribution policy.
-      const projectionPrivateFact = privateFact === undefined ? undefined : applicationPrivateFactView(privateFact);
+      // compound envelope when a commit hook supplies one.
+      const projectionPrivateFact = privateFact === undefined
+        ? undefined
+        : (commitHook?.projectionPrivateFactView ? commitHook.projectionPrivateFactView(privateFact) : privateFact);
       const canonicalPayload = commit.canonicalPayload ?? payload;
       const durableResult = durableBatch.length > 0
         ? await pipeline.applyInTxn(db, durableBatch, {
@@ -1352,9 +1208,10 @@ async function commitEvents(db: any, events: any, {
         batchError.error,
         { actionId, type: (payload as any[])[batchError.actionIndex ?? 0]?.type },
         { actionIndex: batchError.actionIndex },
+        commitHook,
       );
     }
-    return executionFailure(err, { actionId });
+    return executionFailure(err, { actionId }, undefined, commitHook);
   }
 
   // Post-commit fan-out: the durable consumers see the durable events, the
@@ -1399,7 +1256,7 @@ function receiptMetadata(request: any, historyCommit: any) {
 // (AGENTS.md: never a magic default); omitting it is a load-time error. When
 // Phase 2 wires this kernel to a request path, `authorize` is where the route
 // gate + grant engine compose — it is not a second, looser auth path.
-export function createServer({ handlers = {}, authorize, db, pipeline = durableMutationVariant(), livePipeline, tierOfEvent, history, historyActions = {}, cursorPolicy, contributionPolicies = null, authorization, writeQueue = null }: {
+export function createServer({ handlers = {}, authorize, db, pipeline = durableMutationVariant(), livePipeline, tierOfEvent, history, historyActions = {}, cursorPolicy, contributionPolicies = null, authorization, writeQueue = null, commitHook = null }: {
   handlers?: Record<string, any>;
   authorize?: (context: any) => any;
   db?: any;
@@ -1419,6 +1276,8 @@ export function createServer({ handlers = {}, authorize, db, pipeline = durableM
   authorization?: AuthorizationAdapter | null;
   /** Optional platform WriteQueue; when omitted on a durable server, one WriteQueue is created for direct callers. */
   writeQueue?: WriteQueue | null;
+  /** Optional domain-kind commit hook wired by the kernel seam. */
+  commitHook?: PipelineCommitHook | null;
 } = {}) {
   if (typeof authorize !== 'function') {
     throw new Error(
@@ -1740,7 +1599,7 @@ export function createServer({ handlers = {}, authorize, db, pipeline = durableM
     const committed = await commitEvents(db, emitted, {
       now, actionId, principal, payload, pipeline, livePipeline, tierOfEvent, scope, type, authorize, historyCommit,
       handler: handler.inTransaction || historyCommit?.handlerInputs ? handler : null, erasureActionContext,
-      authorization, contributionPolicies, writeQueue: serverWriteQueue,
+      authorization, contributionPolicies, writeQueue: serverWriteQueue, commitHook,
     });
     return committed;
   }
@@ -1907,7 +1766,7 @@ export function createServer({ handlers = {}, authorize, db, pipeline = durableM
     const committed = await commitEvents(db, batchCommit, {
       now, actionId, principal, payload: actions, pipeline, livePipeline, tierOfEvent, scope, type: '$batch', authorize, historyCommit,
       handler: runInTxn ? runHandlers : null,
-      authorization, contributionPolicies, writeQueue: serverWriteQueue,
+      authorization, contributionPolicies, writeQueue: serverWriteQueue, commitHook,
     });
     return committed;
   }

@@ -45,6 +45,9 @@ const GRANT_CLAUSES_CACHE = new WeakMap                                         
 
 
 // The inherit directive (`inherit(Parent, { via })`) as the runtime sees it.
+// `childCan` is the optional child capability refinement; `.where(...)` is
+// compile-only (harvested into the child's read-scope) and has no runtime half.
+
 
 
 
@@ -181,6 +184,12 @@ export async function rowCapabilities(
   // is the field-defaults half of the same move (one capability-resolution path).
   const inherited = inheritedGrant(entityRecord);
   if (inherited) {
+    // A child `.can` refines the inherited authority instead of replacing it:
+    // run it against the child row and intersect its capabilities with the
+    // parent's (a scope-only parent contributes none, so the child decides).
+    if (typeof inherited.childCan === 'function') {
+      return await inheritChildCapabilities(entityRecord, row, principal);
+    }
     const parentRow = inheritedParentRow(entityRecord, row, principal);
     if (!parentRow) return { granted: false, capabilities: [], is: makeIs(entityRecord, row, principal) };
     const parentRecord = resolveInheritedParent(entityRecord, inherited)                ;
@@ -219,6 +228,67 @@ export async function rowCapabilities(
     ? { granted: true, capabilities: grantDecision.capabilities ?? [] }
     : { granted: false, capabilities: [] };
   return { ...result, is };
+}
+
+// Run a child's `inherit(Parent, { via }).can(fn)` refinement. The parent's
+// resolved decision is passed as `defaults` (the same seam field `.can` uses),
+// and the resulting capabilities are the INTERSECTION with the parent's — the
+// child can only take authority away, never widen it. A scope-only parent
+// contributes no capabilities, so the child body is then the capability
+// authority over an already scope-visible row. Checks are built from the
+// CHILD's registry/row; the parent's are evaluated in rowCapabilities.
+
+
+// Does this record (or the inherit chain it delegates to) actually CONFER
+// capabilities? Distinguishes "scope-only parent, no capability opinion" from
+// "parent's .can denied" — a denied parent must never be re-granted by a child
+// refinement. A cycle fails closed (no authority contributed).
+function contributesCapabilities(record              , seen = new Set              ())          {
+  if (seen.has(record)) return false;
+  seen.add(record);
+  if (hasOwnCanGrant(record)) return true;
+  const inherited = inheritedGrant(record);
+  if (!inherited) return false;
+  if (typeof inherited.childCan === 'function') return true;
+  const parent = resolveInheritedParent(record, inherited)                       ;
+  return parent ? contributesCapabilities(parent, seen) : false;
+}
+
+async function inheritChildCapabilities(
+  entityRecord              ,
+  row         ,
+  principal         ,
+)                       {
+  const is = makeIs(entityRecord, row, principal);
+  const denied = ()              => ({ granted: false, capabilities: [], is });
+  const inherited = inheritedGrant(entityRecord);
+  const childCan = inherited?.childCan                              ;
+  if (!inherited || typeof childCan !== 'function') return denied();
+
+  const parentRow = inheritedParentRow(entityRecord, row, principal);
+  if (!parentRow) return denied();
+  const parentRecord = resolveInheritedParent(entityRecord, inherited)                ;
+  const parent = await rowCapabilities(parentRecord, parentRow, principal);
+  // A parent that has a capability opinion and DENIED stays denied — the child
+  // may only narrow, never re-grant. A scope-only parent has no such opinion.
+  if (contributesCapabilities(parentRecord) && !parent.granted) return denied();
+
+  let childDecision                           ;
+  await resolveDecision(
+    async () => {
+      childDecision = await childCan({ is, entity: row }, parent);
+      return childDecision.granted;
+    },
+    [],
+    { where: `the inherit .can grant body on entity('${entityRecord.name}')` },
+  );
+  if (!childDecision || childDecision.granted !== true || !Array.isArray(childDecision.capabilities)) return denied();
+  const childCapabilities                        = childDecision.capabilities;
+
+  const capabilities = parent.granted
+    ? parent.capabilities.filter((capability) => childCapabilities.includes(capability))
+    : childCapabilities;
+  return { granted: true, capabilities, is };
 }
 
 // The capability each CRUD verb requires, derived through the SINGLE
@@ -374,7 +444,18 @@ export async function mayRow(
       const parentRow = inheritedParentRow(entityRecord, row, principal);
       if (!parentRow) return false;
       const parentRecord = resolveInheritedParent(entityRecord, inherited)                ;
-      return await mayRow(parentRecord, verb, parentRow, principal, authz);
+      const parentAdmitted = await mayRow(parentRecord, verb, parentRow, principal, authz);
+      if (!parentAdmitted) return false;
+      // An inherit child with its own `.can` must additionally pass that
+      // refinement (its capabilities are already intersected with the
+      // parent's); a plain inherit is unchanged — one recursion, no new path.
+      if (typeof inherited.childCan === 'function') {
+        const decision = await inheritChildCapabilities(entityRecord, row, principal);
+        if (!decision.granted) return false;
+        const required = VERB_CAPABILITY[verb];
+        return required ? decision.capabilities.includes(required) : false;
+      }
+      return true;
     }
     if (!hasOwnCanGrant(entityRecord)) return verb !== 'admin';
     return await authz(entityRecord, verb, row, principal);

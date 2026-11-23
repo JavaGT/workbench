@@ -102,7 +102,30 @@ export function makeNode(props: Record<string, unknown>): AstNode {
 // the parent must be defined above the child. The directive is a plain frozen
 // record the entity compiler recognizes; it carries the parent's harvested scope
 // AST (so the child can re-lower it under a join alias) and the FK column name.
-export function inherit(parent: unknown, { via }: { via?: unknown } = {}): { inherit: unknown; via: unknown } {
+//
+// Optional child refinement: `.where(predicate)` ANDs a child scope predicate
+// with the inherited parent EXISTS; `.can(fn)` intersects a child capability
+// body with the parent's capabilities. Both are chainable and return a NEW
+// frozen directive, so plain `inherit(Parent, { via })` is byte-for-byte the
+// same grant shape it always was (backwards compatible).
+type InheritPredicate = (ctx: { is: unknown; fields: unknown }) => unknown;
+type InheritCan = (ctx: { is: unknown; entity: unknown }, defaults?: unknown) => unknown;
+
+export interface InheritDirective {
+  readonly inherit: unknown;
+  readonly via?: unknown;
+  /** Harvested child scope predicate (set by `.where(...)`). */
+  readonly childWhere?: InheritPredicate;
+  /** Child capability body (set by `.can(...)`). */
+  readonly childCan?: InheritCan;
+}
+
+export interface InheritHandle extends InheritDirective {
+  where(predicate: InheritPredicate): InheritHandle;
+  can(fn: InheritCan): InheritHandle;
+}
+
+export function inherit(parent: unknown, { via }: { via?: unknown } = {}): InheritHandle {
   if (parent === undefined || parent === null || typeof parent !== 'object' || !(parent as { name?: unknown }).name) {
     throw new NonCompilableError(
       'inherit(Parent, { via }) requires the compiled parent entity object, ' +
@@ -114,7 +137,35 @@ export function inherit(parent: unknown, { via }: { via?: unknown } = {}): { inh
       `inherit(${(parent as { name: unknown }).name}, { via }) requires a 'via' FK column name (string).`,
     );
   }
-  return Object.freeze({ inherit: parent, via });
+
+  // Methods are NON-enumerable so spreading `data` inside a refinement never
+  // copies a method over the data field it is about to replace.
+  function makeHandle(data: InheritDirective): InheritHandle {
+    const handle = { ...data } as Record<string, unknown>;
+    Object.defineProperties(handle, {
+      where: {
+        enumerable: false,
+        value(predicate: InheritPredicate): InheritHandle {
+          if (typeof predicate !== 'function') {
+            throw new NonCompilableError('inherit(...).where() requires a scope predicate function');
+          }
+          return makeHandle({ ...data, childWhere: predicate });
+        },
+      },
+      can: {
+        enumerable: false,
+        value(fn: InheritCan): InheritHandle {
+          if (typeof fn !== 'function') {
+            throw new NonCompilableError('inherit(...).can() requires a capability function');
+          }
+          return makeHandle({ ...data, childCan: fn });
+        },
+      },
+    });
+    return Object.freeze(handle) as unknown as InheritHandle;
+  }
+
+  return makeHandle(Object.freeze({ inherit: parent, via }));
 }
 
 // ---- top-level combinators (imported by the developer) ----------------------
@@ -782,8 +833,13 @@ export function compileReadScope(
 // EXISTS over the parent's compiled scope AST, joined through the `via` FK. The
 // parent must carry its harvested scope AST (entity() stores it as `scopeAst`).
 export function compileInheritScope(
-  directive: { inherit: unknown; via?: unknown },
-  { where }: { where: string },
+  directive: InheritDirective,
+  { where, fields = {}, registry = {}, entityName }: {
+    where: string;
+    fields?: Record<string, unknown>;
+    registry?: Record<string, unknown>;
+    entityName?: string;
+  },
 ): ReadScopeTemplate {
   const parent = directive.inherit as { name: string; scopeAst?: AstNode };
   if (!parent.scopeAst) {
@@ -798,8 +854,26 @@ export function compileInheritScope(
     parentName: parent.name,
     parentAst: parent.scopeAst,
     via: directive.via,
-  });
-  return { ...lowerToSql(joinAst as unknown as AstNode, { where }), ast: joinAst as unknown as AstNode };
+  }) as unknown as AstNode;
+
+  // A child refinement is a SECOND read restriction, never an alternative:
+  // harvest its predicate against the CHILD's own field/registry surface, then
+  // AND it with the inherited parent EXISTS in one AST. One lowered scope, one
+  // param space, one bindReadScope call — no second reconciliation path.
+  let ast = joinAst;
+  if (directive.childWhere !== undefined) {
+    if (typeof directive.childWhere !== 'function') {
+      throw new NonCompilableError('inherit(...).where() requires a scope predicate function', { where });
+    }
+    const childAst = harvest(directive.childWhere, {
+      fields,
+      where: `${where} child predicate`,
+      registry,
+      entityName,
+    });
+    ast = makeNode({ node: 'and', operands: [joinAst, childAst] });
+  }
+  return { ...lowerToSql(ast, { where }), ast };
 }
 
 // The request-time bridge: bind a principal into a compiled read-scope template.

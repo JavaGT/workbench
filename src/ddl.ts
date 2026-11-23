@@ -80,6 +80,8 @@ interface DdlEntity {
   fields?: unknown;
   schedule?: Record<string, unknown>;
   indexes?: ReadonlyArray<{ fields: readonly string[]; unique: boolean }>;
+  /** Single-column (or tuple) UNIQUE constraints normalized by the compiler. */
+  unique?: ReadonlyArray<readonly string[]>;
 }
 
 function fieldsOf(entity: DdlEntity): Readonly<Record<string, FieldDescriptorLike>> | undefined {
@@ -205,7 +207,34 @@ function declaredIndexes(entity: DdlEntity, unique: boolean): Array<{ name: stri
 }
 
 function uniqueIndexes(entity: DdlEntity): Array<{ name: string; fields: readonly string[] }> {
-  return declaredIndexes(entity, true);
+  // Composite unique indexes come from the `indexes` slot; single-column
+  // constraints (including field-level `unique: true`) come from `unique`.
+  // Both emit the same `CREATE UNIQUE INDEX IF NOT EXISTS` statement shape.
+  // Dedupe by canonical field tuple (matching compile.ts) so distinct
+  // constraints like ['a', 'b'] and ['a_b'] never silently collapse onto the
+  // same SQLite index name; disambiguate colliding index names deterministically.
+  const seenTuples = new Set<string>();
+  const usedNames = new Set<string>();
+  const result: Array<{ name: string; fields: readonly string[] }> = [];
+  const add = (fields: readonly string[]) => {
+    const tupleKey = [...fields].sort().join('\u0000');
+    if (seenTuples.has(tupleKey)) return;
+    seenTuples.add(tupleKey);
+    const baseName = `idx_${entity.name}_unique_${fields.join('_')}`;
+    let name = baseName;
+    let suffix = 2;
+    while (usedNames.has(name.toLowerCase())) {
+      name = `${baseName}_${suffix}`;
+      suffix += 1;
+    }
+    usedNames.add(name.toLowerCase());
+    result.push({ name, fields });
+  };
+  for (const index of entity.indexes ?? []) {
+    if (index.unique === true) add(index.fields);
+  }
+  for (const fields of entity.unique ?? []) add(fields);
+  return result;
 }
 
 function nonUniqueIndexes(entity: DdlEntity): Array<{ name: string; fields: readonly string[] }> {

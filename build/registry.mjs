@@ -72,6 +72,8 @@ import {
 
 
 
+
+
 export function buildCheckRegistry({ fields = {}, declaredChecks = {}, entityName }                      )                {
   const registry                             = {};
 
@@ -79,9 +81,23 @@ export function buildCheckRegistry({ fields = {}, declaredChecks = {}, entityNam
   for (const [fieldName, descriptor] of Object.entries(fields)) {
     const field = descriptor                                                         ;
     if (field?.type === 'ref' && field.role) {
-      registry[String(field.role)] = {
+      const role = String(field.role);
+      // Two ref fields claiming one role would make the registry LAST-wins
+      // while owner stamping is FIRST-wins — the named check would evaluate a
+      // different FK than the one the row stores. Fail closed at compile time:
+      // a role has exactly one source of truth (the declaring ref field).
+      const prior = registry[role];
+      if (prior) {
+        throw new NonCompilableError(
+          `ref fields '${prior.sourceField ?? role}' and '${fieldName}' both declare role '${role}'; ` +
+            'a role may be derived from only one ref field (give the second a different role)',
+          { where: `entity '${entityName}'` },
+        );
+      }
+      registry[role] = {
         harvest: () => makeNode({ node: 'eq', field: fieldName, param: PRINCIPAL_ID_PARAM }),
         run: ({ entity: row, principal }) => row[fieldName] === principal.id,
+        sourceField: fieldName,
       };
     }
   }

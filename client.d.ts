@@ -10,6 +10,10 @@ import type {
   AnnotatedTextFieldHandle,
   AnyWorkbenchEntity,
   WorkbenchEntity,
+  QueryContract,
+  QueryCursor,
+  QueryFamilyRequest,
+  QueryPage,
 } from './index.js';
 import type { AnnotatedTextRange, AnnotatedTextRedactionMarker } from './annotated-text-coords.js';
 
@@ -903,6 +907,100 @@ export interface AuthClient {
 }
 
 export function createAuthClient(config?: AuthClientConfig): AuthClient;
+
+// ---------------------------------------------------------------------------
+// createQueryClient — authorized query-family and search HTTP calls (#312)
+// ---------------------------------------------------------------------------
+
+export interface QueryClientOptions {
+  baseUrl?: string;
+  fetchImpl?: typeof globalThis.fetch;
+}
+
+export interface QueryRequestOptions {
+  signal?: AbortSignal;
+  headers?: Record<string, string>;
+}
+
+/**
+ * The `POST /query/:entity` request body: an ordinary query contract with the
+ * entity lifted into the URL path, plus the pagination/count options the read
+ * page accepts.
+ */
+export interface QueryEntityRequest extends Omit<QueryContract, 'entity'> {
+  readonly entity?: string;
+  readonly cursor?: QueryCursor | null;
+  readonly offset?: number;
+  readonly includeCount?: boolean;
+  readonly includeTotal?: boolean;
+  readonly hydrate?: boolean;
+}
+
+export type QuerySearchMode = 'fts' | 'vector' | 'hybrid';
+
+export interface QuerySearchSource {
+  readonly index?: string;
+  readonly pluginId?: string;
+  readonly query?: unknown;
+}
+
+export interface QuerySearchRequest {
+  readonly mode?: QuerySearchMode;
+  readonly index?: string;
+  /** FTS query text, or a plugin-shaped query object. */
+  readonly query?: unknown;
+  /** The vector query (paired with `model` when `query` is not an object). */
+  readonly vector?: readonly number[] | Float32Array;
+  readonly model?: string;
+  readonly limit?: number;
+  readonly scopeId?: string;
+  readonly scope?: string | Readonly<Record<string, unknown>>;
+  readonly sources?: {
+    readonly fts?: string | QuerySearchSource;
+    readonly vector?: string | QuerySearchSource;
+  };
+  readonly weights?: { readonly fts?: number; readonly vector?: number };
+  readonly k?: number;
+}
+
+export interface QuerySearchHit {
+  readonly key?: string;
+  readonly rank?: number;
+  readonly score?: number;
+  readonly id?: string;
+  readonly [field: string]: unknown;
+}
+
+/** The standard search response body: hits plus the registry-derived staleness. */
+export interface QuerySearchResponse {
+  readonly ok: boolean;
+  readonly mode?: QuerySearchMode;
+  readonly index?: string;
+  readonly generation?: number;
+  readonly staleness?: 'fresh' | 'stale' | 'rebuilding';
+  readonly hits: readonly QuerySearchHit[];
+  readonly totalCandidates?: number;
+  readonly k?: number;
+  readonly cancelled?: boolean;
+  readonly timedOut?: boolean;
+  readonly error?: string;
+}
+
+export interface QueryClient {
+  queryEntity<Row extends Record<string, unknown> = Record<string, unknown>>(
+    entity: string,
+    request: QueryEntityRequest,
+    opts?: QueryRequestOptions,
+  ): Promise<QueryPage>;
+  queryFamily<Row extends Record<string, unknown> = Record<string, unknown>>(
+    name: string,
+    request: QueryFamilyRequest,
+    opts?: QueryRequestOptions,
+  ): Promise<QueryPage>;
+  search(request: QuerySearchRequest, opts?: QueryRequestOptions): Promise<QuerySearchResponse>;
+}
+
+export function createQueryClient(options?: QueryClientOptions): QueryClient;
 
 // ---------------------------------------------------------------------------
 // materializeAnnotatedTextSnapshot — browser snapshot materialization

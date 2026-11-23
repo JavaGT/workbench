@@ -71,6 +71,18 @@ import {
 import { resolveAnnotatedTextOwningScope } from './annotated-text-field.mjs';
 import { anonymous, collapseForAdmission,                } from './principal.mjs';
 import { failure } from './outcome.mjs';
+import { requireUser } from './route-gate.mjs';
+import {
+  compileQueryContract,
+  executeQueryPage,
+  QueryScopedReadError,
+
+
+} from './query-scoped-read.mjs';
+
+import { hybridSearch,                           } from './search-plugin.mjs';
+import { searchStalenessOf } from './search-response.mjs';
+
 
 
 
@@ -1254,5 +1266,354 @@ export function handleClientSdkRoute(
     'content-length': Buffer.byteLength(body),
   });
   res.end(body);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Query / query-family / search HTTP routes (#312)
+// ---------------------------------------------------------------------------
+//
+// Three framework-owned POST endpoints (intercepted before matchRoute, like
+// /snapshot and /blobs) that expose the library query and search surfaces over
+// HTTP:
+//
+//   POST /query/:entity           — an authorized query-scoped read page
+//   POST /query-families/:name    — a registered query family page
+//   POST /search                  — FTS / vector / hybrid search
+//
+// Authorization is the SAME engine as every other transport: the entity's
+// default-on `read` route gate (requireUser unless the declaration names
+// allowAnonymous), then the compiled row grant inside the query/search
+// execution. There is no second auth path, and the request principal is already
+// collapsed for admission by the transport.
+
+// The per-entity read route gate (default-on requireUser). An allowAnonymous
+// declaration relaxes only admission; the row grant still runs downstream.
+function entityReadGate(entity            )                                  {
+  const gate = (entity                                      ).gate?.read;
+  return (typeof gate === 'function' ? gate : requireUser())                                   ;
+}
+
+// The standard page JSON. `count`/`filteredTotal` are omitted unless the
+// request asked for `includeCount`; `total` unless it asked for `includeTotal`.
+function queryPageBody(page           )                          {
+  return {
+    rows: page.rows,
+    nextCursor: page.nextCursor,
+    hasMore: page.hasMore,
+    revision: page.revision,
+    ...(page.count !== undefined ? { count: page.count, filteredTotal: page.filteredTotal } : {}),
+    ...(page.total !== undefined ? { total: page.total } : {}),
+  };
+}
+
+// Read a JSON object body, replying with the standard error envelope and
+// returning null when the body is refused.
+async function readJsonObjectBody(
+  req                  ,
+  res                  ,
+)                                          {
+  let body         ;
+  try {
+    body = await readRequestBody(req, { jsonOnly: true });
+  } catch (err) {
+    if (err instanceof BodyError) {
+      reject(res, err.status, err.message);
+      return null;
+    }
+    throw err;
+  }
+  if (body === null || body === undefined) return {};
+  if (typeof body !== 'object' || Array.isArray(body)) {
+    reject(res, 400, 'request body must be a JSON object');
+    return null;
+  }
+  return body                           ;
+}
+
+// Compile the request contract against the mounted entity and execute it in one
+// read snapshot. The body's pagination/count options are lifted out of the
+// contract (compileQueryContract accepts only contract keys); an unknown
+// property therefore surfaces as a 400 validation error, not a silent ignore.
+function executeQueryScopedRead(
+  db         ,
+  entity            ,
+  principal         ,
+  body                         ,
+)            {
+  const queryEntity = entity                          ;
+  const compiled = compileQueryContract({
+    entity: entity.name,
+    filters: body.filters         ,
+    where: body.where         ,
+    expression: body.expression         ,
+    sort: body.sort         ,
+    pageSize: body.pageSize         ,
+  }, queryEntity);
+  return executeQueryPage(db         , queryEntity, principal, compiled, {
+    cursor: (body.cursor ?? null)         ,
+    offset: body.offset                      ,
+    maxOffset: body.maxOffset                      ,
+    includeCount: body.includeCount === true,
+    includeTotal: body.includeTotal === true,
+    hydrate: body.hydrate                       ,
+  });
+}
+
+// POST /query/:entity — an authorized query-scoped read page.
+export async function handleQueryRoute(
+  app                                 ,
+  req                  ,
+  res                  ,
+  principal                              ,
+)                   {
+  if (req.method !== 'POST') return false;
+  const url = new URL(req.url ?? '/', 'http://localhost');
+  const seg = url.pathname.split('/').filter(Boolean);
+  if (seg[0] !== 'query' || seg.length !== 2) return false;
+  if (!app || !app.entities || !app.db) { reject(res, 404, 'not found'); return true; }
+
+  let entityName        ;
+  try {
+    entityName = decodeURIComponent(seg[1] );
+  } catch {
+    reject(res, 404, 'not found');
+    return true;
+  }
+  // Case-sensitive lookup against the app's compiled entities.
+  const entity = app.entities.get(entityName);
+  if (!entity) { reject(res, 404, 'not found'); return true; }
+
+  const admitted = collapseForAdmission(principal ?? anonymous);
+  if (!entityReadGate(entity)(admitted)) { reject(res, 401, 'unauthorized'); return true; }
+
+  const body = await readJsonObjectBody(req, res);
+  if (body === null) return true;
+
+  try {
+    const page = executeQueryScopedRead(app.db, entity, admitted, body);
+    sendJson(res, 200, queryPageBody(page));
+  } catch (err) {
+    if (err instanceof QueryScopedReadError) {
+      reject(res, 400, err.message);
+      return true;
+    }
+    throw err;
+  }
+  return true;
+}
+
+// POST /query-families/:name — a registered query family page. The host
+// entity's read gate (falling back to requireUser) decides admission; the
+// family's compiled host/catalog/element grants decide row visibility.
+export async function handleQueryFamilyRoute(
+  app                                 ,
+  req                  ,
+  res                  ,
+  principal                              ,
+)                   {
+  if (req.method !== 'POST') return false;
+  const url = new URL(req.url ?? '/', 'http://localhost');
+  const seg = url.pathname.split('/').filter(Boolean);
+  if (seg[0] !== 'query-families' || seg.length !== 2) return false;
+  if (!app || !app.db) { reject(res, 404, 'not found'); return true; }
+
+  let familyName        ;
+  try {
+    familyName = decodeURIComponent(seg[1] );
+  } catch {
+    reject(res, 404, 'not found');
+    return true;
+  }
+  const registry = (app                                           ).queryFamilies;
+  const family = registry?.get(familyName);
+  if (!registry || !family) { reject(res, 404, 'not found'); return true; }
+
+  const admitted = collapseForAdmission(principal ?? anonymous);
+  const hostGate = (family.host                                                 ).gate?.read;
+  const gate = (typeof hostGate === 'function' ? hostGate : requireUser())                                   ;
+  if (!gate(admitted)) { reject(res, 401, 'unauthorized'); return true; }
+
+  const body = await readJsonObjectBody(req, res);
+  if (body === null) return true;
+
+  try {
+    const page = registry.execute(familyName, app.db         , admitted, body);
+    sendJson(res, 200, queryPageBody(page));
+  } catch (err) {
+    if (err instanceof QueryScopedReadError) {
+      reject(res, 400, err.message);
+      return true;
+    }
+    throw err;
+  }
+  return true;
+}
+
+
+
+function resolveSearchMode(body                         )                    {
+  if (body.mode !== undefined) {
+    return body.mode === 'fts' || body.mode === 'vector' || body.mode === 'hybrid' ? body.mode : null;
+  }
+  if (body.sources !== undefined && body.sources !== null && typeof body.sources === 'object') return 'hybrid';
+  if (body.vector !== undefined) return 'vector';
+  return 'fts';
+}
+
+// A vector query object. A `query` object wins verbatim (it may carry model,
+// vector, scope, or scopeId); otherwise the flat `vector`/`model` fields form
+// the plugin's `{ model, vector }` query shape.
+function vectorQueryOf(body                         )                          {
+  if (body.query !== undefined && body.query !== null && typeof body.query === 'object' && !Array.isArray(body.query)) {
+    return body.query                           ;
+  }
+  const query                          = {};
+  if (body.vector !== undefined) query.vector = body.vector;
+  if (body.model !== undefined) query.model = body.model;
+  return query;
+}
+
+function searchScope(body                         )                          {
+  const scope                          = {};
+  if (body.limit !== undefined) scope.limit = body.limit;
+  if (body.scopeId !== undefined) scope.scopeId = body.scopeId;
+  if (body.scope !== undefined) scope.scope = body.scope;
+  return scope;
+}
+
+// POST /search — FTS5, Float32 vector, or hybrid RRF retrieval over the app's
+// registered search registry. Fail closed: requireUser admission, unknown index
+// → 404, malformed payload → 400. Results carry the registry-derived staleness
+// stamp, never a plugin-supplied one.
+export async function handleSearchRoute(
+  app                                 ,
+  req                  ,
+  res                  ,
+  principal                              ,
+)                   {
+  if (req.method !== 'POST') return false;
+  const url = new URL(req.url ?? '/', 'http://localhost');
+  if (url.pathname !== '/search') return false;
+  if (!app) { reject(res, 404, 'not found'); return true; }
+
+  const registry = (app                                                                             ).searchRegistry
+    ?? (app                                            ).searchPlugins;
+  if (!registry || (typeof (registry                  ).search !== 'function' && typeof (registry                  ).hybridSearch !== 'function')) {
+    reject(res, 404, 'search is not engaged');
+    return true;
+  }
+
+  const admitted = collapseForAdmission(principal ?? anonymous);
+  if (!requireUser()(admitted         )) { reject(res, 401, 'unauthorized'); return true; }
+
+  const body = await readJsonObjectBody(req, res);
+  if (body === null) return true;
+
+  const mode = resolveSearchMode(body);
+  if (mode === null) { reject(res, 400, 'unknown search mode'); return true; }
+  const registryHasIndex = (index         )          => {
+    if (typeof index !== 'string' || index.length === 0) return false;
+    const has = (registry                  ).has;
+    return typeof has === 'function' ? has.call(registry, index) : true;
+  };
+
+  if (mode === 'hybrid') {
+    const sources = (body.sources ?? {})                           ;
+    const sourceId = (value         )                     => {
+      if (typeof value === 'string' && value.length > 0) return value;
+      if (value && typeof value === 'object') {
+        const record = value                           ;
+        if (typeof record.index === 'string') return record.index;
+        if (typeof record.pluginId === 'string') return record.pluginId;
+      }
+      return undefined;
+    };
+    const ftsIndex = sourceId(sources.fts);
+    const vectorIndex = sourceId(sources.vector);
+    if (!ftsIndex || !vectorIndex) {
+      reject(res, 400, 'hybrid search requires sources.fts and sources.vector');
+      return true;
+    }
+    if (!registryHasIndex(ftsIndex) || !registryHasIndex(vectorIndex)) {
+      reject(res, 404, 'unknown search index');
+      return true;
+    }
+    const weights = (body.weights ?? {})                           ;
+    const ftsSource = sources.fts                                       ;
+    const vectorSource = sources.vector                                       ;
+    const ftsQuery = ftsSource?.query ?? body.query;
+    const vectorQuery = vectorSource?.query ?? vectorQueryOf(body);
+    const shared = {
+      principal: admitted,
+      fts: {
+        pluginId: ftsIndex,
+        index: ftsIndex,
+        query: ftsQuery,
+        ...(weights.fts !== undefined ? { weight: weights.fts } : {}),
+      },
+      vector: {
+        pluginId: vectorIndex,
+        index: vectorIndex,
+        query: vectorQuery,
+        ...(weights.vector !== undefined ? { weight: weights.vector } : {}),
+      },
+      ...(body.k !== undefined ? { k: body.k } : {}),
+      ...searchScope(body),
+    };
+    try {
+      const result = typeof (registry                  ).hybridSearch === 'function'
+        ? await (registry                  ).hybridSearch (shared)
+        : await hybridSearch({ registry: registry                        , ...shared }         );
+      sendJson(res, 200, {
+        ok: result.ok,
+        mode: 'hybrid',
+        staleness: result.staleness,
+        hits: result.hits ?? [],
+        totalCandidates: result.totalCandidates,
+        k: result.k,
+        cancelled: result.cancelled === true,
+        timedOut: result.timedOut === true,
+      });
+    } catch (err) {
+      reject(res, 400, err instanceof Error ? err.message : 'invalid hybrid search request');
+      return true;
+    }
+    return true;
+  }
+
+  const index = body.index;
+  if (typeof index !== 'string' || index.length === 0) {
+    reject(res, 400, 'index is required');
+    return true;
+  }
+  if (!registryHasIndex(index)) { reject(res, 404, 'unknown search index'); return true; }
+
+  const request = {
+    query: mode === 'vector' ? vectorQueryOf(body) : body.query,
+    principal: admitted,
+    ...searchScope(body),
+  };
+  try {
+    const outcome = await (registry                  ).search(index, request);
+    if (!outcome.ok && !outcome.cancelled && !outcome.timedOut && outcome.lastError) {
+      reject(res, 400, outcome.lastError.message ?? 'invalid search request');
+      return true;
+    }
+    sendJson(res, 200, {
+      ok: outcome.ok,
+      mode,
+      index,
+      generation: outcome.generation,
+      staleness: searchStalenessOf(outcome.state),
+      hits: outcome.result?.hits ?? [],
+      cancelled: outcome.cancelled === true,
+      timedOut: outcome.timedOut === true,
+      ...(outcome.lastError ? { error: outcome.lastError.message } : {}),
+    });
+  } catch (err) {
+    reject(res, 400, err instanceof Error ? err.message : 'invalid search request');
+    return true;
+  }
   return true;
 }

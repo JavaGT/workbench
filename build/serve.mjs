@@ -50,7 +50,7 @@ import { createResponseFacade } from './http-response-factory.mjs';
 import { dispatchCrud } from './http-crud-dispatch.mjs';
 import { failure } from './outcome.mjs';
 import { sendFailure,               } from './http-failure.mjs';
-import { handleResyncRoute, handleBlobUploadRoute, handleBlobReadRoute, handleJobRoute, handleClientSdkRoute } from './http-framework-routes.mjs';
+import { handleResyncRoute, handleBlobUploadRoute, handleBlobReadRoute, handleJobRoute, handleClientSdkRoute, handleQueryRoute, handleQueryFamilyRoute, handleSearchRoute } from './http-framework-routes.mjs';
 import { handleApplicationActionHttp } from './application-action-http.mjs';
 
 // sendJson's strict Http response param is wider than the transport's loose
@@ -366,6 +366,25 @@ export function makeRequestHandler(source     , { principalOf = anonymousPrincip
       match: (req     , _url     ) => isApp && req.method === 'POST' && source.jobs,
       handle: async (req     , res     ) => {
         const handled = await handleJobRoute(source, req, res);
+        return handled || responseHasStarted(res);
+      },
+    },
+    // Query / query-family / search endpoints (#312): POST /query/:entity,
+    // POST /query-families/:name, POST /search. Framework-owned (like /blobs and
+    // /snapshot), each running the SAME admission collapse and authorization
+    // engine as REST before executing the compiled read/search.
+    {
+      match: (req     , url     ) => isApp && req.method === 'POST'
+        && (url.pathname === '/search'
+          || url.pathname.startsWith('/query/')
+          || url.pathname.startsWith('/query-families/')),
+      handle: async (req     , res     ) => {
+        const principal = principalOfAdmitted(req);
+        if (await handleQueryRoute(source, req, res, principal)) return true;
+        if (responseHasStarted(res)) return true;
+        if (await handleQueryFamilyRoute(source, req, res, principal)) return true;
+        if (responseHasStarted(res)) return true;
+        const handled = await handleSearchRoute(source, req, res, principal);
         return handled || responseHasStarted(res);
       },
     },

@@ -46,6 +46,46 @@ describe('openLocalLog', () => {
     assert.equal(entry.seq, 1);
   });
 
+  it('append rejects when the transaction aborts after the request succeeds', async () => {
+    const dbName = 'test-workbench-local-log-abort';
+    const log = await openLocalLog(dbName);
+    const originalAdd = IDBObjectStore.prototype.add;
+    let abortedAfterSuccess = false;
+
+    IDBObjectStore.prototype.add = function (...args) {
+      const request = originalAdd.apply(this, args);
+      request.addEventListener('success', () => {
+        queueMicrotask(() => {
+          abortedAfterSuccess = true;
+          request.transaction.abort();
+        });
+      });
+      return request;
+    };
+
+    try {
+      await assert.rejects(
+        log.append({
+          opId: 'abort', seq: 1, scope: 'scope_abort', entity: 'E', rowId: 'r',
+          kind: 'create', type: 'E.create', payload: {}, preimage: null,
+          actionId: 'abort-1', status: 'committed', source: 'local', timestamp: 1000,
+        }),
+        /abort/i,
+      );
+      assert.equal(abortedAfterSuccess, true, 'the request succeeded before the abort');
+      const entries = await log.entriesSince('scope_abort', 0);
+      assert.equal(entries.length, 0, 'the aborted append left no durable row');
+    } finally {
+      IDBObjectStore.prototype.add = originalAdd;
+      log.close();
+      await new Promise((resolve, reject) => {
+        const request = indexedDB.deleteDatabase(`workbench:local:${dbName}`);
+        request.onsuccess = resolve;
+        request.onerror = reject;
+      });
+    }
+  });
+
   it('entriesSince returns entries for a scope with seq > cursor, ordered by seq', async () => {
     const log = await openLocalLog(DB_NAME);
     await log.append({ opId:'a', seq:1, scope:'s1', entity:'E', rowId:'r1', kind:'create', type:'E.create', payload:{}, preimage:null, actionId:'a1', status:'committed', source:'local', timestamp:1000 });

@@ -7,6 +7,38 @@ const DB_VERSION = 2;
 // auto-increment primary key: insertion order is the durable queue order.
 export const OUTBOX_LOG = 'outbox';
 
+function _writeTransaction(db, run, readResult, failureMessage) {
+  return new Promise((resolve, reject) => {
+    const txn = db.transaction([STORE_NAME], 'readwrite');
+    let settled = false;
+    let failure = null;
+
+    function fail(error) {
+      if (settled) return;
+      settled = true;
+      reject(error ?? failure ?? new Error(failureMessage));
+    }
+
+    txn.oncomplete = () => {
+      if (settled) return;
+      settled = true;
+      resolve(readResult());
+    };
+    txn.onerror = () => {
+      failure = txn.error;
+      fail(txn.error);
+    };
+    txn.onabort = () => fail(txn.error);
+
+    try {
+      run(txn.objectStore(STORE_NAME));
+    } catch (error) {
+      try { txn.abort(); } catch { /* transaction already finished */ }
+      fail(error);
+    }
+  });
+}
+
 function _openDb(name) {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(`workbench:local:${name}`, DB_VERSION);
@@ -34,15 +66,11 @@ export async function openLocalLog(name) {
   const db = await _openDb(name);
 
   async function append(entry) {
-    return new Promise((resolve, reject) => {
-      const txn = db.transaction([STORE_NAME], 'readwrite');
-      const store = txn.objectStore(STORE_NAME);
+    let id;
+    return _writeTransaction(db, (store) => {
       const req = store.add(entry);
-      req.onsuccess = () => {
-        resolve({ id: req.result, ...entry });
-      };
-      req.onerror = () => reject(req.error);
-    });
+      req.onsuccess = () => { id = req.result; };
+    }, () => ({ id, ...entry }), 'local log append transaction aborted');
   }
 
   async function entriesSince(scope, cursor) {
@@ -80,15 +108,14 @@ export async function openLocalLog(name) {
   }
 
   async function prune(beforeTimestamp) {
-    return new Promise((resolve, reject) => {
-      const txn = db.transaction([STORE_NAME], 'readwrite');
-      const store = txn.objectStore(STORE_NAME);
+    let count = 0;
+    return _writeTransaction(db, (store) => {
       const index = store.index('byTimestamp');
       const range = IDBKeyRange.upperBound(beforeTimestamp - 1, true);
-      let count = 0;
-      index.openCursor(range).onsuccess = (event) => {
+      const cursorReq = index.openCursor(range);
+      cursorReq.onsuccess = (event) => {
         const c = event.target.result;
-        if (!c) { resolve(count); return; }
+        if (!c) return;
         // Pending outbox rows are live client mutations, not history — a
         // timestamp prune must never drop a mutation that has not committed.
         if (c.value.log === OUTBOX_LOG) { c.continue(); return; }
@@ -96,22 +123,17 @@ export async function openLocalLog(name) {
         count++;
         c.continue();
       };
-      index.openCursor(range).onerror = () => reject(index.openCursor(range).error);
-    });
+    }, () => count, 'local log prune transaction aborted');
   }
 
   // --- Outbox rows (durable client-mutation queue; same entries store) ---
 
   async function outboxAppend(entry) {
-    return new Promise((resolve, reject) => {
-      const txn = db.transaction([STORE_NAME], 'readwrite');
-      const store = txn.objectStore(STORE_NAME);
+    let id;
+    return _writeTransaction(db, (store) => {
       const req = store.add({ ...entry, log: OUTBOX_LOG });
-      req.onsuccess = () => {
-        resolve({ id: req.result, ...entry, log: OUTBOX_LOG });
-      };
-      req.onerror = () => reject(req.error);
-    });
+      req.onsuccess = () => { id = req.result; };
+    }, () => ({ id, ...entry, log: OUTBOX_LOG }), 'outbox append transaction aborted');
   }
 
   // All outbox rows in enqueue order (primary key), optionally after a row id.
@@ -145,21 +167,15 @@ export async function openLocalLog(name) {
   }
 
   async function outboxPut(row) {
-    return new Promise((resolve, reject) => {
-      const txn = db.transaction([STORE_NAME], 'readwrite');
-      const req = txn.objectStore(STORE_NAME).put({ ...row, log: OUTBOX_LOG });
-      req.onsuccess = () => resolve(true);
-      req.onerror = () => reject(req.error);
-    });
+    return _writeTransaction(db, (store) => {
+      store.put({ ...row, log: OUTBOX_LOG });
+    }, () => true, 'outbox put transaction aborted');
   }
 
   async function outboxDelete(id) {
-    return new Promise((resolve, reject) => {
-      const txn = db.transaction([STORE_NAME], 'readwrite');
-      const req = txn.objectStore(STORE_NAME).delete(id);
-      req.onsuccess = () => resolve(true);
-      req.onerror = () => reject(req.error);
-    });
+    return _writeTransaction(db, (store) => {
+      store.delete(id);
+    }, () => true, 'outbox delete transaction aborted');
   }
 
   function close() {

@@ -66,6 +66,8 @@ export type QueryDb = {
   readonly isTransaction?: boolean;
 };
 
+export type QuerySnapshotDb = QueryDb & { exec(sql: string): unknown };
+
 export interface QueryEntity {
   readonly name: string;
   readonly fields: Readonly<Record<string, { readonly kind?: string; readonly type?: string; readonly role?: unknown; readonly [property: string]: unknown }>>;
@@ -868,9 +870,12 @@ let snapshotSeq = 0;
  * nests cleanly if a caller already owns an open transaction without exposing
  * `isTransaction`.
  */
-export function withReadSnapshot<T>(db: QueryDb, run: () => T): T {
-  if (typeof db.exec !== 'function' || db.isTransaction === true) {
+export function withReadSnapshot<T>(db: QuerySnapshotDb, run: () => T): T {
+  if (db.isTransaction === true) {
     return run();
+  }
+  if (typeof db.exec !== 'function') {
+    throw new QueryScopedReadError('database must support exec for a consistent read snapshot');
   }
   const name = `wb_qsnap_${++snapshotSeq}`;
   db.exec(`SAVEPOINT ${name}`);
@@ -889,7 +894,7 @@ export function withReadSnapshot<T>(db: QueryDb, run: () => T): T {
   }
 }
 
-export function withRevisionFence(db: QueryDb, run: () => Omit<QueryPage, 'revision'>): QueryPage {
+export function withRevisionFence(db: QuerySnapshotDb, run: () => Omit<QueryPage, 'revision'>): QueryPage {
   return withReadSnapshot(db, () => {
     const revision = readCommittedRevision(db);
     const page = run();
@@ -923,7 +928,7 @@ function runPage(
 }
 
 export function executeQueryPage(
-  db: QueryDb,
+  db: QuerySnapshotDb,
   entity: QueryEntity,
   principal: unknown,
   compiled: CompiledQuery,

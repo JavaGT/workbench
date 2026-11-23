@@ -210,6 +210,8 @@ export class QueryContentionError extends Error {
 
 
 
+
+
 const CONTRACT_KEYS = Object.freeze(['entity', 'filters', 'where', 'expression', 'sort', 'pageSize']);
 const FILTER_KEYS = Object.freeze(['field', 'op', 'value']);
 const TERM_KEYS = Object.freeze(['kind', 'field', 'op', 'value']);
@@ -868,9 +870,12 @@ let snapshotSeq = 0;
  * nests cleanly if a caller already owns an open transaction without exposing
  * `isTransaction`.
  */
-export function withReadSnapshot   (db         , run         )    {
-  if (typeof db.exec !== 'function' || db.isTransaction === true) {
+export function withReadSnapshot   (db                 , run         )    {
+  if (db.isTransaction === true) {
     return run();
+  }
+  if (typeof db.exec !== 'function') {
+    throw new QueryScopedReadError('database must support exec for a consistent read snapshot');
   }
   const name = `wb_qsnap_${++snapshotSeq}`;
   db.exec(`SAVEPOINT ${name}`);
@@ -889,7 +894,7 @@ export function withReadSnapshot   (db         , run         )    {
   }
 }
 
-export function withRevisionFence(db         , run                                   )            {
+export function withRevisionFence(db                 , run                                   )            {
   return withReadSnapshot(db, () => {
     const revision = readCommittedRevision(db);
     const page = run();
@@ -923,7 +928,7 @@ function runPage(
 }
 
 export function executeQueryPage(
-  db         ,
+  db                 ,
   entity             ,
   principal         ,
   compiled               ,

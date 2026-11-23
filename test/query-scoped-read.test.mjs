@@ -64,6 +64,40 @@ function openPage(Note, pageSize = 2) {
   }, Note);
 }
 
+test('query pages require a database capable of opening a read snapshot', () => {
+  const { db, Note } = setup();
+  try {
+    const withoutExec = { prepare: db.prepare.bind(db) };
+    assert.throws(() => executeQueryPage(withoutExec, Note, alice, openPage(Note)),
+      /database must support exec for a consistent read snapshot/);
+  } finally {
+    db.close();
+  }
+});
+
+test('query pages preserve an existing transaction and its changes', () => {
+  const { db, Note } = setup();
+  try {
+    db.exec('BEGIN');
+    db.prepare('UPDATE Note SET rank = ? WHERE id = ?').run(9, 'n1');
+    const statements = [];
+    const inTransaction = {
+      prepare: db.prepare.bind(db),
+      exec(sql) { statements.push(sql); return db.exec(sql); },
+      get isTransaction() { return db.isTransaction; },
+    };
+    const page = executeQueryPage(inTransaction, Note, alice, openPage(Note, 10), { includeCount: true });
+    assert.equal(page.rows.find((row) => row.id === 'n1').rank, 9);
+    assert.equal(page.count, 4);
+    assert.deepEqual(statements, [], 'the query must reuse the existing transaction');
+    assert.equal(db.isTransaction, true);
+    db.exec('ROLLBACK');
+    assert.equal(db.prepare('SELECT rank FROM Note WHERE id = ?').get('n1').rank, 1);
+  } finally {
+    db.close();
+  }
+});
+
 function p1Dep(fields) {
   return { entity: 'Note', fields, scope: 'Project:p1' };
 }

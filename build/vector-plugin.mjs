@@ -1,13 +1,21 @@
 // vector-plugin.ts — model-space-aware, persistent Float32Array vector search plugin.
 //
 // Embeddings are supplied by the application's worker in source rows. This
-// plugin stores compact Float32Array vectors + precomputed norms + optional
-// scope_id in census-owned SQLite tables (`vec_...`) mirrored by a flat
-// Float32Array slab cache keyed by `(scope_id, source_key)` — never storing
-// frozen JS number[] arrays or full source-row copies in JS heap.
+// plugin stores compact Float32 BLOBs + precomputed L2 norms + optional
+// scope_id in census-owned SQLite tables (`vec_...`).
+//
+// A BOUND index is served from disk: every search applies its scope filter in
+// SQL (scope_id equality, or a source-key IN/merge when the caller filters on
+// arbitrary source columns) and pages the surviving candidates in bounded
+// windows, retaining only one page plus the requested top-K in JS heap. The
+// full table is never materialized as a resident slab — including during a
+// shadow rebuild, which builds directly into the disposable generation table.
+//
+// An UNBOUND owned-index capability (registries/harnesses with no durable
+// tables) keeps the in-memory Float32VectorSlab path unchanged.
 
 import { createHash } from 'node:crypto';
-import { Float32VectorSlab, vectorNorm } from './vector.mjs';
+import { Float32VectorSlab, cosineSimilarityFloat32, vectorNorm } from './vector.mjs';
 import {
   SUPPORTED_SEARCH_PLUGIN_CONTRACT_VERSION,
 
@@ -20,7 +28,7 @@ import {
 } from './search-plugin.mjs';
 import {                                                                           } from './search-reconcile.mjs';
 import { admitSearchHits } from './search-auth.mjs';
-import { searchStalenessOf } from './search-response.mjs';
+import { SEARCH_MAX_RESULTS_CAP, searchStalenessOf } from './search-response.mjs';
 
 
 
@@ -86,9 +94,15 @@ export class VectorPluginValidationError extends Error {
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const MAX_WRITE_STATEMENTS = 128;
 const SOURCE_PAGE_SIZE = 512;
-const HYDRATE_PAGE_SIZE = 1024;
 const DELETE_CHUNK_SIZE = 500;
 const CENSUS_BOUNDARY_SAMPLE = 32;
+// Bounded page for disk-backed vector scans: 512 rows of a 1536-dimension
+// Float32 vector is ~3 MiB, independent of index size.
+const PERSISTED_SCAN_PAGE_SIZE = 512;
+// Bounded lookup chunk for the arbitrary-predicate fallback.
+const PERSISTED_LOOKUP_CHUNK = 256;
+// Cooperative yield cadence between persisted pages so abort/deadline can act.
+const PERSISTED_YIELD_PAGES = 8;
 
 function assertModelSpace(modelSpace                  )       {
   if (typeof modelSpace.model !== 'string' || modelSpace.model.length === 0) {
@@ -189,11 +203,112 @@ function hasBoundIndex(ctx                                 )          {
   return Boolean(ctx && ctx.index && ctx.index.bound !== false);
 }
 
-// Creates a persistent SQLite + compact Float32Array slab vector search plugin.
-// Persists binary Float32 BLOBs + precomputed L2 norms + scope_id in owned
-// `vec_...` tables whenever the owned-index capability is bound, and serves
-// fast scoped cosine scans directly from the flat Float32Array slab without
-// storing frozen JS number[] arrays or source-row copies in JS heap.
+function compareIds(a        , b        )         {
+  if (a < b) return -1;
+  if (a > b) return 1;
+  return 0;
+}
+
+// A scored source key. Higher cosine similarity ranks first; equal scores use
+// the stable source key ascending, exactly like the in-memory slab scan.
+
+
+
+
+
+function compareScoredMatches(a             , b             )         {
+  if (a.score > b.score) return -1;
+  if (a.score < b.score) return 1;
+  return compareIds(a.id, b.id);
+}
+
+// Bounded top-K accumulator: retains at most `limit` candidates regardless of
+// how many are offered. The array root is the current worst kept candidate.
+function createBoundedTopK(limit        )                                                                             {
+  const heap                = [];
+  const push = (candidate             )       => {
+    heap.push(candidate);
+    let child = heap.length - 1;
+    while (child > 0) {
+      const parent = (child - 1) >> 1;
+      if (compareScoredMatches(heap[child], heap[parent]) <= 0) break;
+      const tmp = heap[child];
+      heap[child] = heap[parent];
+      heap[parent] = tmp;
+      child = parent;
+    }
+  };
+  const replaceWorst = (candidate             )       => {
+    heap[0] = candidate;
+    let parent = 0;
+    while (true) {
+      const left = (parent << 1) + 1;
+      const right = left + 1;
+      let worst = parent;
+      if (left < heap.length && compareScoredMatches(heap[left], heap[worst]) > 0) worst = left;
+      if (right < heap.length && compareScoredMatches(heap[right], heap[worst]) > 0) worst = right;
+      if (worst === parent) return;
+      const tmp = heap[parent];
+      heap[parent] = heap[worst];
+      heap[worst] = tmp;
+      parent = worst;
+    }
+  };
+  return {
+    offer(candidate) {
+      if (heap.length < limit) push(candidate);
+      else if (compareScoredMatches(candidate, heap[0]) < 0) replaceWorst(candidate);
+    },
+    results() {
+      return heap.sort(compareScoredMatches);
+    },
+  };
+}
+
+function yieldToEventLoop()                {
+  return new Promise      ((resolve) => setTimeout(resolve, 0));
+}
+
+
+
+
+
+
+
+
+
+function resolveScopeFilter(
+  scopeField                    ,
+  request               ,
+  query                   ,
+)                      {
+  const rawScopeId = request.scopeId ?? query?.scopeId;
+  if (rawScopeId !== undefined) {
+    if (typeof rawScopeId !== 'string' || rawScopeId.length === 0) {
+      throw new TypeError('vector search scopeId must be a non-empty string');
+    }
+    return { scopeId: rawScopeId };
+  }
+  const scope = validateScope(request.scope ?? query?.scope);
+  if (scope === undefined) return {};
+  if (typeof scope === 'string') return { scopeId: scope };
+  const entries = Object.entries(scope);
+  if (entries.length === 0) return {};
+  // A declared scope column (or an explicit scope_id) filters in SQL BEFORE any
+  // vector is fetched or scored.
+  if (scopeField !== undefined && entries.length === 1) {
+    const [key, value] = entries[0];
+    if (key === scopeField || key === 'scope_id') {
+      return { scopeId: value === null || value === undefined ? '' : String(value) };
+    }
+  }
+  return { predicate: scope };
+}
+
+// Creates a persistent SQLite + (unbound-only) compact Float32Array slab vector
+// search plugin. A bound index pages BLOB storage in bounded windows and never
+// materializes the full vector table in JS heap; an unbound index keeps the
+// in-memory slab for harnesses and ephemeral use.
 export function createVectorPlugin(options                     )               {
   if (typeof options.source.owns !== 'function') {
     throw new TypeError('vector plugin source requires an ownership predicate');
@@ -220,9 +335,10 @@ export function createVectorPlugin(options                     )               {
   let activeGen        = 0;
   let buildingGen               = null;
   let promotedGen               = null;
+  // The slab is only ever populated when the owned-index capability is unbound.
+  // In persistent mode it stays empty (never a resident copy of the table).
   let activeSlab = new Float32VectorSlab(modelSpace.dimensions);
   let shadowSlab                           = null;
-  let activeHydrated = false;
   let activeWriteGeneration = 0;
 
   function targetSlab()                    {
@@ -267,48 +383,166 @@ export function createVectorPlugin(options                     )               {
     return tables[buildingGen ?? currentActiveGeneration(ctx)];
   }
 
-  // Hydrate the compact Float32Array slab from persisted SQLite BLOBs (e.g.
-  // after restart/reopen) without reading source rows or creating JS number[].
-  function ensureActiveHydrated(ctx                                 )       {
-    if (activeHydrated || !ctx || !hasBoundIndex(ctx)) return;
+  // Is the persisted active generation materialized for the current model
+  // space? After a setModelSpace() switch the old table stops being searchable
+  // until a rebuild rewrites the state row (mirrors clearing an in-memory slab).
+  function persistentModelCurrent(ctx                     )          {
     const persisted = readPersistedState(ctx);
-    if (persisted === null) {
-      activeHydrated = true;
-      return;
+    return persisted === null
+      || (persisted.model === modelSpace.model && persisted.dimensions === modelSpace.dimensions);
+  }
+
+  function countTable(ctx                     , table        )         {
+    const row = ctx.index.query({ sql: `SELECT COUNT(*) AS count FROM ${table}` })[0];
+    return Number(row?.count ?? 0);
+  }
+
+  // Boundary ids for the SQL-backed census: the same head/tail sample shape the
+  // source census uses, without reading vector payloads.
+  function tableBoundaryIds(ctx                     , table        , count        )                    {
+    if (count === 0) return [];
+    if (count <= CENSUS_BOUNDARY_SAMPLE * 2) {
+      return ctx.index.query({
+        sql: `SELECT source_key FROM ${table} ORDER BY source_key ASC LIMIT ${CENSUS_BOUNDARY_SAMPLE * 2}`,
+      }).map((row) => String(row.source_key));
     }
-    activeGen = persisted.active;
-    if (persisted.model !== modelSpace.model || persisted.dimensions !== modelSpace.dimensions) {
-      activeSlab = new Float32VectorSlab(modelSpace.dimensions);
-      activeHydrated = true;
-      return;
+    const head = ctx.index.query({
+      sql: `SELECT source_key FROM ${table} ORDER BY source_key ASC LIMIT ${CENSUS_BOUNDARY_SAMPLE}`,
+    }).map((row) => String(row.source_key));
+    const tail = ctx.index.query({
+      sql: `SELECT source_key FROM ${table} ORDER BY source_key DESC LIMIT ${CENSUS_BOUNDARY_SAMPLE}`,
+    }).map((row) => String(row.source_key));
+    return [...head, ...tail];
+  }
+
+  function scorePersistedRow(queryVec              , queryNorm        , row                                   )              {
+    const vector = blobToFloat32(row.embedding, modelSpace.dimensions);
+    const storedNorm = row.norm;
+    const norm = typeof storedNorm === 'number' && Number.isFinite(storedNorm) ? storedNorm : vectorNorm(vector);
+    return { id: String(row.source_key), score: cosineSimilarityFloat32(queryVec, queryNorm, vector, norm) };
+  }
+
+  // Arbitrary-predicate fallback: drive from bounded source pages and fetch the
+  // vectors for each matching id chunk. Memory stays bounded by the page/chunk,
+  // never by the number of matching source rows.
+  async function scanPersistedPredicate(
+    ctx                     ,
+    table        ,
+    predicate                                   ,
+    queryVec              ,
+    queryNorm        ,
+    topK                                         ,
+    signal                         ,
+  )                   {
+    let afterId                    ;
+    let pages = 0;
+    while (true) {
+      if (signal?.aborted) return false;
+      const page = ctx.reader.rows(options.source.entity, {
+        afterId,
+        limit: SOURCE_PAGE_SIZE,
+        order: 'asc',
+      });
+      if (page.length === 0) break;
+      const ids           = [];
+      for (const row of page) {
+        if (typeof row.id === 'string' && row.id.length > 0 && matchesScope(row, predicate)) {
+          ids.push(row.id);
+        }
+      }
+      for (let offset = 0; offset < ids.length; offset += PERSISTED_LOOKUP_CHUNK) {
+        if (signal?.aborted) return false;
+        const chunk = ids.slice(offset, offset + PERSISTED_LOOKUP_CHUNK);
+        const placeholders = chunk.map(() => '?').join(', ');
+        const rows = ctx.index.query({
+          sql: `SELECT source_key, norm, embedding FROM ${table} WHERE source_key IN (${placeholders}) LIMIT ${PERSISTED_LOOKUP_CHUNK}`,
+          params: chunk,
+        });
+        for (const row of rows) topK.offer(scorePersistedRow(queryVec, queryNorm, row));
+      }
+      if (page.length < SOURCE_PAGE_SIZE) break;
+      const lastId = String(page[page.length - 1]?.id ?? '');
+      if (lastId.length === 0 || (afterId !== undefined && lastId <= afterId)) break;
+      afterId = lastId;
+      pages += 1;
+      if (pages % PERSISTED_YIELD_PAGES === 0) await yieldToEventLoop();
     }
-    const table = tables[activeGen];
-    const countRow = ctx.index.query({ sql: `SELECT COUNT(*) AS count FROM ${table}` })[0];
-    const total = Number(countRow?.count ?? 0);
-    const nextSlab = new Float32VectorSlab(modelSpace.dimensions, Math.max(64, total));
+    return true;
+  }
+
+  // Exact top-K cosine scan over bounded disk pages. The scope predicate is
+  // applied in SQL before any of a page's vectors are fetched.
+  async function scanPersistedMatches(
+    ctx                     ,
+    table        ,
+    queryVec              ,
+    queryNorm        ,
+    limit        ,
+    filter                     ,
+    signal                         ,
+  )                                  {
+    const topK = createBoundedTopK(limit);
+    if (filter.predicate !== undefined) {
+      const completed = await scanPersistedPredicate(ctx, table, filter.predicate, queryVec, queryNorm, topK, signal);
+      return completed ? topK.results() : [];
+    }
+    const scopeId = filter.scopeId;
+    let afterKey                    ;
+    let pages = 0;
+    while (true) {
+      if (signal?.aborted) return [];
+      const rows = scopeId === undefined
+        ? (afterKey === undefined
+          ? ctx.index.query({ sql: `SELECT source_key, norm, embedding FROM ${table} ORDER BY source_key ASC LIMIT ${PERSISTED_SCAN_PAGE_SIZE}` })
+          : ctx.index.query({
+            sql: `SELECT source_key, norm, embedding FROM ${table} WHERE source_key > ? ORDER BY source_key ASC LIMIT ${PERSISTED_SCAN_PAGE_SIZE}`,
+            params: [afterKey],
+          }))
+        : (afterKey === undefined
+          ? ctx.index.query({
+            sql: `SELECT source_key, norm, embedding FROM ${table} WHERE scope_id = ? ORDER BY source_key ASC LIMIT ${PERSISTED_SCAN_PAGE_SIZE}`,
+            params: [scopeId],
+          })
+          : ctx.index.query({
+            sql: `SELECT source_key, norm, embedding FROM ${table} WHERE scope_id = ? AND source_key > ? ORDER BY source_key ASC LIMIT ${PERSISTED_SCAN_PAGE_SIZE}`,
+            params: [scopeId, afterKey],
+          }));
+      if (rows.length === 0) break;
+      for (const row of rows) topK.offer(scorePersistedRow(queryVec, queryNorm, row));
+      if (rows.length < PERSISTED_SCAN_PAGE_SIZE) break;
+      afterKey = String(rows[rows.length - 1].source_key);
+      pages += 1;
+      if (pages % PERSISTED_YIELD_PAGES === 0) {
+        await yieldToEventLoop();
+        if (signal?.aborted) return [];
+      }
+    }
+    return topK.results();
+  }
+
+  // Page-validate persisted BLOBs (used on restart and before shadow activation)
+  // without hydrating a resident slab.
+  function validatePersistedTable(ctx                     , table        )       {
     let afterKey                    ;
     while (true) {
       const rows = afterKey === undefined
-        ? ctx.index.query({
-          sql: `SELECT source_key, scope_id, norm, embedding FROM ${table} ORDER BY source_key ASC LIMIT ${HYDRATE_PAGE_SIZE}`,
-        })
+        ? ctx.index.query({ sql: `SELECT source_key, embedding FROM ${table} ORDER BY source_key ASC LIMIT ${PERSISTED_SCAN_PAGE_SIZE}` })
         : ctx.index.query({
-          sql: `SELECT source_key, scope_id, norm, embedding FROM ${table} WHERE source_key > ? ORDER BY source_key ASC LIMIT ${HYDRATE_PAGE_SIZE}`,
+          sql: `SELECT source_key, embedding FROM ${table} WHERE source_key > ? ORDER BY source_key ASC LIMIT ${PERSISTED_SCAN_PAGE_SIZE}`,
           params: [afterKey],
         });
       if (rows.length === 0) break;
       for (const row of rows) {
-        const key = String(row.source_key);
-        const scopeId = String(row.scope_id ?? '');
-        const vec = blobToFloat32(row.embedding, modelSpace.dimensions);
-        const norm = typeof row.norm === 'number' && Number.isFinite(row.norm) ? row.norm : vectorNorm(vec);
-        nextSlab.set(key, vec, norm, scopeId);
+        const vector = blobToFloat32(row.embedding, modelSpace.dimensions);
+        for (let i = 0; i < vector.length; i += 1) {
+          if (!Number.isFinite(vector[i])) {
+            throw new Error(`vector '${String(row.source_key)}' contains a non-finite value`);
+          }
+        }
       }
-      if (rows.length < HYDRATE_PAGE_SIZE) break;
+      if (rows.length < PERSISTED_SCAN_PAGE_SIZE) break;
       afterKey = String(rows[rows.length - 1].source_key);
     }
-    activeSlab = nextSlab;
-    activeHydrated = true;
   }
 
   async function clearTable(ctx                     , table        , allowSuperseded = false)                {
@@ -374,14 +608,20 @@ export function createVectorPlugin(options                     )               {
     }
   }
 
+  function materializedCount(ctx                     )         {
+    if (hasBoundIndex(ctx)) return countTable(ctx, targetTable(ctx));
+    return targetSlab().size;
+  }
+
   async function rebuild(ctx                     )                                   {
-    const next = targetSlab();
-    if (!claimGeneration(ctx)) return { counts: { vectors: next.size } };
+    const persistent = hasBoundIndex(ctx);
+    if (!claimGeneration(ctx)) return { counts: { vectors: materializedCount(ctx) } };
     const table = targetTable(ctx);
-    next.clear();
+    const next = persistent ? null : targetSlab();
+    if (next !== null) next.clear();
     await clearTable(ctx, table);
     try {
-      if (hasBoundIndex(ctx) && buildingGen === null && !isSuperseded(ctx)) {
+      if (persistent && buildingGen === null && !isSuperseded(ctx)) {
         await ctx.index.write({
           expectedFence: ctx.fence,
           statements: [{
@@ -401,7 +641,7 @@ export function createVectorPlugin(options                     )               {
         const parsedPage                                                                                                            = [];
         for (const row of page) {
           const parsed = parseAndValidateRow(row);
-          next.set(parsed.id, parsed.vector, parsed.norm, parsed.scopeId);
+          if (next !== null) next.set(parsed.id, parsed.vector, parsed.norm, parsed.scopeId);
           parsedPage.push(parsed);
         }
         await flushUpserts(ctx, table, parsedPage);
@@ -410,22 +650,21 @@ export function createVectorPlugin(options                     )               {
         if (lastId.length === 0 || (afterId !== undefined && lastId <= afterId)) break;
         afterId = lastId;
       }
-      if (shadowSlab === null && !isSuperseded(ctx)) activeHydrated = true;
     } catch (err) {
       // Do not leave a partially rebuilt direct index or shadow generation.
       if (!isSuperseded(ctx)) {
-        next.clear();
+        if (next !== null) next.clear();
         await clearTable(ctx, table);
       }
       throw err;
     }
-    return { counts: { vectors: next.size } };
+    return { counts: { vectors: next === null ? countTable(ctx, table) : next.size } };
   }
 
   async function reconcile(ctx                     , changes                         )                                   {
-    if (shadowSlab === null) ensureActiveHydrated(ctx);
-    const next = targetSlab();
-    if (!claimGeneration(ctx)) return { counts: { vectors: next.size } };
+    const persistent = hasBoundIndex(ctx);
+    const next = persistent ? null : targetSlab();
+    if (!claimGeneration(ctx)) return { counts: { vectors: materializedCount(ctx) } };
     const table = targetTable(ctx);
     const statements                                                                   = [];
     const flushStatements = async ()                => {
@@ -446,7 +685,7 @@ export function createVectorPlugin(options                     )               {
     for (const change of changes) {
       if (change.entity !== options.source.entity) continue;
       if (change.kind === 'removed') {
-        next.delete(change.rowId);
+        next?.delete(change.rowId);
         statements.push({ sql: `DELETE FROM ${table} WHERE source_key = ?`, params: [change.rowId] });
         continue;
       }
@@ -454,19 +693,19 @@ export function createVectorPlugin(options                     )               {
       // so its prior indexed value must not remain searchable.
       const row = ctx.reader.row(options.source.entity, change.rowId);
       if (row === undefined) {
-        next.delete(change.rowId);
+        next?.delete(change.rowId);
         statements.push({ sql: `DELETE FROM ${table} WHERE source_key = ?`, params: [change.rowId] });
       } else {
         try {
           const parsed = parseAndValidateRow(row);
-          next.set(parsed.id, parsed.vector, parsed.norm, parsed.scopeId);
+          next?.set(parsed.id, parsed.vector, parsed.norm, parsed.scopeId);
           statements.push({
             sql: `INSERT OR REPLACE INTO ${table} (source_key, scope_id, norm, embedding) VALUES (?, ?, ?, ?)`,
             params: [parsed.id, parsed.scopeId, parsed.norm, float32ToBlob(parsed.vector)],
           });
         } catch (err) {
           if (err instanceof VectorPluginValidationError && err.code === 'unauthorized-source-ownership') {
-            next.delete(change.rowId);
+            next?.delete(change.rowId);
             statements.push({ sql: `DELETE FROM ${table} WHERE source_key = ?`, params: [change.rowId] });
             await flushStatements();
           }
@@ -475,18 +714,18 @@ export function createVectorPlugin(options                     )               {
       }
     }
     await flushStatements();
-    return { counts: { vectors: next.size } };
+    return { counts: { vectors: next === null ? countTable(ctx, table) : next.size } };
   }
 
   async function revoke(ctx                     , target                        )                                   {
-    if (shadowSlab === null) ensureActiveHydrated(ctx);
-    const next = targetSlab();
+    const persistent = hasBoundIndex(ctx);
+    const next = persistent ? null : targetSlab();
     if (target.entity !== options.source.entity || !claimGeneration(ctx)) {
-      return { counts: { vectors: next.size } };
+      return { counts: { vectors: materializedCount(ctx) } };
     }
     const table = targetTable(ctx);
     if (target.scopeId !== undefined) {
-      next.deleteScope(target.scopeId);
+      next?.deleteScope(target.scopeId);
       if (hasBoundIndex(ctx)) {
         while (!isSuperseded(ctx)) {
           const result = await ctx.index.write({
@@ -500,7 +739,7 @@ export function createVectorPlugin(options                     )               {
         }
       }
     } else if (target.rowId !== undefined) {
-      next.delete(target.rowId);
+      next?.delete(target.rowId);
       if (hasBoundIndex(ctx)) {
         await ctx.index.write({
           expectedFence: ctx.fence,
@@ -508,35 +747,12 @@ export function createVectorPlugin(options                     )               {
         });
       }
     }
-    return { counts: { vectors: next.size } };
+    return { counts: { vectors: next === null ? countTable(ctx, table) : next.size } };
   }
 
-  function resolveScopeFilter(
-    ctx                     ,
-    request               ,
-    query                   ,
-  )                                                                            {
-    const rawScopeId = request.scopeId ?? query?.scopeId;
-    if (rawScopeId !== undefined) {
-      if (typeof rawScopeId !== 'string' || rawScopeId.length === 0) {
-        throw new TypeError('vector search scopeId must be a non-empty string');
-      }
-      return { scopeId: rawScopeId };
-    }
-    const scope = validateScope(request.scope ?? query?.scope);
-    if (scope === undefined) return {};
-    if (typeof scope === 'string') return { scopeId: scope };
-    const entries = Object.entries(scope);
-    if (entries.length === 0) return {};
-    if (scopeField !== undefined && entries.length === 1) {
-      const [key, value] = entries[0];
-      if (key === scopeField || key === 'scope_id') {
-        return { scopeId: value === null || value === undefined ? '' : String(value) };
-      }
-    }
-    // Backwards-compatible fallback when a caller filters on arbitrary source
-    // columns without declaring `scopeField`: resolve matching ids from the
-    // live scoped reader without retaining source-row copies in the index heap.
+  // In-memory predicate bypass: resolve matching source ids into a key set the
+  // slab scan can pre-filter with. Only used by the unbound adapter.
+  function collectAllowedKeys(ctx                     , predicate                                   )                      {
     const allowed = new Set        ();
     let afterId                    ;
     while (true) {
@@ -547,14 +763,14 @@ export function createVectorPlugin(options                     )               {
       });
       if (page.length === 0) break;
       for (const row of page) {
-        if (typeof row.id === 'string' && matchesScope(row, scope)) allowed.add(row.id);
+        if (typeof row.id === 'string' && matchesScope(row, predicate)) allowed.add(row.id);
       }
       if (page.length < SOURCE_PAGE_SIZE) break;
       const lastId = String(page[page.length - 1]?.id ?? '');
       if (lastId.length === 0 || (afterId !== undefined && lastId <= afterId)) break;
       afterId = lastId;
     }
-    return { allowedKeys: allowed };
+    return allowed;
   }
 
   async function search(ctx                     , request               )                                    {
@@ -562,20 +778,36 @@ export function createVectorPlugin(options                     )               {
     if (request.principal === undefined) throw new VectorPluginValidationError('unauthorized-source-ownership', 'vector search requires a principal for result admission');
     const query = request.query                     ;
     const { vector: queryVec, norm: queryNorm } = validateVectorToFloat32(query?.vector, query?.model, modelSpace, 'query');
-    ensureActiveHydrated(ctx);
-    const scopeFilter = resolveScopeFilter(ctx, request, query);
-    const poolSize = scopeFilter.scopeId !== undefined
-      ? activeSlab.slotsForScope(scopeFilter.scopeId).length
-      : scopeFilter.allowedKeys !== undefined
-        ? scopeFilter.allowedKeys.size
-        : activeSlab.size;
-    if (poolSize === 0) return { hits: [] };
-    const limit = Math.max(1, request.limit ?? poolSize);
-    const matches = await activeSlab.topKInterruptibly(queryVec, queryNorm, limit, {
-      scopeId: scopeFilter.scopeId,
-      allowedKeys: scopeFilter.allowedKeys,
-      signal: request.signal,
-    });
+    const filter = resolveScopeFilter(scopeField, request, query);
+
+    let matches                        ;
+    if (hasBoundIndex(ctx)) {
+      if (!persistentModelCurrent(ctx)) return { hits: [] };
+      const table = tables[currentActiveGeneration(ctx)];
+      // The registry always supplies a bounded limit; a capped default keeps
+      // top-K memory bounded even when a direct caller omits one. An empty
+      // table simply yields no matches — no COUNT probe is needed first.
+      const requested = typeof request.limit === 'number' && Number.isFinite(request.limit)
+        ? Math.floor(request.limit)
+        : SEARCH_MAX_RESULTS_CAP;
+      const limit = Math.max(1, requested);
+      matches = await scanPersistedMatches(ctx, table, queryVec, queryNorm, limit, filter, request.signal);
+    } else {
+      const allowedKeys = filter.predicate !== undefined ? collectAllowedKeys(ctx, filter.predicate) : undefined;
+      const poolSize = filter.scopeId !== undefined
+        ? activeSlab.slotsForScope(filter.scopeId).length
+        : allowedKeys !== undefined
+          ? allowedKeys.size
+          : activeSlab.size;
+      if (poolSize === 0) return { hits: [] };
+      const requested = typeof request.limit === 'number' && Number.isFinite(request.limit) ? Math.floor(request.limit) : poolSize;
+      const limit = Math.max(1, requested);
+      matches = await activeSlab.topKInterruptibly(queryVec, queryNorm, limit, {
+        scopeId: filter.scopeId,
+        allowedKeys,
+        signal: request.signal,
+      });
+    }
     if (request.signal?.aborted) return { hits: [] };
     const hits                                      = [];
     const candidates = matches.map((match) => {
@@ -645,10 +877,11 @@ export function createVectorPlugin(options                     )               {
       if (nextModelSpace.model === modelSpace.model && nextModelSpace.dimensions === modelSpace.dimensions) return;
       modelSpace = Object.freeze({ ...nextModelSpace });
       sequence += 1;
+      // The in-memory slab cannot describe the new space; persistent mode is
+      // gated on the persisted state row until a rebuild rewrites it.
       activeSlab = new Float32VectorSlab(modelSpace.dimensions);
       shadowSlab = null;
       buildingGen = null;
-      activeHydrated = true;
     },
     stalenessKey(change) {
       return change.entity === options.source.entity ? `${change.entity}:${change.rowId}` : null;
@@ -662,10 +895,12 @@ export function createVectorPlugin(options                     )               {
           params: [modelSpace.model, modelSpace.dimensions],
         }],
       });
-      ensureActiveHydrated(ctx);
     },
     validate(ctx) {
-      if (shadowSlab === null) ensureActiveHydrated(ctx);
+      if (hasBoundIndex(ctx)) {
+        validatePersistedTable(ctx, targetTable(ctx));
+        return;
+      }
       targetSlab().validateFinite();
     },
     reconcile,
@@ -674,12 +909,23 @@ export function createVectorPlugin(options                     )               {
     search,
     async beginShadow(ctx) {
       claimGeneration(ctx);
-      buildingGen = currentActiveGeneration(ctx) === 0 ? 1 : 0;
-      shadowSlab = new Float32VectorSlab(modelSpace.dimensions);
-      await clearTable(ctx, tables[buildingGen]);
+      const nextGen        = currentActiveGeneration(ctx) === 0 ? 1 : 0;
+      buildingGen = nextGen;
+      if (hasBoundIndex(ctx)) {
+        // Build directly into the disposable generation table — no slab copy.
+        await clearTable(ctx, tables[nextGen]);
+      } else {
+        shadowSlab = new Float32VectorSlab(modelSpace.dimensions);
+      }
     },
     indexCensus(ctx)               {
-      if (shadowSlab === null) ensureActiveHydrated(ctx);
+      if (hasBoundIndex(ctx)) {
+        const table = targetTable(ctx);
+        const count = countTable(ctx, table);
+        return Object.freeze({
+          [options.source.entity]: boundaryKeyCensus(count, tableBoundaryIds(ctx, table, count)),
+        });
+      }
       const slab = targetSlab();
       return Object.freeze({
         [options.source.entity]: boundaryKeyCensus(slab.size, slab.boundaryIds(CENSUS_BOUNDARY_SAMPLE)),
@@ -706,9 +952,10 @@ export function createVectorPlugin(options                     )               {
       });
     },
     async commitShadow(ctx) {
-      if (shadowSlab === null || buildingGen === null) throw new Error('vector plugin has no shadow generation to commit');
+      const promoted = buildingGen;
+      if (promoted === null) throw new Error('vector plugin has no shadow generation to commit');
       if (isSuperseded(ctx)) throw new Error('vector shadow generation superseded by a newer materialization');
-      const nextGen = buildingGen;
+      const nextGen = promoted;
       if (hasBoundIndex(ctx)) {
         await ctx.index.write({
           expectedFence: ctx.fence,
@@ -717,23 +964,25 @@ export function createVectorPlugin(options                     )               {
             params: [nextGen, modelSpace.model, modelSpace.dimensions],
           }],
         });
+        activeGen = nextGen;
+      } else {
+        if (shadowSlab === null) throw new Error('vector plugin has no shadow slab to commit');
+        activeSlab = shadowSlab;
+        shadowSlab = null;
       }
-      activeGen = nextGen;
-      activeSlab = shadowSlab;
-      activeHydrated = true;
       promotedGen = nextGen;
-      shadowSlab = null;
       buildingGen = null;
     },
     async rollbackShadow(ctx) {
       if (promotedGen === null) return;
       if (hasBoundIndex(ctx)) {
+        // Restore the durable active pointer; the previous generation table is
+        // still intact, so no rehydration is required.
         await ctx.index.write({
           expectedFence: ctx.fence,
           statements: [{ sql: `UPDATE ${stateTable} SET active = previous WHERE slot = 'active'` }],
         });
-        activeHydrated = false;
-        ensureActiveHydrated(ctx);
+        currentActiveGeneration(ctx);
       }
       promotedGen = null;
     },
@@ -745,11 +994,13 @@ export function createVectorPlugin(options                     )               {
       if (discarded !== null) await clearTable(ctx, tables[discarded], true);
     },
     health(ctx) {
-      if (shadowSlab === null) ensureActiveHydrated(ctx);
+      const vectors = hasBoundIndex(ctx) && persistentModelCurrent(ctx)
+        ? countTable(ctx, tables[currentActiveGeneration(ctx)])
+        : (hasBoundIndex(ctx) ? 0 : activeSlab.size);
       return Object.freeze({
         generationIdentity: generationIdentity(modelSpace, sequence),
         modelSpace,
-        vectors: activeSlab.size,
+        vectors,
       });
     },
   };

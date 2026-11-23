@@ -641,3 +641,208 @@ describe('generation fencing for overlapping same-identity writes (#243)', () =>
     assert.deepEqual(found.result.hits.map((h) => h.id), ['r-000']);
   });
 });
+
+// ---- bounded, disk-backed vector search (#288) ------------------------------
+
+// Wrap a plugin's owned-index capability to record every embedding-bearing
+// SELECT. Used to prove the persistent path never issues an unbounded vector
+// scan (each page carries an explicit LIMIT) and pushes the scope filter into
+// SQL before fetching vectors.
+function instrumentVectorIndex(kit) {
+  const baseCap = createSearchOwnedIndexCapability({
+    db: kit.db,
+    census: kit.census,
+    writeCoordinator: kit.queue,
+    fenceOf: (id) => kit.registry.stateOf(id).fence,
+  });
+  const queries = [];
+  kit.registry.bindIndex((pluginId) => {
+    const inner = baseCap(pluginId);
+    return Object.freeze({
+      ...inner,
+      query(stmt) {
+        queries.push({ sql: stmt.sql, params: stmt.params ?? [] });
+        return inner.query(stmt);
+      },
+    });
+  });
+  return queries;
+}
+
+function embeddingQueries(queries) {
+  return queries.filter((q) => /\bembedding\b/.test(q.sql));
+}
+
+describe('disk-backed bounded-page vector search (#288)', () => {
+  test('persistent search pages embeddings with an explicit LIMIT and never reads the whole table', async (t) => {
+    const kit = await setupSearchSuite({ dimensions: 2 });
+    t.after(() => kit.close());
+
+    kit.db.exec('BEGIN');
+    for (let i = 0; i < 40; i += 1) {
+      kit.insert(`p-${String(i).padStart(3, '0')}`, 'proj-a', `note ${i}`, 'body', [1, i / 100]);
+    }
+    kit.db.exec('COMMIT');
+    assert.equal((await kit.registry.rebuild('note-vec')).ok, true);
+
+    const queries = instrumentVectorIndex(kit);
+    const found = await kit.registry.search('note-vec', {
+      query: { model: 'embed-v1', vector: [1, 0] },
+      principal: alice,
+      limit: 5,
+    });
+    assert.equal(found.ok, true, found.lastError?.message);
+    assert.equal(found.result.hits.length, 5);
+
+    const embedding = embeddingQueries(queries);
+    assert.ok(embedding.length > 0, 'persistent search must read embeddings from SQLite');
+    for (const q of embedding) {
+      assert.match(q.sql, /LIMIT \d+/, `embedding SELECT must carry a bounded LIMIT: ${q.sql}`);
+      assert.doesNotMatch(q.sql, /LIMIT\s+\d{4,}/, `embedding page must stay bounded, got: ${q.sql}`);
+    }
+    // 40 rows fit in one 512-row page, so a second page must not be fetched.
+    assert.equal(embedding.length, 1);
+  });
+
+  test('scope filter is applied in SQL before any vector is fetched', async (t) => {
+    const kit = await setupSearchSuite({ dimensions: 2 });
+    t.after(() => kit.close());
+
+    kit.db.exec('BEGIN');
+    for (let i = 0; i < 20; i += 1) {
+      kit.insert(`noise-${String(i).padStart(2, '0')}`, 'project-noisy', 'x', 'x', [1, 0]);
+    }
+    kit.insert('target-1', 'project-target', 'x', 'x', [0.8, 0.6]);
+    kit.insert('target-2', 'project-target', 'x', 'x', [0.6, 0.8]);
+    kit.db.exec('COMMIT');
+    assert.equal((await kit.registry.rebuild('note-vec')).ok, true);
+
+    const queries = instrumentVectorIndex(kit);
+    const scoped = await kit.registry.search('note-vec', {
+      query: { model: 'embed-v1', vector: [1, 0] },
+      scopeId: 'project-target',
+      principal: alice,
+      limit: 5,
+    });
+    assert.equal(scoped.ok, true, scoped.lastError?.message);
+    assert.deepEqual(scoped.result.hits.map((h) => h.id), ['target-1', 'target-2']);
+
+    const embedding = embeddingQueries(queries);
+    assert.ok(embedding.length > 0);
+    for (const q of embedding) {
+      assert.match(q.sql, /scope_id = \?/, 'scope must be filtered in SQL before vectors are fetched');
+      assert.deepEqual(q.params[0], 'project-target');
+    }
+  });
+
+  test('arbitrary-predicate scope stays isolated without a resident slab', async (t) => {
+    const kit = await setupSearchSuite({ dimensions: 2 });
+    t.after(() => kit.close());
+
+    kit.db.exec('BEGIN');
+    for (let i = 0; i < 30; i += 1) {
+      kit.insert(`foreign-${String(i).padStart(2, '0')}`, 'project-foreign', 't', 'b', [1, 0]);
+    }
+    kit.insert('own-1', 'project-own', 't', 'b', [0.1, 0.995]);
+    kit.insert('own-2', 'project-own', 't', 'b', [0, 1]);
+    kit.db.exec('COMMIT');
+    assert.equal((await kit.registry.rebuild('note-vec')).ok, true);
+
+    // The scope key is a real source column that is NOT the declared scopeField,
+    // so this exercises the page-driven predicate fallback rather than the
+    // scope_id equality filter.
+    const scoped = await kit.registry.search('note-vec', {
+      query: { model: 'embed-v1', vector: [1, 0] },
+      scope: { title: 't', projectId: 'project-own' },
+      principal: alice,
+      limit: 5,
+    });
+    assert.equal(scoped.ok, true, scoped.lastError?.message);
+    // `own-1` outranks every foreign row only inside its partition; a whole-index
+    // ranking would have filled the window with `foreign-*` rows.
+    assert.deepEqual(scoped.result.hits.map((h) => h.id), ['own-1', 'own-2']);
+  });
+
+  test('restart serves bounded pages from BLOBs without rebuild or slab hydration', async (t) => {
+    const root = mkdtempSync(join(tmpdir(), 'wb-vector-bounded-'));
+    const dbPath = join(root, 'vectors.db');
+    try {
+      const boot1 = await setupSearchSuite({ dbPath, dimensions: 3, withFts: false });
+      boot1.insert('a1', 'proj-a', 't', 'b', [1, 0, 0]);
+      boot1.insert('a2', 'proj-a', 't', 'b', [0.9, 0.1, 0]);
+      boot1.insert('b1', 'proj-b', 't', 'b', [1, 0, 0]);
+      assert.equal((await boot1.registry.rebuild('note-vec')).ok, true);
+      await boot1.close();
+
+      // Fresh handle, registry, and plugin: only the durable BLOB table exists.
+      const boot2 = await setupSearchSuite({ dbPath, dimensions: 3, withFts: false });
+      try {
+        await boot2.registry.prepare('note-vec');
+        const queries = instrumentVectorIndex(boot2);
+        const found = await boot2.registry.search('note-vec', {
+          query: { model: 'embed-v1', vector: [1, 0, 0] },
+          scopeId: 'proj-a',
+          principal: alice,
+          limit: 2,
+        });
+        assert.equal(found.ok, true, found.lastError?.message);
+        assert.deepEqual(found.result.hits.map((h) => h.id), ['a1', 'a2']);
+
+        const embedding = embeddingQueries(queries);
+        assert.ok(embedding.length > 0, 'restart search must read persisted BLOBs');
+        for (const q of embedding) assert.match(q.sql, /LIMIT \d+/);
+      } finally {
+        await boot2.close();
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('shadow rebuild and incremental revocation keep the disk index authoritative', async (t) => {
+    const kit = await setupSearchSuite({ dimensions: 2 });
+    t.after(() => kit.close());
+
+    kit.insert('keep', 'proj-a', 't', 'b', [1, 0]);
+    kit.insert('drop-row', 'proj-a', 't', 'b', [0.99, 0.1]);
+    kit.insert('drop-scope-1', 'proj-gone', 't', 'b', [0.98, 0.2]);
+    kit.insert('drop-scope-2', 'proj-gone', 't', 'b', [0.97, 0.23]);
+    assert.equal((await kit.registry.rebuild('note-vec')).ok, true);
+
+    // A shadow rebuild over the same source must activate and preserve parity.
+    const bridge = createSearchStalenessBridge({ registry: kit.registry });
+    bridge.engage(kit.db);
+    const engine = createSearchReconcileEngine({
+      registry: kit.registry,
+      staleness: bridge,
+      db: kit.db,
+      writeQueue: kit.queue,
+    });
+    const shadow = await engine.rebuildShadow('note-vec');
+    assert.equal(shadow.ok, true, shadow.lastError ?? 'shadow rebuild failed');
+    assert.equal(shadow.activated, true);
+    assert.equal(engine.parity('note-vec').matches, true);
+
+    // Shadow activation flips the durable active pointer to the other generation.
+    const active = Number(kit.db.prepare('SELECT active FROM vec_note_vec_state WHERE slot = ?').get('active').active);
+    const activeTable = active === 1 ? 'vec_note_vec_g1' : 'vec_note_vec_g0';
+
+    // Scope + row revocation delete incrementally from the durable table.
+    await kit.registry.revoke('note-vec', { kind: 'revocation', entity: 'Note', scopeId: 'proj-gone' });
+    await kit.registry.revoke('note-vec', { kind: 'erasure', entity: 'Note', rowId: 'drop-row' });
+
+    const persisted = kit.db
+      .prepare(`SELECT source_key FROM ${activeTable} ORDER BY source_key`)
+      .all()
+      .map((r) => r.source_key);
+    assert.deepEqual(persisted, ['keep']);
+
+    const after = await kit.registry.search('note-vec', {
+      query: { model: 'embed-v1', vector: [1, 0] },
+      principal: alice,
+      limit: 10,
+    });
+    assert.equal(after.ok, true, after.lastError?.message);
+    assert.deepEqual(after.result.hits.map((h) => h.id), ['keep']);
+  });
+});

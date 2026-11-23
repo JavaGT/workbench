@@ -433,16 +433,17 @@ test('an HTTP bind failure rejects the singular ready promise and closes acquire
   assert.equal(app.httpServer.listening, false);
   assert.equal(app.writeQueue.closed, true, 'failed startup closes mutation admission');
   assert.equal(clockStops, 1, 'failed startup releases the application clock');
-  await assert.rejects(app.start(), /EADDRINUSE|shut down/i);
+  await assert.rejects(app.start(), (err) => err?.code === 'EADDRINUSE' || /shut down/i.test(err?.message ?? ''));
   db.close();
 });
 
 test('a synchronous listen argument failure still exposes failed readiness and cleans up', async () => {
   const app = workbench().mount('/start-notes', startNote());
 
-  assert.throws(() => app.listen(-1), (err) => err?.code === 'ERR_SOCKET_BAD_PORT');
+  const invalidPort = (err) => err?.code === 'ERR_SOCKET_BAD_PORT';
+  assert.throws(() => app.listen(-1), invalidPort);
   assert.ok(app.ready, 'readiness exists before Node begins binding the socket');
-  await assert.rejects(app.ready, (err) => err?.code === 'ERR_SOCKET_BAD_PORT');
+  await assert.rejects(app.ready, invalidPort);
   assert.equal(app.writeQueue.closed, true);
 });
 

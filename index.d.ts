@@ -2573,6 +2573,10 @@ export interface QueryDb {
   readonly isTransaction?: boolean;
 }
 
+export interface QuerySnapshotDb extends QueryDb {
+  exec(sql: string): unknown;
+}
+
 export interface QueryEntity {
   readonly name: string;
   readonly fields: Readonly<Record<string, { readonly kind?: string; readonly type?: string; readonly role?: unknown; readonly [property: string]: unknown }>>;
@@ -2727,7 +2731,7 @@ export function compileQueryContract(
   options?: CompileQueryContractOptions,
 ): CompiledQuery;
 export function executeQueryPage<Row extends Record<string, unknown> = Record<string, unknown>>(
-  db: QueryDb,
+  db: QuerySnapshotDb,
   entity: QueryEntity,
   principal: unknown,
   compiled: CompiledQuery,
@@ -2741,7 +2745,7 @@ export function overlayOptimisticQueryPage<Row extends Record<string, unknown> =
 ): OptimisticQueryPage<Row>;
 export function readCommittedRevision(db: QueryDb): number;
 export function queryAuthorizationFields(entity: QueryEntity): string[];
-export function withReadSnapshot<T>(db: QueryDb, run: () => T): T;
+export function withReadSnapshot<T>(db: QuerySnapshotDb, run: () => T): T;
 export function createQueryInvalidationHub(options?: { readonly maxRegistrations?: number }): QueryInvalidationHub;
 export function createQueryInvalidationConsumer(
   hub: QueryInvalidationHub,
@@ -2846,7 +2850,7 @@ export interface QueryFamilyRegistry {
   register(declaration: QueryFamilyDeclaration): CompiledQueryFamily;
   execute<Row extends Record<string, unknown> = Record<string, unknown>>(
     name: string,
-    db: QueryDb,
+    db: QuerySnapshotDb,
     principal: unknown,
     request: QueryFamilyRequest,
     options?: ExecuteQueryFamilyOptions,
@@ -2856,7 +2860,7 @@ export interface QueryFamilyRegistry {
 
 export function compileQueryFamily(input: QueryFamilyDeclaration): CompiledQueryFamily;
 export function executeQueryFamily<Row extends Record<string, unknown> = Record<string, unknown>>(
-  db: QueryDb,
+  db: QuerySnapshotDb,
   family: CompiledQueryFamily,
   principal: unknown,
   request: QueryFamilyRequest,

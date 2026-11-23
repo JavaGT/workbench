@@ -3470,6 +3470,10 @@ export function createLiveDeliverySession({
       // same turn, so no observer sees a settled snapshot under a stale
       // recovering/catching-up status.
       finishRecoveryWarning();
+      // The delayed-warning completion callback runs synchronously and may
+      // close or revoke this session, or start a superseding recovery. Never
+      // install `live` over the transition it just made.
+      if (closed || status === 'revoked' || status === 'unavailable' || generation !== recoveryGeneration) return;
       status = 'live';
       publish();
       if (closed || status === 'revoked' || generation !== recoveryGeneration) return;
@@ -3486,6 +3490,10 @@ export function createLiveDeliverySession({
       if (closed || status === 'revoked' || generation !== recoveryGeneration) return;
       lastSnapshotInstalledFromReceipt = false;
       finishRecoveryWarning();
+      // The delayed-warning completion callback runs synchronously and may
+      // close or revoke this session, or start a superseding recovery. Never
+      // install `live` over the transition it just made.
+      if (closed || status === 'revoked' || status === 'unavailable' || generation !== recoveryGeneration) return;
       status = 'live';
       publish();
       if (initialized && !reconnecting) settleAdmissions(true);

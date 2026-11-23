@@ -127,6 +127,79 @@ describe('LiveDeliverySession', () => {
     await reconnect;
   });
 
+  it('does not install live when the delayed-warning completion callback closes the session', async () => {
+    const pendingSnapshot = deferred();
+    const warnings = [];
+    let signalWarning;
+    const warningShown = new Promise((resolve) => { signalWarning = resolve; });
+    let session;
+    session = createLiveDeliverySession({
+      bootstrap: () => pendingSnapshot.promise,
+      subscribe: async () => ({ close() {} }),
+      validateSnapshot: (snapshot) => snapshot,
+      sendAction: async () => ({ ok: true }),
+      recoveryWarningDelayMs: 5,
+      onRecoveryDelayed: (delayed) => {
+        warnings.push(delayed);
+        if (delayed) signalWarning();
+        else session.close();
+      },
+    });
+
+    // Recovery outlives the warning delay, so `true` fires; resolving the
+    // snapshot then completes the warning, and its callback closes the session
+    // synchronously before recovery installs `live`.
+    await warningShown;
+    pendingSnapshot.resolve({ kind: 'snapshot', snapshot: { values: [] }, cursor: 1 });
+    await session.ready;
+
+    assert.deepEqual(warnings, [true, false]);
+    assert.notEqual(session.status, 'live', 'a session closed by the warning completion must not report live');
+    assert.equal(session.snapshot, null, 'a closed session must not publish the recovered snapshot');
+  });
+
+  it('does not install live when the delayed-warning completion callback revokes during catch-up recovery', async () => {
+    const pendingCatchup = deferred();
+    const warnings = [];
+    let signalWarning;
+    const warningShown = new Promise((resolve) => { signalWarning = resolve; });
+    let signalCatchup;
+    const catchupRequested = new Promise((resolve) => { signalCatchup = resolve; });
+    let revokeDelivery;
+    const session = createLiveDeliverySession({
+      bootstrap: async ({ mode }) => {
+        if (mode === 'catchup') {
+          signalCatchup();
+          return pendingCatchup.promise;
+        }
+        return { kind: 'snapshot', snapshot: { values: [] }, cursor: 1 };
+      },
+      subscribe: async ({ revoke }) => {
+        revokeDelivery = revoke;
+        return { close() {} };
+      },
+      validateSnapshot: (snapshot) => snapshot,
+      sendAction: async () => ({ ok: true }),
+      recoveryWarningDelayMs: 5,
+      onRecoveryDelayed: (delayed) => {
+        warnings.push(delayed);
+        if (delayed) signalWarning();
+        else revokeDelivery({ code: 'access-revoked' });
+      },
+    });
+    await session.ready;
+
+    const reconnect = session.reconnect();
+    await catchupRequested;
+    await warningShown;
+    pendingCatchup.resolve({ kind: 'catchup', envelopes: [], cursor: 1 });
+    await reconnect;
+
+    assert.deepEqual(warnings, [true, false]);
+    assert.equal(session.status, 'revoked', 'the callback revocation must survive the settled catch-up');
+    assert.equal(session.snapshot, null);
+  });
+
   it('publishes exactly once per settled recovery with the final live status installed', async () => {
     let bootstraps = 0;
     const session = createLiveDeliverySession({

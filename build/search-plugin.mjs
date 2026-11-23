@@ -43,9 +43,23 @@ import { buildCheckRegistry } from './registry.mjs';
 import { compileReadScope, NonCompilableError } from './scope-sql.mjs';
 import { SEARCH_STALENESS_TABLE_NAME } from './operational-ledger-ddl.mjs';
 import {
+  composeHybridSearch,
+  HYBRID_SEARCH_DEFAULT_RRF_K,
   SEARCH_DEFAULT_TIMEOUT_MS,
   searchPageWindow,
+  searchStalenessOf,
   searchWithDeadline,
+
+
+} from './search-response.mjs';
+export {
+  composeHybridSearch,
+  HYBRID_SEARCH_DEFAULT_RRF_K,
+
+
+
+
+
 } from './search-response.mjs';
 
 import { compileProjectPurgePlan,                       } from './owned-resource-purge.mjs';
@@ -98,6 +112,18 @@ export const SUPPORTED_SEARCH_PLUGIN_CONTRACT_VERSION = 2;
 // A source change offered to a plugin. `stalenessKey(change)` maps it to the
 // index partition it invalidates, or null when the change does not affect the
 // plugin's index.
+
+
+
+
+
+
+
+// A targeted revocation or erasure directive delivered to a plugin that
+// supports incremental removal (avoiding a full-corpus rebuild when a single
+// row or scope partition is revoked or erased).
+
+
 
 
 
@@ -180,6 +206,7 @@ export const SUPPORTED_SEARCH_PLUGIN_CONTRACT_VERSION = 2;
 
 
 
+
 // Narrow plugin-owned storage capability. The app binds it only after the
 // ownership census settles; it intentionally has neither a raw database handle
 // nor prepare/exec/transaction verbs.
@@ -188,9 +215,17 @@ export const SUPPORTED_SEARCH_PLUGIN_CONTRACT_VERSION = 2;
 
 
 
+
+
 // The scoped source reader handed to a plugin. Reachable sources are exactly
 // the plugin's declared sourceInterests; the reader exposes no write verb and
 // no raw handle (`writeCapable` is the literal `false` — the red-line proof).
+
+
+
+
+
+
 
 
 
@@ -256,6 +291,8 @@ export const SUPPORTED_SEARCH_PLUGIN_CONTRACT_VERSION = 2;
 // NO plugin-supplied generation hook: generation/fence are registry-owned
 // materialization/invalidation counts (spec 5). `stalenessKey` decides which
 // changes invalidate the index (spec: stalenessKey(change) format).
+
+
 
 
 
@@ -439,7 +476,15 @@ export function createSearchSourceReader(
     return handle;
   }
 
-  function rows(entity        , options                                                                = {})                                     {
+  function rows(
+    entity        ,
+    options
+
+
+
+
+      = {},
+  )                                     {
     requireEntity(entity);
     const connection = requireHandle();
     // The declared scope is enforced on EVERY read, not just validated at
@@ -458,8 +503,17 @@ export function createSearchSourceReader(
       where.push(`${quoteIdentifier('id')} IN (${ids.map(() => '?').join(', ')})`);
       params.push(...ids);
     }
+    if (options.afterId !== undefined) {
+      where.push(`${quoteIdentifier('id')} > ?`);
+      params.push(options.afterId);
+    }
     let sql = `SELECT * FROM ${quoteIdentifier(entity)} AS t0`;
     if (where.length > 0) sql += ` WHERE ${where.join(' AND ')}`;
+    if (options.order === 'desc') {
+      sql += ` ORDER BY ${quoteIdentifier('id')} DESC`;
+    } else if (options.order === 'asc' || options.afterId !== undefined) {
+      sql += ` ORDER BY ${quoteIdentifier('id')} ASC`;
+    }
     if (typeof options.limit === 'number' && Number.isFinite(options.limit)) {
       sql += ` LIMIT ${Math.max(0, Math.floor(options.limit))}`;
     }
@@ -477,6 +531,17 @@ export function createSearchSourceReader(
     return connection.prepare(sql).get(id, ...(scoped ? scoped.args : []));
   }
 
+  function count(entity        )         {
+    requireEntity(entity);
+    const connection = requireHandle();
+    const scoped = compiledScopes.get(entity);
+    let sql = `SELECT COUNT(*) AS count FROM ${quoteIdentifier(entity)} AS t0`;
+    if (scoped) sql += ` WHERE (${scoped.sql})`;
+    const result = connection.prepare(sql).get(...(scoped ? scoped.args : []));
+    if (result && typeof result.count === 'number') return result.count;
+    return rows(entity).length;
+  }
+
   return Object.freeze({
     plugin,
     writeCapable: false,
@@ -484,6 +549,7 @@ export function createSearchSourceReader(
     sources: () => Object.freeze([...entities]),
     rows,
     row,
+    count,
   });
 }
 
@@ -562,6 +628,7 @@ export function createSearchPluginRegistry(options                              
       index: ownedIndex(id),
       generation: entry.generation,
       fence: entry.fence,
+      state: entry.state,
     };
   }
 
@@ -600,6 +667,7 @@ export function createSearchPluginRegistry(options                              
     assertFunction(plugin.reconcile, 'reconcile', plugin.id);
     assertFunction(plugin.rebuild, 'rebuild', plugin.id);
     assertFunction(plugin.search, 'search', plugin.id);
+    if (plugin.revoke !== undefined) assertFunction(plugin.revoke, 'revoke', plugin.id);
     if (plugin.health !== undefined) assertFunction(plugin.health, 'health', plugin.id);
 
     if (!Array.isArray(plugin.ownedObjects)) {
@@ -727,8 +795,10 @@ export function createSearchPluginRegistry(options                              
       // binding. They still receive the v2 shape, but every capability use fails
       // closed until the post-census app binding supplies an executor.
       return Object.freeze({
+        bound: false,
         query: () => { throw new Error(`search plugin '${id}' owned-index capability is not bound until schema census succeeds`); },
         write: async () => { throw new Error(`search plugin '${id}' owned-index capability is not bound until schema census succeeds`); },
+        clear: async () => { throw new Error(`search plugin '${id}' owned-index capability is not bound until schema census succeeds`); },
       });
     }
     return indexCapability(id);
@@ -807,6 +877,20 @@ export function createSearchPluginRegistry(options                              
           result: null,
         };
       }
+      // Generation fence (#243): an overlapping same-identity materialization
+      // that started later has already advanced `entry.generation`. Never allow
+      // an older in-flight cycle to publish stale counts or state out of order.
+      if (entry.generation !== generation) {
+        return {
+          ok: true,
+          generation: entry.generation,
+          fence: entry.fence,
+          state: entry.state,
+          counts: entry.counts,
+          lastError: entry.lastError,
+          result: null,
+        };
+      }
       // prepare success leaves the plugin building (owned objects exist, the
       // index is not materialized yet); validate/reconcile/rebuild success
       // makes the index ready — unless the fence moved mid-flight, in which
@@ -827,6 +911,17 @@ export function createSearchPluginRegistry(options                              
         result: result ?? null,
       };
     } catch (err) {
+      if (entry.plugin.generationIdentity !== identityAtStart || entry.generation !== generation) {
+        return {
+          ok: false,
+          generation: entry.generation,
+          fence: entry.fence,
+          state: entry.state,
+          counts: entry.counts,
+          lastError: entry.lastError,
+          result: null,
+        };
+      }
       const message = err instanceof Error ? err.message : String(err);
       recordFailure(id, message, retryableOf(err));
       return {
@@ -855,6 +950,14 @@ export function createSearchPluginRegistry(options                              
 
   function rebuild(id        )                                  {
     return materialize(id, true, (ctx) => ledgerOf(id).plugin.rebuild(ctx));
+  }
+
+  function revoke(id        , target                        )                                  {
+    return materialize(id, true, (ctx) => {
+      const plugin = ledgerOf(id).plugin;
+      if (typeof plugin.revoke === 'function') return plugin.revoke(ctx, target);
+      return plugin.rebuild(ctx);
+    });
   }
 
   async function search(id        , request               )                               {
@@ -978,7 +1081,134 @@ export function createSearchPluginRegistry(options                              
     validate,
     reconcile,
     rebuild,
+    revoke,
     search,
     purgePlans,
+  });
+}
+
+// ---- built-in hybrid retrieval composer (FTS5 + vector RRF) -----------------
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// Run authorized FTS5 and vector searches in parallel through the registry and
+// fuse their admitted hits via Reciprocal Rank Fusion (`weight / (k + rank)`),
+// with deterministic `(score DESC, key ASC)` tie-breaking.
+export async function hybridSearch(request                           )                                     {
+  const { registry, principal, fts, vector, scope, scopeId, signal } = request;
+  const k = request.k ?? HYBRID_SEARCH_DEFAULT_RRF_K;
+  const window = searchPageWindow({
+    limit: request.limit,
+    offset: request.offset,
+    page: request.page,
+    pageSize: request.pageSize,
+  });
+  const defaultBranchLimit = Math.max(window.offset + window.limit, (window.offset + window.limit) * 2);
+  const ftsLimit = fts.limit ?? defaultBranchLimit;
+  const vectorLimit = vector.limit ?? defaultBranchLimit;
+
+  const sharedScope = {
+    ...(scope !== undefined ? { scope } : {}),
+    ...(scopeId !== undefined ? { scopeId } : {}),
+  };
+
+  const [ftsOutcome, vectorOutcome] = await Promise.all([
+    registry.search(fts.pluginId, {
+      query: fts.query,
+      principal,
+      limit: ftsLimit,
+      ...sharedScope,
+      ...(signal !== undefined ? { signal } : {}),
+    }),
+    registry.search(vector.pluginId, {
+      query: vector.query,
+      principal,
+      limit: vectorLimit,
+      ...sharedScope,
+      ...(signal !== undefined ? { signal } : {}),
+    }),
+  ]);
+
+  const cancelled = ftsOutcome.cancelled || vectorOutcome.cancelled;
+  const timedOut = !cancelled && (ftsOutcome.timedOut || vectorOutcome.timedOut);
+  const ftsStaleness                  = searchStalenessOf(ftsOutcome.state);
+  const vectorStaleness                  = searchStalenessOf(vectorOutcome.state);
+
+  if (cancelled || timedOut || !ftsOutcome.ok || !vectorOutcome.ok || !ftsOutcome.result || !vectorOutcome.result) {
+    const worst                  = ftsStaleness === 'stale' || vectorStaleness === 'stale'
+      ? 'stale'
+      : ftsStaleness === 'rebuilding' || vectorStaleness === 'rebuilding'
+        ? 'rebuilding'
+        : 'fresh';
+    return Object.freeze({
+      ok: false,
+      cancelled,
+      timedOut,
+      hits: Object.freeze([]),
+      totalCandidates: 0,
+      staleness: worst,
+      k,
+      outcomes: Object.freeze({ fts: ftsOutcome, vector: vectorOutcome }),
+    });
+  }
+
+  const fused = composeHybridSearch                                   (
+    [
+      {
+        pluginId: fts.pluginId,
+        hits: ftsOutcome.result.hits                                                ,
+        weight: fts.weight,
+        generation: ftsOutcome.generation,
+        staleness: ftsStaleness,
+      },
+      {
+        pluginId: vector.pluginId,
+        hits: vectorOutcome.result.hits                                                ,
+        weight: vector.weight,
+        generation: vectorOutcome.generation,
+        staleness: vectorStaleness,
+      },
+    ],
+    {
+      k,
+      limit: window.limit,
+      offset: window.offset,
+    },
+  );
+
+  return Object.freeze({
+    ...fused,
+    cancelled: false,
+    timedOut: false,
+    outcomes: Object.freeze({ fts: ftsOutcome, vector: vectorOutcome }),
   });
 }

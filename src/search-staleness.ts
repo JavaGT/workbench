@@ -51,7 +51,7 @@
 // exposes.
 
 import type { DbHandle } from './driver.ts';
-import { SEARCH_STALENESS_LEDGER_TABLE, type SearchChange, type SearchChangeKind, type SearchPluginRegistry } from './search-plugin.ts';
+import { SEARCH_STALENESS_LEDGER_TABLE, type SearchChange, type SearchChangeKind, type SearchPluginRegistry, type SearchRevocationTarget } from './search-plugin.ts';
 import type { Principal } from './principal.ts';
 import { normalizeRevocationScope, type RevocationResourceScope } from './live-fanout.ts';
 import { renderSearchStalenessDdl } from './operational-ledger-ddl.ts';
@@ -466,17 +466,30 @@ export function createSearchStalenessBridge(options: SearchStalenessBridgeOption
       }
       return { kind: 'reconcile' };
     }
-    // Revocation / erasure: rebuild from the COMMITTED scoped source. Erased or
-    // newly-unauthorized rows are absent (or out of the plugin's scope) in
-    // committed state, so a successful rebuild cannot contain them.
+    // Revocation / erasure: when the record targets a specific entity key or
+    // scope and a plugin supports incremental `revoke()`, delete those rows
+    // directly without rebuilding the entire corpus. Plugins without `revoke()`
+    // (or broad principal-scope revocations) fall back to full `rebuild()`.
+    const revocationKind = record.kind === 'erasure' ? 'erasure' : 'revocation';
+    const target: SearchRevocationTarget | null = record.sourceResource !== PRINCIPAL_RESOURCE && record.sourceKey !== '*'
+      ? (record.sourceKey.startsWith('scope:')
+        ? { kind: revocationKind, entity: record.sourceResource, scopeId: record.sourceKey.slice('scope:'.length) }
+        : { kind: revocationKind, entity: record.sourceResource, rowId: record.sourceKey })
+      : null;
+    let anyRebuilt = false;
     for (const affected of record.affected) {
-      const outcome = await coordinated(() => registry.rebuild(affected.pluginId)) as { ok: boolean };
+      const plugin = registry.get(affected.pluginId);
+      const canIncremental = target !== null && typeof plugin?.revoke === 'function';
+      const outcome = canIncremental
+        ? await coordinated(() => registry.revoke(affected.pluginId, target)) as { ok: boolean }
+        : await coordinated(() => registry.rebuild(affected.pluginId)) as { ok: boolean };
+      if (!canIncremental) anyRebuilt = true;
       if (!outcome.ok) {
         const state = registry.stateOf(affected.pluginId);
-        throw new Error(state.lastError ? state.lastError.message : `rebuild failed for '${affected.pluginId}'`);
+        throw new Error(state.lastError ? state.lastError.message : `${canIncremental ? 'revoke' : 'rebuild'} failed for '${affected.pluginId}'`);
       }
     }
-    return { kind: 'rebuild' };
+    return { kind: anyRebuilt ? 'rebuild' : 'reconcile' };
   }
 
   function engage(handle: DbHandle): void {

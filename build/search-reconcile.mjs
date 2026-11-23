@@ -54,6 +54,7 @@ import {
 
 
 
+
 } from './search-plugin.mjs';
 
 
@@ -222,11 +223,35 @@ export function censusOfRows(rows                                    )          
 }
 
 // The source census: every declared source interest read through the SCOPED
-// reader (never a raw handle) and canonicalized deterministically.
+// reader (never a raw handle) and canonicalized deterministically. Streams in
+// bounded pages for large tables so the full corpus is not materialized in JS
+// RAM at once.
 export function computeSourceCensus(reader                    )               {
+  const PAGE_SIZE = 512;
   const census                                     = {};
   for (const entity of reader.sources()) {
-    census[entity] = censusOfRows(reader.rows(entity));
+    const totalCount = typeof reader.count === 'function' ? reader.count(entity) : null;
+    if (totalCount !== null && totalCount > PAGE_SIZE) {
+      const hash = createHash('sha256');
+      let count = 0;
+      let afterId                    ;
+      while (true) {
+        const page = reader.rows(entity, { afterId, limit: PAGE_SIZE, order: 'asc' });
+        if (page.length === 0) break;
+        for (const row of page) {
+          if (count > 0) hash.update('\n');
+          hash.update(JSON.stringify(canonicalize(row)));
+          count += 1;
+        }
+        if (page.length < PAGE_SIZE) break;
+        const lastId = String(page[page.length - 1]?.id ?? '');
+        if (lastId.length === 0 || (afterId !== undefined && lastId <= afterId)) break;
+        afterId = lastId;
+      }
+      census[entity] = { count, digest: hash.digest('hex') };
+    } else {
+      census[entity] = censusOfRows(reader.rows(entity));
+    }
   }
   return Object.freeze(census);
 }
@@ -372,18 +397,31 @@ export function createSearchReconcileEngine(options                        )    
     if (row.kind !== 'revocation' && row.kind !== 'erasure') {
       throw new Error(`staleness record '${record.sourceResource}:${record.sourceKey}' has an unknown kind '${row.kind}'`);
     }
-    // Revocation / erasure: rebuild from the COMMITTED scoped source. Erased or
-    // newly-unauthorized rows are absent (or out of the plugin's scope) in
-    // committed state, so a successful rebuild cannot contain them.
+    // Revocation / erasure: when the record targets a specific entity key or
+    // scope and the plugin supports incremental `revoke()`, delete those rows
+    // directly instead of triggering a full-corpus rebuild. Plugins without
+    // `revoke()` (or broad principal-scope revocations) fall back to `rebuild()`.
+    const revocationKind = row.kind === 'erasure' ? 'erasure' : 'revocation';
+    const target                                = record.sourceResource !== '$principal' && record.sourceKey !== '*'
+      ? (record.sourceKey.startsWith('scope:')
+        ? { kind: revocationKind, entity: record.sourceResource, scopeId: record.sourceKey.slice('scope:'.length) }
+        : { kind: revocationKind, entity: record.sourceResource, rowId: record.sourceKey })
+      : null;
+    let anyRebuilt = false;
     for (const affected of row.affected) {
-      const outcome = await registry.rebuild(affected.pluginId);
+      const plugin = registry.get(affected.pluginId);
+      const canIncremental = target !== null && typeof plugin?.revoke === 'function';
+      const outcome = canIncremental
+        ? await registry.revoke(affected.pluginId, target)
+        : await registry.rebuild(affected.pluginId);
+      if (!canIncremental) anyRebuilt = true;
       if (!outcome.ok) {
         const state = registry.stateOf(affected.pluginId);
-        throw new Error(state.lastError ? state.lastError.message : `rebuild failed for '${affected.pluginId}'`);
+        throw new Error(state.lastError ? state.lastError.message : `${canIncremental ? 'revoke' : 'rebuild'} failed for '${affected.pluginId}'`);
       }
     }
     await coordinated(() => deleteIfUnchanged(record, row));
-    return 'rebuild';
+    return anyRebuilt ? 'rebuild' : 'reconcile';
   }
 
   function deleteIfUnchanged(record                       , processed           )       {
@@ -469,6 +507,7 @@ export function createSearchReconcileEngine(options                        )    
       index: registry.ownedIndex(id),
       generation,
       fence,
+      state: registry.stateOf(id).state,
     };
   }
 

@@ -434,3 +434,158 @@ export function buildSearchResponse      (input                           )     
     error,
   });
 }
+
+// ---- hybrid retrieval composer (RRF / weighted fusion) ----------------------
+
+// Standard Reciprocal Rank Fusion smoothing constant k in `weight / (k + rank)`.
+export const HYBRID_SEARCH_DEFAULT_RRF_K = 60;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function defaultHybridKeyOf(hit         )         {
+  if (hit !== null && typeof hit === 'object') {
+    const record = hit                                   ;
+    if (typeof record.key === 'string' && record.key.length > 0) return record.key;
+    if (typeof record.id === 'string' && record.id.length > 0) return record.id;
+  }
+  return '';
+}
+
+function worstStaleness(states                            )                  {
+  if (states.length === 0) return 'fresh';
+  if (states.includes('stale')) return 'stale';
+  if (states.includes('rebuilding')) return 'rebuilding';
+  return 'fresh';
+}
+
+// Fuse multiple authorized ranked hit lists (e.g. FTS5 BM25 + vector cosine)
+// via Reciprocal Rank Fusion (`weight / (k + rank)`, 1-based rank) with
+// deterministic `(score DESC, key ASC)` tie-breaking. Callers pass already-
+// authorized hits so unauthorized rows can never influence RRF ranks.
+export function composeHybridSearch                                          (
+  sources                                          ,
+  options                      = {},
+)                           {
+  const k = options.k ?? HYBRID_SEARCH_DEFAULT_RRF_K;
+  if (typeof k !== 'number' || !Number.isFinite(k) || k <= 0) {
+    throw new RangeError(`hybrid search RRF k must be a positive finite number, got ${String(k)}`);
+  }
+
+
+
+
+
+
+
+
+
+
+  const byKey = new Map                     ();
+  const stalenessStates                    = [];
+
+  for (const source of sources) {
+    const weight = source.weight ?? 1;
+    if (typeof weight !== 'number' || !Number.isFinite(weight) || weight < 0) {
+      throw new RangeError(`hybrid search weight for '${source.pluginId}' must be a non-negative finite number`);
+    }
+    if (source.staleness !== undefined) stalenessStates.push(source.staleness);
+    const keyOf = source.keyOf ?? defaultHybridKeyOf;
+    const seenInSource = new Set        ();
+    let rank = 0;
+    for (const hit of source.hits) {
+      const key = keyOf(hit);
+      if (key.length === 0 || seenInSource.has(key)) continue;
+      seenInSource.add(key);
+      rank += 1;
+      const contribution = weight / (k + rank);
+      const record = hit !== null && typeof hit === 'object' ? (hit                           ) : null;
+      const excerpt = typeof record?.excerpt === 'string' ? record.excerpt : undefined;
+      const excerptField = typeof record?.excerptField === 'string' ? record.excerptField : undefined;
+
+      const existing = byKey.get(key);
+      if (existing === undefined) {
+        byKey.set(key, {
+          key,
+          score: contribution,
+          hit,
+          ...(excerpt !== undefined ? { excerpt } : {}),
+          ...(excerptField !== undefined ? { excerptField } : {}),
+          sources: { [source.pluginId]: Object.freeze({ rank, contribution }) },
+        });
+      } else {
+        existing.score += contribution;
+        existing.sources[source.pluginId] = Object.freeze({ rank, contribution });
+        if (existing.excerpt === undefined && excerpt !== undefined) existing.excerpt = excerpt;
+        if (existing.excerptField === undefined && excerptField !== undefined) existing.excerptField = excerptField;
+      }
+    }
+  }
+
+  const fused = [...byKey.values()].sort((a, b) => {
+    if (a.score > b.score) return -1;
+    if (a.score < b.score) return 1;
+    return compareSearchKeys(a.key, b.key);
+  });
+
+  const hasWindow = options.limit !== undefined
+    || options.offset !== undefined
+    || options.page !== undefined
+    || options.pageSize !== undefined;
+  const sliced = hasWindow
+    ? (() => {
+      const { offset, limit } = searchPageWindow(options);
+      return fused.slice(offset, offset + limit);
+    })()
+    : fused;
+
+  const hits = Object.freeze(sliced.map((entry) => Object.freeze({
+    key: entry.key,
+    score: entry.score,
+    hit: entry.hit,
+    ...(entry.excerpt !== undefined ? { excerpt: entry.excerpt } : {}),
+    ...(entry.excerptField !== undefined ? { excerptField: entry.excerptField } : {}),
+    sources: Object.freeze({ ...entry.sources }),
+  })));
+
+  return Object.freeze({
+    ok: true,
+    hits,
+    totalCandidates: fused.length,
+    staleness: worstStaleness(stalenessStates),
+    k,
+  });
+}

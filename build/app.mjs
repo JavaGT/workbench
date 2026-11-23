@@ -61,6 +61,7 @@ import { retentionMs } from './blob-retention.mjs';
 import { createRecycleManager, recycleManagerBinSeam } from './backup/recycle.mjs';
 import { createJobQueue } from './job-queue.mjs';
 import { createSearchPluginRegistry,                   } from './search-plugin.mjs';
+import { createQueryFamilyRegistry,                          } from './query-family.mjs';
 import { createSearchOwnedIndexCapability } from './index-capability.mjs';
 import { createSearchStalenessBridge } from './search-staleness.mjs';
 import { createSearchReconcileEngine } from './search-reconcile.mjs';
@@ -85,6 +86,34 @@ import { createSchemaReport } from './schema-report.mjs';
 import path from 'node:path';
 import { mkdirSync } from 'node:fs';
 import { makeMountable } from './router.mjs';
+
+/**
+ * The minimal registry `POST /search` executes (issue #312). The framework's
+ * own `searchPlugins` registry satisfies `search(id, request)`; a custom
+ * registry may additionally provide `hybridSearch(request)` for fused
+ * retrieval. `has`/`ids` let the route distinguish an unknown index (404) from
+ * a bad payload (400) before executing.
+ */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -295,6 +324,8 @@ export default function workbench({
   schema,
   entities = [],
   actions = [],
+  queryFamilies,
+  search,
   blobs: blobOpts,
   requireEnv = [],
   migrations = [],
@@ -551,6 +582,28 @@ export default function workbench({
       // registered plugin to the handle when that open completes, so a plugin
       // registered before start() still gets a bound reader after ready.
       if (app.db) app.searchPlugins.bindSource(app.db);
+      return app;
+    };
+    // Registered query families (#312): the same compiled host/catalog/element
+    // grants the library API runs, reached through `POST /query-families/:name`.
+    // `app.queryFamilies` is always present (an empty registry by default) so the
+    // HTTP route can answer 404 for an unregistered family instead of failing on
+    // a missing dependency. `app.queryFamily(declaration)` is the chainable
+    // registration seam (fail-closed: the registry refuses duplicate names and a
+    // malformed declaration at registration time).
+    app.queryFamilies = queryFamilies ?? createQueryFamilyRegistry();
+    app.queryFamily = (declaration         ) => {
+      app.queryFamilies.register(declaration);
+      return app;
+    };
+    // The search registry `POST /search` executes (#312). Defaults to the app's
+    // own plugin registry — the same registry the search lifecycle binds and
+    // materializes — so an app that registered plugins needs no extra wiring.
+    // `app.search(registry)` swaps in a host-provided registry (its `search` and
+    // optional `hybridSearch` are what the route calls).
+    app.searchRegistry = search ?? app.searchPlugins;
+    app.search = (registry                ) => {
+      app.searchRegistry = registry;
       return app;
     };
     // The search staleness + invalidation bridge (S4/A2): the durable,

@@ -1596,6 +1596,7 @@ const FAILURE_CATEGORIES = new Set([
   'denied',
   'unknown-action',
   'not-found',
+  'not-acceptable',
   'conflict',
   'internal',
 ]);
@@ -5612,4 +5613,53 @@ export function createAuthClient({ baseUrl, fetchImpl } = {}) {
   }
 
   return { register, login, logout };
+}
+
+// ---------------------------------------------------------------------------
+// createQueryClient — authorized query-family and search HTTP calls (#312).
+// ---------------------------------------------------------------------------
+//
+// Thin fetch wrappers over the framework's three query/search endpoints:
+//
+//   POST /query/:entity         → queryEntity(entity, request, opts?)
+//   POST /query-families/:name  → queryFamily(name, request, opts?)
+//   POST /search                → search(request, opts?)
+//
+// Every response is decoded with the shared `decodeResult` (HTTP status is
+// authoritative). A non-2xx canonical envelope throws a `WorkbenchFailureError`
+// carrying the stable failure; a non-canonical error throws a plain Error. The
+// success value is the server body: a query page for the family/entity calls,
+// a hits + staleness response for search. `credentials: 'include'` sends the
+// fail-closed session cookie, exactly like the CRUD store.
+export function createQueryClient({ baseUrl, fetchImpl } = {}) {
+  const fetchFn = fetchImpl ?? globalThis.fetch;
+
+  async function post(path, request, opts = {}) {
+    const headers = { 'Content-Type': 'application/json', ...(opts?.headers ?? {}) };
+    const res = await fetchFn(`${baseUrl}${path}`, {
+      method: 'POST',
+      credentials: 'include',
+      headers,
+      body: JSON.stringify(request ?? {}),
+      ...(opts?.signal !== undefined ? { signal: opts.signal } : {}),
+    });
+    const decoded = await decodeResult(res);
+    if (!decoded.ok) {
+      if (decoded.failure) throw new WorkbenchFailureError(decoded.failure);
+      throw new Error(decoded.error);
+    }
+    return decoded.value;
+  }
+
+  return {
+    queryEntity(entity, request, opts) {
+      return post(`/query/${encodeURIComponent(entity)}`, request, opts);
+    },
+    queryFamily(name, request, opts) {
+      return post(`/query-families/${encodeURIComponent(name)}`, request, opts);
+    },
+    search(request, opts) {
+      return post('/search', request, opts);
+    },
+  };
 }

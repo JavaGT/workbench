@@ -61,6 +61,7 @@ import { retentionMs } from './blob-retention.ts';
 import { createRecycleManager, recycleManagerBinSeam } from './backup/recycle.ts';
 import { createJobQueue } from './job-queue.ts';
 import { createSearchPluginRegistry, type SearchPlugin } from './search-plugin.ts';
+import { createQueryFamilyRegistry, type QueryFamilyRegistry } from './query-family.ts';
 import { createSearchOwnedIndexCapability } from './index-capability.ts';
 import { createSearchStalenessBridge } from './search-staleness.ts';
 import { createSearchReconcileEngine } from './search-reconcile.ts';
@@ -86,11 +87,39 @@ import path from 'node:path';
 import { mkdirSync } from 'node:fs';
 import { makeMountable } from './router.ts';
 
+/**
+ * The minimal registry `POST /search` executes (issue #312). The framework's
+ * own `searchPlugins` registry satisfies `search(id, request)`; a custom
+ * registry may additionally provide `hybridSearch(request)` for fused
+ * retrieval. `has`/`ids` let the route distinguish an unknown index (404) from
+ * a bad payload (400) before executing.
+ */
+export interface SearchRegistry {
+  search(index: string, request: any): any;
+  hybridSearch?(request: any): any;
+  has?(index: string): boolean;
+  ids?(): readonly string[];
+}
+
 interface WorkbenchOptions {
   db?: string | DbHandle | DbAdapterConfig | BoundDbAdapter | OpenedSqliteDatabase | null;
   schema?: SqliteSchemaDescription;
   entities?: readonly unknown[];
   actions?: readonly unknown[];
+  /**
+   * Registered query families (issue #312). `POST /query-families/:name` runs
+   * the family's compiled host/catalog/element grants over the same
+   * authorization engine as the REST layer. A family may also be registered
+   * after construction through the chainable `app.queryFamily(declaration)`.
+   */
+  queryFamilies?: QueryFamilyRegistry;
+  /**
+   * The search registry the framework's `POST /search` route executes (issue
+   * #312). Defaults to the app's own `searchPlugins` registry; an app may supply
+   * a custom registry with `search`/`hybridSearch`. The chainable
+   * `app.search(registry)` overrides it after construction.
+   */
+  search?: SearchRegistry;
   blobs?: ByteStore | { root?: string };
   requireEnv?: readonly string[];
   migrations?: readonly Migration[];
@@ -295,6 +324,8 @@ export default function workbench({
   schema,
   entities = [],
   actions = [],
+  queryFamilies,
+  search,
   blobs: blobOpts,
   requireEnv = [],
   migrations = [],
@@ -551,6 +582,28 @@ export default function workbench({
       // registered plugin to the handle when that open completes, so a plugin
       // registered before start() still gets a bound reader after ready.
       if (app.db) app.searchPlugins.bindSource(app.db);
+      return app;
+    };
+    // Registered query families (#312): the same compiled host/catalog/element
+    // grants the library API runs, reached through `POST /query-families/:name`.
+    // `app.queryFamilies` is always present (an empty registry by default) so the
+    // HTTP route can answer 404 for an unregistered family instead of failing on
+    // a missing dependency. `app.queryFamily(declaration)` is the chainable
+    // registration seam (fail-closed: the registry refuses duplicate names and a
+    // malformed declaration at registration time).
+    app.queryFamilies = queryFamilies ?? createQueryFamilyRegistry();
+    app.queryFamily = (declaration: unknown) => {
+      app.queryFamilies.register(declaration);
+      return app;
+    };
+    // The search registry `POST /search` executes (#312). Defaults to the app's
+    // own plugin registry — the same registry the search lifecycle binds and
+    // materializes — so an app that registered plugins needs no extra wiring.
+    // `app.search(registry)` swaps in a host-provided registry (its `search` and
+    // optional `hybridSearch` are what the route calls).
+    app.searchRegistry = search ?? app.searchPlugins;
+    app.search = (registry: SearchRegistry) => {
+      app.searchRegistry = registry;
       return app;
     };
     // The search staleness + invalidation bridge (S4/A2): the durable,

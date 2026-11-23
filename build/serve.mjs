@@ -50,7 +50,7 @@ import { createResponseFacade } from './http-response-factory.mjs';
 import { dispatchCrud } from './http-crud-dispatch.mjs';
 import { failure } from './outcome.mjs';
 import { sendFailure,               } from './http-failure.mjs';
-import { handleResyncRoute, handleBlobUploadRoute, handleBlobReadRoute, handleJobRoute, handleClientSdkRoute } from './http-framework-routes.mjs';
+import { handleResyncRoute, handleBlobUploadRoute, handleBlobReadRoute, handleJobRoute, handleClientSdkRoute, handleQueryRoute, handleQueryFamilyRoute, handleSearchRoute } from './http-framework-routes.mjs';
 import { handleApplicationActionHttp } from './application-action-http.mjs';
 
 // sendJson's strict Http response param is wider than the transport's loose
@@ -202,6 +202,12 @@ export function makeRequestHandler(source     , { principalOf = anonymousPrincip
   // the framework default wraps the row-grant so behavior is unchanged. The
   // route gate AND the REST CRUD dispatch below both consult this one adapter.
   const authorizationAdapter                       = authorization ?? createAuthorizationAdapter();
+  // The framework-owned query/search routes read the injected adapter from the
+  // app (app._authorization, see routeAuthorization in http-framework-routes).
+  // Stash it here too so a directly constructed handler — with no listen() —
+  // consults the SAME instance for its route gate and row admission. An
+  // un-injected server keeps its framework default; this adds no second engine.
+  if (isApp && authorization) (source       )._authorization = authorization;
 
   // The operation category label a route-gate admission carries (informational
   // metadata on the decision; the per-verb gate function is the authority).
@@ -366,6 +372,26 @@ export function makeRequestHandler(source     , { principalOf = anonymousPrincip
       match: (req     , _url     ) => isApp && req.method === 'POST' && source.jobs,
       handle: async (req     , res     ) => {
         const handled = await handleJobRoute(source, req, res);
+        return handled || responseHasStarted(res);
+      },
+    },
+    // Query / query-family / search endpoints (#312): POST /query/:entity,
+    // POST /query-families/:name, POST /search. Framework-owned (like /blobs and
+    // /snapshot), each running the SAME admission collapse and authorization
+    // adapter as REST (route gate + row/hit admission) before returning the
+    // compiled read/search result.
+    {
+      match: (req     , url     ) => isApp && req.method === 'POST'
+        && (url.pathname === '/search'
+          || url.pathname.startsWith('/query/')
+          || url.pathname.startsWith('/query-families/')),
+      handle: async (req     , res     ) => {
+        const principal = principalOfAdmitted(req);
+        if (await handleQueryRoute(source, req, res, principal)) return true;
+        if (responseHasStarted(res)) return true;
+        if (await handleQueryFamilyRoute(source, req, res, principal)) return true;
+        if (responseHasStarted(res)) return true;
+        const handled = await handleSearchRoute(source, req, res, principal);
         return handled || responseHasStarted(res);
       },
     },

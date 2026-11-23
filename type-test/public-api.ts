@@ -44,6 +44,8 @@ import {
 import {
   LiveChannel, LiveList, WorkbenchFailureError, createAuthClient, createLiveStore,
   createLiveDeliverySession, createScopeLiveStore, decodeResult, materializeAnnotatedTextSnapshot,
+  createQueryClient,
+  type QueryClient, type QueryEntityRequest, type QuerySearchRequest, type QuerySearchResponse,
   type EventsSinceResponse, type LiveDeliveryCursor as ClientLiveDeliveryCursor, type LiveDeliverySession, type LiveStore, type ScopeLiveStore, type SnapshotResponse,
   type StaleResponse, type WsEnvelope,
   type LiveDeliverySettlement, type ScopeDispatchResult,
@@ -647,7 +649,10 @@ const channel = new LiveChannel('https://example.test', {
   socketFactory: (url) => new WebSocket(url),
 });
 const liveFailureError = new WorkbenchFailureError(expectedFailure);
-const liveFailure: WorkbenchFailure = liveFailureError.failure;
+// The browser client recognizes one more failure category than this server
+// declaration lists (`not-acceptable`, #256 parity), so compare the shared
+// failure surface rather than the wider category union.
+const liveFailure: Omit<WorkbenchFailure, 'category'> = liveFailureError.failure;
 channel.subscribe('Project', 'project-1', {
   fields: { cursor: true },
   pace: { profile: '15fps' },
@@ -978,3 +983,53 @@ const clientQuery: ClientQueryFamilyRequest = {
 declare const clientQueryPage: ClientQueryPage;
 const clientQueryTotal: number | undefined = clientQueryPage.total;
 void [clientQuery, clientQueryTotal];
+
+// ── createQueryClient (#312) ───────────────────────────────────────────────
+// The client SDK exposes the framework's query/search HTTP endpoints. These
+// assertions pin the request/response shapes and the three method signatures.
+const queryClient: QueryClient = createQueryClient({ baseUrl: 'https://example.test' });
+const entityQueryRequest: QueryEntityRequest = {
+  sort: { field: 'id', direction: 'asc' },
+  pageSize: 10,
+  where: { kind: 'and', children: [
+    { kind: 'term', field: 'status', op: 'eq', value: 'open' },
+    { kind: 'not', child: { kind: 'term', field: 'archived', op: 'eq', value: true } },
+  ] },
+  includeCount: true,
+  includeTotal: true,
+};
+const entityQueryPage: Promise<ClientQueryPage> = queryClient.queryEntity('Note', entityQueryRequest);
+const familyQueryPage: Promise<ClientQueryPage> = queryClient.queryFamily('note-facets', {
+  pageSize: 10,
+  sort: { field: 'id', direction: 'asc' },
+  dynamicFilters: [{ fieldId: 'f-status', op: 'eq', value: 'open' }],
+});
+// The Row generic types page.rows, not just the page envelope: a caller-supplied
+// row shape must surface on each row's declared fields.
+interface NoteQueryRow extends Record<string, unknown> {
+  readonly id: string;
+  readonly title: string;
+}
+const typedEntityPage: Promise<ClientQueryPage<NoteQueryRow>> = queryClient.queryEntity<NoteQueryRow>('Note', entityQueryRequest);
+const typedFamilyPage: Promise<ClientQueryPage<NoteQueryRow>> = queryClient.queryFamily<NoteQueryRow>('note-facets', {
+  pageSize: 10,
+  sort: { field: 'id', direction: 'asc' },
+});
+const typedEntityTitles: Promise<string[]> = typedEntityPage.then((page) => page.rows.map((row) => row.title));
+const typedFamilyTitles: Promise<string[]> = typedFamilyPage.then((page) => page.rows.map((row) => row.title));
+const ftsSearchRequest: QuerySearchRequest = { mode: 'fts', index: 'note-fts', query: 'hello', limit: 5, scopeId: 'project-1' };
+const hybridSearchRequest: QuerySearchRequest = {
+  mode: 'hybrid',
+  sources: { fts: 'note-fts', vector: 'note-vec' },
+  query: 'hello',
+  vector: [1, 0, 0],
+  model: 'embed-v1',
+  weights: { fts: 1, vector: 1 },
+  k: 60,
+  limit: 3,
+};
+const querySearchResponse: Promise<QuerySearchResponse> = queryClient.search(ftsSearchRequest);
+const queryHybridResponse: Promise<QuerySearchResponse> = queryClient.search(hybridSearchRequest, { signal: new AbortController().signal });
+// @ts-expect-error search modes are a closed union
+queryClient.search({ mode: 'semantic' });
+void [queryClient, entityQueryPage, familyQueryPage, typedEntityPage, typedFamilyPage, typedEntityTitles, typedFamilyTitles, querySearchResponse, queryHybridResponse];

@@ -14,8 +14,52 @@
 // index, per-sub-cell diff) lands in Phase 2 — registered here as named wholes
 // whose diff produces element-level deltas (consult #18/#20).
 
-import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
+import { randomBytes, scrypt, scryptSync, timingSafeEqual, type ScryptOptions } from 'node:crypto';
 import { tryBetterAuthHash } from './hash-compat.ts';
+
+const NATIVE_SCRYPT_PREFIX = 'scrypt:';
+const LEGACY_HEX_HASH_RE = /^[0-9a-f]+:[0-9a-f]{128}$/i;
+
+function scryptAsync(
+  password: string,
+  salt: Buffer | string,
+  keylen: number,
+  options?: ScryptOptions,
+): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const callback = (err: Error | null, derivedKey: Buffer) => {
+      if (err) reject(err);
+      else resolve(derivedKey);
+    };
+    if (options) scrypt(password, salt, keylen, options, callback);
+    else scrypt(password, salt, keylen, callback);
+  });
+}
+
+function parsePrefixedNativeHash(stored: string): { salt: Buffer; expected: Buffer } | null {
+  const body = stored.slice(NATIVE_SCRYPT_PREFIX.length);
+  const sep = body.indexOf(':');
+  if (sep <= 0) return null;
+  const saltHex = body.slice(0, sep);
+  const expectedHex = body.slice(sep + 1);
+  if (saltHex.length === 0 || saltHex.length % 2 !== 0 || !/^[0-9a-f]+$/i.test(saltHex)) return null;
+  if (expectedHex.length !== 128 || !/^[0-9a-f]+$/i.test(expectedHex)) return null;
+  const salt = Buffer.from(saltHex, 'hex');
+  const expected = Buffer.from(expectedHex, 'hex');
+  if (salt.length === 0 || expected.length !== 64) return null;
+  return { salt, expected };
+}
+
+function parseLegacyHexHash(stored: string): { saltHex: string; salt: Buffer; expected: Buffer } | null {
+  if (!LEGACY_HEX_HASH_RE.test(stored)) return null;
+  const sep = stored.indexOf(':');
+  const saltHex = stored.slice(0, sep);
+  if (saltHex.length === 0 || saltHex.length % 2 !== 0) return null;
+  const salt = Buffer.from(saltHex, 'hex');
+  const expected = Buffer.from(stored.slice(sep + 1), 'hex');
+  if (salt.length === 0 || expected.length !== 64) return null;
+  return { saltHex, salt, expected };
+}
 
 // A field descriptor as the strategy table sees it: kind, value type, and the
 // option surface the validate/serialize seams read. Kept loose — the descriptor
@@ -274,12 +318,12 @@ export const STRATEGIES: Readonly<Record<string, FieldStrategy>> = Object.freeze
       return { set: next };
     },
     // serialize digests the plaintext: random 16-byte salt + scrypt(64) →
-    // `saltHex:digestHex`. null/undefined pass through (a null cell is null).
+    // `scrypt:saltHex:digestHex`. null/undefined pass through (a null cell is null).
     serialize(value: unknown) {
       if (value === null || value === undefined) return value;
       const salt = randomBytes(16);
       const digest = scryptSync(value as string, salt, 64);
-      return `${salt.toString('hex')}:${digest.toString('hex')}`;
+      return `${NATIVE_SCRYPT_PREFIX}${salt.toString('hex')}:${digest.toString('hex')}`;
     },
   }),
 
@@ -540,23 +584,71 @@ export function deserializeField(descriptor: FieldDescriptor, value: unknown): u
   return strategy.deserialize(value, descriptor);
 }
 
+// hashPasswordAsync(plaintext) — non-blocking password hashing using promisified
+// crypto.scrypt. Produces the prefixed native `scrypt:saltHex:digestHex` format
+// so verification never falls through to legacy better-auth scrypt on mismatch.
+export async function hashPasswordAsync(plaintext: string): Promise<string> {
+  const salt = randomBytes(16);
+  const digest = await scryptAsync(plaintext, salt, 64);
+  return `${NATIVE_SCRYPT_PREFIX}${salt.toString('hex')}:${digest.toString('hex')}`;
+}
+
 // verifyHash(candidate, stored) — the one-way check behind a hydrated hash
 // field's `.verify(plaintext)`. Recomputes scrypt over the candidate with the
 // stored salt and compares in constant time. Fail closed: a missing/malformed
 // stored cell, or a non-string candidate, is `false` (never a thrown 500 on the
 // login path, never a permissive default).
+//
+// Format gating: prefixed `scrypt:<saltHex>:<digestHex>` hashes execute exactly
+// one native scrypt run and never fall back to better-auth's legacy profile.
+// Only unprefixed legacy `hexSalt:hexDigest` cells are eligible for the
+// better-auth fallback.
 export function verifyHash(candidate: unknown, stored: unknown): boolean {
   if (typeof candidate !== 'string' || typeof stored !== 'string') return false;
-  const sep = stored.indexOf(':');
-  if (sep <= 0) return false;
-  const salt = Buffer.from(stored.slice(0, sep), 'hex');
-  const expected = Buffer.from(stored.slice(sep + 1), 'hex');
-  if (salt.length === 0 || expected.length !== 64) return false;
-  const actual = scryptSync(candidate, salt, expected.length);
-  if (timingSafeEqual(actual, expected)) return true;
+  if (stored.startsWith(NATIVE_SCRYPT_PREFIX)) {
+    const parsed = parsePrefixedNativeHash(stored);
+    if (!parsed) return false;
+    const actual = scryptSync(candidate, parsed.salt, parsed.expected.length);
+    return timingSafeEqual(actual, parsed.expected);
+  }
+  const legacy = parseLegacyHexHash(stored);
+  if (!legacy) return false;
+  const actual = scryptSync(candidate, legacy.salt, legacy.expected.length);
+  if (timingSafeEqual(actual, legacy.expected)) return true;
 
-  return tryBetterAuthHash(candidate, stored, expected);
+  return tryBetterAuthHash(candidate, stored, legacy.expected);
 }
+
+// verifyHashAsync(candidate, stored) — non-blocking counterpart to verifyHash
+// using promisified crypto.scrypt so login routes do not block the event loop.
+export async function verifyHashAsync(candidate: unknown, stored: unknown): Promise<boolean> {
+  if (typeof candidate !== 'string' || typeof stored !== 'string') return false;
+  if (stored.startsWith(NATIVE_SCRYPT_PREFIX)) {
+    const parsed = parsePrefixedNativeHash(stored);
+    if (!parsed) return false;
+    const actual = await scryptAsync(candidate, parsed.salt, parsed.expected.length);
+    return timingSafeEqual(actual, parsed.expected);
+  }
+  const legacy = parseLegacyHexHash(stored);
+  if (!legacy) return false;
+  const actual = await scryptAsync(candidate, legacy.salt, legacy.expected.length);
+  if (timingSafeEqual(actual, legacy.expected)) return true;
+
+  const legacyDigest = await scryptAsync(
+    candidate.normalize('NFKC'),
+    legacy.saltHex,
+    legacy.expected.length,
+    {
+      N: 16384,
+      r: 16,
+      p: 1,
+      maxmem: 128 * 16384 * 16 * 2,
+    },
+  );
+  return timingSafeEqual(legacyDigest, legacy.expected);
+}
+
+export const verifyAsync = verifyHashAsync;
 
 // Pipeline stage 1 — validate. Runs each payload key against the field-option
 // rules the payload itself can decide (readonly, required-clear), then its

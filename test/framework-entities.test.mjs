@@ -24,7 +24,7 @@ import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 
 import workbench, { User } from '../build/internal.mjs';
-import { sessionPrincipalOf, SESSION_COOKIE } from '../build/auth/session.mjs';
+import { sessionPrincipalOf, hashSessionToken, SESSION_COOKIE } from '../build/auth/session.mjs';
 
 // Seed the two framework tables. The framework does not generate DDL in Phase 1;
 // the app/test harness owns CREATE TABLE. The Session schema is exactly the shape
@@ -143,8 +143,9 @@ test('a minted link session resolves to a link principal through sessionPrincipa
 test('Session.delete(id) removes the session row', () => {
   const app = bootApp();
   const session = app.entity(Session).create({ userId: 'alice' });
-  const row = app.entity(Session).findOne(Session.token.is(session.token));
+  const tokenHash = hashSessionToken(session.token);
+  const row = app.entity(Session).findOne(Session.token.is(tokenHash));
   assert.ok(row);
   app.entity(Session).delete(row.id);
-  assert.equal(app.entity(Session).findOne(Session.token.is(session.token)), null);
+  assert.equal(app.entity(Session).findOne(Session.token.is(tokenHash)), null);
 });

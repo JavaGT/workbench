@@ -93,7 +93,7 @@ async function enrollAndEnable(origin, cookie) {
   const verifyRes = await fetch(`${origin}/auth/totp/verify`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', cookie },
-    body: JSON.stringify({ token: hotp(secret, counter) }),
+    body: JSON.stringify({ token: hotp(secret, counter - 1) }),
   });
   if (verifyRes.status !== 200) {
     throw new Error(`verify failed: ${verifyRes.status} ${await verifyRes.text()}`);
@@ -463,8 +463,9 @@ test('enroll → verify → disable round-trip', async (t) => {
   assert.equal(enrollRes.status, 201);
   const { secret } = await enrollRes.json();
 
-  // 2. Verify with a valid TOTP token
-  const validToken = currentTotpToken(secret);
+  // 2. Verify with a valid TOTP token (previous step so disable can advance to current step without triggering replay guard)
+  const counter = Math.floor((Date.now() / 1000) / 30);
+  const validToken = hotp(secret, counter - 1);
   const verifyRes = await fetch(`${origin}/auth/totp/verify`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', cookie },
@@ -474,8 +475,8 @@ test('enroll → verify → disable round-trip', async (t) => {
   const verifyBody = await verifyRes.json();
   assert.equal(verifyBody.verified, true);
 
-  // 3. Disable with a valid TOTP token
-  const disableToken = currentTotpToken(secret);
+  // 3. Disable with a fresh TOTP token
+  const disableToken = hotp(secret, counter);
   const disableRes = await fetch(`${origin}/auth/totp/disable`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', cookie },
@@ -765,7 +766,7 @@ test('authenticate fails when the challenge is bound to a user with no enabled T
   const regRes = await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice', password: 'pw' }),
+    body: JSON.stringify({ username: 'alice', password: 'password12' }),
   });
   assert.equal(regRes.status, 201);
   const aliceId = (await regRes.json()).user.id;
@@ -1408,14 +1409,14 @@ test('enroll TOTP for another user is not possible (only own 2FA)', async (t) =>
   const res1 = await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice', password: 'pw' }),
+    body: JSON.stringify({ username: 'alice', password: 'password12' }),
   });
   const aliceCookie = `sid=${sidFromSetCookie(res1.headers.get('set-cookie'))}`;
 
   const res2 = await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'bob', password: 'pw' }),
+    body: JSON.stringify({ username: 'bob', password: 'password12' }),
   });
   const bobCookie = `sid=${sidFromSetCookie(res2.headers.get('set-cookie'))}`;
 
@@ -1438,7 +1439,7 @@ test('enroll TOTP for another user is not possible (only own 2FA)', async (t) =>
   const aliceLogin = await fetch(`${origin}/auth/login`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice', password: 'pw' }),
+    body: JSON.stringify({ username: 'alice', password: 'password12' }),
   });
   const aliceLoginBody = await aliceLogin.json();
   assert.equal(aliceLoginBody.requiresTotp, true);
@@ -1451,7 +1452,7 @@ test('enroll TOTP for another user is not possible (only own 2FA)', async (t) =>
   const bobLogin = await fetch(`${origin}/auth/login`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'bob', password: 'pw' }),
+    body: JSON.stringify({ username: 'bob', password: 'password12' }),
   });
   assert.equal(bobLogin.status, 201);
   const bobBody = await bobLogin.json();

@@ -15,7 +15,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import workbench from '../build/app.mjs';
-import { SESSION_COOKIE } from '../build/auth/session.mjs';
+import { hashSessionToken, SESSION_COOKIE } from '../build/auth/session.mjs';
 import { createAuthClient } from '../public/workbench-client.mjs';
 
 // An owner-scoped Note: the default-on route gate admits a user, the row grant
@@ -60,7 +60,7 @@ test('register sets a fail-closed Set-Cookie (HttpOnly, SameSite=Lax, Path=/)', 
   const res = await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice', password: 'hunter2' }),
+    body: JSON.stringify({ username: 'alice', password: 'hunter22' }),
   });
   assert.equal(res.status, 201);
   const cookie = res.headers.get('set-cookie');
@@ -83,7 +83,7 @@ test('login never creates an unknown user', async (t) => {
   const res = await fetch(`${origin}/auth/login`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'unknown', password: 'hunter2' }),
+    body: JSON.stringify({ username: 'unknown', password: 'hunter22' }),
   });
   assert.equal(res.status, 401);
   assert.equal(res.headers.get('set-cookie'), null);
@@ -102,7 +102,7 @@ test('an active login lockout answers exactly like a wrong password', async (t) 
   assert.equal((await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice', password: 'hunter2' }),
+    body: JSON.stringify({ username: 'alice', password: 'hunter22' }),
   })).status, 201);
 
   // Three consecutive failures arm the lock; the fourth attempt meets it.
@@ -126,7 +126,7 @@ test('an active login lockout answers exactly like a wrong password', async (t) 
 
   // The lock still refuses the attempt — including a CORRECT password — for
   // its whole window. Uniform copy must not weaken the rate limit.
-  const correctWhileLocked = await login('alice', 'hunter2');
+  const correctWhileLocked = await login('alice', 'hunter22');
   assert.equal(correctWhileLocked.status, 401, 'an active lock refuses even the correct password');
   assert.equal(correctWhileLocked.headers.get('set-cookie'), null);
 });
@@ -136,7 +136,7 @@ test('register rejects an existing identity without minting a session', async (t
   const register = () => fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice', password: 'hunter2' }),
+    body: JSON.stringify({ username: 'alice', password: 'hunter22' }),
   });
   assert.equal((await register()).status, 201);
   const duplicate = await register();
@@ -152,7 +152,7 @@ test('a subsequent request carrying the cookie hydrates a user principal (owner 
   const loginRes = await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice', password: 'hunter2' }),
+    body: JSON.stringify({ username: 'alice', password: 'hunter22' }),
   });
   const cookie = `sid=${sidFromSetCookie(loginRes.headers.get('set-cookie'))}`;
 
@@ -181,7 +181,7 @@ test('wrong password → 401 and no cookie', async (t) => {
   await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice', password: 'hunter2' }),
+    body: JSON.stringify({ username: 'alice', password: 'hunter22' }),
   });
   // a wrong-password login is rejected and mints nothing
   const res = await fetch(`${origin}/auth/login`, {
@@ -203,7 +203,7 @@ test('login after an expired lock does not instantly relock (wrong password → 
   await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice', password: 'hunter2' }),
+    body: JSON.stringify({ username: 'alice', password: 'hunter22' }),
   });
   // Arm an EXPIRED lock: the pre-lock failed-attempt counter is stale and the
   // lock time has passed. The next wrong password must restart the series, not
@@ -224,7 +224,7 @@ test('login after an expired lock does not instantly relock (wrong password → 
   const ok = await fetch(`${origin}/auth/login`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice', password: 'hunter2' }),
+    body: JSON.stringify({ username: 'alice', password: 'hunter22' }),
   });
   assert.equal(ok.status, 201);
   assert.ok(ok.headers.get('set-cookie'));
@@ -235,7 +235,7 @@ test('logout deletes the session and clears the cookie; the old cookie is anonym
   const loginRes = await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice', password: 'hunter2' }),
+    body: JSON.stringify({ username: 'alice', password: 'hunter22' }),
   });
   const cookieValue = sidFromSetCookie(loginRes.headers.get('set-cookie'));
   const cookie = `sid=${cookieValue}`;
@@ -276,8 +276,8 @@ test('.auth() on a db-less app throws at construction (fail closed, loud)', () =
 test('createAuthClient.login returns the user and propagates errors', async (t) => {
   const { origin } = await boot(t);
   const client = createAuthClient({ baseUrl: origin });
-  await client.register('alice', 'hunter2');
-  const result = await client.login('alice', 'hunter2');
+  await client.register('alice', 'hunter22');
+  const result = await client.login('alice', 'hunter22');
   assert.equal(result.user.username, 'alice');
   // a wrong-password login throws with the server's error message
   await assert.rejects(() => client.login('alice', 'wrong'), /bad credentials/i);
@@ -291,7 +291,7 @@ test('createAuthClient.logout clears the session', async (t) => {
   const loginRes = await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice', password: 'hunter2' }),
+    body: JSON.stringify({ username: 'alice', password: 'hunter22' }),
   });
   const cookieValue = sidFromSetCookie(loginRes.headers.get('set-cookie'));
   const client = createAuthClient({
@@ -314,7 +314,7 @@ test('/auth/me returns the authenticated user profile', async (t) => {
   const loginRes = await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice', password: 'hunter2' }),
+    body: JSON.stringify({ username: 'alice', password: 'hunter22' }),
   });
   const cookie = `sid=${sidFromSetCookie(loginRes.headers.get('set-cookie'))}`;
 
@@ -338,10 +338,10 @@ test('/auth/me denies an expired session row before scheduled cleanup', async (t
   const loginRes = await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice', password: 'hunter2' }),
+    body: JSON.stringify({ username: 'alice', password: 'hunter22' }),
   });
   const cookie = `sid=${sidFromSetCookie(loginRes.headers.get('set-cookie'))}`;
-  app.db.prepare('UPDATE Session SET createdAt = ? WHERE token = ?').run(Date.now() - 7 * 86_400_000, cookie.slice('sid='.length));
+  app.db.prepare('UPDATE Session SET createdAt = ? WHERE token = ?').run(Date.now() - 7 * 86_400_000, hashSessionToken(cookie.slice('sid='.length)));
 
   const res = await fetch(`${origin}/auth/me`, { headers: { cookie } });
   assert.equal(res.status, 401);
@@ -352,7 +352,7 @@ test('/auth/me with email identity returns the email field', async (t) => {
   const loginRes = await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice@example.com', password: 'hunter2' }),
+    body: JSON.stringify({ username: 'alice@example.com', password: 'hunter22' }),
   });
   const cookie = `sid=${sidFromSetCookie(loginRes.headers.get('set-cookie'))}`;
 
@@ -373,14 +373,14 @@ test('/auth/change-password succeeds with a correct current password', async (t)
   const loginRes = await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice', password: 'hunter2' }),
+    body: JSON.stringify({ username: 'alice', password: 'hunter22' }),
   });
   const cookie = `sid=${sidFromSetCookie(loginRes.headers.get('set-cookie'))}`;
 
   const changeRes = await fetch(`${origin}/auth/change-password`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', cookie },
-    body: JSON.stringify({ currentPassword: 'hunter2', newPassword: 'newpw' }),
+    body: JSON.stringify({ currentPassword: 'hunter22', newPassword: 'newpw123' }),
   });
   assert.equal(changeRes.status, 204, 'password changed successfully');
 
@@ -388,14 +388,14 @@ test('/auth/change-password succeeds with a correct current password', async (t)
   const oldLogin = await fetch(`${origin}/auth/login`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice', password: 'hunter2' }),
+    body: JSON.stringify({ username: 'alice', password: 'hunter22' }),
   });
   assert.equal(oldLogin.status, 401, 'old password is rejected');
 
   const newLogin = await fetch(`${origin}/auth/login`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice', password: 'newpw' }),
+    body: JSON.stringify({ username: 'alice', password: 'newpw123' }),
   });
   assert.equal(newLogin.status, 201, 'new password is accepted');
 });
@@ -405,14 +405,14 @@ test('/auth/change-password returns 401 with a wrong current password', async (t
   const loginRes = await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice', password: 'hunter2' }),
+    body: JSON.stringify({ username: 'alice', password: 'hunter22' }),
   });
   const cookie = `sid=${sidFromSetCookie(loginRes.headers.get('set-cookie'))}`;
 
   const changeRes = await fetch(`${origin}/auth/change-password`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', cookie },
-    body: JSON.stringify({ currentPassword: 'wrong', newPassword: 'newpw' }),
+    body: JSON.stringify({ currentPassword: 'wrong', newPassword: 'newpw123' }),
   });
   assert.equal(changeRes.status, 401);
 });
@@ -422,21 +422,21 @@ test('/auth/change-password returns 400 with missing body fields', async (t) => 
   const loginRes = await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice', password: 'hunter2' }),
+    body: JSON.stringify({ username: 'alice', password: 'hunter22' }),
   });
   const cookie = `sid=${sidFromSetCookie(loginRes.headers.get('set-cookie'))}`;
 
   const noCurrent = await fetch(`${origin}/auth/change-password`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', cookie },
-    body: JSON.stringify({ newPassword: 'newpw' }),
+    body: JSON.stringify({ newPassword: 'newpw123' }),
   });
   assert.equal(noCurrent.status, 400);
 
   const noNew = await fetch(`${origin}/auth/change-password`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', cookie },
-    body: JSON.stringify({ currentPassword: 'hunter2' }),
+    body: JSON.stringify({ currentPassword: 'hunter22' }),
   });
   assert.equal(noNew.status, 400);
 });
@@ -466,7 +466,7 @@ test('identifyBy: a credential is matched against email first', async (t) => {
   const res = await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice@example.com', password: 'hunter2' }),
+    body: JSON.stringify({ username: 'alice@example.com', password: 'hunter22' }),
   });
   assert.equal(res.status, 201);
   const cookie = res.headers.get('set-cookie');
@@ -482,13 +482,13 @@ test('identifyBy: a second login with the same email verifies the password', asy
   await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice@example.com', password: 'hunter2' }),
+    body: JSON.stringify({ username: 'alice@example.com', password: 'hunter22' }),
   });
   // Correct password → 201 + cookie.
   const ok = await fetch(`${origin}/auth/login`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice@example.com', password: 'hunter2' }),
+    body: JSON.stringify({ username: 'alice@example.com', password: 'hunter22' }),
   });
   assert.equal(ok.status, 201);
   assert.ok(ok.headers.get('set-cookie'));
@@ -507,12 +507,12 @@ test('identifyBy: a credential matching no email falls through to username', asy
   // Seed a user directly in the username column (the SECOND identity field),
   // so the email lookup misses but the username lookup hits.
   const { User } = await import('../build/auth/entities.mjs');
-  app.entity(User).create({ username: 'bob', password: 'hunter2' });
+  app.entity(User).create({ username: 'bob', password: 'hunter22' });
   // A login with the bob username credential: no email match, username match.
   const res = await fetch(`${origin}/auth/login`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'bob', password: 'hunter2' }),
+    body: JSON.stringify({ username: 'bob', password: 'hunter22' }),
   });
   assert.equal(res.status, 201);
   assert.ok(res.headers.get('set-cookie'), 'username fall-through login mints a session');
@@ -538,7 +538,7 @@ test('identifyBy: an unknown field fails closed with a 500 at first login', asyn
   const res = await fetch(`http://127.0.0.1:${port}/auth/login`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice', password: 'hunter2' }),
+    body: JSON.stringify({ username: 'alice', password: 'hunter22' }),
   });
   assert.equal(res.status, 500, 'an unknown identity field fails closed, loudly');
 });
@@ -548,12 +548,12 @@ test('identifyBy: an unknown field fails closed with a 500 at first login', asyn
 test('identifyBy: email case folds for sign-in on a pre-existing account', async (t) => {
   const { origin, app } = await bootWithEmail(t);
   const { User } = await import('../build/auth/entities.mjs');
-  app.entity(User).create({ email: 'Ada.Lovelace@Example.com', password: 'hunter2' });
+  app.entity(User).create({ email: 'Ada.Lovelace@Example.com', password: 'hunter22' });
   for (const variant of ['ada.lovelace@example.com', 'ADA.LOVELACE@EXAMPLE.COM', 'Ada.Lovelace@Example.com']) {
     const res = await fetch(`${origin}/auth/login`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ username: variant, password: 'hunter2' }),
+      body: JSON.stringify({ username: variant, password: 'hunter22' }),
     });
     assert.equal(res.status, 201, `${variant} signs in`);
     assert.ok(res.headers.get('set-cookie'), `${variant} mints a session`);
@@ -579,13 +579,13 @@ test('identifyBy: registration rejects a case-variant of an existing email', asy
   const first = await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'Alice@Example.com', password: 'hunter2' }),
+    body: JSON.stringify({ username: 'Alice@Example.com', password: 'hunter22' }),
   });
   assert.equal(first.status, 201);
   const duplicate = await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice@example.com', password: 'hunter2' }),
+    body: JSON.stringify({ username: 'alice@example.com', password: 'hunter22' }),
   });
   assert.equal(duplicate.status, 409, 'a case variant is the same identity');
   const count = app.db.prepare('SELECT COUNT(*) AS n FROM User').get().n;

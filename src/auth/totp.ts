@@ -85,32 +85,68 @@ export function hotp(secret: string, counter: number): string {
   return String(otp).padStart(6, '0');
 }
 
+function safeEqualStrings(a: string, b: string): boolean {
+  const bufA = Buffer.from(a, 'utf8');
+  const bufB = Buffer.from(b, 'utf8');
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+// verifyTotpStep(secret, token, atTime) — verify a 6-digit token against the
+// stored base32 secret using constant-time comparison across the current 30s
+// window and ±1 adjacent windows (90s tolerance). Returns both validity and the
+// matched time-step counter so callers can enforce replay protection.
+export function verifyTotpStep(
+  secret: string,
+  token: string | number,
+  atTime: number = Date.now(),
+): { valid: boolean; counter: number | null } {
+  const raw = String(token).trim();
+  if (!/^\d{1,6}$/.test(raw)) return { valid: false, counter: null };
+  const candidate = raw.padStart(6, '0');
+  const T0 = 0;
+  const step = 30;
+  const counter = Math.floor((Math.floor(atTime / 1000) - T0) / step);
+  let matchedCounter: number | null = null;
+  for (let i = -1; i <= 1; i++) {
+    const expected = hotp(secret, counter + i);
+    if (safeEqualStrings(expected, candidate)) {
+      matchedCounter = counter + i;
+    }
+  }
+  return { valid: matchedCounter !== null, counter: matchedCounter };
+}
+
 // verifyTotp(secret, token) — verify a 6-digit token against the stored base32
 // secret. Accepts the current 30s window AND ±1 adjacent windows (90s tolerance).
 // Returns true iff the token matches any of the three windows.
 export function verifyTotp(secret: string, token: string | number, atTime: number = Date.now()): boolean {
-  const T0 = 0;
-  const step = 30;
-  const counter = Math.floor((Math.floor(atTime / 1000) - T0) / step);
-  for (let i = -1; i <= 1; i++) {
-    if (hotp(secret, counter + i) === String(token).padStart(6, '0')) {
-      return true;
-    }
-  }
-  return false;
+  return verifyTotpStep(secret, token, atTime).valid;
 }
 
 // ---- secret generation --------------------------------------------------------
 
-// generateSecret(username) → { secret, uri }
+// generateSecret(username, issuerOrOptions) → { secret, uri }
 // Generates 20 random bytes, base32-encodes them (RFC 4648, no padding), and
 // builds an otpauth:// URI for QR-code display. The URI uses the standard
-// TOTP params: SHA1, 6 digits, 30s period, issuer=workbench.
-export function generateSecret(username = 'user'): { secret: string; uri: string } {
+// TOTP params: SHA1, 6 digits, 30s period, and a configurable issuer
+// (defaulting to 'workbench').
+export function generateSecret(
+  username = 'user',
+  issuerOrOptions?: string | { issuer?: string },
+): { secret: string; uri: string } {
+  const rawIssuer = typeof issuerOrOptions === 'string'
+    ? issuerOrOptions
+    : issuerOrOptions?.issuer;
+  const issuer = typeof rawIssuer === 'string' && rawIssuer.trim().length > 0
+    ? rawIssuer.trim()
+    : 'workbench';
   const bytes = crypto.randomBytes(20);
   const secret = base32Encode(bytes);
   const encodedUsername = encodeURIComponent(username);
-  const uri = `otpauth://totp/Workbench:${encodedUsername}?secret=${secret}&issuer=workbench&algorithm=SHA1&digits=6&period=30`;
+  const encodedIssuer = encodeURIComponent(issuer);
+  const labelIssuer = issuer === 'workbench' ? 'Workbench' : encodedIssuer;
+  const uri = `otpauth://totp/${labelIssuer}:${encodedUsername}?secret=${secret}&issuer=${encodedIssuer}&algorithm=SHA1&digits=6&period=30`;
   return { secret, uri };
 }
 
@@ -132,14 +168,28 @@ export function generateBackupCodes(n = 8): { plainCodes: string[]; hashedCodes:
 }
 
 // verifyBackupCode(hashedCodes, code) → boolean
-// Compares the SHA-256 of the input code against the stored hashes. On match,
-// the consumed code is removed from the array (one-time use). Returns false if
-// the code is not in the stored set. The `hashedCodes` array is MUTATED in place
-// — callers must persist the updated array.
+// Compares the SHA-256 of the input code against all stored hashes in constant
+// time via `crypto.timingSafeEqual`. On match, the consumed code is removed
+// from the array (one-time use). Returns false if the code is not in the stored
+// set. The `hashedCodes` array is MUTATED in place — callers must persist the
+// updated array.
 export function verifyBackupCode(hashedCodes: string[], code: string): boolean {
-  const hash = sha256hex(code);
-  const idx = hashedCodes.indexOf(hash);
-  if (idx === -1) return false;
-  hashedCodes.splice(idx, 1);
+  if (typeof code !== 'string' || code.length === 0 || !Array.isArray(hashedCodes)) {
+    return false;
+  }
+  const candidateBuf = Buffer.from(sha256hex(code), 'hex');
+  let matchedIdx = -1;
+  for (let i = 0; i < hashedCodes.length; i++) {
+    const entry = hashedCodes[i];
+    if (typeof entry !== 'string' || entry.length !== 64 || !/^[0-9a-f]{64}$/i.test(entry)) {
+      continue;
+    }
+    const entryBuf = Buffer.from(entry, 'hex');
+    if (entryBuf.length === candidateBuf.length && crypto.timingSafeEqual(entryBuf, candidateBuf)) {
+      matchedIdx = i;
+    }
+  }
+  if (matchedIdx === -1) return false;
+  hashedCodes.splice(matchedIdx, 1);
   return true;
 }

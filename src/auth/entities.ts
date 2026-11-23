@@ -27,6 +27,7 @@ import { grant, deny, read, write, subscribe } from '../grant.ts';
 import { schedule, schedulerSource } from '../schedule.ts';
 import { config } from '../config.ts';
 import { generateSecret, generateBackupCodes } from './totp.ts';
+import { hashSessionToken } from './session.ts';
 import type { Principal } from '../principal.ts';
 
 // The check-execution context the grant `.can` bodies and `checks` functions
@@ -98,16 +99,21 @@ interface SessionPayload {
 }
 
 function mintSession(payload: SessionPayload | null | undefined, { insert, mintToken }: SessionMintContext): unknown {
-  const token = mintToken();
+  const plainToken = mintToken();
+  const tokenHash = hashSessionToken(plainToken);
   const now = Date.now();
   if (payload && typeof payload.userId !== 'undefined') {
-    return insert({ token, principalType: 'user', principalId: String(payload.userId), createdAt: now });
+    const row = insert({ token: tokenHash, principalType: 'user', principalId: String(payload.userId), createdAt: now }) as Record<string, unknown>;
+    // Return the plain opaque token ONCE for the Set-Cookie header; only the
+    // SHA-256 digest is persisted in `Session.token`.
+    return { ...row, token: plainToken };
   }
   if (payload && payload.kind === 'link' && typeof payload.token !== 'undefined') {
     // The link principal carries WHICH share granted it: the incoming share
     // token (the grant identity), not the doc id. A fresh session token is minted
     // for the cookie; the share token becomes the principal id.
-    return insert({ token, principalType: 'link', principalId: String(payload.token), createdAt: now });
+    const row = insert({ token: tokenHash, principalType: 'link', principalId: String(payload.token), createdAt: now }) as Record<string, unknown>;
+    return { ...row, token: plainToken };
   }
   throw new Error(
     `Session.create accepts a closed set of session intents: { userId } for a ` +
@@ -248,7 +254,7 @@ interface InvitationPayload {
 
 function mintInvitation(payload: InvitationPayload, { insert }: InsertContext): unknown {
   const token = payload.token || randomBytes(32).toString('base64url');
-  const now = new Date();
+  const now = new Date().toISOString();
   return insert({
     token,
     targetEntity: payload.targetEntity,
@@ -323,7 +329,7 @@ function mintApiKey(payload: ApiKeyPayload, { insert }: InsertContext): unknown 
   const plainToken = randomBytes(32).toString('base64url');
   const tokenHash = sha256hex(plainToken);
   const prefix = plainToken.slice(0, 8);
-  const now = new Date();
+  const now = new Date().toISOString();
   const row = insert({
     tokenHash,
     prefix,
@@ -367,10 +373,11 @@ export const ApiKey = entity('ApiKey', {
 interface TotpPayload {
   username: string;
   userId: unknown;
+  issuer?: string;
 }
 
 function enrollTotp(payload: TotpPayload, { insert }: InsertContext): unknown {
-  const { secret, uri } = generateSecret(payload.username);
+  const { secret, uri } = generateSecret(payload.username, payload.issuer);
   const { plainCodes, hashedCodes } = generateBackupCodes(8);
   const row = insert({
     userId: payload.userId,
@@ -395,6 +402,7 @@ export const TwoFactor = entity('TwoFactor', {
   // auth/lockout.mjs for testability without standing up HTTP.
   totpFailedAttempts: number({ optional: true }),
      totpLockedUntil: number({ optional: true }),
+     lastTotpCounter: number({ optional: true }),
 
   grant: () => [notRequestReadable('TwoFactor')],
   create: enrollTotp,

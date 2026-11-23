@@ -266,7 +266,7 @@ test('verifyAuthentication accepts a valid assertion', () => {
 
   const authData = buildAuthenticatorData({
     rpIdHash: buildRpIdHash(rp.id),
-    flags: 0x01, // UP only
+    flags: 0x05, // UP + UV
     signCount: 1,
   });
 
@@ -305,7 +305,7 @@ test('verifyAuthentication rejects bad signature', () => {
 
   const authData = buildAuthenticatorData({
     rpIdHash: buildRpIdHash(rp.id),
-    flags: 0x01,
+    flags: 0x05,
     signCount: 1,
   });
 
@@ -347,7 +347,7 @@ test('verifyAuthentication rejects counter ≤ stored counter (replay protection
 
   const authData = buildAuthenticatorData({
     rpIdHash: buildRpIdHash(rp.id),
-    flags: 0x01,
+    flags: 0x05,
     signCount: 1,
   });
 
@@ -376,7 +376,7 @@ test('verifyAuthentication rejects counter ≤ stored counter (replay protection
   // Both zero is allowed (first use)
   const authDataZero = buildAuthenticatorData({
     rpIdHash: buildRpIdHash(rp.id),
-    flags: 0x01,
+    flags: 0x05,
     signCount: 0,
   });
   const sigZero = signAssertion(keypair.privateKey, authDataZero, clientDataJSON);
@@ -521,7 +521,7 @@ test('passkey register + authenticate + list + delete round-trip', async (t) => 
 
   const authAuthData = buildAuthenticatorData({
     rpIdHash: buildRpIdHash(rp.id),
-    flags: 0x01,
+    flags: 0x05,
     signCount: 1,
   });
 
@@ -575,7 +575,7 @@ test('authenticate with a wrong credential ID fails', async (t) => {
   const loginRes = await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice', password: 'test' }),
+    body: JSON.stringify({ username: 'alice', password: 'testpass1' }),
   });
   const cookie = `sid=${sidFromSetCookie(loginRes.headers.get('set-cookie'))}`;
 
@@ -629,7 +629,7 @@ test('authenticate with an expired challenge fails', async (t) => {
   const clientDataJSON = buildClientDataJSON({ challenge, origin: rp.origin, type: 'webauthn.get' });
   const authData = buildAuthenticatorData({
     rpIdHash: buildRpIdHash(rp.id),
-    flags: 0x01,
+    flags: 0x05,
     signCount: 1,
   });
   const signature = signAssertion(keypair.privateKey, authData, clientDataJSON);
@@ -661,7 +661,7 @@ test('delete a credential that does not exist returns 404', async (t) => {
   const loginRes = await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'deletor', password: 'pw' }),
+    body: JSON.stringify({ username: 'deletor', password: 'password12' }),
   });
   const cookie = `sid=${sidFromSetCookie(loginRes.headers.get('set-cookie'))}`;
 
@@ -679,7 +679,7 @@ test('delete another user\'s credential returns 403', async (t) => {
   const aliceLogin = await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'alice', password: 'pw' }),
+    body: JSON.stringify({ username: 'alice', password: 'password12' }),
   });
   const aliceCookie = `sid=${sidFromSetCookie(aliceLogin.headers.get('set-cookie'))}`;
 
@@ -706,7 +706,7 @@ test('delete another user\'s credential returns 403', async (t) => {
   const bobLogin = await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'bob', password: 'pw' }),
+    body: JSON.stringify({ username: 'bob', password: 'password12' }),
   });
   const bobCookie = `sid=${sidFromSetCookie(bobLogin.headers.get('set-cookie'))}`;
 
@@ -724,7 +724,7 @@ test('authenticate mints a session cookie with correct attributes', async (t) =>
   const loginRes = await fetch(`${origin}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'user', password: 'pw' }),
+    body: JSON.stringify({ username: 'user', password: 'password12' }),
   });
   const cookie = `sid=${sidFromSetCookie(loginRes.headers.get('set-cookie'))}`;
 
@@ -749,7 +749,7 @@ test('authenticate mints a session cookie with correct attributes', async (t) =>
   const authChRes = await fetch(`${origin}/auth/passkey/challenge`);
   const { challenge: authCh } = await authChRes.json();
   const authCD = buildClientDataJSON({ challenge: authCh, origin: rp.origin, type: 'webauthn.get' });
-  const authAD = buildAuthenticatorData({ rpIdHash: buildRpIdHash(rp.id), flags: 0x01, signCount: 1 });
+  const authAD = buildAuthenticatorData({ rpIdHash: buildRpIdHash(rp.id), flags: 0x05, signCount: 1 });
   const authSig = signAssertion(keypair.privateKey, authAD, authCD);
 
   const authRes = await fetch(`${origin}/auth/passkey/authenticate`, {

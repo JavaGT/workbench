@@ -1,7 +1,6 @@
-import { DatabaseSync } from 'node:sqlite';
-
 import { generateDDL } from './ddl.ts';
 import { collectTableNamesFromDdl } from './schema-table-census.ts';
+import { openSqliteDatabase, type SqliteDatabase } from './sqlite-driver.ts';
 
 function quoteIdent(name: unknown): string {
   if (typeof name !== 'string' || name.length === 0 || name.includes('\0')) {
@@ -107,7 +106,7 @@ export interface SqliteStorageDescription {
   tables: SqliteTableDescription[];
 }
 
-function describeIndexes(db: DatabaseSync, tableName: string): SqliteIndexDescription[] {
+function describeIndexes(db: SqliteDatabase, tableName: string): SqliteIndexDescription[] {
   const rows = db.prepare(`PRAGMA index_list(${quoteIdent(tableName)})`).all() as unknown as IndexListRow[];
   return rows
     .map((row) => {
@@ -141,7 +140,7 @@ function describeIndexes(db: DatabaseSync, tableName: string): SqliteIndexDescri
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
-function describeForeignKeys(db: DatabaseSync, tableName: string): SqliteForeignKeyDescription[] {
+function describeForeignKeys(db: SqliteDatabase, tableName: string): SqliteForeignKeyDescription[] {
   const groups = new Map<number, SqliteForeignKeyDescription>();
   for (const row of db.prepare(`PRAGMA foreign_key_list(${quoteIdent(tableName)})`).all() as unknown as ForeignKeyRow[]) {
     let group = groups.get(row.id);
@@ -166,7 +165,7 @@ function describeForeignKeys(db: DatabaseSync, tableName: string): SqliteForeign
   });
 }
 
-function describeTable(db: DatabaseSync, tableName: string): SqliteTableDescription {
+function describeTable(db: SqliteDatabase, tableName: string): SqliteTableDescription {
   const schema = db
     .prepare("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?")
     .get(tableName) as { sql: string | null } | undefined;
@@ -201,7 +200,7 @@ function describeTable(db: DatabaseSync, tableName: string): SqliteTableDescript
   };
 }
 
-export function describeSqliteStorage(db: DatabaseSync, tableNames: readonly string[]): SqliteStorageDescription {
+export function describeSqliteStorage(db: SqliteDatabase, tableNames: readonly string[]): SqliteStorageDescription {
   if (!Array.isArray(tableNames)) throw new Error('tableNames must be an array');
   if (!tableNames.every((name) => typeof name === 'string' && name.length > 0)) {
     throw new Error('tableNames must contain only non-empty strings');
@@ -221,7 +220,7 @@ export function describeEntityStorage(entity: { name: string; fields?: unknown }
   const tableNames = collectTableNamesFromDdl(
     ddl.map((sql: string) => ({ source: `entity ${entity.name}`, sql })),
   );
-  const db = new DatabaseSync(':memory:');
+  const db = openSqliteDatabase(':memory:');
   try {
     for (const sql of ddl) db.exec(sql);
     return describeSqliteStorage(db, tableNames);

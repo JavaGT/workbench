@@ -11,9 +11,19 @@
 // coordinator) down to 'failed' so the normal prepare/rebuild paths pick the
 // work back up on the next boot.
 
-import { constants } from 'node:sqlite';
 import type { DbHandle } from './driver.ts';
 import { DERIVED_RESOURCE_TABLE_DDL, DERIVED_RESOURCE_TABLE_NAME } from './operational-ledger-ddl.ts';
+
+// Standard SQLite C API authorizer return and action codes (sqlite3.h),
+// matching `node:sqlite`'s `constants` without a direct runtime import so the
+// module loads cleanly on both Node and Bun.
+const SQLITE_OK = 0;
+const SQLITE_DENY = 1;
+const SQLITE_DELETE = 9;
+const SQLITE_INSERT = 18;
+const SQLITE_READ = 20;
+const SQLITE_SELECT = 21;
+const SQLITE_UPDATE = 23;
 
 export const DERIVED_RESOURCE_TABLE = DERIVED_RESOURCE_TABLE_NAME;
 export type DerivedResourceStatus = 'absent' | 'preparing' | 'current' | 'stale' | 'rebuilding' | 'failed';
@@ -120,10 +130,10 @@ export function createDerivedResourceRegistry({
     const execute = <T>(statement: DerivedResourceStatement, write: boolean, run: () => T): T => {
       if (!statement || typeof statement.sql !== 'string' || statement.sql.length === 0 || (statement.params !== undefined && !Array.isArray(statement.params))) throw new TypeError('derived resource statement requires SQL and optional array params');
       handle.setAuthorizer((action, arg1, _arg2, dbName) => {
-        if (dbName !== null && dbName !== 'main') return constants.SQLITE_DENY;
-        if (action === constants.SQLITE_READ || action === constants.SQLITE_SELECT) return constants.SQLITE_OK;
-        if (action === constants.SQLITE_INSERT || action === constants.SQLITE_UPDATE || action === constants.SQLITE_DELETE) return write && arg1 !== null && owned.has(arg1.toLowerCase()) ? constants.SQLITE_OK : constants.SQLITE_DENY;
-        return constants.SQLITE_DENY;
+        if (dbName !== null && dbName !== 'main') return SQLITE_DENY;
+        if (action === SQLITE_READ || action === SQLITE_SELECT) return SQLITE_OK;
+        if (action === SQLITE_INSERT || action === SQLITE_UPDATE || action === SQLITE_DELETE) return write && arg1 !== null && owned.has(arg1.toLowerCase()) ? SQLITE_OK : SQLITE_DENY;
+        return SQLITE_DENY;
       });
       try { return run(); } finally { handle.setAuthorizer(null); }
     };

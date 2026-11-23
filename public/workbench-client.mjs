@@ -2459,6 +2459,12 @@ export function createLiveDeliverySession({
   // legacy path — advertised capabilities are additive and ignorable.
   let deltaCapable = false;
   let status = 'bootstrapping';
+  // The last machine-readable reason a bootstrap retry reported (#252). Kept
+  // across the whole recovery cycle — including the terminal `unavailable`
+  // state — so a host can explain WHY authoring is blocked (capacity/lease
+  // exhaustion) instead of showing only generic recovery. Cleared only when a
+  // replacement snapshot is installed and the session returns to `live`.
+  let recoveryReason = null;
   let closed = false;
   let initialized = false;
   let reconnecting = false;
@@ -2508,6 +2514,10 @@ export function createLiveDeliverySession({
   // starts one (round 4: every control's recovery is captured and awaited —
   // see receive()).
   const MAX_SNAPSHOT_BOOTSTRAPS_PER_CYCLE = 4;
+  // Closed diagnostic vocabulary from the server's bootstrap retry results
+  // (client.d.ts `LiveRetryReason`). Unknown/absent reasons stay opaque: they
+  // never overwrite a known reason already held in recovery state.
+  const LIVE_RETRY_REASONS = new Set(['cursor-moved', 'fence-mismatch', 'lease-budget-exhausted', 'snapshot-contention']);
   let snapshotRecoveryFloor = null;
   let snapshotRecoveryRequested = false;
   let snapshotRecoveryRunning = false;
@@ -3442,6 +3452,11 @@ export function createLiveDeliverySession({
       return;
     }
     if (result.kind === 'retry') {
+      // #252: preserve the lease-capacity (or other) retry reason through
+      // recovery. It is additive diagnostics — retry timing is unchanged — but
+      // a host reading `session.recoveryReason` can now name the cause. A bare
+      // retry must not erase a more specific reason already observed.
+      if (LIVE_RETRY_REASONS.has(result.reason)) recoveryReason = result.reason;
       if (!(await waitForRecoveryRetry(retryAttempt)) || closed || status === 'revoked' || generation !== recoveryGeneration) return;
       if (mode === 'snapshot' && snapshotRecoveryCycle?.connectionGeneration !== connectionGeneration) return;
       return recover('snapshot', snapshotCursorFloor, retryAttempt + 1);
@@ -3475,6 +3490,7 @@ export function createLiveDeliverySession({
       // close or revoke this session, or start a superseding recovery. Never
       // install `live` over the transition it just made.
       if (closed || status === 'revoked' || status === 'unavailable' || generation !== recoveryGeneration) return;
+      recoveryReason = null;
       status = 'live';
       publish();
       if (closed || status === 'revoked' || generation !== recoveryGeneration) return;
@@ -3495,6 +3511,7 @@ export function createLiveDeliverySession({
       // close or revoke this session, or start a superseding recovery. Never
       // install `live` over the transition it just made.
       if (closed || status === 'revoked' || status === 'unavailable' || generation !== recoveryGeneration) return;
+      recoveryReason = null;
       status = 'live';
       publish();
       if (initialized && !reconnecting) settleAdmissions(true);
@@ -4056,6 +4073,10 @@ export function createLiveDeliverySession({
     get confirmedSnapshot() { return baseSnapshot; },
     get cursor() { return cursor; },
     get status() { return status; },
+    // #252: the last machine-readable bootstrap retry reason. Non-null while a
+    // recovery is held back by capacity/lease exhaustion, including the
+    // terminal `unavailable` state, and null once a snapshot is installed.
+    get recoveryReason() { return recoveryReason; },
     // Capability negotiation state (#156): true only while a patch-capable
     // bootstrap result is installed; hosting code and tests read this to
     // verify the response-gated handshake.
@@ -5090,7 +5111,13 @@ export function createAnnotatedTextHttpSession({ baseUrl, context, historySessio
     get family() { return displayFamily ?? familyReplica; },
     recoverFromUnresolvableRange,
     get history() { return session.history; },
+    // Declared on AnnotatedTextHttpSession in client.d.ts; hosts fence document
+    // history on the live-delivery session's optimistic operation count.
+    pendingCount() { return session.pendingCount(); },
     get status() { return session.status; },
+    // #252: forward the lease-capacity retry reason so a host can tell the user
+    // why authoring is blocked instead of showing generic recovery.
+    get recoveryReason() { return session.recoveryReason; },
     get ready() { return session.ready; },
     insert({ mutationId, at, text }) {
       const command = { kind: 'text.insert', mutationId, at, text };

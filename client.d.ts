@@ -716,6 +716,14 @@ export interface LiveDeliverySession<Snapshot, Payload = unknown> {
   /** The ledger handle minted by the last accepted patch-capable bootstrap/patch. */
   readonly projectionToken: string | null;
   readonly status: 'bootstrapping' | 'recovering' | 'catching-up' | 'live' | 'unavailable' | 'revoked';
+  /**
+   * Last machine-readable reason a bootstrap retry reported (#252), e.g.
+   * `lease-budget-exhausted` when every authoring lease is live. Non-null while
+   * recovery is held back for that reason (including the terminal `unavailable`
+   * state) and null once a replacement snapshot installs and the session is
+   * `live`. Additive diagnostics: retry timing is unchanged.
+   */
+  readonly recoveryReason: LiveRetryReason | null;
   readonly ready: Promise<void>;
   dispatch(type: string, payload: Payload, options?: { actionId?: string }): Promise<LiveDeliveryDispatchResult>;
   batch(actions: readonly LiveDeliveryBatchAction<Payload>[]): Promise<LiveDeliveryDispatchResult>;
@@ -848,9 +856,13 @@ export interface ScopeOperation<Payload = unknown> {
  *
  * The field is OPTIONAL because `createScopeLiveStore().dispatch` (the legacy
  * scope engine) never mints a settlement — it returns a bare receipt/value
- * result. The document-path producers always set it. Keeping it optional is the
- * least-risky shape: removing it would break the working doc-path result, and
- * minting settlements in the legacy scope engine would be a behavior change.
+ * result (verified by `test/client-sdk-contract.test.mjs`). The document-path
+ * producers — `applyAnnotation`, `applyAnnotationAction`,
+ * `removeAnnotationEntity`, `removeAnnotation` and the text edits — always set
+ * it: they return the live-delivery session's `LiveDeliveryDispatchResult`.
+ * Keeping it optional is the least-risky shape: removing it would break the
+ * working doc-path result, and minting settlements in the legacy scope engine
+ * would be a behavior change that changes the one-reconciliation-path contract.
  */
 export type ScopeDispatchResult =
   | { ok: true; status: 'committed'; opId: string; settlement?: LiveDeliverySettlement; value?: unknown }
@@ -1119,6 +1131,8 @@ export interface AnnotatedTextHttpSession {
   /** Number of optimistic document operations not yet reconciled by ingest. */
   pendingCount(): number;
   readonly status: LiveDeliverySession<AnnotatedTextDocument>['status'];
+  /** Forwarded from the live-delivery session: why authoring recovery is held back (#252). */
+  readonly recoveryReason: LiveRetryReason | null;
   readonly ready: Promise<void>;
   insert(input: { readonly mutationId?: string; readonly at: AnnotatedTextEditPosition; readonly text: string }): Promise<LiveDeliveryDispatchResult>;
   delete(input: { readonly mutationId?: string; readonly from: AnnotatedTextEditPosition; readonly to: AnnotatedTextEditPosition }): Promise<LiveDeliveryDispatchResult>;

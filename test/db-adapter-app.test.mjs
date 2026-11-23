@@ -10,6 +10,12 @@ import { DatabaseSync } from 'node:sqlite';
 import { entity, text, ref, grant, read, write, subscribe, scope } from '../build/index.mjs';
 import { createSqliteAdapter } from '../build/sqlite-adapter.mjs';
 import workbench from '../build/internal.mjs';
+import { SQLITE_RUNTIME } from '../build/sqlite-driver.mjs';
+
+function assertOpenHandle(db) {
+  if (SQLITE_RUNTIME === 'node') assert.ok(db instanceof DatabaseSync);
+  assert.equal(db.prepare('SELECT 1 AS value').get().value, 1);
+}
 
 // A minimal owned entity (the note.mjs floor), used to confirm a db accepted as
 // a conforming adapter yields a working app whose entity table is created.
@@ -29,7 +35,7 @@ test('workbench({ db: adapter }) defers the open and installs the handle at prep
   const app = workbench({ db: createSqliteAdapter({ mode: 'memory' }) }).mount('/notes', makeNote());
   assert.equal(app.db, null, 'no handle before the deferred open completes');
   await app.prepareSchema();
-  assert.ok(app.db instanceof DatabaseSync, 'handle installed by the deferred open');
+  assertOpenHandle(app.db);
   const row = app.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='Note'").get();
   assert.ok(row, 'the entity table exists in the adapter-opened db');
   await app.shutdown();
@@ -39,14 +45,14 @@ test('awaiting app.ready resolves the deferred open before listen()', async () =
   const app = workbench({ db: createSqliteAdapter({ mode: 'memory' }) });
   assert.equal(app.db, null);
   await app.ready;
-  assert.ok(app.db instanceof DatabaseSync, 'handle installed by app.ready');
+  assertOpenHandle(app.db);
   await app.shutdown();
 });
 
 test('an adapter-backed app starts headless and shutdown closes the adapter', async () => {
   const app = workbench({ db: createSqliteAdapter({ mode: 'memory' }) }).mount('/notes', makeNote());
   await app.start();
-  assert.ok(app.db instanceof DatabaseSync, 'handle installed by the headless start');
+  assertOpenHandle(app.db);
   assert.equal(
     app.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='Note'").get() != null,
     true,

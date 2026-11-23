@@ -6,7 +6,6 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { DatabaseSync } from 'node:sqlite';
 
 import {
   openMemoryAdapter,
@@ -30,7 +29,7 @@ test('openMemoryAdapter exposes the same surface as the file adapter (minus dire
     assert.equal(memory.root, null, 'memory owns no directory');
     assert.equal(memory.isManagedPath('/any/path'), false, 'memory refuses no paths');
     assert.deepEqual(memory.capabilities, EXPECTED_CAPABILITIES);
-    assert.ok(memory.handle instanceof DatabaseSync, 'handle is a DatabaseSync');
+    assert.equal(memory.handle.prepare('SELECT 1 AS value').get().value, 1);
     assert.equal(typeof memory.handle.txn, 'function', 'driver helpers attached');
     assert.equal(typeof memory.handle.upsert, 'function', 'driver helpers attached');
     const row = memory.handle.prepare('SELECT 1 AS one').get();

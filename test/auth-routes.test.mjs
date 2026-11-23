@@ -131,6 +131,132 @@ test('an active login lockout answers exactly like a wrong password', async (t) 
   assert.equal(correctWhileLocked.headers.get('set-cookie'), null);
 });
 
+// #260 — the ACTIVE login-lock route response on the password path.
+//
+// The login lock's contract diverged from the TOTP twin on purpose: where the
+// TOTP routes answer 429 with a `retryAfterMs` detail, the login route answers
+// the SAME 401 body a wrong password does, and reveals NO retry hint at all.
+// Commit 802d755 replaced the old 403 'account locked' + retryAfterMs answer
+// with this uniform refusal because the URL is unauthenticated: a distinct
+// status or a retry window told a caller that the identity it guessed was real
+// (an account-enumeration oracle). The lock still throttles every attempt for
+// its whole window; only the surface response is uniform. These assertions are
+// the login twin of test/totp.test.mjs:961 — pinning the response shape, the
+// counter behavior, and the expiry boundary so a regression lands in CI.
+test('active login lock answers a uniform 401 with no retry hint and no details', async (t) => {
+  const { origin, app } = await boot(t);
+  const login = (username, password) => fetch(`${origin}/auth/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  });
+
+  assert.equal((await fetch(`${origin}/auth/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'alice', password: 'hunter22' }),
+  })).status, 201);
+
+  // Three consecutive failures arm the lock; the fourth attempt meets it.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    assert.equal((await login('alice', 'wrong')).status, 401);
+  }
+
+  const locked = await login('alice', 'wrong');
+  assert.equal(locked.status, 401, 'the active lock is a plain failed login, never a distinct 403');
+  assert.equal(locked.headers.get('set-cookie'), null, 'a locked attempt mints no session');
+  assert.equal(locked.headers.get('retry-after'), null, 'the lock reveals no Retry-After header');
+
+  const body = await locked.json();
+  assert.deepEqual(body, {
+    ok: false,
+    failure: { category: 'denied', message: 'bad credentials' },
+  }, 'the locked body is the shared bad-credentials outcome');
+  assert.equal(body.failure.details, undefined, 'the lock leaks no retryAfterMs detail');
+
+  // A correct password is still refused while the lock holds — the uniform copy
+  // must not weaken the throttle.
+  const correctWhileLocked = await login('alice', 'hunter22');
+  assert.equal(correctWhileLocked.status, 401, 'the active lock refuses even the correct password');
+  assert.equal(correctWhileLocked.headers.get('set-cookie'), null);
+  assert.equal(correctWhileLocked.headers.get('retry-after'), null);
+
+  // The lock itself throttles, so a locked attempt does not advance the failed
+  // counter — it is pinned at the threshold that armed the lock.
+  const row = app.db.prepare('SELECT failedLoginAttempts FROM User WHERE username = ?').get('alice');
+  assert.equal(row.failedLoginAttempts, 3, 'a locked attempt does not advance the counter');
+});
+
+test('a directly armed future lock refuses the correct password until it expires', async (t) => {
+  const { origin, app } = await boot(t);
+  const login = (password) => fetch(`${origin}/auth/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'alice', password }),
+  });
+
+  assert.equal((await fetch(`${origin}/auth/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'alice', password: 'hunter22' }),
+  })).status, 201);
+
+  // Arm an ACTIVE lock directly, one millisecond into the future window.
+  app.db.prepare('UPDATE User SET failedLoginAttempts = ?, lockedUntil = ? WHERE username = ?')
+    .run(3, Date.now() + 60_000, 'alice');
+
+  const whileLocked = await login('hunter22');
+  assert.equal(whileLocked.status, 401, 'an active lock refuses the correct password');
+  assert.equal(whileLocked.headers.get('set-cookie'), null);
+  assert.equal(whileLocked.headers.get('retry-after'), null);
+
+  // Let the lock expire; the same correct password now signs in and the fence
+  // clears so the stale counter cannot instantly relock the next attempt.
+  app.db.prepare('UPDATE User SET lockedUntil = ? WHERE username = ?').run(Date.now() - 1, 'alice');
+  const afterExpiry = await login('hunter22');
+  assert.equal(afterExpiry.status, 201, 'a correct password works once the lock has expired');
+  assert.ok(afterExpiry.headers.get('set-cookie'));
+
+  const row = app.db.prepare('SELECT failedLoginAttempts, lockedUntil FROM User WHERE username = ?').get('alice');
+  assert.equal(row.failedLoginAttempts, 0, 'a successful login resets the failed-attempt counter');
+  assert.equal(row.lockedUntil, null, 'a successful login clears the lock fence');
+});
+
+test('a successful login resets the failed-attempt counter before the lock threshold', async (t) => {
+  const { origin, app } = await boot(t);
+  const login = (password) => fetch(`${origin}/auth/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'alice', password }),
+  });
+
+  assert.equal((await fetch(`${origin}/auth/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'alice', password: 'hunter22' }),
+  })).status, 201);
+
+  // Two failures sit below the three-attempt threshold — no lock is armed.
+  assert.equal((await login('wrong')).status, 401);
+  assert.equal((await login('wrong')).status, 401);
+  let row = app.db.prepare('SELECT failedLoginAttempts, lockedUntil FROM User WHERE username = ?').get('alice');
+  assert.equal(row.failedLoginAttempts, 2, 'failures accumulate below the threshold');
+  assert.equal(row.lockedUntil, null, 'no lock is armed below the threshold');
+
+  // The correct password signs in and clears the partial series, so the next
+  // wrong attempt counts from 1 rather than tripping the threshold.
+  const ok = await login('hunter22');
+  assert.equal(ok.status, 201);
+  assert.ok(ok.headers.get('set-cookie'));
+  row = app.db.prepare('SELECT failedLoginAttempts, lockedUntil FROM User WHERE username = ?').get('alice');
+  assert.equal(row.failedLoginAttempts, 0, 'the successful login reset the counter');
+  assert.equal(row.lockedUntil, null);
+
+  assert.equal((await login('wrong')).status, 401, 'a fresh series starts after the reset');
+  row = app.db.prepare('SELECT failedLoginAttempts FROM User WHERE username = ?').get('alice');
+  assert.equal(row.failedLoginAttempts, 1, 'the post-reset series counts from 1, not 3');
+});
+
 test('register rejects an existing identity without minting a session', async (t) => {
   const { origin, app } = await boot(t);
   const register = () => fetch(`${origin}/auth/register`, {

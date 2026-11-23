@@ -928,13 +928,21 @@ export function authRoutes({
     }
 
     const userId = req.principal.id;
+    // The browser's WebAuthn RegistrationResponseJSON carries no product/device
+    // name; the RP's optional `name` is the only source of one (#231). Absent or
+    // blank input stays ABSENT (SQL NULL) instead of becoming a fabricated
+    // "Passkey" label that makes unrelated credentials indistinguishable; an
+    // explicitly supplied name is stored trimmed, so a meaningful label
+    // round-trips. Omitting the key (rather than binding null) is what leaves the
+    // column NULL — a required-clear would be rejected by validateMutation.
+    const suppliedName = typeof credential.name === 'string' ? credential.name.trim() : '';
     try {
       Credential.create({
         credentialId: result.credentialId,
         publicKey: result.publicKey,
         userId,
         signCount: result.signCount,
-        name: credential.name || 'Passkey',
+        ...(suppliedName.length > 0 ? { name: suppliedName } : {}),
         transports: Array.isArray(credential.transports) ? credential.transports.join(',') : '',
         backedUp: credential.backedUp ? 1 : 0,
         createdAt: new Date().toISOString(),

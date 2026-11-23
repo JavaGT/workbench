@@ -568,6 +568,135 @@ test('passkey register + authenticate + list + delete round-trip', async (t) => 
   assert.equal(credsAfter.length, 0);
 });
 
+test('register without a name keeps it absent and lists name: null (#231)', async (t) => {
+  const { origin } = await boot(t);
+
+  const loginRes = await fetch(`${origin}/auth/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'noname', password: 'password12' }),
+  });
+  const cookie = `sid=${sidFromSetCookie(loginRes.headers.get('set-cookie'))}`;
+
+  const { keypair, spki } = generateTestKeypair();
+  const rp = rpConfig({});
+  const credentialId = generateChallenge(32);
+  const regChallengeRes = await fetch(`${origin}/auth/passkey/challenge`);
+  const { challenge } = await regChallengeRes.json();
+
+  const cd = buildClientDataJSON({ challenge, origin: rp.origin, type: 'webauthn.create' });
+  const ad = buildAuthenticatorData({ rpIdHash: buildRpIdHash(rp.id), flags: 0x45, signCount: 0, credentialId, publicKey: cosePublicKeyFromKeyPair(keypair) });
+  const att = buildAttestationObject({ fmt: 'none', authData: ad });
+
+  // A browser RegistrationResponseJSON carries id/rawId/response/type and NO
+  // name — the omitted name must stay absent, never become "Passkey".
+  const regRes = await fetch(`${origin}/auth/passkey/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', cookie },
+    body: JSON.stringify({
+      credential: {
+        id: credentialId,
+        rawId: credentialId,
+        response: { clientDataJSON: cd, attestationObject: att },
+        type: 'public-key',
+      },
+    }),
+  });
+  assert.equal(regRes.status, 201, `register failed: ${await regRes.text()}`);
+
+  const listRes = await fetch(`${origin}/auth/passkey`, { headers: { cookie } });
+  assert.equal(listRes.status, 200);
+  const [stored] = await listRes.json();
+  assert.equal(stored.credentialId, credentialId);
+  assert.equal(stored.name, null, 'an unnamed credential lists name: null, never a fabricated label');
+  // The rest of the list contract is retained.
+  assert.ok(Object.hasOwn(stored, 'createdAt'));
+  assert.ok(Object.hasOwn(stored, 'backedUp'));
+  assert.deepEqual(stored.transports, [], 'no transports supplied → empty array');
+  assert.ok(spki.length > 0);
+});
+
+test('register with a blank name keeps it absent (#231)', async (t) => {
+  const { origin } = await boot(t);
+
+  const loginRes = await fetch(`${origin}/auth/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'blankname', password: 'password12' }),
+  });
+  const cookie = `sid=${sidFromSetCookie(loginRes.headers.get('set-cookie'))}`;
+
+  const { keypair } = generateTestKeypair();
+  const rp = rpConfig({});
+  const credentialId = generateChallenge(32);
+  const { challenge } = await (await fetch(`${origin}/auth/passkey/challenge`)).json();
+
+  const cd = buildClientDataJSON({ challenge, origin: rp.origin, type: 'webauthn.create' });
+  const ad = buildAuthenticatorData({ rpIdHash: buildRpIdHash(rp.id), flags: 0x45, signCount: 0, credentialId, publicKey: cosePublicKeyFromKeyPair(keypair) });
+  const att = buildAttestationObject({ fmt: 'none', authData: ad });
+
+  // Whitespace-only input is not a meaningful name — it must stay absent, not
+  // be stored as a blank or coerced to "Passkey".
+  const regRes = await fetch(`${origin}/auth/passkey/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', cookie },
+    body: JSON.stringify({
+      credential: {
+        id: credentialId,
+        rawId: credentialId,
+        response: { clientDataJSON: cd, attestationObject: att },
+        type: 'public-key',
+        name: '   ',
+      },
+    }),
+  });
+  assert.equal(regRes.status, 201, `register failed: ${await regRes.text()}`);
+
+  const [stored] = await (await fetch(`${origin}/auth/passkey`, { headers: { cookie } })).json();
+  assert.equal(stored.credentialId, credentialId);
+  assert.equal(stored.name, null, 'a blank name stays absent, never a fabricated label');
+});
+
+test('register with a supplied name stores it trimmed and round-trips (#231)', async (t) => {
+  const { origin } = await boot(t);
+
+  const loginRes = await fetch(`${origin}/auth/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'named', password: 'password12' }),
+  });
+  const cookie = `sid=${sidFromSetCookie(loginRes.headers.get('set-cookie'))}`;
+
+  const { keypair } = generateTestKeypair();
+  const rp = rpConfig({});
+  const credentialId = generateChallenge(32);
+  const { challenge } = await (await fetch(`${origin}/auth/passkey/challenge`)).json();
+
+  const cd = buildClientDataJSON({ challenge, origin: rp.origin, type: 'webauthn.create' });
+  const ad = buildAuthenticatorData({ rpIdHash: buildRpIdHash(rp.id), flags: 0x45, signCount: 0, credentialId, publicKey: cosePublicKeyFromKeyPair(keypair) });
+  const att = buildAttestationObject({ fmt: 'none', authData: ad });
+
+  const regRes = await fetch(`${origin}/auth/passkey/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', cookie },
+    body: JSON.stringify({
+      credential: {
+        id: credentialId,
+        rawId: credentialId,
+        response: { clientDataJSON: cd, attestationObject: att },
+        type: 'public-key',
+        name: '  My YubiKey  ',
+        transports: ['usb', 'nfc'],
+      },
+    }),
+  });
+  assert.equal(regRes.status, 201, `register failed: ${await regRes.text()}`);
+
+  const [stored] = await (await fetch(`${origin}/auth/passkey`, { headers: { cookie } })).json();
+  assert.equal(stored.name, 'My YubiKey', 'an explicit name is preserved, trimmed of surrounding space');
+  assert.deepEqual(stored.transports, ['usb', 'nfc'], 'supplied transports still round-trip');
+});
+
 test('authenticate with a wrong credential ID fails', async (t) => {
   const { origin } = await boot(t);
 

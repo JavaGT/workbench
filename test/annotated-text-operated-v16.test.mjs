@@ -1,7 +1,7 @@
 // W1b v16 bounded operated-witness tests (#149 / #148 rev 2).
 // One planner/reducer authority: the plan's computed postimage IS the event
 // witness; replay re-derives both sides through the same reducer and rejects
-// any divergence with zero writes. V13-v15 remain replay-only.
+// any divergence with zero writes. v13/v15 are retired and rejected (#315).
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -21,7 +21,7 @@ import {
   textFamilyBasis,
 } from '../build/annotated-text-continuous.mjs';
 import { attachAnnotationRange } from '../build/annotated-text-storage.mjs';
-import { constructV15RegionEvent, constructV16RegionEvent } from '../build/annotated-text-operated-event.mjs';
+import { constructV16RegionEvent } from '../build/annotated-text-operated-event.mjs';
 import {
   computeAffectedClosure,
   digestAffectedClosure,
@@ -633,7 +633,7 @@ test('canonical serializer emits sorted keys and byte-stable output', async () =
   assert.ok(first.startsWith('{"after"'), 'top-level keys must be sorted');
 });
 
-test('v15 constructor still produces legacy envelopes but nothing new-emits them', async () => {
+test('v15 envelopes are retired and nothing new-emits them', async () => {
   const { readFileSync } = await import('node:fs');
   // The deletion copy ships build/ only, so assert against the compiled
   // region policy (same authority the runtime executes).

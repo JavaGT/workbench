@@ -783,16 +783,8 @@ export function constructV14OperatedEvent(data: LegacyOperatedEventInput): Opera
   });
 }
 
-/** Loose revision shape shared by legacy constructors (TS7-safe element type). */
+/** Loose revision shape for v16 envelope before/after (TS7-safe element type). */
 type LegacyTextRevision = Readonly<{ structuralRevision: number; frontier: ReadonlyArray<unknown> }>;
-
-// Retired v15 constructor. The symbol remains only because a non-owned test
-// still imports the name (#315); every call fails closed. New region writes go
-// through constructV16RegionEvent below.
-export function constructV15RegionEvent(plan: RegionPlan): never {
-  void plan;
-  throw new Error('operated v15 is retired: use constructV16RegionEvent');
-}
 
 // ---- V16 durable grammar (#148 rev 2 "V16 durable grammar") ----
 // The sole new-emission region constructor, canonical byte serializer, and

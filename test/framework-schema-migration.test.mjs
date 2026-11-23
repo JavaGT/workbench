@@ -2,8 +2,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 
-test('executeFrameworkDDL migrates a pre-historyOrder _ActionReceipt and creates its read index (#124)', async () => {
+test('executeFrameworkDDL + workbench@7 migrates a pre-historyOrder _ActionReceipt and creates its read index (#124, #283)', async () => {
   const { executeFrameworkDDL } = await import('../build/ddl.mjs');
+  const { runWorkbenchMigrations, appliedWorkbenchVersion } = await import('../build/workbench-migrations.mjs');
   const { insertReceipt } = await import('../build/committed-log.mjs');
   const db = new DatabaseSync(':memory:');
   try {
@@ -20,7 +21,9 @@ test('executeFrameworkDDL migrates a pre-historyOrder _ActionReceipt and creates
       "INSERT INTO _ActionReceipt (scope, actionId, committedAt, eventRefs) VALUES ('Doc:1', 'old-1', '2026-01-01T00:00:00.000Z', '[]')",
     ).run();
 
-    executeFrameworkDDL(db); // must not throw on the legacy shape
+    executeFrameworkDDL(db); // must not throw on the legacy shape (defers index to workbench@7)
+    runWorkbenchMigrations(db);
+    assert.equal(appliedWorkbenchVersion(db), 7);
 
     const columns = new Set(db.prepare('PRAGMA table_info(_ActionReceipt)').all().map((column) => column.name));
     assert.ok(columns.has('historyOrder'), 'historyOrder column migrated');
@@ -102,14 +105,14 @@ test('the package migrations run under the reserved workbench namespace on a fre
   const db = new DatabaseSync(':memory:');
   try {
     runWorkbenchMigrations(db);
-    assert.equal(appliedWorkbenchVersion(db), 6);
+    assert.equal(appliedWorkbenchVersion(db), 7);
 
     const rows = ledgerRows(db);
-    assert.equal(rows.length, 6, 'all package migrations recorded');
+    assert.equal(rows.length, 7, 'all package migrations recorded');
     assert.ok(rows.every((row) => row.namespace === 'workbench'), 'every package migration lives in the workbench namespace');
     assert.deepEqual(
       rows.map((row) => row.version).sort((a, b) => a - b),
-      [1, 2, 3, 4, 5, 6],
+      [1, 2, 3, 4, 5, 6, 7],
     );
     assert.ok(rows.every((row) => row.name.length > 0), 'every package migration records a name');
     assert.ok(rows.every((row) => /^[0-9a-f]{64}$/.test(row.checksum)), 'every package migration records a checksum');
@@ -118,8 +121,8 @@ test('the package migrations run under the reserved workbench namespace on a fre
     // Re-running is a no-op (idempotent) and the reserved namespace is the only
     // lane the package owns — no other namespace was touched.
     runWorkbenchMigrations(db);
-    assert.equal(appliedWorkbenchVersion(db), 6);
-    assert.equal(db.prepare(`SELECT COUNT(*) AS c FROM ${MIGRATION_LEDGER_TABLE}`).get().c, 6);
+    assert.equal(appliedWorkbenchVersion(db), 7);
+    assert.equal(db.prepare(`SELECT COUNT(*) AS c FROM ${MIGRATION_LEDGER_TABLE}`).get().c, 7);
 
     // The framework census derives the single namespaced ledger table.
     const { frameworkTableNames } = await import('../build/schema-table-census.mjs');
@@ -208,6 +211,101 @@ test('v6 repairs a mixed partial membership schema without aborting boot', async
     runWorkbenchMigrations(db);
     assert.deepEqual(db.prepare('PRAGMA table_info(partial_field_membership)').all().map((row) => row.name), ['annotation_id', 'range_id', 'document_id', 'ordinal']);
     assert.equal(db.prepare('SELECT COUNT(*) AS count FROM partial_field_membership').get().count, 1);
+  } finally {
+    db.close();
+  }
+});
+
+test('v7 upgrades legacy _Job, _ActionReceipt, User, TwoFactor, _PendingBlob, and BlobStore columns atomically (#283)', async () => {
+  const { runWorkbenchMigrations, appliedWorkbenchVersion } = await import('../build/workbench-migrations.mjs');
+  const db = new DatabaseSync(':memory:');
+  try {
+    db.exec(`
+      CREATE TABLE BlobStore (id TEXT PRIMARY KEY, status TEXT NOT NULL, createdAt TEXT NOT NULL);
+      CREATE TABLE _PendingBlob (
+        pendingKey TEXT PRIMARY KEY,
+        blobId TEXT NOT NULL UNIQUE,
+        claimTokenHash TEXT NOT NULL,
+        principalKey TEXT NOT NULL,
+        contentDigest TEXT NOT NULL,
+        byteLength INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        scopeId TEXT,
+        createdAt TEXT NOT NULL
+      );
+      CREATE TABLE _Job (id TEXT PRIMARY KEY, kind TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued', enqueuedAt INTEGER NOT NULL);
+      CREATE TABLE _ActionReceipt (
+        scope TEXT NOT NULL,
+        actionId TEXT NOT NULL,
+        committedAt TEXT NOT NULL,
+        eventRefs TEXT NOT NULL,
+        PRIMARY KEY (scope, actionId)
+      );
+      CREATE TABLE User (id TEXT PRIMARY KEY, username TEXT);
+      CREATE TABLE TwoFactor (id TEXT PRIMARY KEY, userId TEXT);
+    `);
+    const digest = 'a'.repeat(64);
+    db.prepare(`INSERT INTO _PendingBlob (pendingKey, blobId, claimTokenHash, principalKey, contentDigest, byteLength, status, scopeId, createdAt)
+      VALUES (?, 'b1', 'hash', 'user:u1', ?, 10, 'pending', 'Project:p1', '2026-01-01T00:00:00.000Z')`)
+      .run(`Project:p1/res-42/${digest}.pending`, digest);
+    db.prepare("INSERT INTO _ActionReceipt (scope, actionId, committedAt, eventRefs) VALUES ('S:1', 'a1', '2026-01-01T00:00:00.000Z', '[]')").run();
+    db.prepare("INSERT INTO _ActionReceipt (scope, actionId, committedAt, eventRefs) VALUES ('S:1', 'a2', '2026-01-02T00:00:00.000Z', '[]')").run();
+
+    runWorkbenchMigrations(db);
+    assert.equal(appliedWorkbenchVersion(db), 7);
+
+    const colsOf = (table) => new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((r) => r.name));
+    for (const col of ['replacedBy', 'replacedAt', 'cleanupError', 'cleanupAttempts']) {
+      assert.ok(colsOf('BlobStore').has(col), `BlobStore.${col} added`);
+    }
+    for (const col of ['resourceId', 'claimedAt', 'finalizedAt', 'deletedAt', 'deleteActionId', 'recoveryFailure']) {
+      assert.ok(colsOf('_PendingBlob').has(col), `_PendingBlob.${col} added`);
+    }
+    assert.equal(db.prepare("SELECT resourceId FROM _PendingBlob WHERE blobId = 'b1'").get().resourceId, 'res-42');
+    for (const col of ['attempts', 'availableAt', 'progress', 'stage', 'scope', 'principalKey', 'operations']) {
+      assert.ok(colsOf('_Job').has(col), `_Job.${col} added`);
+    }
+    for (const col of ['historyOrder', 'actionType', 'actionData', 'principalKey', 'sessionId', 'operation', 'resultData', 'historyRootActionId', 'historyTargetActionId', 'historyOutcome']) {
+      assert.ok(colsOf('_ActionReceipt').has(col), `_ActionReceipt.${col} added`);
+    }
+    assert.equal(db.prepare("SELECT historyOrder FROM _ActionReceipt WHERE actionId = 'a1'").get().historyOrder, 1);
+    assert.equal(db.prepare("SELECT historyOrder FROM _ActionReceipt WHERE actionId = 'a2'").get().historyOrder, 2);
+    assert.ok(colsOf('User').has('failedLoginAttempts') && colsOf('User').has('lockedUntil'));
+    assert.ok(colsOf('TwoFactor').has('totpFailedAttempts') && colsOf('TwoFactor').has('totpLockedUntil'));
+
+    // Re-running is idempotent
+    runWorkbenchMigrations(db);
+    assert.equal(appliedWorkbenchVersion(db), 7);
+  } finally {
+    db.close();
+  }
+});
+
+test('v7 rolls back atomically when a legacy _PendingBlob key cannot recover resourceId (#283)', async () => {
+  const { runWorkbenchMigrations, appliedWorkbenchVersion } = await import('../build/workbench-migrations.mjs');
+  const db = new DatabaseSync(':memory:');
+  try {
+    db.exec(`
+      CREATE TABLE _Job (id TEXT PRIMARY KEY, kind TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued', enqueuedAt INTEGER NOT NULL);
+      CREATE TABLE _PendingBlob (
+        pendingKey TEXT PRIMARY KEY,
+        blobId TEXT NOT NULL UNIQUE,
+        claimTokenHash TEXT NOT NULL,
+        principalKey TEXT NOT NULL,
+        contentDigest TEXT NOT NULL,
+        byteLength INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        scopeId TEXT,
+        createdAt TEXT NOT NULL
+      );
+    `);
+    db.prepare(`INSERT INTO _PendingBlob (pendingKey, blobId, claimTokenHash, principalKey, contentDigest, byteLength, status, scopeId, createdAt)
+      VALUES ('corrupt-key', 'b1', 'hash', 'user:u1', 'd', 1, 'pending', 'Project:p1', '2026-01-01T00:00:00.000Z')`).run();
+
+    assert.throws(() => runWorkbenchMigrations(db), /cannot recover pending blob resource identity/);
+    assert.equal(appliedWorkbenchVersion(db), 0, 'failed v7 rolled back the whole workbench lane');
+    const jobCols = new Set(db.prepare('PRAGMA table_info(_Job)').all().map((r) => r.name));
+    assert.equal(jobCols.has('attempts'), false, 'earlier ALTER in v7 rolled back with the failed backfill');
   } finally {
     db.close();
   }

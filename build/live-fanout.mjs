@@ -24,7 +24,6 @@ import { createDeltaProjector } from './field-delta.mjs';
 import { EventKind, parseEventType } from './event-handle.mjs';
 
 import { scopeOf, tryParseScopeKey } from './scope-handle.mjs';
-
 import { createdTextReducerSeeds } from './text-reducer-transport.mjs';
 import { publicEvent } from './event-delivery.mjs';
 
@@ -75,7 +74,6 @@ import { projectRowForRecipient } from './entity/projection.mjs';
 
 
 /** Structural connection contract — the LiveConnection class satisfies it. */
-
 
 
 
@@ -202,12 +200,6 @@ export function normalizeRevocationScope(principal                              
 
 
 
-
-
-
-
-
-
 // ---- Live fan-out -----------------------------------------------------------
 
 function hasAnnotatedText(entityRecord                  )          {
@@ -291,7 +283,14 @@ export function createLiveFanout({ mayVerb = null, authorization = null }       
   let snapshotControlFlushTimer                                         = null;
   let onCaretInterestChange                                                                            = null;
   let onCaretInterestAdded                                                                          = null;
-  const revocationListeners                       = [];
+
+  function clearPaceBuffers(predicate                                     )       {
+    for (const [bufKey, entry] of paceBuffers) {
+      if (!predicate(entry)) continue;
+      if (entry.timer !== null) { clearTimeout(entry.timer); entry.timer = null; }
+      paceBuffers.delete(bufKey);
+    }
+  }
 
   function snapshotControlKey(conn          , entity        , id         )         {
     return `${conn.id}\u0000${entity}\u0000${String(id)}`;
@@ -348,19 +347,15 @@ export function createLiveFanout({ mayVerb = null, authorization = null }       
     return connSubs.get(conn)?.has(scopeOrEntity) ?? false;
   }
 
-  function addSubscription(a                                         , b          , c                                          = null, d                                 = null, e                                 = null)       {
+  function addSubscription(a        , b          , c                                          = null, d                                 = null, e                                 = null)       {
     // The legacy positional form is (entity, id, conn, fields, pace): the same
     // `e` slot carries interest for scope-keyed calls and pace for legacy calls.
     if (typeof a === 'string' && (a.includes(':') || e?.rule)) {
       addSubscriptionScope(a, b, c, d, e ?? {});
       return;
     }
-    if (a && (a                       ).brand === 'scope-handle') {
-      addSubscriptionScope((a               ).key, b, c, d, e ?? {});
-      return;
-    }
     addSubscriptionLegacy(
-      a          ,
+      a,
       b           ,
       c                       ,
       d                                           ,
@@ -382,7 +377,7 @@ export function createLiveFanout({ mayVerb = null, authorization = null }       
     const previousCarets = (previous?.interest?.carets                        ) ?? [];
     const removedCarets = previousCarets.filter((field) => !nextCarets.includes(field));
     if (removedCarets.length > 0) onCaretInterestChange?.(conn, scope, removedCarets);
-    scopeSubs.set(conn, { fields, latch: true, pace, interest });
+    scopeSubs.set(conn, { fields, pace, interest });
     // A late-joining caret subscriber must learn the CURRENT presence state for
     // the fields it now cares about; the caret module replays existing slots.
     const addedCarets = nextCarets.filter((field) => !previousCarets.includes(field));
@@ -397,16 +392,12 @@ export function createLiveFanout({ mayVerb = null, authorization = null }       
     addSubscriptionScope(handle.key, conn, fields, pace, { entity: handle.entity, id: handle.id });
   }
 
-  function removeSubscription(a                                         , b          , c          )       {
+  function removeSubscription(a        , b          , c          )       {
     if (typeof a === 'string' && (a.includes(':') || c === undefined)) {
       removeSubscriptionScope(a, b);
       return;
     }
-    if (a && (a                       ).brand === 'scope-handle') {
-      removeSubscriptionScope((a               ).key, b);
-      return;
-    }
-    removeSubscriptionLegacy(a          , b           , c                       );
+    removeSubscriptionLegacy(a, b           , c                       );
   }
 
   function removeSubscriptionScope(scope        , conn          )       {
@@ -425,12 +416,7 @@ export function createLiveFanout({ mayVerb = null, authorization = null }       
     // A paced ephemeral buffer must not outlive its subscription: events
     // buffered for (conn, scope) are dropped on removal, so a removed
     // subscriber never receives cells drained after unsubscribe.
-    for (const [bufKey, entry] of paceBuffers) {
-      if (entry.conn === conn && entry.scope === scope) {
-        if (entry.timer !== null) { clearTimeout(entry.timer); entry.timer = null; }
-        paceBuffers.delete(bufKey);
-      }
-    }
+    clearPaceBuffers((entry) => entry.conn === conn && entry.scope === scope);
   }
 
   function removeSubscriptionLegacy(entity        , id         , conn          )       {
@@ -450,14 +436,7 @@ export function createLiveFanout({ mayVerb = null, authorization = null }       
       }
     }
     connSubs.delete(conn);
-
-    for (const [bufKey, entry] of paceBuffers) {
-      if (entry.conn === conn) {
-        if (entry.timer !== null) { clearTimeout(entry.timer); entry.timer = null; }
-        paceBuffers.delete(bufKey);
-      }
-    }
-
+    clearPaceBuffers((entry) => entry.conn === conn);
   }
 
   function recipients(scope        , field        )                                          {
@@ -477,28 +456,13 @@ export function createLiveFanout({ mayVerb = null, authorization = null }       
     onCaretInterestAdded = callback;
   }
 
-  function onRevocation(listener                    )             {
-    revocationListeners.push(listener);
-    return () => {
-      const idx = revocationListeners.indexOf(listener);
-      if (idx !== -1) revocationListeners.splice(idx, 1);
-    };
-  }
-
-  // Publish a revocation. Fires the registered listeners exactly once (isolated
-  // per listener) and immediately evicts the affected subscriptions from the
-  // fan-out registry — matching by scope key (entity scope) or principal key
-  // (principal scope) — so a revoked reader receives nothing further. This is
-  // the event-driven counterpart to the core's committed revocation path: the
-  // fan-out no longer waits for the next emit to re-authorize a revoked reader.
-  // The descriptor is normalized/validated first (findings #75-4): a malformed
-  // descriptor throws RevocationScopeError before any listener or registry is
-  // touched.
+  // Evict affected subscriptions from the fan-out registry — matching by scope
+  // key (entity scope) or principal key (principal scope) — so a revoked reader
+  // receives nothing further without waiting for the next emit. The descriptor
+  // is normalized/validated first (findings #75-4): a malformed descriptor
+  // throws RevocationScopeError before the registry is touched.
   function revoke(principal           , resourceScope                         )       {
     const normalized = normalizeRevocationScope(principal, resourceScope);
-    for (const listener of revocationListeners) {
-      try { listener(principal, normalized); } catch { /* per-listener isolation */ }
-    }
     if (normalized.category === 'entity') {
       const subs = byScope.get(normalized.key);
       if (subs) {
@@ -555,7 +519,7 @@ export function createLiveFanout({ mayVerb = null, authorization = null }       
 
   // Fan-out: forward a committed kernel event to authorized subscribers
   // of the event's scope. One registry, one fan-out path.
-  async function emit(entityRecord                  , id         , row                                     , committedEvent                      , { hydrated = false }                         = {})                {
+  async function emit(entityRecord                  , id         , row                                     , committedEvent                      )                {
     const name = entityRecord?.name;
     if (!name) return;
     let committed                       = committedEvent;
@@ -596,7 +560,7 @@ export function createLiveFanout({ mayVerb = null, authorization = null }       
       && entityRecord.fields?.[handle.field]?.kind === 'annotatedText';
 
     let authzRow                                      = row;
-    if (!removed && !hydrated && entityRecord.findById) {
+    if (!removed && entityRecord.findById) {
       try { authzRow = entityRecord.findById(String(id), null) ?? row; } catch { authzRow = row; }
     }
 
@@ -772,7 +736,6 @@ export function createLiveFanout({ mayVerb = null, authorization = null }       
     hasCaretInterest,
     setOnCaretInterestChange,
     setOnCaretInterestAdded,
-    onRevocation,
     revoke,
     emit,
     close,

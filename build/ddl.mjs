@@ -516,128 +516,17 @@ export function generateFrameworkDDL()           {
 }
 
 export function executeFrameworkDDL(db          )       {
-  // The receipt-history read index (#124) references _ActionReceipt.historyOrder,
-  // which legacy databases only receive from ensureActionReceiptColumns below.
-  // It stays DECLARED in frameworkLogDDL — generateFrameworkDDL feeds the
-  // framework object census — but is CREATED after the column migrations ran.
+  // The receipt-history read index (#124) references _ActionReceipt.historyOrder.
+  // Fresh databases receive historyOrder from actionReceiptTableDDL() so the
+  // index is created immediately; legacy databases without historyOrder receive
+  // the column backfill and index atomically via workbench@7 in
+  // runWorkbenchMigrations().
   const historyIndexSql = actionReceiptHistoryIndexDDL();
   for (const sql of generateFrameworkDDL()) {
-    if (sql !== historyIndexSql) db.exec(sql);
-  }
-  // Additive column migrations for persistent dbs where CREATE TABLE IF NOT
-  // EXISTS would not add columns added after the table's first creation. Each
-  // guard checks PRAGMA table_info so it is a no-op on a fresh db and a safe
-  // one-time ALTER on an older one.
-  ensureJobColumns(db);
-  ensureActionReceiptColumns(db);
-  ensureAuthEntityColumns(db);
-  ensurePendingBlobColumns(db);
-  ensureBlobStoreColumns(db);
-}
-
-function ensureBlobStoreColumns(db          )       {
-  // S6/A5 replacement + durable-cleanup state: generation-replacement metadata
-  // (replacedBy/replacedAt) and the durable failed-deletion ledger
-  // (cleanupError/cleanupAttempts) on the BlobStore row itself — a failed byte
-  // deletion keeps the row until the next sweep retries and verifies it.
-  const cols = new Set(db.prepare('PRAGMA table_info(BlobStore)').all().map((r) => r.name));
-  for (const [name, type] of [['replacedBy', 'TEXT'], ['replacedAt', 'TEXT'], ['cleanupError', 'TEXT'], ['cleanupAttempts', 'INTEGER NOT NULL DEFAULT 0']]) {
-    if (!cols.has(name)) db.exec(`ALTER TABLE BlobStore ADD COLUMN ${name} ${type}`);
-  }
-}
-
-function ensurePendingBlobColumns(db          )       {
-  const cols = new Set(db.prepare('PRAGMA table_info(_PendingBlob)').all().map((r) => r.name));
-  for (const [name, type] of [['resourceId', 'TEXT'], ['claimedAt', 'TEXT'], ['finalizedAt', 'TEXT'], ['deletedAt', 'TEXT'], ['deleteActionId', 'TEXT'], ['recoveryFailure', 'TEXT']]) {
-    if (!cols.has(name)) db.exec(`ALTER TABLE _PendingBlob ADD COLUMN ${name} ${type}`);
-  }
-  const legacyRows = db.prepare('SELECT pendingKey, scopeId FROM _PendingBlob WHERE resourceId IS NULL').all();
-  for (const row of legacyRows) {
-    const prefix = `${row.scopeId}/`;
-    const suffixLength = 1 + 64 + '.pending'.length;
-    const pendingKey = row.pendingKey          ;
-    if (typeof row.scopeId !== 'string' || !pendingKey.startsWith(prefix) || pendingKey.length <= prefix.length + suffixLength) {
-      throw new Error(`cannot recover pending blob resource identity for '${row.pendingKey}'`);
+    if (sql === historyIndexSql) {
+      const cols = new Set(db.prepare('PRAGMA table_info(_ActionReceipt)').all().map((r) => r.name));
+      if (!cols.has('historyOrder')) continue;
     }
-    const resourceId = pendingKey.slice(prefix.length, -suffixLength);
-    db.prepare('UPDATE _PendingBlob SET resourceId = ? WHERE pendingKey = ? AND resourceId IS NULL').run(resourceId, pendingKey);
+    db.exec(sql);
   }
-}
-
-function ensureActionReceiptColumns(db          )       {
-  const cols = new Set(db.prepare('PRAGMA table_info(_ActionReceipt)').all().map((r) => r.name));
-  const additions = [
-    ['historyOrder', 'INTEGER'],
-    ['actionType', 'TEXT'],
-    ['actionData', 'TEXT'],
-    ['principalKey', 'TEXT'],
-    ['sessionId', 'TEXT'],
-    ['operation', "TEXT NOT NULL DEFAULT 'action'"],
-    ['resultData', 'TEXT'],
-    ['historyRootActionId', 'TEXT'],
-    ['historyTargetActionId', 'TEXT'],
-    ['historyOutcome', 'TEXT'],
-  ];
-  for (const [name, sqlTypeName] of additions) {
-    if (!cols.has(name)) db.exec(`ALTER TABLE _ActionReceipt ADD COLUMN ${name} ${sqlTypeName}`);
-  }
-  db.exec(`UPDATE _ActionReceipt SET historyOrder = (
-    SELECT COUNT(*) FROM _ActionReceipt AS earlier
-    WHERE earlier.scope = _ActionReceipt.scope
-      AND (earlier.committedAt < _ActionReceipt.committedAt
-        OR (earlier.committedAt = _ActionReceipt.committedAt AND earlier.actionId <= _ActionReceipt.actionId))
-  ) WHERE historyOrder IS NULL`);
-  // Declared with the framework DDL, created only now that historyOrder
-  // exists on every database shape (#124). IF NOT EXISTS: a no-op when the
-  // first pass already created it on a database that never needed the ALTERs.
-  db.exec(actionReceiptHistoryIndexDDL());
-}
-
-function ensureJobColumns(db          )       {
-  const cols = new Set(db.prepare('PRAGMA table_info(_Job)').all().map((r) => r.name));
-  if (!cols.has('attempts')) {
-    db.exec('ALTER TABLE _Job ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0');
-  }
-  if (!cols.has('availableAt')) {
-    db.exec('ALTER TABLE _Job ADD COLUMN availableAt INTEGER');
-  }
-  if (!cols.has('progress')) {
-    db.exec('ALTER TABLE _Job ADD COLUMN progress INTEGER NOT NULL DEFAULT 0');
-  }
-  if (!cols.has('stage')) {
-    db.exec('ALTER TABLE _Job ADD COLUMN stage TEXT');
-  }
-  if (!cols.has('scope')) {
-    db.exec('ALTER TABLE _Job ADD COLUMN scope TEXT');
-  }
-  if (!cols.has('principalKey')) {
-    db.exec('ALTER TABLE _Job ADD COLUMN principalKey TEXT');
-  }
-  if (!cols.has('operations')) {
-    db.exec('ALTER TABLE _Job ADD COLUMN operations TEXT');
-  }
-}
-
-function ensureAuthEntityColumns(db          )       {
-  // Entity tables (User, TwoFactor) are created by executeDDL AFTER
-  // executeFrameworkDDL runs, so the tables may not exist yet on first boot.
-  // Catch and skip — the entity DDL already includes the new columns.
-  try {
-    const userCols = new Set(db.prepare('PRAGMA table_info(User)').all().map((r) => r.name));
-    if (!userCols.has('failedLoginAttempts')) {
-      db.exec('ALTER TABLE User ADD COLUMN failedLoginAttempts INTEGER DEFAULT 0');
-    }
-    if (!userCols.has('lockedUntil')) {
-      db.exec('ALTER TABLE User ADD COLUMN lockedUntil INTEGER');
-    }
-  } catch { /* table may not exist yet — entity DDL handles first creation */ }
-  try {
-    const tfCols = new Set(db.prepare('PRAGMA table_info(TwoFactor)').all().map((r) => r.name));
-    if (!tfCols.has('totpFailedAttempts')) {
-      db.exec('ALTER TABLE TwoFactor ADD COLUMN totpFailedAttempts INTEGER DEFAULT 0');
-    }
-    if (!tfCols.has('totpLockedUntil')) {
-      db.exec('ALTER TABLE TwoFactor ADD COLUMN totpLockedUntil INTEGER');
-    }
-  } catch { /* table may not exist yet — entity DDL handles first creation */ }
 }

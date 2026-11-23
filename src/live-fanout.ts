@@ -24,7 +24,6 @@ import { createDeltaProjector } from './field-delta.ts';
 import { EventKind, parseEventType } from './event-handle.ts';
 import type { EventIdentityHandle } from './event-handle.ts';
 import { scopeOf, tryParseScopeKey } from './scope-handle.ts';
-import type { ScopeHandle } from './scope-handle.ts';
 import { createdTextReducerSeeds } from './text-reducer-transport.ts';
 import { publicEvent } from './event-delivery.ts';
 import type { AuthorizationAdapter } from './authorization-adapter.ts';
@@ -84,7 +83,6 @@ export interface LiveConn {
 
 export interface LiveSubscriptionSpec {
   fields: Record<string, true> | null;
-  latch: boolean;
   pace: PaceProfile | null;
   interest: Record<string, unknown>;
 }
@@ -194,17 +192,11 @@ export interface LiveFanoutHandle {
   hasCaretInterest(conn: LiveConn, scope: string, field: string): boolean;
   setOnCaretInterestChange(callback: ((conn: LiveConn, scope: string, removedFields: string[]) => void) | null): void;
   setOnCaretInterestAdded(callback: ((conn: LiveConn, scope: string, addedFields: string[]) => void) | null): void;
-  // S5/A5 revocation contract: register a listener (S4/S6 adapters) notified
-  // when a revocation is published; returns an unsubscribe.
-  onRevocation(listener: RevocationListener): () => void;
-  // Publish a revocation for a principal + resource scope. Fires the registered
-  // listeners exactly once and immediately evicts the affected subscriptions
-  // (matching by scope key or principal key) from the fan-out registry, so a
-  // revoked reader receives nothing further without waiting for the next emit.
-  // The descriptor is normalized/validated first: a malformed descriptor throws
-  // RevocationScopeError before any listener or registry is touched.
+  // Evict affected subscriptions (matching by scope key or principal key) from
+  // the fan-out registry. The descriptor is normalized/validated first: a
+  // malformed descriptor throws RevocationScopeError before the registry is touched.
   revoke(principal: Principal, resourceScope: RevocationResourceScope): void;
-  emit(entityRecord: LiveEntityRecord, id: unknown, row: Record<string, unknown> | undefined, committedEvent: FanoutCommittedEvent, options?: { hydrated?: boolean }): Promise<void>;
+  emit(entityRecord: LiveEntityRecord, id: unknown, row: Record<string, unknown> | undefined, committedEvent: FanoutCommittedEvent): Promise<void>;
   close(): void;
 }
 
@@ -291,7 +283,14 @@ export function createLiveFanout({ mayVerb = null, authorization = null }: { may
   let snapshotControlFlushTimer: ReturnType<typeof setImmediate> | null = null;
   let onCaretInterestChange: ((conn: LiveConn, scope: string, removedFields: string[]) => void) | null = null;
   let onCaretInterestAdded: ((conn: LiveConn, scope: string, addedFields: string[]) => void) | null = null;
-  const revocationListeners: RevocationListener[] = [];
+
+  function clearPaceBuffers(predicate: (entry: PaceBufferEntry) => boolean): void {
+    for (const [bufKey, entry] of paceBuffers) {
+      if (!predicate(entry)) continue;
+      if (entry.timer !== null) { clearTimeout(entry.timer); entry.timer = null; }
+      paceBuffers.delete(bufKey);
+    }
+  }
 
   function snapshotControlKey(conn: LiveConn, entity: string, id: unknown): string {
     return `${conn.id}\u0000${entity}\u0000${String(id)}`;
@@ -348,19 +347,15 @@ export function createLiveFanout({ mayVerb = null, authorization = null }: { may
     return connSubs.get(conn)?.has(scopeOrEntity) ?? false;
   }
 
-  function addSubscription(a: string | ScopeHandle | LiveEntityRecord, b: LiveConn, c: Record<string, true> | null | undefined = null, d: PaceProfile | null | undefined = null, e: Record<string, unknown> | null = null): void {
+  function addSubscription(a: string, b: LiveConn, c: Record<string, true> | null | undefined = null, d: PaceProfile | null | undefined = null, e: Record<string, unknown> | null = null): void {
     // The legacy positional form is (entity, id, conn, fields, pace): the same
     // `e` slot carries interest for scope-keyed calls and pace for legacy calls.
     if (typeof a === 'string' && (a.includes(':') || e?.rule)) {
       addSubscriptionScope(a, b, c, d, e ?? {});
       return;
     }
-    if (a && (a as { brand?: unknown }).brand === 'scope-handle') {
-      addSubscriptionScope((a as ScopeHandle).key, b, c, d, e ?? {});
-      return;
-    }
     addSubscriptionLegacy(
-      a as string,
+      a,
       b as unknown,
       c as unknown as LiveConn,
       d as Record<string, true> | null | undefined,
@@ -382,7 +377,7 @@ export function createLiveFanout({ mayVerb = null, authorization = null }: { may
     const previousCarets = (previous?.interest?.carets as string[] | undefined) ?? [];
     const removedCarets = previousCarets.filter((field) => !nextCarets.includes(field));
     if (removedCarets.length > 0) onCaretInterestChange?.(conn, scope, removedCarets);
-    scopeSubs.set(conn, { fields, latch: true, pace, interest });
+    scopeSubs.set(conn, { fields, pace, interest });
     // A late-joining caret subscriber must learn the CURRENT presence state for
     // the fields it now cares about; the caret module replays existing slots.
     const addedCarets = nextCarets.filter((field) => !previousCarets.includes(field));
@@ -397,16 +392,12 @@ export function createLiveFanout({ mayVerb = null, authorization = null }: { may
     addSubscriptionScope(handle.key, conn, fields, pace, { entity: handle.entity, id: handle.id });
   }
 
-  function removeSubscription(a: string | ScopeHandle | LiveEntityRecord, b: LiveConn, c?: unknown): void {
+  function removeSubscription(a: string, b: LiveConn, c?: unknown): void {
     if (typeof a === 'string' && (a.includes(':') || c === undefined)) {
       removeSubscriptionScope(a, b);
       return;
     }
-    if (a && (a as { brand?: unknown }).brand === 'scope-handle') {
-      removeSubscriptionScope((a as ScopeHandle).key, b);
-      return;
-    }
-    removeSubscriptionLegacy(a as string, b as unknown, c as unknown as LiveConn);
+    removeSubscriptionLegacy(a, b as unknown, c as unknown as LiveConn);
   }
 
   function removeSubscriptionScope(scope: string, conn: LiveConn): void {
@@ -425,12 +416,7 @@ export function createLiveFanout({ mayVerb = null, authorization = null }: { may
     // A paced ephemeral buffer must not outlive its subscription: events
     // buffered for (conn, scope) are dropped on removal, so a removed
     // subscriber never receives cells drained after unsubscribe.
-    for (const [bufKey, entry] of paceBuffers) {
-      if (entry.conn === conn && entry.scope === scope) {
-        if (entry.timer !== null) { clearTimeout(entry.timer); entry.timer = null; }
-        paceBuffers.delete(bufKey);
-      }
-    }
+    clearPaceBuffers((entry) => entry.conn === conn && entry.scope === scope);
   }
 
   function removeSubscriptionLegacy(entity: string, id: unknown, conn: LiveConn): void {
@@ -450,14 +436,7 @@ export function createLiveFanout({ mayVerb = null, authorization = null }: { may
       }
     }
     connSubs.delete(conn);
-
-    for (const [bufKey, entry] of paceBuffers) {
-      if (entry.conn === conn) {
-        if (entry.timer !== null) { clearTimeout(entry.timer); entry.timer = null; }
-        paceBuffers.delete(bufKey);
-      }
-    }
-
+    clearPaceBuffers((entry) => entry.conn === conn);
   }
 
   function recipients(scope: string, field: string): Array<[LiveConn, LiveSubscriptionSpec]> {
@@ -477,28 +456,13 @@ export function createLiveFanout({ mayVerb = null, authorization = null }: { may
     onCaretInterestAdded = callback;
   }
 
-  function onRevocation(listener: RevocationListener): () => void {
-    revocationListeners.push(listener);
-    return () => {
-      const idx = revocationListeners.indexOf(listener);
-      if (idx !== -1) revocationListeners.splice(idx, 1);
-    };
-  }
-
-  // Publish a revocation. Fires the registered listeners exactly once (isolated
-  // per listener) and immediately evicts the affected subscriptions from the
-  // fan-out registry — matching by scope key (entity scope) or principal key
-  // (principal scope) — so a revoked reader receives nothing further. This is
-  // the event-driven counterpart to the core's committed revocation path: the
-  // fan-out no longer waits for the next emit to re-authorize a revoked reader.
-  // The descriptor is normalized/validated first (findings #75-4): a malformed
-  // descriptor throws RevocationScopeError before any listener or registry is
-  // touched.
+  // Evict affected subscriptions from the fan-out registry — matching by scope
+  // key (entity scope) or principal key (principal scope) — so a revoked reader
+  // receives nothing further without waiting for the next emit. The descriptor
+  // is normalized/validated first (findings #75-4): a malformed descriptor
+  // throws RevocationScopeError before the registry is touched.
   function revoke(principal: Principal, resourceScope: RevocationResourceScope): void {
     const normalized = normalizeRevocationScope(principal, resourceScope);
-    for (const listener of revocationListeners) {
-      try { listener(principal, normalized); } catch { /* per-listener isolation */ }
-    }
     if (normalized.category === 'entity') {
       const subs = byScope.get(normalized.key);
       if (subs) {
@@ -555,7 +519,7 @@ export function createLiveFanout({ mayVerb = null, authorization = null }: { may
 
   // Fan-out: forward a committed kernel event to authorized subscribers
   // of the event's scope. One registry, one fan-out path.
-  async function emit(entityRecord: LiveEntityRecord, id: unknown, row: Record<string, unknown> | undefined, committedEvent: FanoutCommittedEvent, { hydrated = false }: { hydrated?: boolean } = {}): Promise<void> {
+  async function emit(entityRecord: LiveEntityRecord, id: unknown, row: Record<string, unknown> | undefined, committedEvent: FanoutCommittedEvent): Promise<void> {
     const name = entityRecord?.name;
     if (!name) return;
     let committed: FanoutCommittedEvent = committedEvent;
@@ -596,7 +560,7 @@ export function createLiveFanout({ mayVerb = null, authorization = null }: { may
       && entityRecord.fields?.[handle.field]?.kind === 'annotatedText';
 
     let authzRow: Record<string, unknown> | undefined = row;
-    if (!removed && !hydrated && entityRecord.findById) {
+    if (!removed && entityRecord.findById) {
       try { authzRow = entityRecord.findById(String(id), null) ?? row; } catch { authzRow = row; }
     }
 
@@ -772,7 +736,6 @@ export function createLiveFanout({ mayVerb = null, authorization = null }: { may
     hasCaretInterest,
     setOnCaretInterestChange,
     setOnCaretInterestAdded,
-    onRevocation,
     revoke,
     emit,
     close,

@@ -22,6 +22,7 @@ import {
 
 } from './migration-ledger.mjs';
 
+import { actionReceiptHistoryIndexDDL } from './committed-log.mjs';
 import { restoreTextFamily, serializeCompactTextFamilyCheckpoint } from './annotated-text-continuous.mjs';
 
 // The package version that supplies the lane, recorded per ledger row. Keep in
@@ -216,6 +217,97 @@ function repairIntermediateMembershipFamily(db          , prefix        ) {
   db.exec(`DROP TABLE ${membership}; ALTER TABLE ${tmp} RENAME TO ${membership}`);
 }
 
+function addMissingColumns(db          , table        , columns                                          )       {
+  const existing = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((row) => row.name          ));
+  for (const [name, definition] of columns) {
+    if (!existing.has(name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
+  }
+}
+
+function ensureBlobStoreColumns(db          )       {
+  if (!tableExists(db, 'BlobStore')) return;
+  addMissingColumns(db, 'BlobStore', [
+    ['replacedBy', 'TEXT'],
+    ['replacedAt', 'TEXT'],
+    ['cleanupError', 'TEXT'],
+    ['cleanupAttempts', 'INTEGER NOT NULL DEFAULT 0'],
+  ]);
+}
+
+function ensurePendingBlobColumns(db          )       {
+  if (!tableExists(db, '_PendingBlob')) return;
+  addMissingColumns(db, '_PendingBlob', [
+    ['resourceId', 'TEXT'],
+    ['claimedAt', 'TEXT'],
+    ['finalizedAt', 'TEXT'],
+    ['deletedAt', 'TEXT'],
+    ['deleteActionId', 'TEXT'],
+    ['recoveryFailure', 'TEXT'],
+  ]);
+  const legacyRows = db.prepare('SELECT pendingKey, scopeId FROM _PendingBlob WHERE resourceId IS NULL').all();
+  for (const row of legacyRows) {
+    const prefix = `${row.scopeId}/`;
+    const suffixLength = 1 + 64 + '.pending'.length;
+    const pendingKey = row.pendingKey          ;
+    if (typeof row.scopeId !== 'string' || !pendingKey.startsWith(prefix) || pendingKey.length <= prefix.length + suffixLength) {
+      throw new Error(`cannot recover pending blob resource identity for '${row.pendingKey}'`);
+    }
+    const resourceId = pendingKey.slice(prefix.length, -suffixLength);
+    db.prepare('UPDATE _PendingBlob SET resourceId = ? WHERE pendingKey = ? AND resourceId IS NULL').run(resourceId, pendingKey);
+  }
+}
+
+function ensureActionReceiptColumns(db          )       {
+  if (!tableExists(db, '_ActionReceipt')) return;
+  addMissingColumns(db, '_ActionReceipt', [
+    ['historyOrder', 'INTEGER'],
+    ['actionType', 'TEXT'],
+    ['actionData', 'TEXT'],
+    ['principalKey', 'TEXT'],
+    ['sessionId', 'TEXT'],
+    ['operation', "TEXT NOT NULL DEFAULT 'action'"],
+    ['resultData', 'TEXT'],
+    ['historyRootActionId', 'TEXT'],
+    ['historyTargetActionId', 'TEXT'],
+    ['historyOutcome', 'TEXT'],
+  ]);
+  db.exec(`UPDATE _ActionReceipt SET historyOrder = (
+    SELECT COUNT(*) FROM _ActionReceipt AS earlier
+    WHERE earlier.scope = _ActionReceipt.scope
+      AND (earlier.committedAt < _ActionReceipt.committedAt
+        OR (earlier.committedAt = _ActionReceipt.committedAt AND earlier.actionId <= _ActionReceipt.actionId))
+  ) WHERE historyOrder IS NULL`);
+  db.exec(actionReceiptHistoryIndexDDL());
+}
+
+function ensureJobColumns(db          )       {
+  if (!tableExists(db, '_Job')) return;
+  addMissingColumns(db, '_Job', [
+    ['attempts', 'INTEGER NOT NULL DEFAULT 0'],
+    ['availableAt', 'INTEGER'],
+    ['progress', 'INTEGER NOT NULL DEFAULT 0'],
+    ['stage', 'TEXT'],
+    ['scope', 'TEXT'],
+    ['principalKey', 'TEXT'],
+    ['operations', 'TEXT'],
+  ]);
+}
+
+function ensureAuthEntityColumns(db          )       {
+  if (tableExists(db, 'User')) {
+    addMissingColumns(db, 'User', [
+      ['failedLoginAttempts', 'INTEGER DEFAULT 0'],
+      ['lockedUntil', 'INTEGER'],
+    ]);
+  }
+  if (tableExists(db, 'TwoFactor')) {
+    addMissingColumns(db, 'TwoFactor', [
+      ['totpFailedAttempts', 'INTEGER DEFAULT 0'],
+      ['totpLockedUntil', 'INTEGER'],
+    ]);
+  }
+}
+
 export const WORKBENCH_MIGRATIONS                       = Object.freeze([
   {
     namespace: 'workbench',
@@ -342,6 +434,23 @@ export const WORKBENCH_MIGRATIONS                       = Object.freeze([
         const name = row.name          ;
         if (name.endsWith('_membership')) repairIntermediateMembershipFamily(db, name.slice(0, -'_membership'.length));
       }
+    },
+  },
+  {
+    // v7: move the legacy additive column upgrades formerly run ad-hoc on every
+    // boot inside executeFrameworkDDL into the versioned, transactional
+    // package migration lane. Fresh databases already include every column in
+    // CREATE TABLE IF NOT EXISTS, so v7 is an idempotent no-op on fresh DBs and
+    // an atomic one-time upgrade on legacy DBs.
+    namespace: 'workbench',
+    name: 'framework-legacy-column-upgrades',
+    version: 7,
+    up(db) {
+      ensureJobColumns(db);
+      ensureActionReceiptColumns(db);
+      ensureAuthEntityColumns(db);
+      ensurePendingBlobColumns(db);
+      ensureBlobStoreColumns(db);
     },
   },
 ]);

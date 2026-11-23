@@ -46,6 +46,7 @@ import { admitRowTransition } from './field-admission.ts';
 import { writeInvalidationInTxn } from './invalidation-ledger.ts';
 import { ownedResourcesCapability } from './owned-resource-purge.ts';
 import { ANNOTATED_TEXT_STALE } from './annotated-text-region-limits.ts';
+import { createWriteQueue, type WriteQueue } from './write-queue.ts';
 
 // `action(type)` — declare an imperative request type. The handler that turns it
 // into events is attached later by the entity/dispatch wiring.
@@ -143,320 +144,424 @@ function effectEventsFor(registry: unknown, executeEffectsForEvent: unknown) {
   };
 }
 
-export function durableMutationVariant({
-  projectionConsumers = [],
-  admission = noAdmission(),
-  blobAdapter = noBlobAdapter(),
-  effectsRegistry = null,
-  executeEffectsForEvent = null,
-  postCommitConsumers = [],
-  maxEffectDepth = 8,
-  compositeJournal,
-}: {
-  projectionConsumers?: any[];
-  admission?: {
-    beforeProjection: (context: any) => Promise<unknown>;
-    afterProjection: (context: any) => Promise<unknown>;
-    annotatedMutation?: {
-      before: (context: any) => unknown;
-      after: (context: any) => Promise<unknown>;
-    };
+interface MutationAdmission {
+  beforeProjection: (context: any) => Promise<unknown>;
+  afterProjection: (context: any) => Promise<unknown>;
+  annotatedMutation?: {
+    before: (context: any) => unknown;
+    after: (context: any) => Promise<unknown>;
   };
+}
+
+interface SharedMutationVariantOptions {
+  projectionConsumers?: any[];
+  admission?: MutationAdmission;
   blobAdapter?: { adoptInTxn: (db: unknown, events: unknown[]) => Promise<unknown> };
   effectsRegistry?: unknown;
   executeEffectsForEvent?: unknown;
   postCommitConsumers?: Array<(events: unknown, context: unknown) => Promise<unknown> | unknown>;
   maxEffectDepth?: number;
-  /** Compiled patch plans + journal routing (#122). Undefined keeps the pre-patch behavior unchanged. */
-  compositeJournal?: {
-    plans: ReadonlyMap<string, unknown>;
-    /**
-     * Entity names whose row changes can revoke or admit OTHER rows (grant
-     * dependencies, membership tables — cross-exam 9). A committed change to
-     * any of these invalidates every composite that projects them.
-     */
-    authorizationDependencies?: readonly string[];
-  };
-} = {}) {
+}
+
+interface CompositeJournalConfig {
+  plans: ReadonlyMap<string, unknown>;
+  /**
+   * Entity names whose row changes can revoke or admit OTHER rows (grant
+   * dependencies, membership tables — cross-exam 9). A committed change to
+   * any of these invalidates every composite that projects them.
+   */
+  authorizationDependencies?: readonly string[];
+}
+
+interface ApplyInTxnArgs {
+  now: string;
+  actionId: string;
+  nextSeq?: (scope: unknown) => number;
+  principal: unknown;
+  depth?: number;
+  payload?: unknown;
+  type?: unknown;
+  scope?: unknown;
+  privateFact?: unknown;
+  claimedBlobs?: unknown;
+}
+
+type CompositeEvidence = {
+  before: Map<string, Map<string, Record<string, unknown>>>;
+  after: Map<string, Map<string, Record<string, unknown>>>;
+};
+
+async function runPreProjectionAdmission(
+  admission: MutationAdmission,
+  db: unknown,
+  events: any[],
+  { actionId, type, scope, principal, payload, now }: {
+    actionId: string;
+    type: unknown;
+    scope: unknown;
+    principal: unknown;
+    payload: unknown;
+    now: string;
+  },
+) {
+  const admittedEvents: any[] = [];
+  for (const e of events) {
+    const withHandle = eventWithParsedHandle(e);
+    admittedEvents.push(withHandle);
+    const verb = lifecycleVerb(withHandle.handle);
+    if (!verb) continue;
+    requireAdmission(await admission.beforeProjection({
+      entityName: withHandle.handle.entity,
+      verb,
+      principal,
+      eventType: withHandle.type,
+      event: withHandle,
+      db,
+      now,
+      payload,
+    }));
+  }
+  // Application-owned annotation admission: snapshot the pre-image now and
+  // compare it after projection, inside the same transaction.
+  const annotatedState = admission.annotatedMutation?.before({
+    db, events: admittedEvents, actionId, actionType: type, scope, principal, payload, now,
+  }) ?? null;
+  return annotatedState;
+}
+
+function finalizeEvents(
+  events: any[],
+  { now, actionId, nextSeq, preserveV16Capability }: {
+    now: string;
+    actionId: string;
+    nextSeq: (scope: any) => number;
+    preserveV16Capability: boolean;
+  },
+): any[] {
+  const finalizedEvents: any[] = [];
+  for (const e of events) {
+    const withHandle = eventWithParsedHandle(e);
+    const scope = withHandle.scope;
+    const seq = nextSeq(scope);
+    const data = resolveNowTokens(withHandle.data ?? {}, now);
+    const ev = {
+      ...withHandle,
+      data,
+      seq,
+      actionId,
+      committedAt: now,
+      ...(preserveV16Capability && withHandle.v16Capability !== undefined ? { v16Capability: withHandle.v16Capability } : {}),
+    };
+    finalizedEvents.push(eventWithHandle(ev, withHandle.handle));
+  }
+  return finalizedEvents;
+}
+
+// Projection consumers — materialize entity rows from events.
+// Registered-action projections pin actionType to the declaring action.
+// Batch commits use type '$batch'; admit a projection when its action is
+// one of the submitted batch members (same event-type filter still applies).
+// Events project in EMISSION order (event-major, not consumer-major): a
+// generated action may span several entity projections and its handler
+// owns a load-bearing order between them — the annotation-entity remove
+// action must tear the annotation down BEFORE the related row whose FK
+// references it (ON DELETE RESTRICT), and compose must create the row
+// BEFORE its annotation.
+async function applyProjectionConsumers(
+  projectionConsumers: any[],
+  db: unknown,
+  finalizedEvents: any[],
+  { type, payload, privateFact, claimedBlobs }: {
+    type: unknown;
+    payload: unknown;
+    privateFact: unknown;
+    claimedBlobs: unknown;
+  },
+) {
+  const batchActionTypes = type === '$batch' && Array.isArray(payload)
+    ? new Set(payload.map((action) => action?.type).filter((value) => typeof value === 'string'))
+    : null;
+  for (const ev of finalizedEvents) {
+    for (const consumer of projectionConsumers) {
+      if (!consumer.eventTypes.includes(ev.type)) continue;
+      if (consumer.actionType !== undefined && consumer.actionType !== type
+        && !(batchActionTypes?.has(consumer.actionType))) continue;
+      if (consumer.privateFact === true) {
+        if (privateFact === undefined) throw new TypeError('private-fact projection requires a canonical private fact');
+        await (consumer.applyAsync ?? consumer.apply)(ev, db, Object.freeze({ privateFact, ...(claimedBlobs ? { claimedBlobs } : {}) }));
+      } else if (claimedBlobs) {
+        await (consumer.applyAsync ?? consumer.apply)(ev, db, Object.freeze({ claimedBlobs }));
+      } else {
+        await (consumer.applyAsync ?? consumer.apply)(ev, db);
+      }
+    }
+  }
+}
+
+async function runPostProjectionAdmission(
+  admission: MutationAdmission,
+  db: unknown,
+  finalizedEvents: any[],
+  { principal, now, payload }: { principal: unknown; now: string; payload: unknown },
+) {
+  // Post-projection admission — runs IN-TXN after projection. Create
+  // row-grants need this deep visibility: the row exists only after the
+  // projection consumer has materialized it.
+  for (const ev of finalizedEvents) {
+    const verb = lifecycleVerb(ev.handle);
+    if (!verb) continue;
+    requireAdmission(await admission.afterProjection({
+      entityName: ev.handle.entity,
+      verb,
+      principal,
+      eventType: ev.type,
+      event: ev,
+      db,
+      now,
+      payload,
+    }));
+  }
+}
+
+async function runInTxnEffects(
+  effectsExecutor: ReturnType<typeof effectEventsFor>,
+  { db, finalizedEvents, now, actionId, principal, depth, maxEffectDepth, recurse }: {
+    db: unknown;
+    finalizedEvents: any[];
+    now: string;
+    actionId: string;
+    principal: unknown;
+    depth: number;
+    maxEffectDepth: number;
+    recurse: (effectEvents: any[], effectPrincipal: unknown, nextDepth: number) => Promise<void>;
+  },
+) {
+  if (!effectsExecutor) return;
+  for (const ev of finalizedEvents) {
+    const effectEvents = effectsExecutor(ev, { now, actionId, db });
+    if (effectEvents && effectEvents.length > 0) {
+      if (depth >= maxEffectDepth) {
+        throw new Error(
+          `Effect reentrancy depth limit exceeded (max: ${maxEffectDepth}). ` +
+          'This is a runtime backstop against runaway effect chains (ADR #22).',
+        );
+      }
+      const effectPrincipal = effectEvents[0]?._effectPrincipal ?? principal;
+      await recurse(effectEvents, effectPrincipal, depth + 1);
+    }
+  }
+}
+
+function captureCompositeBeforeEvidence(
+  db: DbHandle,
+  finalizedEvents: any[],
+  compositeJournal: CompositeJournalConfig | undefined,
+): CompositeEvidence | null {
+  if (compositeJournal === undefined || !finalizedEvents.some((e) => e?.handle)) return null;
+  const evidence: CompositeEvidence = { before: new Map(), after: new Map() };
+  for (const ev of finalizedEvents) {
+    const entityName: string | undefined = ev?.handle?.entity;
+    const rowId: unknown = ev?.data?.id;
+    if (!entityName || typeof rowId !== 'string') continue;
+    if (!/\.updated$|\.removed$/.test(ev.type)) continue;
+    try {
+      const row = db.prepare(`SELECT * FROM ${entityName} WHERE id = ?`).get(rowId) as Record<string, unknown> | undefined;
+      if (row) {
+        let rows = evidence.before.get(entityName);
+        if (!rows) evidence.before.set(entityName, rows = new Map());
+        rows.set(String(rowId), { ...row });
+      }
+    } catch {
+      // No such table: the router invalidates on missing evidence instead of guessing.
+    }
+  }
+  return evidence;
+}
+
+function recordCompositeJournalEvidence(
+  db: DbHandle,
+  finalizedEvents: any[],
+  compositeJournal: CompositeJournalConfig,
+  compositeEvidence: CompositeEvidence | null,
+  { actionId, now, privateFact }: { actionId: string; now: string; privateFact: unknown },
+) {
+  const plans = compositeJournal.plans as ReadonlyMap<string, import('./composite-patch-plan.ts').AnchorPatchPlan>;
+  const evidence: CompositeEvidence = compositeEvidence ?? { before: new Map(), after: new Map() };
+  for (const ev of finalizedEvents) {
+    const entityName: string | undefined = ev?.handle?.entity;
+    const rowId: unknown = ev?.data?.id;
+    if (!entityName || typeof rowId !== 'string') continue;
+    if (!/\.created$|\.updated$/.test(ev.type)) continue;
+    try {
+      const row = db.prepare(`SELECT * FROM ${entityName} WHERE id = ?`).get(rowId) as Record<string, unknown> | undefined;
+      if (row) {
+        let rows = evidence.after.get(entityName);
+        if (!rows) evidence.after.set(entityName, rows = new Map());
+        rows.set(String(rowId), { ...row });
+      }
+    } catch {
+      // Absent table/row: the router invalidates on missing evidence.
+    }
+  }
+  const inputs: CompositeChangeInput[] = [];
+  // Declared routing facts (cross-exam 2): registered actions may declare
+  // touched rows via a `compositeRouting` block on their private fact —
+  // at the fact's top level or inside its `after` half (the canonical
+  // {before, after} shape).
+  let declaredRoutingFacts: import('./composite-journal.ts').DeclaredRoutingFact[] | undefined;
+  {
+    const fact = privateFact as Record<string, unknown> | undefined;
+    const candidates: unknown[] = [fact];
+    if (fact && typeof fact === 'object') {
+      candidates.push((fact as { application?: unknown }).application);
+      const after = (fact as { after?: unknown }).after;
+      candidates.push(after);
+      if (after && typeof after === 'object' && (after as { application?: unknown }).application !== undefined) {
+        candidates.push((after as { application?: unknown }).application);
+      }
+    }
+    for (const source of candidates) {
+      const block = source && typeof source === 'object' ? (source as { compositeRouting?: unknown }).compositeRouting : undefined;
+      if (Array.isArray(block)) {
+        declaredRoutingFacts = block.filter((entry) => entry !== null && typeof entry === 'object') as import('./composite-journal.ts').DeclaredRoutingFact[];
+        break;
+      }
+    }
+  }
+  for (const ev of finalizedEvents) {
+    for (const entry of routeCompositeEvent(
+      db,
+      plans,
+      {
+        type: ev.type as string,
+        scope: ev.scope as string,
+        seq: ev.seq as number,
+        actionId,
+        data: (ev as { data?: Record<string, unknown> }).data,
+        declaredRoutingFacts: declaredRoutingFacts ?? [],
+      },
+      evidence,
+    )) {
+      inputs.push({ ...entry, actionId });
+    }
+  }
+  // Authorization-dependency invalidation (cross-exam 3/9): a committed
+  // change to a declared grant/membership entity can flip ANY row's
+  // admission in affected scopes — record an explicit invalidating entry.
+  const authDeps = compositeJournal.authorizationDependencies;
+  if (authDeps !== undefined && authDeps.length > 0) {
+    for (const ev of finalizedEvents) {
+      const depEntity: string | undefined = ev?.handle?.entity;
+      if (!depEntity || !authDeps.includes(depEntity)) continue;
+      for (const plan of plans.values()) {
+        const scopeEntityName = plan.declaration;
+        const isAnchorScopeEvent = ev.scope.startsWith(`${scopeEntityName}:`);
+        inputs.push({
+          scope: isAnchorScopeEvent ? ev.scope : '',
+          declaration: scopeEntityName,
+          actionId,
+          eventRefs: [{ scope: ev.scope, seq: ev.seq }],
+          affected: [],
+          invalidating: true,
+        });
+      }
+    }
+  }
+  recordCompositeChanges(db, inputs, now);
+}
+
+function createMutationVariant<TState>({
+  name,
+  label,
+  options,
+  beforeApply,
+  prepareEvents,
+  afterAnnotatedAdmission,
+  afterEffects,
+  recursiveArgs,
+}: {
+  name: string;
+  label: string;
+  options: SharedMutationVariantOptions;
+  beforeApply?: (db: DbHandle, args: ApplyInTxnArgs) => any[] | null;
+  prepareEvents: (db: DbHandle, events: any[], args: ApplyInTxnArgs) => { finalizedEvents: any[]; state: TState };
+  afterAnnotatedAdmission?: (db: DbHandle, finalizedEvents: any[], args: ApplyInTxnArgs, state: TState) => void;
+  afterEffects?: (db: DbHandle, finalizedEvents: any[], args: ApplyInTxnArgs, state: TState) => void;
+  recursiveArgs: (args: ApplyInTxnArgs, effectPrincipal: unknown, nextDepth: number) => ApplyInTxnArgs;
+}) {
+  const {
+    projectionConsumers = [],
+    admission = noAdmission() as MutationAdmission,
+    blobAdapter = noBlobAdapter(),
+    effectsRegistry = null,
+    executeEffectsForEvent = null,
+    postCommitConsumers = [],
+    maxEffectDepth = 8,
+  } = options;
   if (!Number.isInteger(maxEffectDepth) || maxEffectDepth < 0) {
-    throw new Error('durableMutationVariant: maxEffectDepth must be a non-negative integer');
+    throw new Error(`${label}: maxEffectDepth must be a non-negative integer`);
   }
   const effectsExecutor = effectEventsFor(effectsRegistry, executeEffectsForEvent);
   const variant = {
-    name: 'durable.mutation',
-    async applyInTxn(db: unknown, events: any[], {
-      now,
-      actionId,
-      nextSeq,
-      principal,
-      depth = 0,
-      payload,
-      type,
-      scope: _scope,
-      privateFact,
-      claimedBlobs,
-    }: {
-      now: string;
-      actionId: string;
-      nextSeq: (scope: unknown) => number;
-      principal: unknown;
-      depth?: number;
-      payload?: unknown;
-      type?: unknown;
-      scope?: unknown;
-      privateFact?: unknown;
-      claimedBlobs?: unknown;
-    }) {
-      const finalizedEvents: any[] = [];
+    name,
+    async applyInTxn(db: unknown, events: any[], args: ApplyInTxnArgs) {
+      const {
+        now,
+        actionId,
+        principal,
+        depth = 0,
+        payload,
+        type,
+        scope,
+        privateFact,
+        claimedBlobs,
+      } = args;
+
+      const shortCircuit = beforeApply?.(db as DbHandle, args);
+      if (shortCircuit !== null && shortCircuit !== undefined) return shortCircuit;
 
       // Pre-projection admission — runs IN-TXN against the PRE-mutation row,
-      // before the _Log append and before projection. Denial leaves zero
-      // footprint. This shallow module interface keeps scheduler admission on
-      // the durable variant instead of exporting low-level append/authorize
-      // primitives across the seam.
-      const admittedEvents: any[] = [];
-      for (const e of events) {
-        const withHandle = eventWithParsedHandle(e);
-        admittedEvents.push(withHandle);
-        const verb = lifecycleVerb(withHandle.handle);
-        if (!verb) continue;
-        requireAdmission(await admission.beforeProjection({
-          entityName: withHandle.handle.entity,
-          verb,
-          principal,
-          eventType: withHandle.type,
-          event: withHandle,
-          db,
-          now,
-          payload,
-        }));
-      }
-      // Application-owned annotation admission: snapshot the pre-image now and
-      // compare it after projection, inside the same transaction.
-      const annotatedState = admission.annotatedMutation?.before({
-        db, events: admittedEvents, actionId, actionType: type, scope: _scope, principal, payload, now,
-      }) ?? null;
+      // before log/receipt writes and before projection. Denial leaves zero footprint.
+      const annotatedState = await runPreProjectionAdmission(admission, db, events, {
+        actionId, type, scope, principal, payload, now,
+      });
 
-      // Append events to _Log with per-scope sequence numbers. NOW tokens in the
-      // event data are resolved to the commit-time ISO here (ADR #24) — before
-      // serialization, so the token never reaches _Log. The actual INSERT is
-      // centralized in committed-log.mjs — one canonical write surface.
-      for (const e of events) {
-        const withHandle = eventWithParsedHandle(e);
-        const scope = withHandle.scope;
-        const seq = nextSeq(scope);
-        const data = resolveNowTokens(withHandle.data ?? {}, now);
-        const ev = { ...withHandle, data, seq, actionId, committedAt: now, ...(withHandle.v16Capability !== undefined ? { v16Capability: withHandle.v16Capability } : {}) };
-        finalizedEvents.push(eventWithHandle(ev, withHandle.handle));
-      }
-      appendEvents(db as DbHandle, finalizedEvents);
+      const { finalizedEvents, state } = prepareEvents(db as DbHandle, events, args);
 
-      // Composite journal evidence pass 1 (#122): capture private before-images
-      // BEFORE this action's own projection consumers run. Update/remove rows
-      // are still pre-image here; the post-projection pass below supplies
-      // after-images. Identity-only — no recipient value is retained.
-      let compositeEvidence: { before: Map<string, Map<string, Record<string, unknown>>>; after: Map<string, Map<string, Record<string, unknown>>> } | null = null;
-      if (compositeJournal !== undefined && finalizedEvents.some((e) => e?.handle)) {
-        compositeEvidence = { before: new Map(), after: new Map() };
-        for (const ev of finalizedEvents) {
-          const entityName: string | undefined = ev?.handle?.entity;
-          const rowId: unknown = ev?.data?.id;
-          if (!entityName || typeof rowId !== 'string') continue;
-          if (!/\.updated$|\.removed$/.test(ev.type)) continue;
-          try {
-            const row = (db as DbHandle).prepare(`SELECT * FROM ${entityName} WHERE id = ?`).get(rowId) as Record<string, unknown> | undefined;
-            if (row) {
-              let rows = compositeEvidence.before.get(entityName);
-              if (!rows) compositeEvidence.before.set(entityName, rows = new Map());
-              rows.set(String(rowId), { ...row });
-            }
-          } catch {
-            // No such table (e.g. tombstone-only entities are real tables, but
-            // foreign event scopes may not be): the router invalidates on the
-            // missing evidence instead of guessing.
-          }
-        }
-      }
+      await applyProjectionConsumers(projectionConsumers, db, finalizedEvents, {
+        type, payload, privateFact, claimedBlobs,
+      });
 
-      // Projection consumers — materialize entity rows from events.
-      // Registered-action projections pin actionType to the declaring action.
-      // Batch commits use type '$batch'; admit a projection when its action is
-      // one of the submitted batch members (same event-type filter still applies).
-      const batchActionTypes = type === '$batch' && Array.isArray(payload)
-        ? new Set(payload.map((action) => action?.type).filter((value) => typeof value === 'string'))
-        : null;
-      // Events project in EMISSION order (event-major, not consumer-major): a
-      // generated action may span several entity projections and its handler
-      // owns a load-bearing order between them — the annotation-entity remove
-      // action must tear the annotation down BEFORE the related row whose FK
-      // references it (ON DELETE RESTRICT), and compose must create the row
-      // BEFORE its annotation. Each event still applies exactly once per
-      // subscribing consumer, and per consumer the relative emission order of
-      // its own events is unchanged.
-      for (const ev of finalizedEvents) {
-        for (const consumer of projectionConsumers) {
-          if (consumer.eventTypes.includes(ev.type)) {
-            if (consumer.actionType !== undefined && consumer.actionType !== type
-              && !(batchActionTypes?.has(consumer.actionType))) continue;
-            if (consumer.privateFact === true) {
-              if (privateFact === undefined) throw new TypeError('private-fact projection requires a canonical private fact');
-              await (consumer.applyAsync ?? consumer.apply)(ev, db, Object.freeze({ privateFact, ...(claimedBlobs ? { claimedBlobs } : {}) }));
-            } else if (claimedBlobs) {
-              await (consumer.applyAsync ?? consumer.apply)(ev, db, Object.freeze({ claimedBlobs }));
-            } else {
-              await (consumer.applyAsync ?? consumer.apply)(ev, db);
-            }
-          }
-        }
-      }
-
-      // Blob adoption is in-txn and atomic with the log + projection writes.
+      // Blob adoption is in-txn and atomic with the projection + log/receipt writes.
       await blobAdapter.adoptInTxn(db, finalizedEvents);
 
       // Application-owned annotation admission runs after projection has
       // materialized the new annotation images and before any receipt write.
-      // A refusal throws here and rolls the whole coordinated transaction back.
       if (admission.annotatedMutation !== undefined) {
         await admission.annotatedMutation.after({
-          db, events: finalizedEvents, state: annotatedState, actionId, actionType: type, scope: _scope, principal, payload, now,
+          db, events: finalizedEvents, state: annotatedState, actionId, actionType: type, scope, principal, payload, now,
         });
       }
 
-      // Composite journal evidence pass 2 + routing (#122): after projection,
-      // capture after-images, route every finalized event through the compiled
-      // patch plans, and record the entries atomically with _Log and
-      // _ActionReceipt. A journal failure fails the commit — an unrecorded
-      // composite change would be a silent gap in the patch protocol.
-      if (compositeJournal !== undefined && (compositeEvidence !== null || finalizedEvents.length > 0)) {
-        const plans = compositeJournal.plans as ReadonlyMap<string, import('./composite-patch-plan.ts').AnchorPatchPlan>;
-        const evidence: { before: Map<string, Map<string, Record<string, unknown>>>; after: Map<string, Map<string, Record<string, unknown>>> } = compositeEvidence ??= { before: new Map(), after: new Map() };
-        for (const ev of finalizedEvents) {
-          const entityName: string | undefined = ev?.handle?.entity;
-          const rowId: unknown = ev?.data?.id;
-          if (!entityName || typeof rowId !== 'string') continue;
-          if (!/\.created$|\.updated$/.test(ev.type)) continue;
-          try {
-            const row = (db as DbHandle).prepare(`SELECT * FROM ${entityName} WHERE id = ?`).get(rowId) as Record<string, unknown> | undefined;
-            if (row) {
-              let rows = evidence.after.get(entityName);
-              if (!rows) evidence.after.set(entityName, rows = new Map());
-              rows.set(String(rowId), { ...row });
-            }
-          } catch {
-            // Absent table/row: the router invalidates on missing evidence.
-          }
-        }
-        const inputs: CompositeChangeInput[] = [];
-        // Declared routing facts (cross-exam 2): registered actions may declare
-        // touched rows via a `compositeRouting` block on their private fact —
-        // at the fact's top level or inside its `after` half (the canonical
-        // {before, after} shape). The application view of compound facts
-        // exposes `application`; plain facts expose themselves. Identity-only.
-        let declaredRoutingFacts: import('./composite-journal.ts').DeclaredRoutingFact[] | undefined;
-        {
-          const fact = privateFact as Record<string, unknown> | undefined;
-          const candidates: unknown[] = [fact];
-          if (fact && typeof fact === 'object') {
-            candidates.push((fact as { application?: unknown }).application);
-            const after = (fact as { after?: unknown }).after;
-            candidates.push(after);
-            if (after && typeof after === 'object' && (after as { application?: unknown }).application !== undefined) {
-              candidates.push((after as { application?: unknown }).application);
-            }
-          }
-          for (const source of candidates) {
-            const block = source && typeof source === 'object' ? (source as { compositeRouting?: unknown }).compositeRouting : undefined;
-            if (Array.isArray(block)) {
-              declaredRoutingFacts = block.filter((entry) => entry !== null && typeof entry === 'object') as import('./composite-journal.ts').DeclaredRoutingFact[];
-              break;
-            }
-          }
-        }
-        for (const ev of finalizedEvents) {
-          for (const entry of routeCompositeEvent(
-            db as DbHandle,
-            plans,
-            {
-              type: ev.type as string,
-              scope: ev.scope as string,
-              seq: ev.seq as number,
-              actionId,
-              data: (ev as { data?: Record<string, unknown> }).data,
-              declaredRoutingFacts: declaredRoutingFacts ?? [],
-            },
-            evidence,
-          )) {
-            inputs.push({ ...entry, actionId });
-          }
-        }
-        // Authorization-dependency invalidation (cross-exam 3/9): a committed
-        // change to a declared grant/membership entity can flip ANY row's
-        // admission in affected scopes — record an explicit invalidating entry.
-        const authDeps = compositeJournal.authorizationDependencies;
-        if (authDeps !== undefined && authDeps.length > 0) {
-          for (const ev of finalizedEvents) {
-            const depEntity: string | undefined = ev?.handle?.entity;
-            if (!depEntity || !authDeps.includes(depEntity)) continue;
-            for (const plan of plans.values()) {
-              const scopeEntityName = plan.declaration;
-              const isAnchorScopeEvent = ev.scope.startsWith(`${scopeEntityName}:`);
-              inputs.push({
-                scope: isAnchorScopeEvent ? ev.scope : '',
-                declaration: scopeEntityName,
-                actionId,
-                eventRefs: [{ scope: ev.scope, seq: ev.seq }],
-                affected: [],
-                invalidating: true,
-              });
-            }
-          }
-        }
-        recordCompositeChanges(db as DbHandle, inputs, now);
-      }
+      afterAnnotatedAdmission?.(db as DbHandle, finalizedEvents, args, state);
 
-      // Post-projection admission — runs IN-TXN after projection. Create
-      // row-grants need this deep visibility: the row exists only after the
-      // projection consumer has materialized it.
-      for (const ev of finalizedEvents) {
-        const verb = lifecycleVerb(ev.handle);
-        if (!verb) continue;
-        requireAdmission(await admission.afterProjection({
-          entityName: ev.handle.entity,
-          verb,
-          principal,
-          eventType: ev.type,
-          event: ev,
-          db,
-          now,
-          payload,
-        }));
-      }
+      await runPostProjectionAdmission(admission, db, finalizedEvents, { principal, now, payload });
 
-      // Effects recurse through this SAME named variant. The implementation is
-      // local to the variant so dispatch and batch get identical depth behavior
-      // and leverage one pipeline interface rather than an options lattice.
-      if (effectsExecutor) {
-        for (const ev of finalizedEvents) {
-          const effectEvents = effectsExecutor(ev, { now, actionId, db });
-          if (effectEvents && effectEvents.length > 0) {
-            if (depth >= maxEffectDepth) {
-              throw new Error(
-                `Effect reentrancy depth limit exceeded (max: ${maxEffectDepth}). ` +
-                'This is a runtime backstop against runaway effect chains (ADR #22).',
-              );
-            }
-            const effectPrincipal = effectEvents[0]?._effectPrincipal ?? principal;
-            await variant.applyInTxn(db, effectEvents, {
-              now,
-              actionId,
-              nextSeq,
-              principal: effectPrincipal,
-              depth: depth + 1,
-              payload,
-            });
-          }
-        }
-      }
+      // Effects recurse through this SAME named variant (ADR #6, #22).
+      await runInTxnEffects(effectsExecutor, {
+        db,
+        finalizedEvents,
+        now,
+        actionId,
+        principal,
+        depth,
+        maxEffectDepth,
+        recurse: async (effectEvents, effectPrincipal, nextDepth) => {
+          await variant.applyInTxn(db, effectEvents, recursiveArgs(args, effectPrincipal, nextDepth));
+        },
+      });
+
+      afterEffects?.(db as DbHandle, finalizedEvents, args, state);
 
       return finalizedEvents;
     },
@@ -478,6 +583,48 @@ export function durableMutationVariant({
   return Object.freeze(variant);
 }
 
+export function durableMutationVariant({
+  compositeJournal,
+  ...options
+}: SharedMutationVariantOptions & {
+  /** Compiled patch plans + journal routing (#122). Undefined keeps the pre-patch behavior unchanged. */
+  compositeJournal?: CompositeJournalConfig;
+} = {}) {
+  return createMutationVariant<CompositeEvidence | null>({
+    name: 'durable.mutation',
+    label: 'durableMutationVariant',
+    options,
+    prepareEvents(db, events, { now, actionId, nextSeq }) {
+      // Append events to _Log with per-scope sequence numbers. NOW tokens are
+      // resolved to the commit-time ISO before serialization (ADR #24).
+      const finalizedEvents = finalizeEvents(events, {
+        now,
+        actionId,
+        nextSeq: nextSeq!,
+        preserveV16Capability: true,
+      });
+      appendEvents(db, finalizedEvents);
+      // Composite journal evidence pass 1 (#122): capture private before-images
+      // BEFORE this action's own projection consumers run.
+      const state = captureCompositeBeforeEvidence(db, finalizedEvents, compositeJournal);
+      return { finalizedEvents, state };
+    },
+    afterAnnotatedAdmission(db, finalizedEvents, { actionId, now, privateFact }, compositeEvidence) {
+      // Composite journal evidence pass 2 + routing (#122): after projection,
+      // capture after-images, route finalized events through patch plans, and
+      // record entries atomically with _Log and _ActionReceipt.
+      if (compositeJournal !== undefined && (compositeEvidence !== null || finalizedEvents.length > 0)) {
+        recordCompositeJournalEvidence(db, finalizedEvents, compositeJournal, compositeEvidence, {
+          actionId, now, privateFact,
+        });
+      }
+    },
+    recursiveArgs({ now, actionId, nextSeq, payload }, effectPrincipal, nextDepth) {
+      return { now, actionId, nextSeq, principal: effectPrincipal, depth: nextDepth, payload };
+    },
+  });
+}
+
 // liveMutationVariant — the no-history mutation lane (S3/A2, #100).
 //
 // A live-tier entity's mutation must NOT quietly write every mutation into
@@ -488,238 +635,62 @@ export function durableMutationVariant({
 // the no-history core: bump the resource/collection revision, write the
 // MINIMIZED idempotency receipt, and never touch `_Log` or `_Cursor`. No `_Log`
 // row is ever produced for a live entity through this variant.
-//
-// The durable `_ActionReceipt` is also skipped for a live-only commit: it
-// retains the request payload, which the no-history receipt must not
-// (considerations #8/#9). The minimized `_NoHistoryReceipt` IS the idempotency
-// proof; a retried (scope, actionId) settles to the same outcome without a
-// second apply.
-//
-// The expected-revision guard is the S3/A6 hook surface: an edit may carry
-// `expectedRevision` in its request payload; a mismatch rejects the action with
-// a safe `conflict` classification before any row change lands — no blind
-// last-write-wins.
-//
-// All writes join the caller's write-coordinator transaction (BEGIN IMMEDIATE);
-// this variant never opens its own.
-export function liveMutationVariant({
-  projectionConsumers = [],
-  admission = noAdmission(),
-  blobAdapter = noBlobAdapter(),
-  effectsRegistry = null,
-  executeEffectsForEvent = null,
-  postCommitConsumers = [],
-  maxEffectDepth = 8,
-}: {
-  projectionConsumers?: any[];
-  admission?: {
-    beforeProjection: (context: any) => Promise<unknown>;
-    afterProjection: (context: any) => Promise<unknown>;
-    annotatedMutation?: {
-      before: (context: any) => unknown;
-      after: (context: any) => Promise<unknown>;
-    };
-  };
-  blobAdapter?: { adoptInTxn: (db: unknown, events: unknown[]) => Promise<unknown> };
-  effectsRegistry?: unknown;
-  executeEffectsForEvent?: unknown;
-  postCommitConsumers?: Array<(events: unknown, context: unknown) => Promise<unknown> | unknown>;
-  maxEffectDepth?: number;
-} = {}) {
-  if (!Number.isInteger(maxEffectDepth) || maxEffectDepth < 0) {
-    throw new Error('liveMutationVariant: maxEffectDepth must be a non-negative integer');
-  }
-  const effectsExecutor = effectEventsFor(effectsRegistry, executeEffectsForEvent);
-  const variant = {
+export function liveMutationVariant(options: SharedMutationVariantOptions = {}) {
+  return createMutationVariant<void>({
     name: 'live.mutation',
-    async applyInTxn(db: unknown, events: any[], {
-      now,
-      actionId,
-      principal,
-      depth = 0,
-      payload,
-      type,
-      scope: owningScope,
-      privateFact,
-      claimedBlobs,
-    }: {
-      now: string;
-      actionId: string;
-      principal: unknown;
-      depth?: number;
-      payload?: unknown;
-      type?: unknown;
-      scope?: unknown;
-      privateFact?: unknown;
-      claimedBlobs?: unknown;
-    }) {
+    label: 'liveMutationVariant',
+    options,
+    beforeApply(db, { scope, actionId }) {
       // Retry backstop: an already-receipted (scope, actionId) never applies a
       // second time — not even when the pre-handler dedupe missed (batch retry,
-      // effect re-entrancy). No row change, no revision bump, no receipt re-
-      // write; the existing receipt IS the settled outcome.
-      if (noHistoryReceiptFor(db as DbHandle, owningScope as string, actionId)) {
-        return [];
-      }
-
-      const finalizedEvents: any[] = [];
-
-      // Pre-projection admission — runs IN-TXN against the PRE-mutation row,
-      // before the row change and before the receipt. Denial leaves zero
-      // footprint, exactly as on the durable lane.
-      const admittedEvents: any[] = [];
-      for (const e of events) {
-        const withHandle = eventWithParsedHandle(e);
-        admittedEvents.push(withHandle);
-        const verb = lifecycleVerb(withHandle.handle);
-        if (!verb) continue;
-        requireAdmission(await admission.beforeProjection({
-          entityName: withHandle.handle.entity,
-          verb,
-          principal,
-          eventType: withHandle.type,
-          event: withHandle,
-          db,
-          now,
-          payload,
-        }));
-      }
-      const annotatedState = admission.annotatedMutation?.before({
-        db, events: admittedEvents, actionId, actionType: type, scope: owningScope, principal, payload, now,
-      }) ?? null;
-
+      // effect re-entrancy).
+      if (noHistoryReceiptFor(db, scope as string, actionId)) return [];
+      return null;
+    },
+    prepareEvents(db, events, { now, actionId, payload, scope: owningScope }) {
       // No-history sequence allocation: events carry a transaction-local seq so
-      // projections and consumers observe a monotonic per-scope order, but no
-      // `_Cursor` row is read or written — the durable sequence space is never
-      // consumed by a live entity.
+      // projections and consumers observe a monotonic per-scope order without
+      // reading or writing `_Cursor`.
       const liveSeqs = new Map<string, number>();
       const nextLiveSeq = (eventScope: string): number => {
         const seq = (liveSeqs.get(eventScope) ?? 0) + 1;
         liveSeqs.set(eventScope, seq);
         return seq;
       };
-      for (const e of events) {
-        const withHandle = eventWithParsedHandle(e);
-        const eventScope = withHandle.scope;
-        const data = resolveNowTokens(withHandle.data ?? {}, now);
-        const ev = { ...withHandle, data, seq: nextLiveSeq(eventScope), actionId, committedAt: now };
-        finalizedEvents.push(eventWithHandle(ev, withHandle.handle));
-      }
+      const finalizedEvents = finalizeEvents(events, {
+        now,
+        actionId,
+        nextSeq: nextLiveSeq,
+        preserveV16Capability: false,
+      });
 
-      // Expected-revision guard (S3/A2 hook; the full atomic-op surface is
-      // S3/A6). Optimistic concurrency for the no-history lane: an edit may
-      // carry expectedRevision; a mismatch rejects the whole action with a safe
-      // classification before any row change lands — no blind last-write-wins.
+      // Expected-revision guard (S3/A2 hook; S3/A6 optimistic concurrency).
       const expectedRevision = isPlainObject(payload) ? (payload as Record<string, unknown>).expectedRevision : undefined;
       if (expectedRevision !== undefined) {
         const guardScope = finalizedEvents[0]?.scope ?? owningScope;
-        guardExpectedRevision(db as DbHandle, guardScope as string, expectedRevision);
+        guardExpectedRevision(db, guardScope as string, expectedRevision);
       }
 
-      // Atomic handlers resolve their operation against the current row inside
-      // this coordinator transaction, then emit the ordinary update event. The
-      // operation grammar is validated here as well, before projection, receipt,
-      // and revision bump can make a malformed request observable.
+      // Validate atomicOperations grammar before projection/receipt/revision bump.
       const atomicOperations = isPlainObject(payload) ? (payload as Record<string, unknown>).atomicOperations : undefined;
       if (atomicOperations !== undefined
         && (!Array.isArray(atomicOperations) || !atomicOperations.every(isAtomicOperation))) {
         throw new ValidationError('atomicOperations must be an array of known atomic operations');
       }
-
-      // Projection consumers — materialize entity rows from the events. Batch
-      // commits use type '$batch'; admit a projection when its action is one of
-      // the submitted batch members (same event-type filter still applies).
-      const batchActionTypes = type === '$batch' && Array.isArray(payload)
-        ? new Set(payload.map((action) => action?.type).filter((value) => typeof value === 'string'))
-        : null;
-      // Events project in EMISSION order (event-major, not consumer-major): a
-      // generated action may span several entity projections and its handler
-      // owns a load-bearing order between them — the annotation-entity remove
-      // action must tear the annotation down BEFORE the related row whose FK
-      // references it (ON DELETE RESTRICT), and compose must create the row
-      // BEFORE its annotation. Each event still applies exactly once per
-      // subscribing consumer, and per consumer the relative emission order of
-      // its own events is unchanged.
-      for (const ev of finalizedEvents) {
-        for (const consumer of projectionConsumers) {
-          if (consumer.eventTypes.includes(ev.type)) {
-            if (consumer.actionType !== undefined && consumer.actionType !== type
-              && !(batchActionTypes?.has(consumer.actionType))) continue;
-            if (consumer.privateFact === true) {
-              if (privateFact === undefined) throw new TypeError('private-fact projection requires a canonical private fact');
-              await (consumer.applyAsync ?? consumer.apply)(ev, db, Object.freeze({ privateFact, ...(claimedBlobs ? { claimedBlobs } : {}) }));
-            } else if (claimedBlobs) {
-              await (consumer.applyAsync ?? consumer.apply)(ev, db, Object.freeze({ claimedBlobs }));
-            } else {
-              await (consumer.applyAsync ?? consumer.apply)(ev, db);
-            }
-          }
-        }
-      }
-
-      // Blob adoption is in-txn and atomic with the projection + receipt writes.
-      await blobAdapter.adoptInTxn(db, finalizedEvents);
-
-      if (admission.annotatedMutation !== undefined) {
-        await admission.annotatedMutation.after({
-          db, events: finalizedEvents, state: annotatedState, actionId, actionType: type, scope: owningScope, principal, payload, now,
-        });
-      }
-
-      // Post-projection admission — runs IN-TXN after projection. Create
-      // row-grants need this deep visibility: the row exists only after the
-      // projection consumer has materialized it.
-      for (const ev of finalizedEvents) {
-        const verb = lifecycleVerb(ev.handle);
-        if (!verb) continue;
-        requireAdmission(await admission.afterProjection({
-          entityName: ev.handle.entity,
-          verb,
-          principal,
-          eventType: ev.type,
-          event: ev,
-          db,
-          now,
-          payload,
-        }));
-      }
-
-      // Effects recurse through this SAME named variant (identical depth
-      // semantics to the durable lane — ADR #6, #22).
-      if (effectsExecutor) {
-        for (const ev of finalizedEvents) {
-          const effectEvents = effectsExecutor(ev, { now, actionId, db });
-          if (effectEvents && effectEvents.length > 0) {
-            if (depth >= maxEffectDepth) {
-              throw new Error(
-                `Effect reentrancy depth limit exceeded (max: ${maxEffectDepth}). ` +
-                'This is a runtime backstop against runaway effect chains (ADR #22).',
-              );
-            }
-            const effectPrincipal = effectEvents[0]?._effectPrincipal ?? principal;
-            await variant.applyInTxn(db, effectEvents, {
-              now,
-              actionId,
-              principal: effectPrincipal,
-              depth: depth + 1,
-              payload,
-              type,
-              scope: owningScope,
-            });
-          }
-        }
-      }
-
+      return { finalizedEvents, state: undefined };
+    },
+    recursiveArgs({ now, actionId, payload, type, scope }, effectPrincipal, nextDepth) {
+      return { now, actionId, principal: effectPrincipal, depth: nextDepth, payload, type, scope };
+    },
+    afterEffects(db, finalizedEvents, { now, actionId, principal, scope: owningScope }) {
       // Revision bump and invalidation marker share this transaction with the
       // projection. The ledger proves live reconnect cursors without retaining
       // the mutation payload or creating a second history.
-      // The receipt records the FIRST resource's key and THAT resource's new
-      // revision (single-resource actions are the live norm; multi-resource
-      // atomicity is the S3/A6 surface).
       const touched = new Map<string, number>();
       for (const ev of finalizedEvents) {
-        const revision = bumpRevision(db as DbHandle, ev.scope);
+        const revision = bumpRevision(db, ev.scope);
         touched.set(ev.scope, revision);
-        writeInvalidationInTxn(db as DbHandle, {
+        writeInvalidationInTxn(db, {
           resourceKey: ev.scope,
           kind: 'resource',
           revision,
@@ -727,9 +698,9 @@ export function liveMutationVariant({
         });
       }
       const resourceKey = finalizedEvents[0]?.scope ?? (owningScope as string);
-      const committedRevision = touched.get(resourceKey) ?? readLiveRevision(db as DbHandle, resourceKey);
+      const committedRevision = touched.get(resourceKey) ?? readLiveRevision(db, resourceKey);
       const actor = principal as { type?: unknown; id?: unknown } | null | undefined;
-      insertNoHistoryReceipt(db as DbHandle, {
+      insertNoHistoryReceipt(db, {
         scope: owningScope as string,
         actionId,
         resourceKey,
@@ -740,25 +711,8 @@ export function liveMutationVariant({
         safeErrorClassification: null,
         committedAt: now,
       });
-
-      return finalizedEvents;
     },
-    requiresPrivateFact(events: any[], actionType: unknown) {
-      return projectionConsumers.some((consumer) => consumer.privateFact === true
-        && (consumer.actionType === undefined || consumer.actionType === actionType)
-        && events.some((event) => consumer.eventTypes.includes(event.type)));
-    },
-    async afterCommit(events: unknown, context: unknown) {
-      for (const consumer of postCommitConsumers) {
-        try {
-          await consumer(events, context);
-        } catch {
-          // a post-commit fan-out failure never undoes the committed dispatch
-        }
-      }
-    },
-  };
-  return Object.freeze(variant);
+  });
 }
 
 // createServer({ handlers, authorize, db, effects }) — the server-side mutation handler
@@ -977,23 +931,6 @@ function handleOfEvent(event: any): any {
   }
 }
 
-// A raw DatabaseSync has no async transaction mutex. Pipeline stages may await
-// admission or projections, so serialize transaction entry per handle rather
-// than allowing a second dispatch to begin inside the first transaction.
-const transactionTails = new WeakMap<object, Promise<void>>();
-async function coordinatedTxn<T>(db: DbHandle, fn: () => Promise<T>): Promise<T> {
-  let release: (() => void) | undefined;
-  const previous = transactionTails.get(db as object) ?? Promise.resolve();
-  const tail = new Promise<void>((resolve) => { release = resolve; });
-  transactionTails.set(db as object, previous.then(() => tail));
-  await previous;
-  try {
-    return await txn(db, fn) as T;
-  } finally {
-    release!();
-  }
-}
-
 // commitEvents — the durable transaction brace shared by `dispatch` and
 // `dispatchBatch`: BEGIN IMMEDIATE → durable variant applyInTxn → COMMIT →
 // post-commit fan-out, with ROLLBACK on execution error. Expected failures are
@@ -1005,7 +942,7 @@ async function coordinatedTxn<T>(db: DbHandle, fn: () => Promise<T>): Promise<T>
 // Post-commit delivery can no longer turn a committed mutation into a failure.
 async function commitEvents(db: any, events: any, {
   now, actionId, principal, payload, pipeline, livePipeline, tierOfEvent, scope, type, authorize, historyCommit, handler,
-  erasureActionContext, authorization, contributionPolicies = null,
+  erasureActionContext, authorization, contributionPolicies = null, writeQueue = null,
 }: {
   now: string;
   actionId: string;
@@ -1022,6 +959,7 @@ async function commitEvents(db: any, events: any, {
   erasureActionContext?: unknown;
   authorization?: AuthorizationAdapter | null;
   contributionPolicies?: any;
+  writeQueue?: WriteQueue | null;
 }) {
   // A batch and any in-transaction effects share one sequence allocator. The
   // first event for a scope reads its committed cursor once; later events use
@@ -1037,6 +975,13 @@ async function commitEvents(db: any, events: any, {
     updateCursor.run(eventScope, seq, seq);
     return seq;
   };
+  // Serialize transaction entry through the single platform WriteQueue when not
+  // already inside an owned coordinator turn (never a second nested mutex).
+  const runTransaction = <T>(fn: () => Promise<T>): Promise<T> => (
+    writeQueue && !writeQueue.owned
+      ? writeQueue.run(() => txn(db, fn))
+      : txn(db, fn)
+  ) as Promise<T>;
   let committed: any;
   try {
     // Wave 4.4 — Authorize INSIDE the transaction, atomic with log append,
@@ -1051,7 +996,7 @@ async function commitEvents(db: any, events: any, {
     //
     // A denied action rolls back the entire transaction — no partial state.
     // Post-commit consumers (afterCommit) remain outside the txn as before.
-    committed = await coordinatedTxn(db, async () => {
+    committed = await runTransaction(async () => {
       if (authorize) {
         if (Array.isArray(payload)) {
           for (const action of payload) {
@@ -1454,7 +1399,7 @@ function receiptMetadata(request: any, historyCommit: any) {
 // (AGENTS.md: never a magic default); omitting it is a load-time error. When
 // Phase 2 wires this kernel to a request path, `authorize` is where the route
 // gate + grant engine compose — it is not a second, looser auth path.
-export function createServer({ handlers = {}, authorize, db, pipeline = durableMutationVariant(), livePipeline, tierOfEvent, history, historyActions = {}, cursorPolicy, contributionPolicies = null, authorization }: {
+export function createServer({ handlers = {}, authorize, db, pipeline = durableMutationVariant(), livePipeline, tierOfEvent, history, historyActions = {}, cursorPolicy, contributionPolicies = null, authorization, writeQueue = null }: {
   handlers?: Record<string, any>;
   authorize?: (context: any) => any;
   db?: any;
@@ -1472,6 +1417,8 @@ export function createServer({ handlers = {}, authorize, db, pipeline = durableM
   cursorPolicy?: any;
   contributionPolicies?: any;
   authorization?: AuthorizationAdapter | null;
+  /** Optional platform WriteQueue; when omitted on a durable server, one WriteQueue is created for direct callers. */
+  writeQueue?: WriteQueue | null;
 } = {}) {
   if (typeof authorize !== 'function') {
     throw new Error(
@@ -1700,6 +1647,7 @@ export function createServer({ handlers = {}, authorize, db, pipeline = durableM
   }
 
   // ---- durable path (db engaged) — async, SQLite-backed ----
+  const serverWriteQueue = writeQueue ?? createWriteQueue();
 
   // The durable dispatch: authorize (Fork C, outside txn — revoked-principal
   // detection before dedupe) → dedupe by actionId → run handler → commit
@@ -1792,7 +1740,7 @@ export function createServer({ handlers = {}, authorize, db, pipeline = durableM
     const committed = await commitEvents(db, emitted, {
       now, actionId, principal, payload, pipeline, livePipeline, tierOfEvent, scope, type, authorize, historyCommit,
       handler: handler.inTransaction || historyCommit?.handlerInputs ? handler : null, erasureActionContext,
-      authorization, contributionPolicies,
+      authorization, contributionPolicies, writeQueue: serverWriteQueue,
     });
     return committed;
   }
@@ -1959,7 +1907,7 @@ export function createServer({ handlers = {}, authorize, db, pipeline = durableM
     const committed = await commitEvents(db, batchCommit, {
       now, actionId, principal, payload: actions, pipeline, livePipeline, tierOfEvent, scope, type: '$batch', authorize, historyCommit,
       handler: runInTxn ? runHandlers : null,
-      authorization, contributionPolicies,
+      authorization, contributionPolicies, writeQueue: serverWriteQueue,
     });
     return committed;
   }

@@ -679,21 +679,32 @@ export function lowerToSql(ast         , ctx               = {})                
       }
       // A map-membership check: the row is admitted iff the side-table
       // has a row whose owner FK points at THIS entity row AND whose member column
-      // matches. When the node carries a `param` field, it uses the rebindable
+      // matches (plus optional role filter when `roles` is declared on the node).
+      // When the node carries a `param` field, it uses the rebindable
       // principalId param; when it carries a `value` field, the literal is baked
       // in (not the requesting principal, so it must not be rebound per request).
       case 'existsMembership': {
         const mAlias = `j${state.n += 1}`;
         const ownerExpr = `${alias}.${node.ownerField ?? 'id'}`;
+        let memberKey        ;
         if ('param' in node) {
-          const key = freshParam(node.param);
-          params[key] = null;
-          return `EXISTS (SELECT 1 FROM ${node.table} AS ${mAlias} WHERE ${mAlias}.${node.ownerCol} = ${ownerExpr} AND ${mAlias}.${MEMBER_COLUMN} = :${key})`;
+          memberKey = freshParam(node.param);
+          params[memberKey] = null;
+        } else {
+          // Literal value branch: bake the literal member id directly.
+          memberKey = freshParam(MEMBER_COLUMN);
+          params[memberKey] = node.value;
         }
-        // Literal value branch: bake the literal member id directly.
-        const key = freshParam(MEMBER_COLUMN);
-        params[key] = node.value;
-        return `EXISTS (SELECT 1 FROM ${node.table} AS ${mAlias} WHERE ${mAlias}.${node.ownerCol} = ${ownerExpr} AND ${mAlias}.${MEMBER_COLUMN} = :${key})`;
+        let roleClause = '';
+        if (Array.isArray(node.roles) && node.roles.length > 0) {
+          const roleKeys = (node.roles             ).map((role, i) => {
+            const key = freshParam(`role_${i}`);
+            params[key] = role;
+            return `:${key}`;
+          });
+          roleClause = ` AND ${mAlias}.role IN (${roleKeys.join(', ')})`;
+        }
+        return `EXISTS (SELECT 1 FROM ${node.table} AS ${mAlias} WHERE ${mAlias}.${node.ownerCol} = ${ownerExpr} AND ${mAlias}.${MEMBER_COLUMN} = :${memberKey}${roleClause})`;
       }
       // A full-text-search MATCH predicate: the row is admitted iff the FTS5
       // virtual table has an entry for this row that matches the query. The
@@ -806,7 +817,7 @@ export function bindReadScope(readScope                               , principa
   const record = principal                                                                             ;
   for (const [key, value] of Object.entries(readScope.params)) {
     if (key.endsWith(`_${PRINCIPAL_ID_PARAM}`)) {
-      params[key] = record?.id;           // the user principal's id
+      params[key] = record?.id ?? null;   // the user principal's id (null if absent)
     } else if (key.endsWith(`_${PRINCIPAL_ATTR_PARAM}`)) {
       // The link principal's token (absent for a non-link principal → NULL →
       // `col = NULL` is false in SQL → the linkHolder arm never admits a row:
@@ -833,20 +844,21 @@ export function bindReadScope(readScope                               , principa
 // principal-id param resolves to the principal's id (an anonymous principal's
 // id is null → the eq is unevaluable, exactly like `col = NULL` in SQL).
 //
-// The evaluator is THREE-VALUED, not boolean. In SQL a NULL comparison (`col =
-// NULL`, `col IN (NULL)`, `NULL >= x`) is neither true nor false — a WHERE
-// clause treats it as "not satisfied", and NOT of it is STILL not satisfied. A
-// boolean evaluator would reduce those to `false`, which `not` then flips to
-// `true`, admitting rows the SQL path denies. So every decision the row alone
-// cannot prove — a SQL NULL comparison, a membership/join/FTS predicate (their
-// side tables are not visible to one row), or a caller-supplied row that omits
-// a field the SQL path always returns — yields UNEVALUABLE, which `not` and
-// `and` PROPAGATE instead of inverting. A scope containing any unevaluable
-// construct therefore DENIES (fail closed); this is deliberately stricter than
-// SQL's three-valued logic (`false AND NULL` is false in SQL, but here any
-// unevaluable operand denies) because this gate re-verifies a caller-supplied
-// row and must never admit on a guess. `nearest` lowers to no SQL filter (1=1),
-// so it imposes no constraint and evaluates TRUE.
+// The evaluator is THREE-VALUED (Kleene / SQL 3VL), not boolean. In SQL a NULL
+// comparison (`col = NULL`, `col IN (NULL)`, `NULL >= x`) is neither true nor
+// false — a WHERE clause treats it as "not satisfied", and NOT of it is STILL
+// not satisfied. A boolean evaluator would reduce those to `false`, which `not`
+// then flips to `true`, admitting rows the SQL path denies. So every decision
+// the row alone cannot prove — a SQL NULL comparison, a membership/join/FTS
+// predicate (their side tables are not visible to one row), or a caller-supplied
+// row that omits a field the SQL path always returns — yields UNEVALUABLE,
+// which `not` propagates (`NOT UNEVALUABLE === UNEVALUABLE`). Under `and`,
+// `false AND UNEVALUABLE === false` (matching SQL 3VL): a provably false
+// branch short-circuits `and` so De Morgan `anyOf(true, UNEVALUABLE)` =
+// `NOT(AND(false, UNEVALUABLE))` = `true` (e.g. `anyOf(is.owner(), is.member())`
+// still admits the owner in DB-less mode), while `true AND UNEVALUABLE ===
+// UNEVALUABLE` (fail closed when no branch proves true). `nearest` lowers to no
+// SQL filter (1=1), so it imposes no constraint and evaluates TRUE.
 
 
 
@@ -946,17 +958,17 @@ function evaluateScopeNode(node         , ctx                  )             {
       return inner === UNEVALUABLE ? UNEVALUABLE : !inner;
     }
     case 'and': {
-      // Deliberately stricter than SQL: ANY unevaluable operand makes the whole
-      // scope unevaluable, even alongside a false operand — a boolean false here
-      // could be flipped by an enclosing `not` and admit a row the SQL path
-      // never would. Every operand is inspected (no short-circuit on false).
-      let result             = true;
+      // Standard SQL / Kleene three-valued logic:
+      //   false AND anything === false  (so De Morgan anyOf(true, UNEVALUABLE) === true)
+      //   true AND UNEVALUABLE === UNEVALUABLE (fail closed when no branch proves true)
+      //   true AND true === true
+      let hasUnevaluable = false;
       for (const operand of node.operands             ) {
         const inner = evaluateScopeNode(operand           , ctx);
-        if (inner === UNEVALUABLE) return UNEVALUABLE;
-        if (inner === false) result = false;
+        if (inner === false) return false;
+        if (inner === UNEVALUABLE) hasUnevaluable = true;
       }
-      return result;
+      return hasUnevaluable ? UNEVALUABLE : true;
     }
     // `nearest` lowers to no SQL filter (1=1) — the query layer post-filters.
     case 'nearest': return true;

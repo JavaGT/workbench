@@ -14,6 +14,7 @@
 
 import { prepareCached, type DbHandle } from './driver.ts';
 import { tryParseScopeKey } from './scope-handle.ts';
+import { EventKind, parseEventType, type EventIdentityHandle } from './event-handle.ts';
 import type { AnchorPatchPlan, PatchPlanRelation } from './composite-patch-plan.ts';
 
 export function compositeChangeTableDDL() {
@@ -90,21 +91,60 @@ function rowOf(evidence: RowEvidence, phase: 'before' | 'after', entity: string,
   return row ?? null;
 }
 
-// The router classifies events by the event TYPE suffix — the same contract
-// snapshotEventTouchesComposite already uses.
-/** Entity name from an event type ('Code.updated' -> 'Code'), else null. */
+// The Event-type grammar authority is parseEventType (event-handle.ts). For
+// grammar events the router derives both entity and phase from its handle —
+// never from a local suffix/regex re-derivation — so dotted field events
+// (Note.title.set, kind 'fieldSet') and lifecycle events agree with every other
+// grammar consumer. Application-defined event types the authority rejects keep
+// only a prefix-based entity extraction, so custom events still fan out an
+// invalidation instead of being silently dropped.
+function tryParseEventType(eventType: string): EventIdentityHandle | null {
+  try {
+    return parseEventType(eventType);
+  } catch {
+    return null;
+  }
+}
+
+/** Entity name from the grammar handle ('Code.updated' -> 'Code'), else null. */
 function classifyEntityName(eventType: string): string | null {
+  const handle = tryParseEventType(eventType);
+  if (handle) return handle.entity;
   const match = /^([A-Za-z_][A-Za-z0-9_]*)\./.exec(eventType);
   return match ? match[1] : null;
 }
 
-function classify(eventType: string): { phase: 'created' | 'updated' | 'removed' } | { phase: 'native'; field: string } | null {
-  if (eventType.endsWith('.created')) return { phase: 'created' };
-  if (eventType.endsWith('.updated')) return { phase: 'updated' };
-  if (eventType.endsWith('.removed')) return { phase: 'removed' };
-  const operated = /\.([A-Za-z_][A-Za-z0-9_]*)\.(operated|retired|restored)$/.exec(eventType);
-  if (operated) return { phase: 'native', field: operated[1] };
-  return null;
+type ClassifiedPhase = 'created' | 'updated' | 'removed' | 'native';
+
+interface EventClassification {
+  readonly phase: ClassifiedPhase;
+  readonly field?: string;
+}
+
+// Routing policy, NOT a re-derivation of the Event grammar: parseEventType
+// alone decides an event's entity, field and kind. This set says which *field*
+// operations the journal may route precisely — the annotated-text verbs whose
+// mutations change no projected selected field. Every other native verb stays
+// unclassifiable so a custom application event (code.merged.raw, ...) can never
+// be silently swallowed by a precise route that finds no branch to update.
+const ROUTABLE_NATIVE_VERBS = new Set(['operated', 'retired', 'restored']);
+
+function classify(eventType: string): EventClassification | null {
+  const handle = tryParseEventType(eventType);
+  if (!handle) return null;
+  switch (handle.kind) {
+    case EventKind.created: return { phase: 'created' };
+    case EventKind.updated: return { phase: 'updated' };
+    case EventKind.removed: return { phase: 'removed' };
+    // A dotted field-set event (Note.title.set) is a field mutation, exactly
+    // like a native field op — never an unclassifiable lifecycle event.
+    case EventKind.fieldSet: return { phase: 'native', field: handle.field };
+    case EventKind.native:
+      return ROUTABLE_NATIVE_VERBS.has(handle.nativeName)
+        ? { phase: 'native', field: handle.field }
+        : null;
+    default: return null;
+  }
 }
 
 /** All plan branches (depth-first) whose child entity matches `entity`, including the synthetic anchor branch. */

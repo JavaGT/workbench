@@ -51,6 +51,7 @@
 // exposes.
 
 
+import { EventKind, parseEventType,                          } from './event-handle.mjs';
 import { SEARCH_STALENESS_LEDGER_TABLE,                                                                                                  } from './search-plugin.mjs';
 
 import { normalizeRevocationScope,                              } from './live-fanout.mjs';
@@ -643,19 +644,25 @@ export function createSearchStalenessBridge(options                             
 function sourceChangeFromCommittedEvent(event         )                                 {
   if (event === null || typeof event !== 'object') return null;
   const value = event                                                                               ;
-  const handle = value.handle                                                                     ;
-  let entity         ;
-  let kind         ;
-  if (handle && handle.brand === 'event-handle') {
-    entity = handle.entity;
-    kind = handle.kind;
+  const attached = value.handle                                   ;
+  let handle                                 ;
+  if (attached?.brand === 'event-handle') {
+    handle = value.handle                       ;
   } else if (typeof value.type === 'string') {
-    const [entityName, kindName, ...rest] = value.type.split('.');
-    entity = entityName;
-    kind = rest.length > 0 ? 'updated' : kindName;
+    // No attached handle: derive identity from the exported Event-type grammar
+    // authority, not a bare split('.'). A dotted field event (Note.title.set)
+    // is a fieldSet handle and maps to an update, just like a native mutation;
+    // a type outside the grammar is skipped rather than fabricating a change.
+    try {
+      handle = parseEventType(value.type);
+    } catch {
+      return null;
+    }
   } else {
     return null;
   }
+  const entity = handle.entity;
+  const kind = handle.kind;
   const data = value.data;
   const rowId = data !== null && typeof data === 'object' && 'id' in data
     ? (data                    ).id
@@ -667,8 +674,8 @@ function sourceChangeFromCommittedEvent(event         )                         
     return null;
   }
   let changeKind                  ;
-  if (kind === 'created') changeKind = 'created';
-  else if (kind === 'removed') changeKind = 'removed';
+  if (kind === EventKind.created) changeKind = 'created';
+  else if (kind === EventKind.removed) changeKind = 'removed';
   else changeKind = 'updated';
   return {
     entity,

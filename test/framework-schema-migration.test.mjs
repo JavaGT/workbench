@@ -23,7 +23,7 @@ test('executeFrameworkDDL + workbench@7 migrates a pre-historyOrder _ActionRecei
 
     executeFrameworkDDL(db); // must not throw on the legacy shape (defers index to workbench@7)
     runWorkbenchMigrations(db);
-    assert.equal(appliedWorkbenchVersion(db), 7);
+    assert.equal(appliedWorkbenchVersion(db), 8);
 
     const columns = new Set(db.prepare('PRAGMA table_info(_ActionReceipt)').all().map((column) => column.name));
     assert.ok(columns.has('historyOrder'), 'historyOrder column migrated');
@@ -105,14 +105,14 @@ test('the package migrations run under the reserved workbench namespace on a fre
   const db = new DatabaseSync(':memory:');
   try {
     runWorkbenchMigrations(db);
-    assert.equal(appliedWorkbenchVersion(db), 7);
+    assert.equal(appliedWorkbenchVersion(db), 8);
 
     const rows = ledgerRows(db);
-    assert.equal(rows.length, 7, 'all package migrations recorded');
+    assert.equal(rows.length, 8, 'all package migrations recorded');
     assert.ok(rows.every((row) => row.namespace === 'workbench'), 'every package migration lives in the workbench namespace');
     assert.deepEqual(
       rows.map((row) => row.version).sort((a, b) => a - b),
-      [1, 2, 3, 4, 5, 6, 7],
+      [1, 2, 3, 4, 5, 6, 7, 8],
     );
     assert.ok(rows.every((row) => row.name.length > 0), 'every package migration records a name');
     assert.ok(rows.every((row) => /^[0-9a-f]{64}$/.test(row.checksum)), 'every package migration records a checksum');
@@ -121,8 +121,8 @@ test('the package migrations run under the reserved workbench namespace on a fre
     // Re-running is a no-op (idempotent) and the reserved namespace is the only
     // lane the package owns — no other namespace was touched.
     runWorkbenchMigrations(db);
-    assert.equal(appliedWorkbenchVersion(db), 7);
-    assert.equal(db.prepare(`SELECT COUNT(*) AS c FROM ${MIGRATION_LEDGER_TABLE}`).get().c, 7);
+    assert.equal(appliedWorkbenchVersion(db), 8);
+    assert.equal(db.prepare(`SELECT COUNT(*) AS c FROM ${MIGRATION_LEDGER_TABLE}`).get().c, 8);
 
     // The framework census derives the single namespaced ledger table.
     const { frameworkTableNames } = await import('../build/schema-table-census.mjs');
@@ -252,7 +252,7 @@ test('v7 upgrades legacy _Job, _ActionReceipt, User, TwoFactor, _PendingBlob, an
     db.prepare("INSERT INTO _ActionReceipt (scope, actionId, committedAt, eventRefs) VALUES ('S:1', 'a2', '2026-01-02T00:00:00.000Z', '[]')").run();
 
     runWorkbenchMigrations(db);
-    assert.equal(appliedWorkbenchVersion(db), 7);
+    assert.equal(appliedWorkbenchVersion(db), 8);
 
     const colsOf = (table) => new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((r) => r.name));
     for (const col of ['replacedBy', 'replacedAt', 'cleanupError', 'cleanupAttempts']) {
@@ -262,7 +262,7 @@ test('v7 upgrades legacy _Job, _ActionReceipt, User, TwoFactor, _PendingBlob, an
       assert.ok(colsOf('_PendingBlob').has(col), `_PendingBlob.${col} added`);
     }
     assert.equal(db.prepare("SELECT resourceId FROM _PendingBlob WHERE blobId = 'b1'").get().resourceId, 'res-42');
-    for (const col of ['attempts', 'availableAt', 'progress', 'stage', 'scope', 'principalKey', 'operations']) {
+    for (const col of ['attempts', 'availableAt', 'progress', 'stage', 'scope', 'principalKey', 'operations', 'output']) {
       assert.ok(colsOf('_Job').has(col), `_Job.${col} added`);
     }
     for (const col of ['historyOrder', 'actionType', 'actionData', 'principalKey', 'sessionId', 'operation', 'resultData', 'historyRootActionId', 'historyTargetActionId', 'historyOutcome']) {
@@ -275,7 +275,7 @@ test('v7 upgrades legacy _Job, _ActionReceipt, User, TwoFactor, _PendingBlob, an
 
     // Re-running is idempotent
     runWorkbenchMigrations(db);
-    assert.equal(appliedWorkbenchVersion(db), 7);
+    assert.equal(appliedWorkbenchVersion(db), 8);
   } finally {
     db.close();
   }

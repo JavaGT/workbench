@@ -158,16 +158,17 @@ test('reaper: revokes a worker whose heartbeat is stale (bearer rejected after)'
 test('result: idempotent by job id — a retried result for a completed job is a no-op (no double-apply)', () => {
   const { db, queue } = freshQueue();
   const w = queue.registerWorker(SECRET);
-  queue.enqueue({ kind: 'k', payload: {} });
+  queue.enqueue({ kind: 'k', payload: { input: 'orig' } });
   const job = queue.claim(w.workerId);
   const r1 = queue.submitResult(job.id, w.workerId, { status: 'completed', output: { url: 'thumb.png' } });
   assert.deepEqual(r1, { accepted: true, noop: false }, 'first result accepted + applied');
   // retry with DIFFERENT output — must NOT overwrite (idempotent: first terminal wins)
   const r2 = queue.submitResult(job.id, w.workerId, { status: 'completed', output: { url: 'evil.png' } });
   assert.deepEqual(r2, { accepted: true, noop: true }, 'retried result is a no-op ack');
-  const row = db.prepare('SELECT status, payload FROM _Job WHERE id=?').get(job.id);
+  const row = db.prepare('SELECT status, payload, output FROM _Job WHERE id=?').get(job.id);
   assert.equal(row.status, 'completed', 'still completed');
-  assert.equal(JSON.parse(row.payload).url, 'thumb.png', 'output NOT overwritten by the retry');
+  assert.deepEqual(JSON.parse(row.payload), { input: 'orig' }, 'input payload preserved immutably');
+  assert.equal(JSON.parse(row.output).url, 'thumb.png', 'output NOT overwritten by the retry');
   db.close();
 });
 
@@ -273,8 +274,9 @@ test('result: a non-owner cannot ack an already-terminal job (owner-only idempot
     { accepted: true, noop: true },
     'owner retry is an idempotent no-op',
   );
-  const row = db.prepare('SELECT payload FROM _Job WHERE id=?').get(job.id);
-  assert.equal(JSON.parse(row.payload).ok, true, 'terminal output NOT overwritten by owner retry');
+  const row = db.prepare('SELECT payload, output FROM _Job WHERE id=?').get(job.id);
+  assert.deepEqual(JSON.parse(row.payload), {}, 'original input payload preserved immutably');
+  assert.equal(JSON.parse(row.output).ok, true, 'terminal output NOT overwritten by owner retry');
   // non-owner probing the terminal job → REJECTED, never a noop ack
   assert.deepEqual(
     queue.submitResult(job.id, w2.workerId, { status: 'failed', output: { x: 1 } }),

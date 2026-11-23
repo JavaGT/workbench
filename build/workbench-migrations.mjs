@@ -453,6 +453,21 @@ export const WORKBENCH_MIGRATIONS                       = Object.freeze([
       ensureBlobStoreColumns(db);
     },
   },
+  {
+    // v8: add dedicated `output` column to `_Job` so completed job results no
+    // longer overwrite the immutable input `payload` (#286). Fresh databases
+    // already include `output` in CREATE TABLE IF NOT EXISTS, so v8 is an
+    // idempotent no-op on fresh DBs and an additive column upgrade on legacy DBs.
+    namespace: 'workbench',
+    name: 'job-output-column',
+    version: 8,
+    up(db) {
+      if (!tableExists(db, '_Job')) return;
+      addMissingColumns(db, '_Job', [
+        ['output', 'TEXT'],
+      ]);
+    },
+  },
 ]);
 
 // The reserved `workbench` lane is internal-only via internal.ts.

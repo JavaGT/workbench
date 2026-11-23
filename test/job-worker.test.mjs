@@ -47,9 +47,10 @@ test('work once() runs a job of its kind and marks it completed; fn sees the pay
   const res = await w.once();
   assert.equal(res.job.kind, 'send-title');
   assert.deepEqual(seen, [{ title: 'Hi', n: 1 }]);
-  const row = db.prepare('SELECT status, payload FROM _Job WHERE kind=?').get('send-title');
+  const row = db.prepare('SELECT status, payload, output FROM _Job WHERE kind=?').get('send-title');
   assert.equal(row.status, 'completed');
-  assert.deepEqual(JSON.parse(row.payload), { sent: true });
+  assert.deepEqual(JSON.parse(row.payload), { title: 'Hi', n: 1 });
+  assert.deepEqual(JSON.parse(row.output), { sent: true });
   assert.equal(db.prepare('SELECT status FROM _Job WHERE kind=?').get('other').status, 'queued');
   w.stop();
   db.close();

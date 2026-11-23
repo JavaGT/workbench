@@ -672,16 +672,167 @@ export function createOwnedLiveDelivery({ db, entities, mayVerb, authorization, 
     },
   };
 
+  // Targeted composite resync resolution (#282): resolve the exact affected
+  // anchor scope(s) for a composite-touching event using the durable composite
+  // journal (which already captured in-txn pre/post-image evidence for deletes
+  // and reparents), falling back to the event scope / compiled patch plan, and
+  // only falling back to entity-wide resync when the anchor id genuinely cannot
+  // be determined.
+  const isSafeSqlIdent = (name        )          => /^[A-Za-z_][A-Za-z0-9_]*$/.test(name);
+  const readTableRow = (table        , id        )                                 => {
+    if (!isSafeSqlIdent(table)) return null;
+    try {
+      const row = db.prepare(`SELECT * FROM ${table} WHERE id = ?`).get(id)                                       ;
+      return row ?? null;
+    } catch {
+      return null;
+    }
+  };
+  const findBranchesForEntity = (plan                 , entityName        )                      => {
+    const found                      = [];
+    const visit = (relations                              )       => {
+      for (const relation of relations) {
+        if (relation.entity === entityName) found.push(relation);
+        visit(relation.children);
+      }
+    };
+    visit(plan.relations);
+    return found;
+  };
+  const findBranchById = (plan                 , branchId        )                           => {
+    const visit = (relations                              )                           => {
+      for (const relation of relations) {
+        if (relation.branchId === branchId) return relation;
+        const nested = visit(relation.children);
+        if (nested) return nested;
+      }
+      return null;
+    };
+    return visit(plan.relations);
+  };
+  const resolveBranchAnchorScopes = (plan                 , branch                   , rowId        , eventData                                )                  => {
+    const chain                      = [];
+    const segments = branch.branchId.split('.');
+    for (let end = 1; end <= segments.length; end += 1) {
+      const found = findBranchById(plan, segments.slice(0, end).join('.'));
+      if (!found) return null;
+      chain.push(found);
+    }
+    let currentRow                                 = eventData;
+    let currentId                = rowId;
+    for (let index = chain.length - 1; index >= 0; index -= 1) {
+      const step = chain[index];
+      if (step.inverse) {
+        let parentId = currentRow ? currentRow[step.fk] : undefined;
+        if ((typeof parentId !== 'string' || parentId.length === 0) && currentId) {
+          const fetched = readTableRow(step.entity, currentId);
+          if (fetched) {
+            currentRow = fetched;
+            parentId = fetched[step.fk];
+          }
+        }
+        if (typeof parentId !== 'string' || parentId.length === 0) return null;
+        if (index === 0) return [`${plan.declaration}:${parentId}`];
+        const parentRow = readTableRow(step.parentEntity, parentId);
+        if (!parentRow) return null;
+        currentRow = parentRow;
+        currentId = parentId;
+      } else {
+        if (index !== 0 || !currentId || !isSafeSqlIdent(step.parentEntity) || !isSafeSqlIdent(step.fk)) return null;
+        try {
+          const parents = db.prepare(`SELECT id FROM ${step.parentEntity} WHERE ${step.fk} = ?`).all(currentId)                           ;
+          const resolved           = [];
+          for (const parent of parents) {
+            if (typeof parent.id === 'string' && parent.id.length > 0) resolved.push(`${plan.declaration}:${parent.id}`);
+          }
+          return resolved.length > 0 ? resolved : null;
+        } catch {
+          return null;
+        }
+      }
+    }
+    return null;
+  };
+  const resolveCompositeResyncScopes = (
+    anchorName        ,
+    event                    ,
+    handle             ,
+  )                                                                 => {
+    // 1. Durable composite journal entries (written in-txn with pre/post-image
+    // evidence for deletes, reparents, nested paths, and wide invalidations).
+    if (typeof event.actionId === 'string' && event.actionId.length > 0) {
+      try {
+        const rows = db.prepare(
+          'SELECT DISTINCT scope FROM _CompositeChange WHERE actionId = :actionId AND declaration = :declaration',
+        ).all({ actionId: event.actionId, declaration: anchorName })                              ;
+        if (rows.length > 0) {
+          const scopes = new Set        ();
+          for (const row of rows) {
+            if (row.scope === '') return { kind: 'entity-wide' };
+            if (typeof row.scope === 'string' && row.scope.length > 0) scopes.add(row.scope);
+          }
+          if (handle.entity === anchorName && typeof event.scope === 'string') scopes.add(event.scope);
+          if (scopes.size > 0) return { kind: 'scopes', scopes: [...scopes] };
+        }
+      } catch {
+        // Standalone cores without _CompositeChange fall through to plan/event resolution.
+      }
+    }
+    const plan = patchPlans.get(anchorName);
+    const eventData = event.data && typeof event.data === 'object' ? event.data : null;
+    // 2. Event committed directly on the anchor's own scope (e.g. Project:p1).
+    if (handle.entity === anchorName) {
+      const scopes = new Set        ([`${anchorName}:${handle.id}`]);
+      if (plan && eventData) {
+        for (const relation of plan.relations) {
+          if (relation.parentBranchId !== 'anchor' || !relation.inverse) continue;
+          const fkVal = eventData[relation.fk];
+          if (typeof fkVal === 'string' && fkVal.length > 0) scopes.add(`${anchorName}:${fkVal}`);
+        }
+      }
+      return { kind: 'scopes', scopes: [...scopes] };
+    }
+    // 3. Member or tombstone scope (e.g. Code:c1, Codebook:cb1): resolve owning
+    // anchor scope(s) via the compiled plan (event payload or current row).
+    if (!plan) return { kind: 'entity-wide' };
+    const scopes = new Set        ();
+    let resolvedAny = false;
+    const rowId = typeof eventData?.id === 'string' && eventData.id.length > 0 ? eventData.id : handle.id;
+    if (plan.tombstone && plan.tombstone.entity === handle.entity) {
+      const idCol = plan.tombstone.scopeId ?? plan.tombstone.entityId;
+      let anchorId = eventData ? eventData[idCol] : undefined;
+      if (typeof anchorId !== 'string' || anchorId.length === 0) {
+        const fetched = readTableRow(plan.tombstone.entity, rowId);
+        if (fetched) anchorId = fetched[idCol];
+      }
+      if (typeof anchorId !== 'string' || anchorId.length === 0) return { kind: 'entity-wide' };
+      scopes.add(`${anchorName}:${anchorId}`);
+      resolvedAny = true;
+    }
+    const branches = findBranchesForEntity(plan, handle.entity);
+    for (const branch of branches) {
+      const resolved = resolveBranchAnchorScopes(plan, branch, rowId, eventData);
+      if (!resolved || resolved.length === 0) return { kind: 'entity-wide' };
+      for (const scope of resolved) scopes.add(scope);
+      resolvedAny = true;
+    }
+    return resolvedAny && scopes.size > 0
+      ? { kind: 'scopes', scopes: [...scopes] }
+      : { kind: 'entity-wide' };
+  };
+
   return {
     delivery,
     /** Compiled patch plans (#122) — the commit pipeline's journal router consumes these. */
     patchPlans,
-    consumer: async (events                               )                => {      const scopes = new Set        ();
+    consumer: async (events                               )                => {
+      const scopes = new Set        ();
       for (const event of events) {
         if (event?.scope) scopes.add(event.scope);
       }
       for (const scope of scopes) core.wake(scope);
-      const invalidatedAnchors = new Set        ();
+      const entityWideAnchors = new Set        ();
+      const targetedScopes = new Map                     ();
       for (const event of events) {
         const handle = tryParseScopeKey(event?.scope          );
         if (!handle) continue;
@@ -690,19 +841,34 @@ export function createOwnedLiveDelivery({ db, entities, mayVerb, authorization, 
           // (anchor/tombstone identity, member presence, or a selected field).
           // This keeps per-keystroke annotated-text body edits from forcing a
           // full composite snapshot re-bootstrap for every shell subscriber.
-          if (declaration.output && eventTouchesComposite(declaration, event)) {
-            invalidatedAnchors.add(anchorName);
+          if (!declaration.output || !eventTouchesComposite(declaration, event)) continue;
+          if (entityWideAnchors.has(anchorName)) continue;
+          const resolution = resolveCompositeResyncScopes(anchorName, event, handle);
+          if (resolution.kind === 'entity-wide') {
+            entityWideAnchors.add(anchorName);
+            targetedScopes.delete(anchorName);
+          } else {
+            let bucket = targetedScopes.get(anchorName);
+            if (!bucket) {
+              bucket = new Set        ();
+              targetedScopes.set(anchorName, bucket);
+            }
+            for (const scope of resolution.scopes) bucket.add(scope);
           }
         }
       }
-      // Member events invalidate every live aggregate of that declaration. The
-      // deliberate broad fan-out needs no pre-image cache, so deletion and both
-      // sides of a reparent are authoritative.
-      for (const anchorName of invalidatedAnchors) {
+      for (const anchorName of entityWideAnchors) {
         core.resyncEntity(anchorName, (scope) => {
           const anchor = tryParseScopeKey(scope);
           return { type: 'resync', entity: anchorName, id: anchor .id, seq: 0, reason: 'recipient-snapshot-required' };
         });
+      }
+      for (const [anchorName, anchorScopes] of targetedScopes) {
+        for (const scope of anchorScopes) {
+          const anchor = tryParseScopeKey(scope);
+          if (!anchor) continue;
+          core.resyncScope(scope, { type: 'resync', entity: anchorName, id: anchor.id, seq: 0, reason: 'recipient-snapshot-required' });
+        }
       }
     },
     close()       {
@@ -729,22 +895,25 @@ export function buildSnapshotResyncRelevance(composites                   )     
   const resyncRelevance = new Map                                           ();
   for (const [anchorName, declaration] of composites) {
     const relevantFields = new Map                     ();
-    const collect = (branch                                   , isRoot         )       => {
+    const collect = (branch                                   , ownerEntityName        )       => {
       for (const entry of branch?.entries ?? []) {
         const entityName = entry.entity?.name;
         if (entityName) {
           const fields = relevantFields.get(entityName) ?? new Set        ();
           for (const field of entry.selected ?? []) fields.add(field);
+          if (typeof entry.fk === 'string' && entry.fk.length > 0 && entry.inverse) fields.add(entry.fk);
+          const orderField = (entry.order                                          )?.field;
+          if (typeof orderField === 'string' && orderField.length > 0) fields.add(orderField);
           relevantFields.set(entityName, fields);
-        } else if (isRoot && entry.kind === 'select') {
-          const fields = relevantFields.get(anchorName) ?? new Set        ();
+        } else if (entry.kind === 'select') {
+          const fields = relevantFields.get(ownerEntityName) ?? new Set        ();
           for (const field of entry.fields ?? []) fields.add(field);
-          relevantFields.set(anchorName, fields);
+          relevantFields.set(ownerEntityName, fields);
         }
-        if (entry.nested) collect(entry.nested, false);
+        if (entry.nested) collect(entry.nested, entityName ?? ownerEntityName);
       }
     };
-    collect(declaration.output, true);
+    collect(declaration.output, anchorName);
     const tombstone = declaration.tombstone;
     // Tombstone identity events always resync; the anchor's own selected fields
     // are captured in relevantFields (its create/remove also resync via

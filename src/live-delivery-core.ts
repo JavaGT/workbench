@@ -145,7 +145,8 @@ export interface LiveDeliveryCore {
   subscribe(input: CoreSubscribeInput): Promise<CoreActivation | undefined>;
   wake(scope: string): void;
   resync(scope: string, envelope: unknown): void;
-  resyncEntity(entityName: string, envelopeForScope: (scope: string) => unknown): void;
+  resyncScope(scope: string, envelope: unknown | ((scope: string) => unknown)): void;
+  resyncEntity(entityName: string, envelopeForScope: (scope: string) => unknown, filter?: (scope: string) => boolean): void;
   // S5/A5 revocation contract (spec item 4): register a listener (S4/S6
   // adapters) notified on every revocation; returns an unsubscribe.
   onRevocation(listener: RevocationListener): () => void;
@@ -962,10 +963,26 @@ export function createLiveDeliveryCore({ db, entities, mayVerb, authorization, p
     }
   }
 
-  function resyncEntity(entityName: string, envelopeForScope: (scope: string) => unknown): void {
-    for (const sub of [...subs.values()]) {
-      if (sub.entityRec.name !== entityName) continue;
-      resync(sub.scope, envelopeForScope(sub.scope));
+  function resyncScope(scope: string, envelopeOrFactory: unknown | ((scope: string) => unknown)): void {
+    if (closed) return;
+    const set = byScope.get(scope);
+    if (!set || set.size === 0) return;
+    const envelope = typeof envelopeOrFactory === 'function'
+      ? (envelopeOrFactory as (scope: string) => unknown)(scope)
+      : envelopeOrFactory;
+    resync(scope, envelope);
+  }
+
+  function resyncEntity(entityName: string, envelopeForScope: (scope: string) => unknown, filter?: (scope: string) => boolean): void {
+    if (closed) return;
+    const matchedScopes = new Set<string>();
+    for (const sub of subs.values()) {
+      if (!sub.active || sub.entityRec.name !== entityName) continue;
+      if (filter && !filter(sub.scope)) continue;
+      matchedScopes.add(sub.scope);
+    }
+    for (const scope of matchedScopes) {
+      resync(scope, envelopeForScope(scope));
     }
   }
 
@@ -1039,5 +1056,5 @@ export function createLiveDeliveryCore({ db, entities, mayVerb, authorization, p
     }
   }
 
-  return { bootstrap, catchup, subscribe, wake, resync, resyncEntity, onRevocation, revoke, close, snapshot, exceedsCatchupLimit };
+  return { bootstrap, catchup, subscribe, wake, resync, resyncScope, resyncEntity, onRevocation, revoke, close, snapshot, exceedsCatchupLimit };
 }

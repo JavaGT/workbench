@@ -2504,6 +2504,7 @@ export function createLiveDeliverySession({
   let snapshotRecoveryWaiters = [];
   let snapshotRecoveryCycle = null;
   let snapshotRecoveryCycleSeq = 0;
+  let lastSnapshotInstalledFromReceipt = false;
   // Delta-mode control recovery (#159): in delta mode an ordinary transport
   // `resync` control re-establishes state by CATCH-UP (pulling journal
   // patches from the held cursor+token) rather than a full snapshot bootstrap.
@@ -2677,13 +2678,16 @@ export function createLiveDeliverySession({
     for (const waiter of snapshotRecoveryWaiters.splice(0)) waiter.reject(error);
   }
 
-  function beginSnapshotRecoveryCycle(floor) {
+  function beginSnapshotRecoveryCycle(floor, fromReceipt = false) {
     snapshotRecoveryCycle = {
       id: ++snapshotRecoveryCycleSeq,
       attempts: 0,
       floor: floor ?? null,
       receiptFloor: floor ?? null,
+      fromReceipt,
       followupRequested: false,
+      unsequencedFollowup: false,
+      receiptFollowup: false,
       connectionGeneration,
     };
     return snapshotRecoveryCycle;
@@ -2696,13 +2700,13 @@ export function createLiveDeliverySession({
       : Math.max(snapshotRecoveryCycle.floor, floor);
   }
 
-  function requestSnapshotRecovery(floor, wait = !hasUnknownTransmission(), inline = false) {
+  function requestSnapshotRecovery(floor, wait = !hasUnknownTransmission(), inline = false, { fromReceipt = false } = {}) {
     if (closed || status === 'revoked' || status === 'unavailable') {
       const error = new ClientClosedError('Live delivery is unavailable');
       return wait ? Promise.reject(error) : Promise.resolve();
     }
     if (!snapshotRecoveryCycle || snapshotRecoveryCycle.connectionGeneration !== connectionGeneration) {
-      beginSnapshotRecoveryCycle(floor);
+      beginSnapshotRecoveryCycle(floor, fromReceipt);
     } else {
       raiseSnapshotCycleFloor(floor);
       if (floor != null) {
@@ -2710,7 +2714,12 @@ export function createLiveDeliverySession({
           ? floor
           : Math.max(snapshotRecoveryCycle.receiptFloor, floor);
       }
-      if (snapshotRecoveryRunning) snapshotRecoveryCycle.followupRequested = true;
+      if (fromReceipt) snapshotRecoveryCycle.fromReceipt = true;
+      if (snapshotRecoveryRunning) {
+        snapshotRecoveryCycle.followupRequested = true;
+        if (fromReceipt) snapshotRecoveryCycle.receiptFollowup = true;
+        if (floor == null || floor <= 0) snapshotRecoveryCycle.unsequencedFollowup = true;
+      }
     }
     snapshotRecoveryRequested = true;
     if (floor != null) {
@@ -2739,9 +2748,14 @@ export function createLiveDeliverySession({
     const receiptFloor = cycle?.receiptFloor ?? snapshotRecoveryFloor;
     snapshotRecoveryFloor = null;
     snapshotRecoveryRequested = false;
-    if (cycle) cycle.followupRequested = false;
+    if (cycle) {
+      cycle.followupRequested = false;
+      cycle.unsequencedFollowup = false;
+      cycle.receiptFollowup = false;
+    }
     const waiters = snapshotRecoveryWaiters.splice(0);
     const snapshotGenerationAtStart = snapshotGeneration;
+    const receiptGenerationAtStart = receiptGeneration;
     const cycleId = cycle?.id;
     const run = async () => {
       try {
@@ -2768,12 +2782,31 @@ export function createLiveDeliverySession({
             throw new Error('replacement snapshot does not cover the receipt fence');
           }
         }
-        if (liveCycle && latestCoverage != null && cursorAnchor(cursor) < latestCoverage) {
+        const coverageSatisfied = latestCoverage == null || cursorAnchor(cursor) >= latestCoverage;
+        const receiptSatisfied = latestReceipt == null || cursorAnchor(cursor) >= latestReceipt;
+        const newerReceiptPending = receiptGeneration > receiptGenerationAtStart || Boolean(liveCycle?.receiptFollowup);
+        const needsUnsequencedFollowup = Boolean(liveCycle?.unsequencedFollowup);
+        if (liveCycle && (!coverageSatisfied || !receiptSatisfied)) {
           liveCycle.followupRequested = true;
           snapshotRecoveryRequested = true;
-        }
-        if (snapshotRecoveryCycle?.id === cycleId
-          && (latestCoverage == null || cursorAnchor(cursor) >= latestCoverage)
+        } else if (liveCycle
+          && snapshotGeneration > snapshotGenerationAtStart
+          && coverageSatisfied
+          && receiptSatisfied
+          && !newerReceiptPending
+          && !needsUnsequencedFollowup) {
+          // Attempt #1 already installed a fresh snapshot whose anchor cursor
+          // covers every sequenced control that arrived while it was in flight
+          // (and no newer receipt or unsequenced invalidation remains): close
+          // the cycle and resolve any in-flight waiters instead of kicking a
+          // redundant second full snapshot (#282).
+          liveCycle.followupRequested = false;
+          snapshotRecoveryRequested = false;
+          snapshotRecoveryFloor = null;
+          snapshotRecoveryCycle = null;
+          for (const waiter of snapshotRecoveryWaiters.splice(0)) waiter.resolve();
+        } else if (snapshotRecoveryCycle?.id === cycleId
+          && coverageSatisfied
           && !snapshotRecoveryCycle.followupRequested) {
           snapshotRecoveryCycle = null;
         }
@@ -2936,6 +2969,7 @@ export function createLiveDeliverySession({
     if (closed || status === 'revoked') return { status: 'revoked' };
     baseSnapshot = nextSnapshot;
     cursor = decision.cursor;
+    lastSnapshotInstalledFromReceipt = false;
     const actionId = envelope.event?.actionId;
     const operation = actionId ? operations.get(actionId) : null;
     if (operation) {
@@ -2972,6 +3006,7 @@ export function createLiveDeliverySession({
     if (closed || status === 'revoked') return { status: 'revoked' };
     baseSnapshot = nextSnapshot;
     cursor = decision.cursor;
+    lastSnapshotInstalledFromReceipt = false;
     // A whole-state replacement names no per-action echo, so every delivered
     // operation whose confirmed receipt fence the replacement cursor covers is
     // reconciled — the same settlement rule applyEvent uses for an echo.
@@ -3254,6 +3289,7 @@ export function createLiveDeliverySession({
     // alone (cross-exam 6).
     baseSnapshot = nextSnapshot;
     cursor = { anchor: tail.anchor, composite: tail.composite };
+    lastSnapshotInstalledFromReceipt = false;
     projectionToken = valid[valid.length - 1].projectionToken;
     const echoed = new Set();
     for (const checked of valid) for (const id of checked.actionIds ?? []) echoed.add(id);
@@ -3418,6 +3454,7 @@ export function createLiveDeliverySession({
       baseSnapshot = nextSnapshot;
       cursor = result.cursor;
       snapshotGeneration += 1;
+      lastSnapshotInstalledFromReceipt = Boolean(mode === 'snapshot' && snapshotRecoveryCycle?.fromReceipt);
       settleSnapshotConfirmations(receiptGenerationAtStart);
       publish();
       if (closed || status === 'revoked' || generation !== recoveryGeneration) return;
@@ -3435,6 +3472,7 @@ export function createLiveDeliverySession({
     if (result.kind === 'catchup' && mode === 'catchup') {
       if (!(await applyCatchup(result))) return recover('snapshot');
       if (closed || status === 'revoked' || generation !== recoveryGeneration) return;
+      lastSnapshotInstalledFromReceipt = false;
       finishRecoveryWarning();
       status = 'live';
       publish();
@@ -3481,6 +3519,7 @@ export function createLiveDeliverySession({
       // until ITS replacement lands — later envelopes are never evaluated
       // against a base any control in this batch declared untrusted.
       if (envelope.type === 'resync' || envelope.type === 'state-invalidate') {
+        let isStateInvalidate = envelope.type === 'state-invalidate';
         let coverage = Number.isSafeInteger(envelope.seq) ? envelope.seq : undefined;
         // A consecutive run of sequenced legacy controls invalidates one base.
         // Recover once at its highest fence before reading any following data.
@@ -3490,9 +3529,27 @@ export function createLiveDeliverySession({
             if ((next?.type !== 'resync' && next?.type !== 'state-invalidate')
               || !Number.isSafeInteger(next.seq)
               || next.entity !== envelope.entity || next.id !== envelope.id) break;
+            if (next.type === 'state-invalidate') isStateInvalidate = true;
             coverage = Math.max(coverage, next.seq);
             envelopeIndex += 1;
           }
+        }
+        // Short-circuit an already-covered sequenced `resync` (#282):
+        // - Never skip `state-invalidate` (bounded-overflow / topology boundary).
+        // - Never skip unsequenced (`coverage === undefined`) or synthetic
+        //   member-invalidation (`coverage <= 0`) controls.
+        // - Never skip `coverage === cursorAnchor(cursor)` for composite cursors
+        //   (subscribe emits `seq: after.anchor` when member/composite state
+        //   moved without the anchor advancing) or immediately after a receipt
+        //   snapshot (preserves receipt-floor recovery invariants).
+        const currentAnchor = cursor != null ? cursorAnchor(cursor) : null;
+        const isCompositeCursor = cursor !== null && typeof cursor === 'object';
+        if (!isStateInvalidate
+          && coverage !== undefined && coverage > 0
+          && currentAnchor !== null
+          && (coverage < currentAnchor
+            || (!deltaCapable && !isCompositeCursor && !lastSnapshotInstalledFromReceipt && coverage <= currentAnchor))) {
+          continue;
         }
         // Delta mode (#159): an ordinary `resync` control re-establishes state
         // by CATCH-UP — journal patches pulled from the held cursor+token —
@@ -3504,7 +3561,7 @@ export function createLiveDeliverySession({
         // recovery is also preserved for legacy (non-delta) sessions and for
         // patch-validation failures, where the installed base is untrusted and
         // only an authorized snapshot restores it.
-        recoveryWait = deltaCapable && typeof projectionToken === 'string' && envelope.type === 'resync'
+        recoveryWait = deltaCapable && typeof projectionToken === 'string' && !isStateInvalidate
           ? requestCatchupRecovery(!hasUnknownTransmission(), true)
           : requestSnapshotRecovery(coverage, !hasUnknownTransmission(), true);
         // A control declares the CURRENT base untrusted (#156 round 3): later
@@ -3552,7 +3609,7 @@ export function createLiveDeliverySession({
   }
 
   function recoverReceiptSnapshot(operation) {
-    requestSnapshotRecovery(operation.confirmedThrough, false);
+    requestSnapshotRecovery(operation.confirmedThrough, false, false, { fromReceipt: true });
   }
 
   // True when the delta patch stream has already advanced to (or past) an
@@ -3649,7 +3706,7 @@ export function createLiveDeliverySession({
           await recover('catchup');
           if (closed || status === 'revoked') break;
           if (pendingReceiptFloor != null && cursorAnchor(cursor) < pendingReceiptFloor) {
-            requestSnapshotRecovery(pendingReceiptFloor, false);
+            requestSnapshotRecovery(pendingReceiptFloor, false, false, { fromReceipt: true });
           }
           status = 'recovering';
           if (!(await connect())) {

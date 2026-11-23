@@ -4,11 +4,13 @@ import { execFileSync } from 'node:child_process';
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { stripTypeScriptTypes } from 'node:module';
+import * as nodeModule from 'node:module';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const srcRoot = join(root, 'src');
 const buildRoot = join(root, 'build');
+const stripTypeScriptTypes = nodeModule.stripTypeScriptTypes;
+const nodeBinary = process.versions.bun ? (process.env.WORKBENCH_NODE_BIN ?? 'node') : process.execPath;
 
 // Mirrors the emit script's source walk: every .ts except hand-written .d.ts / .d.mts.
 function walkSources(dir, out = []) {
@@ -52,6 +54,15 @@ test('no emitted src/**/*.mjs siblings remain (src is source-only)', () => {
 });
 
 test('build/ is current against src/ (exact image)', () => {
+  // TypeScript emission uses Node's stripTypeScriptTypes, which Bun does not
+  // implement. Run this same freshness assertion with the build runtime.
+  if (process.versions.bun) {
+    execFileSync(nodeBinary, ['--test', '--test-name-pattern=build/ is current against src/', 'test/emit-ts-fresh.test.mjs'], {
+      cwd: root, stdio: 'pipe',
+      env: Object.fromEntries(Object.entries(process.env).filter(([key]) => key !== 'NODE_TEST_CONTEXT')),
+    });
+    return;
+  }
   const sources = walkSources(srcRoot);
   assert.ok(sources.length > 0, 'expected at least one src/**/*.ts module');
   const expected = new Map(sources.map((p) => [
@@ -75,7 +86,7 @@ test('build/ is current against src/ (exact image)', () => {
 });
 
 test('emit:ts script rewrites without error', () => {
-  execFileSync(process.execPath, ['scripts/emit-ts.mjs'], {
+  execFileSync(nodeBinary, ['scripts/emit-ts.mjs'], {
     cwd: root,
     stdio: 'pipe',
   });

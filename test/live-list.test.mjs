@@ -914,6 +914,71 @@ describe('LiveList', () => {
     await list.close();
   });
 
+  // --- 11b. Immutable state identity (reactive frameworks) ---
+  // A Solid createSignal (and React, and Vue) compares by reference: mutating
+  // the same object in place drops every update. LiveList must emit a NEW state
+  // object on each applied change and on snapshot install, while unchanged
+  // fields keep their references (structural sharing).
+  it('applied changes and snapshot installs publish new state identities with structural sharing', async () => {
+    const channel = makeFakeChannel();
+    channel._setAck({ currentSeq: 1 });
+    const firstSnapshot = { title: 'hello', config: { theme: 'dark' } };
+    const fetch = makeFakeFetch([
+      { match: '/snapshot', response: { snapshot: firstSnapshot, seq: 1 } },
+    ]);
+
+    const list = new LiveList({
+      entity: 'ticket', id: '1', channel, fetchImpl: fetch,
+      snapshotUrl, eventsSinceUrl,
+    });
+    const renders = [];
+    list.onRender(s => renders.push(s));
+    await list.subscribe();
+
+    const initial = list.state;
+    assert.notEqual(initial, firstSnapshot, 'snapshot install copies the fetched object');
+
+    // Delta-set one scalar: a new top-level object, other fields shared.
+    channel.emit({
+      type: 'event', entity: 'ticket', id: '1',
+      seq: 2, seqSpan: [2, 2],
+      event: { type: 'ticket.updated', data: {} },
+      delta: { title: { set: 'world' } },
+    });
+    const afterUpdate = list.state;
+    assert.notEqual(afterUpdate, initial, 'delta update publishes a new identity');
+    assert.equal(afterUpdate.config, initial.config, 'unchanged nested field is shared by reference');
+    assert.equal(afterUpdate.title, 'world');
+
+    // Struct delta under a shared field: the nested object is cloned, the
+    // top-level identity is new again.
+    channel.emit({
+      type: 'event', entity: 'ticket', id: '1',
+      seq: 3, seqSpan: [3, 3],
+      event: { type: 'ticket.updated', data: {} },
+      delta: { config: { cells: { theme: { set: 'light' } } } },
+    });
+    const afterStruct = list.state;
+    assert.notEqual(afterStruct, afterUpdate, 'struct delta publishes a new identity');
+    assert.deepEqual(afterStruct.config, { theme: 'light' });
+
+    // Map + ordered + log mutations each emit their own new identity.
+    channel.emit({
+      type: 'event', entity: 'ticket', id: '1',
+      seq: 4, seqSpan: [4, 4],
+      event: { type: 'ticket.members.added', data: { member: 'bob', role: 'editor' } },
+    });
+    const afterMap = list.state;
+    assert.notEqual(afterMap, afterStruct, 'map add publishes a new identity');
+    assert.deepEqual(afterMap.members, { bob: 'editor' });
+
+    // Every render already observed a distinct object (the reactive contract).
+    const renderedIdentities = new Set(renders);
+    assert.equal(renderedIdentities.size, renders.length, 'each render receives a distinct state object');
+
+    await list.close();
+  });
+
   // --- 12. Close ---
   it('close(): after close, further emitted envelopes do not change state or render', async () => {
     const channel = makeFakeChannel();

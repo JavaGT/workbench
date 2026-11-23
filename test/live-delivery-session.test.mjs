@@ -127,6 +127,125 @@ describe('LiveDeliverySession', () => {
     await reconnect;
   });
 
+  it('does not install live when the delayed-warning completion callback closes the session', async () => {
+    const pendingSnapshot = deferred();
+    const warnings = [];
+    let signalWarning;
+    const warningShown = new Promise((resolve) => { signalWarning = resolve; });
+    let session;
+    session = createLiveDeliverySession({
+      bootstrap: () => pendingSnapshot.promise,
+      subscribe: async () => ({ close() {} }),
+      validateSnapshot: (snapshot) => snapshot,
+      sendAction: async () => ({ ok: true }),
+      recoveryWarningDelayMs: 5,
+      onRecoveryDelayed: (delayed) => {
+        warnings.push(delayed);
+        if (delayed) signalWarning();
+        else session.close();
+      },
+    });
+
+    // Recovery outlives the warning delay, so `true` fires; resolving the
+    // snapshot then completes the warning, and its callback closes the session
+    // synchronously before recovery installs `live`.
+    await warningShown;
+    pendingSnapshot.resolve({ kind: 'snapshot', snapshot: { values: [] }, cursor: 1 });
+    await session.ready;
+
+    assert.deepEqual(warnings, [true, false]);
+    assert.notEqual(session.status, 'live', 'a session closed by the warning completion must not report live');
+    assert.equal(session.snapshot, null, 'a closed session must not publish the recovered snapshot');
+  });
+
+  it('does not install live when the delayed-warning completion callback revokes during catch-up recovery', async () => {
+    const pendingCatchup = deferred();
+    const warnings = [];
+    let signalWarning;
+    const warningShown = new Promise((resolve) => { signalWarning = resolve; });
+    let signalCatchup;
+    const catchupRequested = new Promise((resolve) => { signalCatchup = resolve; });
+    let revokeDelivery;
+    const session = createLiveDeliverySession({
+      bootstrap: async ({ mode }) => {
+        if (mode === 'catchup') {
+          signalCatchup();
+          return pendingCatchup.promise;
+        }
+        return { kind: 'snapshot', snapshot: { values: [] }, cursor: 1 };
+      },
+      subscribe: async ({ revoke }) => {
+        revokeDelivery = revoke;
+        return { close() {} };
+      },
+      validateSnapshot: (snapshot) => snapshot,
+      sendAction: async () => ({ ok: true }),
+      recoveryWarningDelayMs: 5,
+      onRecoveryDelayed: (delayed) => {
+        warnings.push(delayed);
+        if (delayed) signalWarning();
+        else revokeDelivery({ code: 'access-revoked' });
+      },
+    });
+    await session.ready;
+
+    const reconnect = session.reconnect();
+    await catchupRequested;
+    await warningShown;
+    pendingCatchup.resolve({ kind: 'catchup', envelopes: [], cursor: 1 });
+    await reconnect;
+
+    assert.deepEqual(warnings, [true, false]);
+    assert.equal(session.status, 'revoked', 'the callback revocation must survive the settled catch-up');
+    assert.equal(session.snapshot, null);
+  });
+
+  it('publishes exactly once per settled recovery with the final live status installed', async () => {
+    let bootstraps = 0;
+    const session = createLiveDeliverySession({
+      bootstrap: async ({ mode }) => {
+        bootstraps += 1;
+        if (mode === 'catchup') return { kind: 'catchup', envelopes: [], cursor: 1 };
+        return { kind: 'snapshot', snapshot: { values: [`snap-${bootstraps}`] }, cursor: bootstraps };
+      },
+      subscribe: async () => ({ close() {} }),
+      validateSnapshot: (snapshot) => snapshot,
+      sendAction: async () => ({ ok: true }),
+    });
+    await session.ready;
+
+    // Snapshot recovery (reconnect catch-up) settles live in one publish.
+    const reconnectStatuses = [];
+    const unsubscribe = session.subscribe(() => reconnectStatuses.push(session.status));
+    reconnectStatuses.length = 0; // drop the immediate replay subscribe() delivers
+    await session.reconnect();
+    assert.deepEqual(reconnectStatuses, ['live'], 'one publish per settled recovery, status live');
+    unsubscribe();
+    session.close();
+
+    // A resync control drives a full snapshot recovery: exactly one publish,
+    // with the final `live` status already installed (no interim publish under
+    // the recovering status).
+    let deliver = null;
+    let snapshotBootstraps = 0;
+    const resyncSession = createLiveDeliverySession({
+      bootstrap: async () => {
+        snapshotBootstraps += 1;
+        return { kind: 'snapshot', snapshot: { values: [`snap-${snapshotBootstraps}`] }, cursor: snapshotBootstraps };
+      },
+      subscribe: async ({ deliver: deliverFn }) => { deliver = deliverFn; return { close() {} }; },
+      validateSnapshot: (snapshot) => snapshot,
+      sendAction: async () => ({ ok: true }),
+    });
+    await resyncSession.ready;
+    const publications = [];
+    resyncSession.subscribe(() => publications.push(resyncSession.status));
+    publications.length = 0; // drop the immediate replay subscribe() delivers
+    await deliver([{ type: 'resync', seq: 2, reason: 'recipient-snapshot-required' }]);
+    assert.deepEqual(publications, ['live'], 'one publish for a settled snapshot recovery');
+    resyncSession.close();
+  });
+
   it('silently drops duplicate delivery and confirms pending work only through its echo', async () => {
     const { session, deliver } = setup();
     await session.ready;

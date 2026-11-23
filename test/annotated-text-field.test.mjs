@@ -1193,7 +1193,7 @@ test('T8 freezes registered callbacks before exposing the adapter', () => {
   });
   registerAnnotatedTextStructuralExtension('t8frozenCallbacks', spec);
   assert.ok(Object.isFrozen(validate));
-  assert.throws(() => { validate.changed = true; }, /Cannot add property/);
+  assert.throws(() => { validate.changed = true; }, TypeError);
   assert.equal(resolveDeclarationMeasurementExtension(measurement('m', { extension: 't8frozenCallbacks' })).validate, validate);
 });
 

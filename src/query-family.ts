@@ -25,6 +25,7 @@ import {
   type FilterExpressionCompileState,
   type QueryCursor,
   type QueryDb,
+  type QuerySnapshotDb,
   type QueryDependency,
   type QueryEntity,
   type QueryFilter,
@@ -443,7 +444,7 @@ function normalizeWhereForIdentity(node: unknown, depth = 1): unknown {
 }
 
 export function executeQueryFamily(
-  db: QueryDb,
+  db: QuerySnapshotDb,
   family: CompiledQueryFamily,
   principal: unknown,
   request: unknown,
@@ -724,7 +725,7 @@ export interface QueryFamilyRegistry {
   register(declaration: unknown): CompiledQueryFamily;
   execute(
     name: string,
-    db: QueryDb,
+    db: QuerySnapshotDb,
     principal: unknown,
     request: unknown,
     options?: ExecuteQueryFamilyOptions,
@@ -743,7 +744,7 @@ export function createQueryFamilyRegistry(): QueryFamilyRegistry {
     },
     execute(
       name: string,
-      db: QueryDb,
+      db: QuerySnapshotDb,
       principal: unknown,
       request: unknown,
       options?: ExecuteQueryFamilyOptions,

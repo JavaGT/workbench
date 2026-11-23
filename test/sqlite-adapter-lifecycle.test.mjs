@@ -74,7 +74,8 @@ test('openSqliteAdapter reports the closed capability set and a working handle',
     const opened = openSqliteAdapter({ directory: dir, name: 'app' });
     try {
       assert.deepEqual(opened.capabilities, EXPECTED_CAPABILITIES);
-      assert.ok(opened.handle instanceof DatabaseSync, 'handle is a DatabaseSync');
+      if (typeof globalThis.Bun === 'undefined') assert.ok(opened.handle instanceof DatabaseSync);
+      assert.equal(opened.handle.prepare('SELECT 1 AS value').get().value, 1);
       assert.equal(typeof opened.handle.txn, 'function', 'driver helpers attached');
       assert.equal(typeof opened.handle.upsert, 'function', 'driver helpers attached');
       const row = opened.handle.prepare('SELECT 1 AS one').get();

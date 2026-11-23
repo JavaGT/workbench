@@ -78,6 +78,7 @@ export {
   type QueryOperator,
   type QueryFieldType,
   type QueryDb,
+  type QuerySnapshotDb,
   type QueryEntity,
   type QueryFilter,
   type QueryFilterTermNode,

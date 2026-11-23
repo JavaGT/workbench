@@ -13,6 +13,17 @@ import type {
 } from './index.js';
 import type { AnnotatedTextRange, AnnotatedTextRedactionMarker } from './annotated-text-coords.js';
 
+// Browser query consumers share the server's query grammar and result types.
+export type {
+  QueryOperator, QueryFieldType, QueryFilter, QueryFilterTermNode,
+  QueryFilterAndNode, QueryFilterOrNode, QueryFilterNotNode, QueryFilterExpression,
+  QuerySort, QueryContract, QueryCursor, QueryPage, QueryPageDecision,
+  QueryInvalidationKind, QueryInvalidationSignal, QueryDynamicFilter,
+  QueryDynamicSort, QueryFamilySort, QueryFamilyDynamicTermNode,
+  QueryFamilyAndNode, QueryFamilyOrNode, QueryFamilyNotNode,
+  QueryFamilyFilterExpression, QueryFamilyRequest,
+} from './index.js';
+
 // ---------------------------------------------------------------------------
 // LiveChannel — WebSocket transport layer
 // ---------------------------------------------------------------------------
@@ -90,6 +101,8 @@ export interface CaretUpdate {
   id: string;
   field: string;
   offset: number;
+  /** Optional document-absolute UTF-16 selection carried with the caret. */
+  selection?: { from: number; to: number };
 }
 
 export interface CaretClear {
@@ -217,6 +230,11 @@ export class LiveList<Row extends Record<string, unknown> = Record<string, unkno
   get cursor(): number;
   get ready(): Promise<void>;
 
+  /** The durable annotated-text reducer checkpoint for a field, or null. */
+  textState(field: string): unknown;
+  /** Resolves when every observed text reducer transaction has committed. */
+  get textReducerReady(): Promise<void>;
+
   subscribe(): Promise<void>;
   onRender(cb: (state: Row | null) => void): () => void;
   close(): Promise<void>;
@@ -234,6 +252,19 @@ export interface LiveListConfig {
   maxBufferedEvents?: number;
   resyncBackoffBase?: number;
   maxResyncBackoff?: number;
+  /**
+   * Durable replica observation hook (#126). Called in delivery order for each
+   * folded native text reducer state; readiness waits for its promise so a
+   * later local edit can anchor after the persisted counters.
+   */
+  onTextReducer?: (observation: {
+    entity: string;
+    id: string | number;
+    field: string;
+    epoch?: string;
+    state: unknown;
+    operation?: unknown;
+  }) => Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -295,7 +326,37 @@ export interface LiveStoreConfig {
   channel?: LiveChannel;
   fetchImpl?: typeof globalThis.fetch;
   replicaState?: TextReplicaState;
+  /**
+   * Override the default direct-fetch CRUD transport. Returns a settlement (the
+   * first authoritative outcome) and a completion (the terminal outcome a
+   * durable outbox settles later); the direct transport returns the same
+   * promise for both. `body` is the exact serialized request bytes; a durable
+   * transport must resend them with the same `opId` so a lost response never
+   * forks the outcome into two server-side mutations.
+   */
+  sendMutation?: (input: {
+    entity: string;
+    opId: string;
+    kind: 'create' | 'update' | 'remove';
+    id: string | number | undefined;
+    payload: Record<string, unknown> | undefined;
+    method: 'POST' | 'PATCH' | 'DELETE';
+    url: string;
+    body: string | undefined;
+  }) => { settlement: Promise<MutationOutcome>; completion: Promise<MutationOutcome> };
 }
+
+/**
+ * The outcome of one serialized CRUD mutation. `committed` carries the commit
+ * sequence evidence (when the transport surfaced it); `rejected` is a known
+ * server "no"; `outcome-unknown` means the mutation was transmitted but its
+ * result was lost.
+ */
+export type MutationOutcome =
+  | { status: 'committed'; row?: unknown; seq?: number | null }
+  | { status: 'rejected'; failure: WorkbenchFailure }
+  | { status: 'outcome-unknown'; deliveryError: { message: string } }
+  | { status: 'queued'; actionId: string };
 
 export interface TextReplicaState {
   reserve(document: string, generate: (reservation: { actor: string; counter: number; lamport: number; frontier: Array<[string, number]>; epoch: string | null }) => unknown): Promise<TextOutboxRecord>;
@@ -473,17 +534,65 @@ export interface LiveDeliveryNotificationEnvelope {
   readonly seq?: number;
 }
 
+/** Two-key composite cursor carried by a snapshot-patch envelope. */
+export interface LiveDeliveryPatchCursor {
+  readonly anchor: number;
+  readonly composite: number;
+}
+
+export type LiveDeliverySnapshotPatchOperation =
+  | { readonly op: 'put-keyed'; readonly path: readonly string[]; readonly id: string; readonly value: Readonly<Record<string, unknown>> }
+  | { readonly op: 'remove-keyed'; readonly path: readonly string[]; readonly id: string }
+  | { readonly op: 'replace-many'; readonly path: readonly string[]; readonly value: readonly Readonly<Record<string, unknown>>[] }
+  | { readonly op: 'replace-one'; readonly path: readonly string[]; readonly value: Readonly<Record<string, unknown>> | null }
+  | { readonly op: 'replace-fields'; readonly path: readonly string[]; readonly value: Readonly<Record<string, unknown>> }
+  | { readonly op: 'replace-value'; readonly path: readonly string[]; readonly value: unknown };
+
+/**
+ * Additive snapshot-patch delta envelope (#122/#156). A patch-capable host
+ * answers a `snapshot-patch/v1` capability advertisement with a protocol echo
+ * and a fresh `projectionToken`; subsequent catch-up and stream selections may
+ * carry patches instead of a full snapshot. A client that never received the
+ * echo stays on the legacy snapshot path. `from`/`to` form a composite cursor
+ * chain; `seqSpan` mirrors it exactly.
+ */
+export interface LiveDeliverySnapshotPatchEnvelope {
+  readonly type: 'snapshot-patch';
+  readonly protocol: 'snapshot-patch/v1';
+  readonly declaration: string;
+  readonly projectionToken: string;
+  readonly from: LiveDeliveryPatchCursor;
+  readonly to: LiveDeliveryPatchCursor;
+  readonly seqSpan: readonly [LiveDeliveryPatchCursor, LiveDeliveryPatchCursor];
+  readonly operations: readonly LiveDeliverySnapshotPatchOperation[];
+  readonly actionIds?: readonly string[];
+  readonly routedInvisibleActionIds?: readonly string[];
+}
+
 export type LiveDeliveryEnvelope =
   | LiveDeliveryEventEnvelope
   | LiveDeliveryResyncEnvelope
   | LiveDeliveryStateEnvelope
   | LiveDeliveryStateInvalidateEnvelope
-  | LiveDeliveryNotificationEnvelope;
+  | LiveDeliveryNotificationEnvelope
+  | LiveDeliverySnapshotPatchEnvelope;
 
 export type LiveDeliveryCursor = number | Readonly<{ anchor: number; aggregate: number }>;
 
 export type LiveDeliveryBootstrap<Snapshot> =
-  | { kind: 'snapshot'; snapshot: Snapshot; cursor: LiveDeliveryCursor }
+  | {
+      kind: 'snapshot';
+      snapshot: Snapshot;
+      cursor: LiveDeliveryCursor;
+      /**
+       * Capability echo (#122 §12): a patch-capable host answers the client's
+       * `snapshot-patch/v1` advertisement with this protocol tag and a freshly
+       * minted `projectionToken`. Their presence arms delta ingestion; a
+       * legacy result omits BOTH and the session stays on the snapshot path.
+       */
+      protocol?: 'snapshot-patch/v1';
+      projectionToken?: string;
+    }
   | { kind: 'catchup'; envelopes: readonly LiveDeliveryEnvelope[]; cursor: LiveDeliveryCursor }
   | { kind: 'revoked'; reason?: unknown }
   | { kind: 'retry'; reason?: LiveRetryReason };
@@ -555,6 +664,19 @@ export interface LiveDeliverySessionConfig<Snapshot, Payload = unknown> {
   sendBatch?(batch: LiveDeliveryBatchEnvelope<Payload>): Promise<LiveDeliveryActionReceipt | void>;
   createActionId?: () => string;
   onRecoveryStart?: () => void;
+  /**
+   * Delayed-recovery warning: called with `true` once a managed recovery stays
+   * unsettled for `recoveryWarningDelayMs`, and with `false` when it settles (or
+   * the session closes) before that. Non-terminal — delivery still recovers.
+   */
+  onRecoveryDelayed?: (delayed: boolean) => void;
+  /** Idle window before the first delayed-recovery warning fires; defaults to 5000ms. */
+  recoveryWarningDelayMs?: number;
+  /**
+   * Classifies an action whose committed echo is foldable onto the snapshot.
+   * Internal to the annotated-text HTTP skin; hosts never set it.
+   */
+  isFoldableEcho?: (action: { actionId: string; type: string; payload: Payload }) => boolean;
 }
 
 export interface LiveDeliveryBatchAction<Payload = unknown> {
@@ -584,6 +706,10 @@ export interface LiveDeliverySession<Snapshot, Payload = unknown> {
    */
   readonly confirmedSnapshot: Snapshot | null;
   readonly cursor: LiveDeliveryCursor;
+  /** True only while a patch-capable bootstrap result is installed (response-gated). */
+  readonly deltaCapable: boolean;
+  /** The ledger handle minted by the last accepted patch-capable bootstrap/patch. */
+  readonly projectionToken: string | null;
   readonly status: 'bootstrapping' | 'recovering' | 'catching-up' | 'live' | 'unavailable' | 'revoked';
   readonly ready: Promise<void>;
   dispatch(type: string, payload: Payload, options?: { actionId?: string }): Promise<LiveDeliveryDispatchResult>;
@@ -632,6 +758,15 @@ export interface LiveDeliveryHttpSessionConfig<Snapshot, Payload = unknown> {
   eventSourceFactory?: (url: string, options: EventSourceInit) => EventSource;
   createActionId?: () => string;
   onRecoveryStart?: () => void;
+  /** See {@link LiveDeliverySessionConfig.onRecoveryDelayed}. */
+  onRecoveryDelayed?: (delayed: boolean) => void;
+  /**
+   * Classifies an action whose commit must be serialized ahead of later sends
+   * (and whose echo is foldable). Returning `true` chains the send behind any
+   * in-flight foldable send, so two dependent text edits never race. Hosts
+   * that never dispatch foldable text actions leave this unset.
+   */
+  serializeAction?: (action: { actionId: string; type: string; payload: Payload }) => boolean;
   /** Package-owned entity identity used to derive a server-side scope. */
   requestIdentity?: Readonly<Record<string, string>> | null;
 }
@@ -701,12 +836,16 @@ export interface ScopeOperation<Payload = unknown> {
 
 /**
  * A document-path dispatch result (`applyAnnotation` / `applyAnnotationAction`
- * / `removeAnnotation`). Mirrors `LiveDeliveryDispatchResult`: a dispatched
- * mutation carries the operation's `settlement`, whose `wait()` resolves
- * `reconciled` once the positive receipt fence (`confirmedThrough`) is covered
- * by an authorized replacement snapshot. The field is optional because the
- * legacy `ScopeLiveStore.dispatch` path and plain local conflict shapes
- * predate settlements and never carry one.
+ * / `removeAnnotation` / the annotated-text session's text edits). Mirrors
+ * `LiveDeliveryDispatchResult`: a dispatched mutation carries the operation's
+ * `settlement`, whose `wait()` resolves `reconciled` once the positive receipt
+ * fence (`confirmedThrough`) is covered by an authorized replacement snapshot.
+ *
+ * The field is OPTIONAL because `createScopeLiveStore().dispatch` (the legacy
+ * scope engine) never mints a settlement — it returns a bare receipt/value
+ * result. The document-path producers always set it. Keeping it optional is the
+ * least-risky shape: removing it would break the working doc-path result, and
+ * minting settlements in the legacy scope engine would be a behavior change.
  */
 export type ScopeDispatchResult =
   | { ok: true; status: 'committed'; opId: string; settlement?: LiveDeliverySettlement; value?: unknown }

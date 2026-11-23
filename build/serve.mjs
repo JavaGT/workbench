@@ -686,6 +686,11 @@ export function listen(app     , port     , optionsOrCallback      = {}) {
   // accepted at the first possible instant observes the boot barrier.
   app.start();
   try {
+    // Bun may report an invalid numeric port asynchronously. Keep the
+    // synchronous argument-error contract on both supported runtimes.
+    if (typeof port === 'number' && (!Number.isInteger(port) || port < 0 || port > 65535)) {
+      throw Object.assign(new RangeError(`Invalid port: ${port}`), { code: 'ERR_SOCKET_BAD_PORT' });
+    }
     httpServer.listen(port);
   } catch (err) {
     failTransport?.(err);

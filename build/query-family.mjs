@@ -34,6 +34,7 @@ import {
 
 
 
+
 } from './query-scoped-read.mjs';
 
 export const DYNAMIC_VALUE_TYPES = Object.freeze(['text', 'number', 'epoch', 'boolean', 'option']         );
@@ -443,7 +444,7 @@ function normalizeWhereForIdentity(node         , depth = 1)          {
 }
 
 export function executeQueryFamily(
-  db         ,
+  db                 ,
   family                     ,
   principal         ,
   request         ,
@@ -743,7 +744,7 @@ export function createQueryFamilyRegistry()                      {
     },
     execute(
       name        ,
-      db         ,
+      db                 ,
       principal         ,
       request         ,
       options                            ,

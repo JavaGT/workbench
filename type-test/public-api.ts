@@ -1,3 +1,4 @@
+import type { QueryFamilyRequest as ClientQueryFamilyRequest, QueryPage as ClientQueryPage } from 'workbench/client';
 import workbench, {
   action, event, entity, text, date, ref, number, projected, computed, ephemeral, inherit, log, state,
   schedule, tick,
@@ -46,6 +47,8 @@ import {
   type EventsSinceResponse, type LiveDeliveryCursor as ClientLiveDeliveryCursor, type LiveDeliverySession, type LiveStore, type ScopeLiveStore, type SnapshotResponse,
   type StaleResponse, type WsEnvelope,
   type LiveDeliverySettlement, type ScopeDispatchResult,
+  type CaretUpdate, type LiveDeliveryEnvelope, type LiveDeliverySnapshotPatchEnvelope,
+  type LiveStoreConfig, type LiveDeliveryHttpSessionConfig, type MutationOutcome, type OnCaret,
 } from 'workbench/client';
 import {
   annotatedText, annotation, annotationAction, measurement, protectingAnnotation,
@@ -676,6 +679,87 @@ const deliverySession: LiveDeliverySession<{ projects: ProjectRow[] }> = createL
 });
 const aggregateDeliveryCursor: ClientLiveDeliveryCursor = { anchor: 1, aggregate: 2 };
 void [aggregateDeliveryCursor, deliverySession.cursor];
+
+// ── client.d.ts drift-guard declarations (issue #293) ─────────────────────
+// These assert the corrected shapes compile: a snapshot-patch envelope is part
+// of the delivery union; the capability echo rides on the bootstrap result;
+// CaretUpdate carries an optional selection; LiveStoreConfig accepts a
+// sendMutation transport; the session configs accept the delayed-recovery and
+// foldable/action-serialization hooks.
+
+const patchCursor = { anchor: 1, composite: 2 } as const;
+const snapshotPatchEnvelope: LiveDeliverySnapshotPatchEnvelope = {
+  type: 'snapshot-patch',
+  protocol: 'snapshot-patch/v1',
+  declaration: 'Project',
+  projectionToken: 'token-1',
+  from: patchCursor,
+  to: { anchor: 1, composite: 3 },
+  seqSpan: [patchCursor, { anchor: 1, composite: 3 }],
+  operations: [{ op: 'replace-fields', path: ['projects', 'p1'], value: { name: 'Renamed' } }],
+  actionIds: ['action-1'],
+  routedInvisibleActionIds: [],
+};
+const deliveryEnvelopeUnion: LiveDeliveryEnvelope = snapshotPatchEnvelope;
+// @ts-expect-error a snapshot-patch envelope requires the protocol echo
+const patchWithoutProtocol: LiveDeliverySnapshotPatchEnvelope = {
+  type: 'snapshot-patch', declaration: 'Project', projectionToken: 'token-1',
+  from: patchCursor, to: patchCursor, seqSpan: [patchCursor, patchCursor], operations: [],
+};
+// @ts-expect-error unknown patch operations are rejected by the closed union
+const patchBadOperation: LiveDeliverySnapshotPatchEnvelope = { type: 'snapshot-patch', protocol: 'snapshot-patch/v1', declaration: 'Project', projectionToken: 'token-1', from: patchCursor, to: patchCursor, seqSpan: [patchCursor, patchCursor], operations: [{ op: 'delete-everything', path: [] }] };
+void [deliveryEnvelopeUnion, patchWithoutProtocol, patchBadOperation];
+
+// Capability echo on a snapshot bootstrap result.
+const capabilitySession: LiveDeliverySession<{ projects: ProjectRow[] }> = createLiveDeliverySession({
+  bootstrap: async () => ({
+    kind: 'snapshot', snapshot: { projects: [] }, cursor: 0,
+    protocol: 'snapshot-patch/v1', projectionToken: 'token-1',
+  }),
+  subscribe: async () => ({ close() {} }),
+  validateSnapshot: (value) => value as { projects: ProjectRow[] },
+  fold: (current) => current,
+  sendAction: async () => ({ ok: true }),
+  onRecoveryDelayed: (delayed: boolean) => { void delayed; },
+  recoveryWarningDelayMs: 1234,
+  isFoldableEcho: () => false,
+});
+const sessionDeltaCapable: boolean = capabilitySession.deltaCapable;
+const sessionProjectionToken: string | null = capabilitySession.projectionToken;
+void [sessionDeltaCapable, sessionProjectionToken];
+
+const httpSessionConfig: LiveDeliveryHttpSessionConfig<{ projects: ProjectRow[] }> = {
+  baseUrl: 'https://example.test',
+  scope: 'workspace:one',
+  historySession: 'history-one',
+  validateSnapshot: (value) => value as { projects: ProjectRow[] },
+  sendAction: async () => ({ ok: true }),
+  onRecoveryDelayed: (delayed: boolean) => { void delayed; },
+  serializeAction: (action) => action.type.endsWith('.apply'),
+};
+void httpSessionConfig;
+
+// CaretUpdate carries an optional document-absolute selection.
+const caretWithSelection: CaretUpdate = {
+  entity: 'Project', id: 'p1', field: 'notes', offset: 5, selection: { from: 2, to: 5 },
+};
+const caretWithoutSelection: CaretUpdate = { entity: 'Project', id: 'p1', field: 'notes', offset: 5 };
+const caretListener: OnCaret = () => {};
+void [caretWithSelection, caretWithoutSelection, caretListener];
+
+// LiveStoreConfig accepts the durable sendMutation transport.
+const durableMutationOutcome: MutationOutcome = { status: 'committed', row: { id: 'p1' }, seq: 3 };
+const liveStoreWithSendMutation: LiveStoreConfig = {
+  baseUrl: 'https://example.test', name: 'Project', path: '/projects', channel,
+  sendMutation: (input) => {
+    void [input.entity, input.opId, input.kind, input.id, input.payload, input.method, input.url, input.body];
+    return {
+      settlement: Promise.resolve(durableMutationOutcome),
+      completion: Promise.resolve<MutationOutcome>({ status: 'outcome-unknown', deliveryError: { message: 'lost' } }),
+    };
+  },
+};
+void [liveStoreWithSendMutation, durableMutationOutcome];
 const auth = createAuthClient({ baseUrl: 'https://example.test' });
 void [list, store, scopeStore, deliverySession, auth.register('researcher', 'password'), auth.login('researcher', 'password'), decodeResult(new Response(null, { status: 204 }))];
 
@@ -885,3 +969,12 @@ const serverRetry: ServerOperationalRetry = {
 	nextAttemptAt: Date.now()
 };
 void [retryCode, serverRetry, invalidEventRetry, invariantRetry];
+
+const clientQuery: ClientQueryFamilyRequest = {
+  pageSize: 25,
+  where: { kind: 'not', child: { kind: 'term', field: 'status', op: 'eq', value: 'archived' } },
+  includeTotal: true,
+};
+declare const clientQueryPage: ClientQueryPage;
+const clientQueryTotal: number | undefined = clientQueryPage.total;
+void [clientQuery, clientQueryTotal];

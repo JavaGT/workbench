@@ -318,7 +318,8 @@ test('B3 GATE WIRING: the #157 structural-counter gates pass (re-run of the targ
   // test/composite-patch-targeted-capture.test.mjs (#157). This suite does not
   // duplicate them — it RE-RUNS them in a child process and fails if their
   // invariant regresses, making them part of the benchmark gate set.
-  const output = execFileSync(process.execPath, ['--test', 'test/composite-patch-targeted-capture.test.mjs'], {
+  const node = process.versions.bun ? (process.env.WORKBENCH_NODE_BIN ?? 'node') : process.execPath;
+  const output = execFileSync(node, ['--test', 'test/composite-patch-targeted-capture.test.mjs'], {
     // node --test runs this file from the package root; the child re-runs in
     // the same root so its relative specifiers resolve identically.
     cwd: process.cwd(),
@@ -478,8 +479,11 @@ test('B4 HEAP: retained memory per active subscription stays within the ledger b
   // fraction of the setup cost.
   const fixture = await getProject(100);
   const SIZE_BUDGET_PER_SUB = 5000 * 400; // ids × ~50B budget, 8× GC-noise headroom
-  assert.equal(typeof globalThis.gc, 'function', 'heap benchmark requires --expose-gc');
-  globalThis.gc();
+  const collectGarbage = typeof globalThis.gc === 'function'
+    ? () => globalThis.gc()
+    : typeof globalThis.Bun?.gc === 'function' ? () => globalThis.Bun.gc(true) : null;
+  assert.ok(collectGarbage, 'heap benchmark requires an explicit garbage collector');
+  collectGarbage();
   const baseline = process.memoryUsage().heapUsed;
   // K=20 ACTIVE subscriptions on the public seam — distinct principals so each
   // holds its own independent ledger entry + projection token.
@@ -488,7 +492,7 @@ test('B4 HEAP: retained memory per active subscription stays within the ledger b
     subs.push(await bootstrapRecipient(fixture, principalFor(`b4-heap-${i}`)));
   }
   await new Promise((resolve) => setTimeout(resolve, 50));
-  globalThis.gc();
+  collectGarbage();
   const afterBootstrap = process.memoryUsage().heapUsed;
   const perSubDelta = Math.max(0, afterBootstrap - baseline) / subs.length;
   console.table([{

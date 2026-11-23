@@ -443,7 +443,8 @@ export function generateFrameworkDDL(): string[] {
   stage TEXT,
   scope TEXT,
   principalKey TEXT,
-  operations TEXT
+  operations TEXT,
+  output TEXT
 );`,
     `CREATE TABLE IF NOT EXISTS _PrivateActionFact (
   originOrder INTEGER PRIMARY KEY AUTOINCREMENT,

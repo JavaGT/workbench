@@ -70,7 +70,7 @@
 import { randomBytes, randomUUID, createHash, timingSafeEqual } from 'node:crypto';
 import { getLog } from './log.mjs';
 import { appendEvents, readSeq,                    } from './committed-log.mjs';
-
+import { begin, commit, rollback,               } from './driver.mjs';
 
 import { rawRow } from './entity/query.mjs';
 import { operationCategory } from './operation.mjs';
@@ -88,6 +88,7 @@ const TERMINAL = new Set           ([STATES.COMPLETED, STATES.FAILED, STATES.CAN
 // Distinct from every closed-vocabulary operation name, so it can never be
 // confused with a real ungranted operation in a denial report.
 const ATTRIBUTION_INVALID = '<attribution-invalid>';
+
 
 
 
@@ -130,6 +131,11 @@ const ATTRIBUTION_INVALID = '<attribution-invalid>';
 
 
 
+
+
+
+
+                           
 
 
 
@@ -193,6 +199,31 @@ function normalizeDeclaredOperations(operations                   , context     
   );
 }
 
+// Normalize the opt-in per-kind active cap. Fail closed on a malformed map: a
+// negative, zero, fractional, or non-numeric value would silently under- or
+// over-enforce at claim time, so the whole map is rejected at construction.
+function normalizeMaxActiveByKind(value                                              )                              {
+  if (value == null) return new Map();
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('jobs.maxActiveByKind must be an object mapping job kinds to positive safe integers');
+  }
+  const caps = new Map                ();
+  for (const [kind, limit] of Object.entries(value)) {
+    if (kind.length === 0) {
+      throw new Error('jobs.maxActiveByKind: a job kind must be a non-empty string');
+    }
+    if (!Number.isSafeInteger(limit) || limit < 1) {
+      throw new Error(`jobs.maxActiveByKind[${JSON.stringify(kind)}] must be a positive safe integer`);
+    }
+    caps.set(kind, limit);
+  }
+  return caps;
+}
+
+function isInTransaction(db          )          {
+  return Boolean((db                               ).isTransaction);
+}
+
 export function createJobQueue({
   db,
   sharedSecret,
@@ -203,6 +234,7 @@ export function createJobQueue({
   maxAttempts = 5,
   backoffMs = 5_000,
   pollIntervalMs = 1_000,
+  maxActiveByKind,
   now = () => Date.now(),
   clock,
 }                 ) {
@@ -210,6 +242,7 @@ export function createJobQueue({
   if (sharedSecret == null || sharedSecret === '') {
     throw new Error('createJobQueue: sharedSecret is required (fail-closed — worker registration needs a secret)');
   }
+  const activeCaps = normalizeMaxActiveByKind(maxActiveByKind);
   // Store only the hash — the plaintext never persists past construction.
   const secretHash = sha256hex(sharedSecret);
   let timer                                        = null;
@@ -232,6 +265,7 @@ export function createJobQueue({
   // ---- event emission (W3 live visibility) ----
 
   const listeners             = [];
+  let pendingEvents                    = null;
 
   function onEvent(fn          )             {
     listeners.push(fn);
@@ -239,6 +273,52 @@ export function createJobQueue({
       const idx = listeners.indexOf(fn);
       if (idx !== -1) listeners.splice(idx, 1);
     };
+  }
+
+  function notifyListeners(events                     )       {
+    for (const event of events) {
+      for (const fn of listeners) {
+        try { fn(event); } catch { /* per-listener isolation */ }
+      }
+    }
+  }
+
+  // Wrap multi-statement _Job + _Cursor + _Log mutations in a synchronous
+  // BEGIN IMMEDIATE…COMMIT transaction via the driver dispatchers (driver.ts
+  // remains the sole module with raw BEGIN/COMMIT/ROLLBACK literals). When the
+  // caller already opened a transaction (db.isTransaction === true), join that
+  // transaction instead of opening a nested one. Listeners fire only after
+  // COMMIT succeeds so rolled-back mutations never notify subscribers.
+  function runInTxn   (fn         )    {
+    if (isInTransaction(db)) {
+      return fn();
+    }
+    const events             = [];
+    const prev = pendingEvents;
+    pendingEvents = events;
+    let result   ;
+    begin(db);
+    try {
+      result = fn();
+      commit(db);
+    } catch (err) {
+      pendingEvents = prev;
+      try {
+        rollback(db);
+      } catch {
+        /* already rolled back or txn unusable */
+      }
+      throw err;
+    }
+    pendingEvents = prev;
+    if (events.length > 0) {
+      if (pendingEvents !== null) {
+        pendingEvents.push(...events);
+      } else {
+        notifyListeners(events);
+      }
+    }
+    return result;
   }
 
   function nextSeq(scope        ) {
@@ -251,9 +331,11 @@ export function createJobQueue({
 
   function emit(event          )       {
     appendEvents(db, [event                            ]);
-    for (const fn of listeners) {
-      try { fn(event); } catch { /* per-listener isolation */ }
+    if (pendingEvents !== null) {
+      pendingEvents.push(event);
+      return;
     }
+    notifyListeners([event]);
   }
 
   function buildEvent(job        , transition        , nowTime        )           {
@@ -311,6 +393,7 @@ export function createJobQueue({
       id: String(row.id ?? ''),
       kind: String(row.kind ?? ''),
       payload: row.payload != null ? JSON.parse(row.payload          ) : null,
+      output: row.output != null ? JSON.parse(row.output          ) : null,
       status: row.status             ,
       enqueuedAt: row.enqueuedAt          ,
       workerId: row.workerId                 ,
@@ -373,60 +456,90 @@ export function createJobQueue({
       if (principal != null && !isMachinePrincipal(principal)) {
         throw new Error('enqueue: principal must be an attributable machine principal (machinePrincipal({ id, operations })) — a raw system or human principal is never a job attribution');
       }
-      const jobId = id ?? randomUUID();
-      const t = now();
-      db.prepare(
-        'INSERT INTO _Job (id, kind, payload, status, enqueuedAt, scope, workerId, claimedAt, leaseUntil, principalKey, operations) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)',
-      ).run(
-        jobId, kind, payload != null ? JSON.stringify(payload) : null, STATES.QUEUED, t, scope ?? null,
-        principal ? principalKeyOf(principal) : null,
-        principal ? JSON.stringify(principal.attributes.operations) : null,
-      );
-      const job = parseJob(rawRow(db, '_Job', jobId));
-      if (job && job.scope != null) {
-        emit(buildEvent(job, 'enqueued', t));
-      }
-      return job;
+      return runInTxn(() => {
+        const jobId = id ?? randomUUID();
+        const t = now();
+        db.prepare(
+          'INSERT INTO _Job (id, kind, payload, status, enqueuedAt, scope, workerId, claimedAt, leaseUntil, principalKey, operations) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)',
+        ).run(
+          jobId, kind, payload != null ? JSON.stringify(payload) : null, STATES.QUEUED, t, scope ?? null,
+          principal ? principalKeyOf(principal) : null,
+          principal ? JSON.stringify(principal.attributes.operations) : null,
+        );
+        const job = parseJob(rawRow(db, '_Job', jobId));
+        if (job && job.scope != null) {
+          emit(buildEvent(job, 'enqueued', t));
+        }
+        return job;
+      });
     });
   }
 
   // Claim the oldest available queued job for a worker. The claim itself is an
-  // atomic single-statement UPDATE…RETURNING (a racing claim sees
-  // status='claimed' and gets zero rows), but the entry point routes through the
-  // write coordinator because a scoped claim also appends a live-visibility
-  // event afterwards. `availableAt` is the backoff gate: a retried job is not
-  // claimable until now. `{ kind }` restricts the claim to one kind (an
-  // in-process worker runs one kind's handler). Returns the claimed job (status
-  // 'claimed', leaseUntil set) or null.
+  // atomic single-statement UPDATE…RETURNING inside BEGIN IMMEDIATE (a racing
+  // claim sees status='claimed' and gets zero rows), and any scoped claim
+  // appends its live-visibility _Log/_Cursor event in the same transaction.
+  // `availableAt` is the backoff gate: a retried job is not claimable until now.
+  // `{ kind }` restricts the claim to one kind. A kind configured in
+  // `maxActiveByKind` is not claimed while it already has that many jobs in
+  // claimed/running (counted across scopes and handles), while uncapped or
+  // under-cap kinds remain claimable. Ties on `enqueuedAt` break deterministically
+  // by `rowid ASC`. Returns the claimed job (status 'claimed', leaseUntil set) or null.
   function claim(workerId        , { kind, scope }                                    = {})                                         {
-    return coordinated(() => {
+    return coordinated(() => runInTxn(() => {
       const t = now();
-      const clauses = ['status = ?', '(availableAt IS NULL OR availableAt <= ?)'];
+      const clauses = ['candidate.status = ?', '(candidate.availableAt IS NULL OR candidate.availableAt <= ?)'];
       const params                      = [STATES.QUEUED, t];
-      if (kind != null) { clauses.push('kind = ?'); params.push(kind); }
-      if (scope != null) { clauses.push('scope = ?'); params.push(scope); }
+      if (kind != null) { clauses.push('candidate.kind = ?'); params.push(kind); }
+      if (scope != null) { clauses.push('candidate.scope = ?'); params.push(scope); }
       const where = clauses.join(' AND ');
+
+      // Enforce per-kind concurrency cap inside the same UPDATE…RETURNING
+      // statement so concurrent handles and scopes observe an atomic count.
+      // CASE returns NULL for uncapped kinds, and COUNT(*) >= NULL is falsy in
+      // HAVING, so uncapped kinds retain default FIFO behavior.
+      let capGuard = '';
+      const capParams                      = [];
+      if (activeCaps.size > 0) {
+        const cases = [...activeCaps].map(() => 'WHEN ? THEN ?').join(' ');
+        capGuard = ` AND NOT EXISTS (
+          SELECT 1 FROM _Job AS active
+           WHERE active.kind = candidate.kind
+             AND active.status IN (?, ?)
+           GROUP BY active.kind
+          HAVING COUNT(*) >= CASE candidate.kind ${cases} END
+        )`;
+        capParams.push(STATES.CLAIMED, STATES.RUNNING);
+        for (const [capKind, limit] of activeCaps) capParams.push(capKind, limit);
+      }
+
       const row = db.prepare(
         `UPDATE _Job
            SET status = ?, workerId = ?, claimedAt = ?, leaseUntil = ?
-         WHERE id = (SELECT id FROM _Job WHERE ${where} ORDER BY enqueuedAt LIMIT 1)
+         WHERE id = (
+           SELECT candidate.id FROM _Job AS candidate
+            WHERE ${where}${capGuard}
+            ORDER BY candidate.enqueuedAt ASC, candidate.rowid ASC
+            LIMIT 1
+         )
          RETURNING *`,
-      ).get(STATES.CLAIMED, workerId, t, t + leaseMs, ...params);
+      ).get(STATES.CLAIMED, workerId, t, t + leaseMs, ...params, ...capParams);
       const job = parseJob(row) ?? null;
       if (job && job.scope != null) {
         emit(buildEvent(job, 'claimed', t));
       }
       return job;
-    });
+    }));
   }
 
   // Heartbeat: the owning worker extends its lease; the first heartbeat flips
   // claimed→running. Non-owner or terminal → false. Best-effort: a dropped
   // heartbeat is fine within the lease window (the reaper reconciles). Routed
-  // through the write coordinator: the _Job update, the _Worker lastHeartbeat
-  // touch, and the possible live-visibility event are separate statements.
+  // through the write coordinator and wrapped in BEGIN IMMEDIATE: the _Job
+  // update, the _Worker lastHeartbeat touch, and the live-visibility event
+  // commit atomically.
   function heartbeat(jobId        , workerId        , { now: nowFn = now }                         = {})                             {
-    return coordinated(() => {
+    return coordinated(() => runInTxn(() => {
       const t = (typeof nowFn === 'function' ? nowFn : now)();
       const pre = db.prepare('SELECT status, scope FROM _Job WHERE id = ?').get(jobId);
       if (!pre) return false;
@@ -451,16 +564,18 @@ export function createJobQueue({
         }
       }
       return res.changes > 0;
-    });
+    }));
   }
 
   // Submit a result. Idempotent by job id: a retried result for an already-terminal
   // job is a no-op ack ({accepted:true, noop:true}) — the first terminal result
   // wins, the stored output is NOT overwritten (no double-apply of the derived
   // write). Non-owner / not-found → {accepted:false}. Routed through the write
-  // coordinator: the guard read, the result UPDATE, and the possible
-  // live-visibility event are separate statements (the UPDATE itself is the
-  // atomic result write).
+  // coordinator and wrapped in BEGIN IMMEDIATE: the guard read, the result
+  // UPDATE, and the live-visibility event commit atomically.
+  //
+  // Completed results write to the dedicated `_Job.output` column so the
+  // original input `_Job.payload` remains immutable.
   //
   // Failure policy (substrate-owned, singular): a `failed` result is NOT
   // terminal while attempts < maxAttempts — the job is re-queued with backoff
@@ -472,91 +587,93 @@ export function createJobQueue({
       if (status !== STATES.COMPLETED && status !== STATES.FAILED) {
         throw new Error('submitResult: status must be completed or failed');
       }
-      const current = db.prepare('SELECT status, payload, workerId, attempts, scope FROM _Job WHERE id = ?').get(jobId);
-      if (!current) return { accepted: false };
-      if (TERMINAL.has(current.status             )) {
-        // Idempotent retry: only the OWNING worker gets the no-op ack. A non-owner
-        // probing someone else's terminal job is rejected — no accepting ack and no
-        // confirmation that the job is terminal.
-        return current.workerId === workerId ? { accepted: true, noop: true } : { accepted: false };
-      }
-      if (status === STATES.COMPLETED) {
-        const res = db.prepare(
-          `UPDATE _Job SET status = ?, payload = ?
-           WHERE id = ? AND workerId = ? AND status IN (?, ?)`,
-        ).run(status, output != null ? JSON.stringify(output) : null, jobId, workerId, STATES.CLAIMED, STATES.RUNNING);
-        if (res.changes > 0) {
-          if (current.scope != null) {
-            const job = parseJob(rawRow(db, '_Job', jobId));
-            if (job) emit(buildEvent(job, 'completed', now()));
-          }
-          return { accepted: true, noop: false };
+      return runInTxn(() => {
+        const current = db.prepare('SELECT status, payload, workerId, attempts, scope FROM _Job WHERE id = ?').get(jobId);
+        if (!current) return { accepted: false };
+        if (TERMINAL.has(current.status             )) {
+          // Idempotent retry: only the OWNING worker gets the no-op ack. A non-owner
+          // probing someone else's terminal job is rejected — no accepting ack and no
+          // confirmation that the job is terminal.
+          return current.workerId === workerId ? { accepted: true, noop: true } : { accepted: false };
         }
-        return { accepted: false };
-      }
-      // FAILED: retry while under maxAttempts, else terminal dead-letter.
-      const ownerGuard = 'AND workerId = ? AND status IN (?, ?)';
-      const attempts = Number(current.attempts ?? 0) + 1;
-      if (attempts < maxAttempts) {
+        if (status === STATES.COMPLETED) {
+          const res = db.prepare(
+            `UPDATE _Job SET status = ?, output = ?
+             WHERE id = ? AND workerId = ? AND status IN (?, ?)`,
+          ).run(status, output != null ? JSON.stringify(output) : null, jobId, workerId, STATES.CLAIMED, STATES.RUNNING);
+          if (res.changes > 0) {
+            if (current.scope != null) {
+              const job = parseJob(rawRow(db, '_Job', jobId));
+              if (job) emit(buildEvent(job, 'completed', now()));
+            }
+            return { accepted: true, noop: false };
+          }
+          return { accepted: false };
+        }
+        // FAILED: retry while under maxAttempts, else terminal dead-letter.
+        const ownerGuard = 'AND workerId = ? AND status IN (?, ?)';
+        const attempts = Number(current.attempts ?? 0) + 1;
+        if (attempts < maxAttempts) {
+          const res = db.prepare(
+            `UPDATE _Job SET status = ?, workerId = NULL, claimedAt = NULL, leaseUntil = NULL, attempts = ?, availableAt = ?
+             WHERE id = ? ${ownerGuard}`,
+          ).run(STATES.QUEUED, attempts, now() + backoffMs, jobId, workerId, STATES.CLAIMED, STATES.RUNNING);
+          if (res.changes > 0) {
+            if (current.scope != null) {
+              const job = parseJob(rawRow(db, '_Job', jobId));
+              if (job) emit(buildEvent(job, 'retried', now()));
+            }
+            return { accepted: true, retried: true, attempts };
+          }
+          return { accepted: false };
+        }
         const res = db.prepare(
-          `UPDATE _Job SET status = ?, workerId = NULL, claimedAt = NULL, leaseUntil = NULL, attempts = ?, availableAt = ?
+          `UPDATE _Job SET status = ?, payload = ?, attempts = ?
            WHERE id = ? ${ownerGuard}`,
-        ).run(STATES.QUEUED, attempts, now() + backoffMs, jobId, workerId, STATES.CLAIMED, STATES.RUNNING);
+        ).run(status, output != null ? JSON.stringify(output) : null, attempts, jobId, workerId, STATES.CLAIMED, STATES.RUNNING);
         if (res.changes > 0) {
           if (current.scope != null) {
             const job = parseJob(rawRow(db, '_Job', jobId));
-            if (job) emit(buildEvent(job, 'retried', now()));
+            if (job) emit(buildEvent(job, 'deadLettered', now()));
           }
-          return { accepted: true, retried: true, attempts };
+          return { accepted: true, deadLettered: true, attempts };
         }
         return { accepted: false };
-      }
-      const res = db.prepare(
-        `UPDATE _Job SET status = ?, payload = ?, attempts = ?
-         WHERE id = ? ${ownerGuard}`,
-      ).run(status, output != null ? JSON.stringify(output) : null, attempts, jobId, workerId, STATES.CLAIMED, STATES.RUNNING);
-      if (res.changes > 0) {
-        if (current.scope != null) {
-          const job = parseJob(rawRow(db, '_Job', jobId));
-          if (job) emit(buildEvent(job, 'deadLettered', now()));
-        }
-        return { accepted: true, deadLettered: true, attempts };
-      }
-      return { accepted: false };
+      });
     });
   }
 
   // Update progress: the owning worker reports progress (0–100) and an
   // optional stage label while the job is claimed/running. Non-owner,
-  // not-found, or terminal → null. Routed through the write coordinator (the
-  // guard read, the UPDATE, and the live-visibility event are separate
-  // statements).
+  // not-found, or terminal → null. Routed through the write coordinator and
+  // wrapped in BEGIN IMMEDIATE.
   function updateProgress({ jobId, workerId, progress, stage }                                                                           = {})                                         {
     return coordinated(() => {
       if (typeof progress !== 'number' || !Number.isFinite(progress)) return null;
-      const clamped = Math.max(0, Math.min(100, Math.round(progress)));
-      const current = db.prepare('SELECT id, workerId, status, scope FROM _Job WHERE id = ?').get(jobId);
-      if (!current) return null;
-      if (current.workerId !== workerId) return null; // only the owning worker may report progress
-      if (current.status !== STATES.CLAIMED && current.status !== STATES.RUNNING) return null;
-      db.prepare(
-        'UPDATE _Job SET progress = ?, stage = ? WHERE id = ?',
-      ).run(clamped, stage ?? null, jobId);
-      const job = parseJob(rawRow(db, '_Job', jobId));
-      if (job && job.scope != null) {
-        emit(buildEvent(job, 'progress', now()));
-      }
-      return job;
+      return runInTxn(() => {
+        const clamped = Math.max(0, Math.min(100, Math.round(progress)));
+        const current = db.prepare('SELECT id, workerId, status, scope FROM _Job WHERE id = ?').get(jobId);
+        if (!current) return null;
+        if (current.workerId !== workerId) return null; // only the owning worker may report progress
+        if (current.status !== STATES.CLAIMED && current.status !== STATES.RUNNING) return null;
+        db.prepare(
+          'UPDATE _Job SET progress = ?, stage = ? WHERE id = ?',
+        ).run(clamped, stage ?? null, jobId);
+        const job = parseJob(rawRow(db, '_Job', jobId));
+        if (job && job.scope != null) {
+          emit(buildEvent(job, 'progress', now()));
+        }
+        return job;
+      });
     });
   }
 
   // Cancel a job. A queued job can be cancelled without owner check (no worker
   // owns it yet); a claimed/running job must be cancelled by its owning worker.
   // Terminal jobs (completed/failed/cancelled) cannot be cancelled. Routed
-  // through the write coordinator (the guard read, the UPDATE, and the
-  // live-visibility event are separate statements).
+  // through the write coordinator and wrapped in BEGIN IMMEDIATE.
   function cancelJob({ jobId, workerId }                                        = {})                                             {
-    return coordinated(() => {
+    return coordinated(() => runInTxn(() => {
       const current = db.prepare('SELECT id, status, workerId, scope FROM _Job WHERE id = ?').get(jobId);
       if (!current) return null;
       if (TERMINAL.has(current.status             )) return { terminal: true };
@@ -569,7 +686,7 @@ export function createJobQueue({
         emit(buildEvent(job, 'cancelled', now()));
       }
       return job;
-    });
+    }));
   }
 
   // Reaper sweep. (1) Jobs whose lease expired: a lease loss COUNTS as an attempt
@@ -583,51 +700,54 @@ export function createJobQueue({
   // (2) Revoke workers whose lastHeartbeat is older than the grace window — their
   // bearer is rejected after. The worker's work must be idempotent (documented)
   // because a reassigned job is re-run from scratch by the new claimant. Routed
-  // through the write coordinator: the sweep is several separate statements.
+  // through the write coordinator and wrapped in BEGIN IMMEDIATE.
   function reap({ now: nowFn = now }                         = {})                                                                                                                                         {
     return coordinated(() => {
-      const t = (typeof nowFn === 'function' ? nowFn : now)();
-      // Dead-letter first, then requeue: any expired row matches exactly one
-      // predicate, and the back-to-back synchronous statements cannot interleave
-      // with anything else (single-threaded sync DB, and this runs inside the
-      // coordinated turn when one is configured).
-      const deadRows = db.prepare(
-        `UPDATE _Job SET status = ?, attempts = attempts + 1, leaseUntil = NULL
-         WHERE status IN (?, ?) AND leaseUntil < ? AND attempts + 1 >= ${Number(maxAttempts)}
-         RETURNING *`,
-      ).all(STATES.FAILED, STATES.CLAIMED, STATES.RUNNING, t);
-      for (const row of deadRows) {
-        const payload = row.payload != null ? JSON.parse(row.payload          ) : {};
-        db.prepare('UPDATE _Job SET payload = ? WHERE id = ?').run(
-          JSON.stringify({ ...payload, deadLetterReason: 'lease-expired' }), row.id,
-        );
-        if (row.scope != null) {
-          const job = parseJob(row);
-          if (job) emit(buildEvent(job, 'deadLettered', t));
+      let deadRows                            = [];
+      let reassignedRows                            = [];
+      const summary = runInTxn(() => {
+        const t = (typeof nowFn === 'function' ? nowFn : now)();
+        // Dead-letter first, then requeue: any expired row matches exactly one
+        // predicate, and the whole sweep commits atomically.
+        deadRows = db.prepare(
+          `UPDATE _Job SET status = ?, attempts = attempts + 1, leaseUntil = NULL
+           WHERE status IN (?, ?) AND leaseUntil < ? AND attempts + 1 >= ${Number(maxAttempts)}
+           RETURNING *`,
+        ).all(STATES.FAILED, STATES.CLAIMED, STATES.RUNNING, t);
+        for (const row of deadRows) {
+          const payload = row.payload != null ? JSON.parse(row.payload          ) : {};
+          db.prepare('UPDATE _Job SET payload = ? WHERE id = ?').run(
+            JSON.stringify({ ...payload, deadLetterReason: 'lease-expired' }), row.id,
+          );
+          if (row.scope != null) {
+            const job = parseJob(row);
+            if (job) emit(buildEvent(job, 'deadLettered', t));
+          }
         }
-      }
-      const reassignedRows = db.prepare(
-        `UPDATE _Job SET status = ?, workerId = NULL, claimedAt = NULL, leaseUntil = NULL, attempts = attempts + 1, availableAt = ?
-         WHERE status IN (?, ?) AND leaseUntil < ?
-         RETURNING *`,
-      ).all(STATES.QUEUED, t + backoffMs, STATES.CLAIMED, STATES.RUNNING, t);
-      for (const row of reassignedRows) {
-        if (row.scope != null) {
-          const job = parseJob(row);
-          if (job) emit(buildEvent(job, 'reassigned', t));
+        reassignedRows = db.prepare(
+          `UPDATE _Job SET status = ?, workerId = NULL, claimedAt = NULL, leaseUntil = NULL, attempts = attempts + 1, availableAt = ?
+           WHERE status IN (?, ?) AND leaseUntil < ?
+           RETURNING *`,
+        ).all(STATES.QUEUED, t + backoffMs, STATES.CLAIMED, STATES.RUNNING, t);
+        for (const row of reassignedRows) {
+          if (row.scope != null) {
+            const job = parseJob(row);
+            if (job) emit(buildEvent(job, 'reassigned', t));
+          }
         }
-      }
+        const revoked = db.prepare(
+          `UPDATE _Worker SET revoked = 1
+           WHERE revoked = 0 AND lastHeartbeat < ?`,
+        ).run(t - heartbeatGraceMs).changes;
+        return { reassigned: reassignedRows.length, deadLettered: deadRows.length, revoked };
+      });
       if (deadRows.length > 0 || reassignedRows.length > 0) {
         getLog().warn('system', 'job-queue reaper: lease-expired jobs', {
           reassigned: reassignedRows.map((r) => ({ id: r.id, kind: r.kind, attempts: r.attempts })),
           deadLettered: deadRows.map((r) => ({ id: r.id, kind: r.kind, attempts: r.attempts })),
         });
       }
-      const revoked = db.prepare(
-        `UPDATE _Worker SET revoked = 1
-         WHERE revoked = 0 AND lastHeartbeat < ?`,
-      ).run(t - heartbeatGraceMs).changes;
-      return { reassigned: reassignedRows.length, deadLettered: deadRows.length, revoked };
+      return summary;
     });
   }
 
@@ -673,7 +793,7 @@ export function createJobQueue({
     if (status != null) { clauses.push('status = ?'); params.push(status); }
     const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
     const rows = db.prepare(
-      `SELECT * FROM _Job ${where} ORDER BY enqueuedAt ASC LIMIT ?`,
+      `SELECT * FROM _Job ${where} ORDER BY enqueuedAt ASC, rowid ASC LIMIT ?`,
     ).all(...params, limit);
     return rows.map((row) => parseJob(row)          );
   }
@@ -759,12 +879,44 @@ export function createJobQueue({
         return { job, result, denied };
       }
       let result              ;
+      let heartbeatTimer                                        = null;
+      let active = true;
+      const clearHeartbeat = () => {
+        active = false;
+        if (heartbeatTimer) {
+          clearInterval(heartbeatTimer);
+          heartbeatTimer = null;
+        }
+      };
+      const heartbeatIntervalMs = Number.isFinite(leaseMs) && leaseMs > 0
+        ? Math.max(10, Math.floor(leaseMs / 3))
+        : null;
+      if (heartbeatIntervalMs != null) {
+        heartbeatTimer = setInterval(() => {
+          if (!active) return;
+          try {
+            const hb = heartbeat(job.id, workerId);
+            if (hb && typeof (hb                    ).then === 'function') {
+              (hb                    ).catch((err) => {
+                getLog().warn('system', 'job worker auto-heartbeat failed', { err, kind, jobId: job.id });
+              });
+            }
+          } catch (err) {
+            getLog().warn('system', 'job worker auto-heartbeat failed', { err, kind, jobId: job.id });
+          }
+        }, heartbeatIntervalMs);
+        if (typeof heartbeatTimer.unref === 'function') heartbeatTimer.unref();
+      }
       try {
         const output = await fn(job);
+        clearHeartbeat();
         result = await submitResult(job.id, workerId, { status: STATES.COMPLETED, output: output ?? null });
       } catch (err) {
+        clearHeartbeat();
         result = await submitResult(job.id, workerId, { status: STATES.FAILED, output: { error: err instanceof Error ? err.message : String(err) } });
         getLog().warn('system', 'job worker fn failed', { err, kind, jobId: job.id });
+      } finally {
+        clearHeartbeat();
       }
       return { job, result };
     }

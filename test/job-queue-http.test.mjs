@@ -141,3 +141,52 @@ test('result: revoked bearer → 401 (reaper revoked the worker)', async (t) => 
   });
   assert.equal(res.status, 401, 'revoked bearer → 401');
 });
+
+test('claim: filters by kind via query (?kind=...) and JSON body ({ kind, scope })', async (t) => {
+  const { db, app } = makeApp();
+  const base = await ready(app);
+  t.after(() => { app.httpServer.close(); db.close(); });
+  await app.jobs.enqueue({ kind: 'transcribe', payload: { n: 1 }, scope: 'project:p1' });
+  await app.jobs.enqueue({ kind: 'thumbnail', payload: { n: 2 }, scope: 'project:p1' });
+  await app.jobs.enqueue({ kind: 'transcribe', payload: { n: 3 }, scope: 'project:p2' });
+  const w = await (await fetch(`${base}/workers/register`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ secret: SECRET }),
+  })).json();
+
+  // Query param ?kind=thumbnail skips the earlier transcribe job
+  const byQuery = await fetch(`${base}/jobs/claim?kind=thumbnail`, {
+    method: 'POST', headers: bearer(w.workerId, w.token),
+  });
+  assert.equal(byQuery.status, 200);
+  const thumb = await byQuery.json();
+  assert.equal(thumb.kind, 'thumbnail');
+  assert.equal(thumb.payload.n, 2);
+
+  // JSON body { kind, scope } targets project:p2 transcribe specifically
+  const byBody = await fetch(`${base}/jobs/claim`, {
+    method: 'POST',
+    headers: { ...bearer(w.workerId, w.token), 'content-type': 'application/json' },
+    body: JSON.stringify({ kind: 'transcribe', scope: 'project:p2' }),
+  });
+  assert.equal(byBody.status, 200);
+  const p2 = await byBody.json();
+  assert.equal(p2.kind, 'transcribe');
+  assert.equal(p2.scope, 'project:p2');
+  assert.equal(p2.payload.n, 3);
+
+  // No more thumbnail jobs → 204
+  const emptyThumb = await fetch(`${base}/jobs/claim`, {
+    method: 'POST',
+    headers: { ...bearer(w.workerId, w.token), 'content-type': 'application/json' },
+    body: JSON.stringify({ kind: 'thumbnail' }),
+  });
+  assert.equal(emptyThumb.status, 204);
+
+  // Remaining project:p1 transcribe job is still queued and claimable
+  const remaining = await fetch(`${base}/jobs/claim?kind=transcribe&scope=project:p1`, {
+    method: 'POST', headers: bearer(w.workerId, w.token),
+  });
+  assert.equal(remaining.status, 200);
+  const p1 = await remaining.json();
+  assert.equal(p1.payload.n, 1);
+});

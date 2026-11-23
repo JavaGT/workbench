@@ -675,8 +675,32 @@ export async function handleJobRoute(
   if (url.pathname === '/jobs/claim') {
     const workerId = jobs.authenticate(bearer);
     if (!workerId) { reject(res, 401, 'unauthorized'); return true; }
-    const scope = url.searchParams.get('scope') || null;
-    const job = await jobs.claim(workerId, scope ? { scope } : undefined);
+    let body         ;
+    try { body = await readRequestBody(req, { jsonOnly: true }); } catch (err) {
+      if (err instanceof BodyError) { reject(res, err.status, err.message); return true; }
+      throw err;
+    }
+    if (body != null && (typeof body !== 'object' || Array.isArray(body))) {
+      reject(res, 400, 'request body must be a JSON object');
+      return true;
+    }
+    const bodyRecord = (body ?? {})                                       ;
+    if (bodyRecord.kind != null && typeof bodyRecord.kind !== 'string') {
+      reject(res, 400, 'kind must be a string');
+      return true;
+    }
+    if (bodyRecord.scope != null && typeof bodyRecord.scope !== 'string') {
+      reject(res, 400, 'scope must be a string');
+      return true;
+    }
+    const queryKind = url.searchParams.get('kind') || undefined;
+    const queryScope = url.searchParams.get('scope') || undefined;
+    const kind = queryKind || (bodyRecord.kind ? bodyRecord.kind : undefined);
+    const scope = queryScope || (bodyRecord.scope ? bodyRecord.scope : undefined);
+    const claimOpts = kind !== undefined || scope !== undefined
+      ? { ...(kind !== undefined ? { kind } : {}), ...(scope !== undefined ? { scope } : {}) }
+      : undefined;
+    const job = await jobs.claim(workerId, claimOpts);
     if (!job) { res.writeHead(204); res.end(); return true; } // no queued work
     sendJson(res, 200, job);
     return true;

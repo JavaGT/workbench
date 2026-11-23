@@ -60,8 +60,9 @@
 		"verify:concise": "pnpm lint && pnpm typecheck && pnpm check:annotated-text-single-authority && pnpm check:architecture-map && pnpm test"
 	},
 	"devDependencies": {
-		"@types/node": "^26.1.1",
 		"@playwright/test": "^1.62.1",
+		"@types/node": "^26.1.1",
+		"@types/ws": "^8.18.2",
 		"eslint": "^9.39.5",
 		"fake-indexeddb": "^6.2.5",
 		"globals": "^17.7.0",
@@ -70,5 +71,8 @@
 	},
 	"engines": {
 		"node": ">=24.10.0"
+	},
+	"dependencies": {
+		"ws": "^8.23.0"
 	}
 }

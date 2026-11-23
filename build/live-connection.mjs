@@ -1,13 +1,12 @@
-// A live WebSocket connection — socket I/O, frame parsing/sending,
-// message routing, and the connection lifecycle.
+// A live WebSocket connection — socket I/O over `ws`, message routing,
+// heartbeat liveness, and the connection lifecycle.
 //
 // Subscribe-time admission is delegated to live-admission.mjs; subscription
 // registration delegates to the injected fanout handle. The transport wiring
-// (WebSocket upgrade, CSWSH check, principalOf) stays in live-delivery.mjs.
+// (WebSocket upgrade, CSWSH check, principalOf, heartbeat timer) stays in
+// live-delivery-websocket.mjs.
 
-
-
-import { FrameSender, FrameParser } from './websocket.mjs';
+import { DEFAULT_WS_MAX_PAYLOAD,                                    } from './websocket.mjs';
 import { authorizeSubscription, parseSubscribeMsg } from './live-admission.mjs';
 import { failure, isWorkbenchFailure, sanitizeUnexpectedFailure } from './outcome.mjs';
 import { anonymous } from './principal.mjs';
@@ -17,6 +16,9 @@ import { anonymous } from './principal.mjs';
 
 
 
+const WS_OPEN = 1;
+const WS_CLOSED = 3;
+
 function requestIdOf(msg                         )                              {
   const value = msg?.requestId;
   if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) return value;
@@ -24,25 +26,20 @@ function requestIdOf(msg                         )                              
   return undefined;
 }
 
+function rawDataToUtf8(data         )         {
+  if (typeof data === 'string') return data;
+  if (Buffer.isBuffer(data)) return data.toString('utf-8');
+  if (Array.isArray(data)) return Buffer.concat(data).toString('utf-8');
+  return Buffer.from(data).toString('utf-8');
+}
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-// Keep a stalled peer from turning the Node writable buffer into an
-// unbounded per-connection allocation. A peer that exceeds this budget is
-// disconnected and can recover through its normal cursor resubscribe.
-const MAX_QUEUED_BYTES = 1024 * 1024;
+// Keep a stalled peer from turning the socket write buffer into an unbounded
+// per-connection allocation. A peer that exceeds this budget is disconnected
+// and can recover through its normal cursor resubscribe.
 const DRAIN_TIMEOUT_MS = 30_000;
+const CLOSE_HANDSHAKE_GRACE_MS = 250;
+
+
 
 
 
@@ -64,12 +61,11 @@ const DRAIN_TIMEOUT_MS = 30_000;
 
 
 export class LiveConnection {
-  #socket        ;
-  #sender             ;
-  #parser             ;
+  #ws                 ;
   #id        ;
   #closed = false;
   #closing = false;
+  #alive = true;
   #closePromise                       = null;
   #principal                  ;
   #fanout                  ;
@@ -85,14 +81,23 @@ export class LiveConnection {
   #coreAcs                              ;
   #coreActivations                             ;
   #coreGen                     ;
-  #writeQueue                = [];
-  #queuedBytes = 0;
-  #writing = false;
+  #maxBufferedBytes        ;
 
-  constructor(socket        , id        , { fanout, core = null, resolveEntity, mayVerb, authorization = null, db, currentSeq, onClose, log = null, carets = null }                       ) {
-    this.#socket = socket;
-    this.#sender = new FrameSender();
-    this.#parser = new FrameParser();
+  constructor(ws                 , id        , {
+    fanout,
+    core = null,
+    resolveEntity,
+    mayVerb,
+    authorization = null,
+    db,
+    currentSeq,
+    onClose,
+    log = null,
+    carets = null,
+    maxPayload = DEFAULT_WS_MAX_PAYLOAD,
+    maxBufferedBytes,
+  }                       ) {
+    this.#ws = ws;
     this.#id = id;
     this.#principal = null;
     this.#fanout = fanout;
@@ -108,106 +113,127 @@ export class LiveConnection {
     this.#coreAcs = new Map();
     this.#coreActivations = new Map();
     this.#coreGen = new Map();
+    this.#maxBufferedBytes = maxBufferedBytes ?? Math.max(4 * 1024 * 1024, maxPayload * 2);
 
-    socket.on('data', (chunk) => {
-      if (this.#closing) return;
-      this.#parser.feed(chunk);
-      this.#drain();
+    ws.on('message', (data         , isBinary         ) => {
+      if (this.#closing || this.#closed || isBinary) return;
+      try {
+        const parsed = JSON.parse(rawDataToUtf8(data));
+        this.#handleMessage(parsed);
+      } catch {
+        this.error(failure('invalid-input', 'Invalid JSON.'));
+      }
     });
 
-    socket.on('error', () => this.#close());
-    socket.on('end', () => this.#close());
-    socket.on('close', () => this.#close());
+    ws.on('pong', () => {
+      this.#alive = true;
+    });
+
+    ws.on('error', () => {
+      void this.#close({ abrupt: true });
+    });
+
+    ws.on('close', () => {
+      // Mark closing before cleanup so a departing client is not echoed its
+      // own caret retraction; ws has already completed the RFC 6455 close ack.
+      this.#closing = true;
+      void this.#close({ peerClosed: true });
+    });
   }
 
   get id()         { return this.#id; }
   get closed()          { return this.#closed; }
   get principal()                   { return this.#principal; }
+  get isAlive()          { return this.#alive; }
+
+  markAlive()       {
+    this.#alive = true;
+  }
+
+  ping()       {
+    if (this.#closed || this.#closing || this.#ws.readyState !== WS_OPEN) return;
+    this.#alive = false;
+    try {
+      this.#ws.ping();
+    } catch {
+      void this.#close({ abrupt: true });
+    }
+  }
 
   close()                { return this.#close(); }
+
+  terminate()                {
+    this.#closing = true;
+    return this.#close({ abrupt: true });
+  }
 
   setPrincipal(p           )       {
     this.#principal = p;
   }
 
   send(data         )       {
-    if (this.#closed || this.#closing) return;
+    if (this.#closed || this.#closing || this.#ws.readyState !== WS_OPEN) return;
     try {
-      void this.#enqueueFrame(this.#sender.text(JSON.stringify(data))).catch(() => {});
+      const payload = JSON.stringify(data);
+      const byteLength = Buffer.byteLength(payload);
+      if (this.#ws.bufferedAmount + byteLength > this.#maxBufferedBytes) {
+        void this.#close({ abrupt: true });
+        return;
+      }
+      this.#ws.send(payload, (err) => {
+        if (err) void this.#close({ abrupt: true });
+      });
     } catch {
-      this.#close();
+      void this.#close({ abrupt: true });
     }
   }
 
-  async #sendAndWait(data         )                {
-    if (this.#closed || this.#closing) throw new Error('live connection closed');
-    await this.#enqueueFrame(this.#sender.text(JSON.stringify(data)));
-  }
-
-  #enqueueFrame(frame        )                {
-    if (this.#closed) return Promise.reject(new Error('live connection closed'));
-    if (this.#queuedBytes + frame.length > MAX_QUEUED_BYTES) {
+  #sendAndWait(data         )                {
+    if (this.#closed || this.#closing || this.#ws.readyState !== WS_OPEN) {
+      return Promise.reject(new Error('live connection closed'));
+    }
+    const payload = JSON.stringify(data);
+    const byteLength = Buffer.byteLength(payload);
+    if (this.#ws.bufferedAmount + byteLength > this.#maxBufferedBytes) {
       const error = new Error('live connection write queue exceeded its byte limit');
-      this.#rejectQueued(error);
-      void this.#close();
+      void this.#close({ abrupt: true });
       return Promise.reject(error);
     }
-    const promise = new Promise      ((resolve, reject) => {
-      this.#writeQueue.push({ frame, resolve, reject });
-    });
-    this.#queuedBytes += frame.length;
-    void this.#processWriteQueue();
-    return promise;
-  }
 
-  async #processWriteQueue()                {
-    if (this.#writing) return;
-    this.#writing = true;
-    try {
-      while (this.#writeQueue.length > 0) {
-        const item = this.#writeQueue.shift() ;
-        this.#queuedBytes -= item.frame.length;
-        try {
-          const accepted = this.#socket.write(item.frame);
-          if (accepted === false) await this.#waitForDrain();
-          item.resolve();
-        } catch (error) {
-          item.reject(error);
-          this.#rejectQueued(error);
-          void this.#close();
-          return;
-        }
-      }
-    } finally {
-      this.#writing = false;
-    }
-  }
-
-  #rejectQueued(error         )       {
-    for (const item of this.#writeQueue) item.reject(error);
-    this.#writeQueue = [];
-    this.#queuedBytes = 0;
-  }
-
-  #waitForDrain()                {
-    return new Promise((resolve, reject) => {
+    return new Promise      ((resolve, reject) => {
       let settled = false;
-      const finish = (error          ) => {
+      const finish = (err          ) => {
         if (settled) return;
         settled = true;
         clearTimeout(timeout);
-        this.#socket.removeListener('drain', onDrain);
-        this.#socket.removeListener('error', onError);
-        this.#socket.removeListener('close', onClose);
-        if (error) reject(error); else resolve();
+        this.#ws.off('close', onClose);
+        this.#ws.off('error', onError);
+        if (err) reject(err);
+        else resolve();
       };
-      const onDrain = () => finish();
-      const onError = (error         ) => finish(error);
       const onClose = () => finish(new Error('live connection closed while draining'));
-      const timeout = setTimeout(() => finish(new Error('live connection drain timed out')), DRAIN_TIMEOUT_MS);
-      this.#socket.once('drain', onDrain);
-      this.#socket.once('error', onError);
-      this.#socket.once('close', onClose);
+      const onError = (err       ) => finish(err);
+      const timeout = setTimeout(() => {
+        void this.#close({ abrupt: true });
+        finish(new Error('live connection drain timed out'));
+      }, DRAIN_TIMEOUT_MS);
+      timeout.unref?.();
+
+      this.#ws.once('close', onClose);
+      this.#ws.once('error', onError);
+      try {
+        this.#ws.send(payload, (err) => {
+          if (err) {
+            void this.#close({ abrupt: true });
+            finish(err);
+          } else {
+            finish();
+          }
+        });
+      } catch (err) {
+        void this.#close({ abrupt: true });
+        finish(err);
+      }
     });
   }
 
@@ -220,46 +246,6 @@ export class LiveConnection {
     };
     if (requestId !== undefined) response.requestId = requestId;
     this.send(response);
-  }
-
-  #drain()       {
-    const msgs = this.#parser.drainMessages()                 ;
-    for (const msg of msgs) {
-      if (msg.opcode === 0x8) {
-        // 1005 means the peer sent a close frame without a status code. It is
-        // an internal RFC 6455 sentinel, not a code valid on the wire; echo an
-        // empty close frame rather than sending Chromium an illegal 1005 code.
-        const code = msg.closeCode === 1005 ? undefined : (msg.closeCode ?? 1000);
-        // Mark the connection closing before cleanup can fan out a presence
-        // retraction, then acknowledge the peer's close frame.
-        this.#closing = true;
-         void this.#enqueueFrame(this.#sender.close(code, msg.closeReason)).catch(() => {});
-        this.#close();
-        return;
-      }
-      if (msg.opcode === 0x1) {
-        try {
-          const parsed = JSON.parse(msg.payload?.toString('utf-8') ?? '');
-          this.#handleMessage(parsed);
-        } catch {
-          this.error(failure('invalid-input', 'Invalid JSON.'));
-        }
-      }
-      if (msg.opcode === -1) {
-        if (msg.closeCode === 1002) {
-          this.#closing = true;
-          void this.#enqueueFrame(this.#sender.close(1002, 'Protocol error')).catch(() => {});
-          void this.#close();
-          return;
-        }
-        this.error(failure('invalid-input', String(msg.error || 'Invalid WebSocket frame.')));
-      }
-    }
-
-    const pongs = this.#parser.drainPongs();
-    for (const payload of pongs) {
-      void this.#enqueueFrame(this.#sender.pong(payload)).catch(() => {});
-    }
   }
 
   #handleMessage(msg                         )       {
@@ -418,11 +404,11 @@ export class LiveConnection {
             // `resync`) is forwarded verbatim, one frame per envelope. No
             // kind-specific reshaping happens on this transport, so SSE and
             // WebSocket can never diverge on tier/admission/recovery/confirmation.
+            if (this.#closed) throw new Error('live connection closed');
+            for (const envelope of batch) {
               if (this.#closed) throw new Error('live connection closed');
-              for (const envelope of batch) {
-                if (this.#closed) throw new Error('live connection closed');
-                await this.#sendAndWait(envelope);
-              }
+              await this.#sendAndWait(envelope);
+            }
           },
           revoke: () => {
             // A reauthorization failure after acknowledgement is terminal for
@@ -478,7 +464,7 @@ export class LiveConnection {
       // Fanout owns the connection-scoped collection cap. Register before the
       // acknowledgement so the check and registration are one synchronous step.
       this.#fanout.addSubscription(scope, this, result.fields, result.pace, { ...result.interest, carets: result.carets });
-    } catch (err) {
+    } catch {
       coreSubscription?.unsubscribe?.();
       requestController?.abort();
       this.#coreAcs.delete(scope);
@@ -533,26 +519,65 @@ export class LiveConnection {
     if (this.#coreAcs.get(scope) === undefined) this.#fanout.removeSubscription(scope, this);
   }
 
-  #close()                {
+  #close(options                                             )                {
     if (this.#closePromise) return this.#closePromise;
-    this.#closePromise = this.#performClose();
+    this.#closePromise = this.#performClose(options);
     return this.#closePromise;
   }
 
-  async #performClose()                {
+  async #performClose({ abrupt = false, peerClosed = false } = {})                {
     if (this.#closed) return;
     // Remove the connection from the transport registry synchronously. The
     // returned promise still waits for caret retraction and socket cleanup,
     // but callers observing count() during shutdown must not see a closing
     // connection as live. Do not set #closing until after cleanup: send()
     // drops frames while #closing, and shutdown must flush the caret remove
-    // before the socket is destroyed. Peer close (opcode 0x8) already sets
-    // #closing first so a departing client is not echoed its own retraction.
+    // before the socket closes. Peer close already sets #closing first so a
+    // departing client is not echoed its own retraction.
     this.#onClose?.();
     await this.#cleanup();
     this.#closing = true;
     this.#closed = true;
-    try { this.#socket.destroy(); } catch { /* ignore */ }
+
+    if (abrupt || peerClosed) {
+      if (this.#ws.readyState !== WS_CLOSED) {
+        try { this.#ws.terminate(); } catch { /* ignore */ }
+      }
+      return;
+    }
+
+    // Server-initiated close: issue a clean RFC 6455 close handshake via `ws`
+    // (which flushes any previously queued send() frames such as caret remove
+    // before sending the close frame), then wait briefly for the peer's close
+    // ack before terminating so shutdown never hangs on unresponsive peers.
+    if (this.#ws.readyState === WS_OPEN) {
+      await new Promise      ((resolve) => {
+        let settled = false;
+        const done = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          this.#ws.off('close', done);
+          this.#ws.off('error', done);
+          resolve();
+        };
+        const timer = setTimeout(() => {
+          try { this.#ws.terminate(); } catch { /* ignore */ }
+          done();
+        }, CLOSE_HANDSHAKE_GRACE_MS);
+        timer.unref?.();
+        this.#ws.once('close', done);
+        this.#ws.once('error', done);
+        try {
+          this.#ws.close(1000, '');
+        } catch {
+          try { this.#ws.terminate(); } catch { /* ignore */ }
+          done();
+        }
+      });
+    } else if (this.#ws.readyState !== WS_CLOSED) {
+      try { this.#ws.terminate(); } catch { /* ignore */ }
+    }
   }
 
   async #cleanup()                {

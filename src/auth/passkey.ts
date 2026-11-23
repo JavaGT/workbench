@@ -533,19 +533,49 @@ export function decodeCbor(buf: Buffer, offset = 0, depth = 0): CborResult {
 
 // ---- attestation object parsing ----------------------------------------------
 
+// The only attestation format this server accepts. `fmt: 'none'` (self
+// attestation) carries an empty attStmt, so there is no statement to verify.
+// Every other WebAuthn format (packed, tpm, u2f, ...) requires its own
+// statement verification; accepting one without verifying it would let a
+// client submit unverified, attacker-chosen authenticator material (#245).
+// Fail closed: reject every format we do not verify.
+const SUPPORTED_ATTESTATION_FMT = 'none';
+
 // parseAttestationObject(base64urlStr) → { fmt, attStmt, authData }.
-// Decodes the base64url-encoded CBOR attestation object from the client.
-function parseAttestationObject(base64urlStr: string): { fmt: unknown; attStmt: unknown; authData: Buffer } {
+// Decodes the base64url-encoded CBOR attestation object from the client and
+// validates its structure and format before any credential material is trusted.
+function parseAttestationObject(base64urlStr: string): { fmt: string; attStmt: Record<string, unknown>; authData: Buffer } {
   const buf = base64urlToBuffer(base64urlStr);
-  const { value } = decodeCbor(buf, 0);
-  if (value == null || typeof value !== 'object' || Array.isArray(value)) {
+  const { value, pos } = decodeCbor(buf, 0);
+  // A second CBOR item (or stray bytes) after the attestation object is
+  // malformed input; do not silently ignore the unparsed portion.
+  if (pos !== buf.length) {
+    throw new Error('attestation object has trailing data');
+  }
+  if (value == null || typeof value !== 'object' || Array.isArray(value) || Buffer.isBuffer(value)) {
     throw new Error('attestation object is not a CBOR map');
   }
   const { fmt, attStmt, authData } = value as Record<string, unknown>;
   if (!Buffer.isBuffer(authData)) {
     throw new Error('attestation object missing authData byte string');
   }
-  return { fmt: fmt ?? null, attStmt: attStmt ?? {}, authData };
+  // fmt must be a declared, supported string. A missing/malformed fmt or an
+  // unsupported format is rejected rather than defaulted into acceptance.
+  if (typeof fmt !== 'string' || fmt.length === 0) {
+    throw new Error('attestation object missing fmt');
+  }
+  if (fmt !== SUPPORTED_ATTESTATION_FMT) {
+    throw new Error(`unsupported attestation format: ${fmt}`);
+  }
+  // WebAuthn requires an empty attStmt for 'none'. A non-empty statement is
+  // either malformed or an attestation we are not verifying — reject both.
+  if (attStmt == null || typeof attStmt !== 'object' || Array.isArray(attStmt) || Buffer.isBuffer(attStmt)) {
+    throw new Error('attestation object has malformed attStmt');
+  }
+  if (Object.keys(attStmt).length !== 0) {
+    throw new Error('fmt "none" requires an empty attStmt');
+  }
+  return { fmt, attStmt: attStmt as Record<string, unknown>, authData };
 }
 
 // ---- attested credential data extraction -------------------------------------
@@ -735,9 +765,20 @@ export function verifyRegistration(challenge: string, credential: PublicKeyCrede
 
   // 7. Extract credential ID and public key from attested credential data
   const { credentialId, publicKey } = extractAttestedCredentialData(authData);
+  const attestedCredentialId = credentialId.toString('base64url');
+
+  // 8. The client-declared id/rawId must name the SAME credential the
+  //    authenticator attested to. Without this comparison a caller could bind
+  //    its own key pair to a victim's credential ID and shadow their passkey
+  //    (#245). The attested ID is authoritative for storage and uniqueness.
+  for (const declared of [credential.id, credential.rawId]) {
+    if (typeof declared === 'string' && declared.length > 0 && declared !== attestedCredentialId) {
+      throw new Error('credential id does not match attested credential data');
+    }
+  }
 
   return {
-    credentialId: credentialId.toString('base64url'),
+    credentialId: attestedCredentialId,
     publicKey: publicKey.toString('base64url'),
     signCount: parsed.signCount,
   };

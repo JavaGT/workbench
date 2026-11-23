@@ -6,7 +6,13 @@ import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 
 import workbench, { entity } from '../build/internal.mjs';
-import { parseCookies, sessionCookie } from '../build/auth/session.mjs';
+import {
+  parseCookies,
+  sessionCookie,
+  sessionTokenOf,
+  sessionPrincipalOf,
+  hashSessionToken,
+} from '../build/auth/session.mjs';
 
 // M1: Malformed cookie does not throw → anonymous principal, not 500
 test('parseCookies: malformed % escape does not throw', () => {
@@ -51,6 +57,32 @@ test('request with malformed sid cookie → anonymous principal (route 401s)', a
   });
   // Should be 401 (anonymous denied by route gate), NOT 500
   assert.equal(r.status, 401, `Expected 401 for anonymous (malformed cookie), got ${r.status}`);
+});
+
+// #218: duplicate sid cookies must fail closed instead of last-value-wins.
+test('#218: sessionTokenOf rejects duplicate sid cookies', () => {
+  assert.equal(sessionTokenOf({ headers: { cookie: 'sid=first; sid=second' } }), undefined);
+  assert.equal(sessionTokenOf({ headers: { cookie: 'sid=first; other=x; sid=second' } }), undefined);
+  assert.equal(sessionTokenOf({ headers: { cookie: 'sid=first; sid=first' } }), undefined);
+  assert.equal(sessionTokenOf({ headers: { cookie: 'sid=only; other=x' } }), 'only');
+  assert.equal(sessionTokenOf({ headers: {} }), undefined);
+});
+
+test('#218: duplicate sid cookies resolve to anonymous at the auth boundary', (t) => {
+  const db = new DatabaseSync(':memory:');
+  t.after(() => db.close());
+  db.exec('CREATE TABLE Session (id TEXT PRIMARY KEY, token TEXT, principalType TEXT, principalId TEXT, createdAt TEXT)');
+  const token = 'valid-session-token';
+  db.prepare('INSERT INTO Session (id, token, principalType, principalId, createdAt) VALUES (?, ?, ?, ?, ?)')
+    .run('s1', hashSessionToken(token), 'user', 'u1', new Date().toISOString());
+  const principalOf = sessionPrincipalOf(db);
+
+  assert.equal(principalOf({ headers: { cookie: `sid=${token}` } }).type, 'user', 'single sid resolves');
+  assert.equal(
+    principalOf({ headers: { cookie: `sid=${token}; sid=attacker-token` } }).type,
+    'anonymous',
+    'duplicate sid fails closed even when one value is a real session',
+  );
 });
 
 // M2: sessionCookie refuses secure:false in production

@@ -146,6 +146,47 @@ test('create invitation with auto-generated token', async () => {
   }
 });
 
+// #247: a Date in the batch action payload used to make canonicalStringify
+// throw while writing the committed-log receipt, so createInvitation never
+// succeeded. Prove the whole path now works: action → receipt → projection →
+// stored row, with a JSON-safe ISO createdAt.
+test('#247: createInvitation succeeds through the real committed-log pipeline', async () => {
+  const { db, createInvitation } = await setupDb();
+  try {
+    const inv = await createInvitation({
+      targetEntity: 'Project',
+      targetId: 'p1',
+      role: 'member',
+      principal: owner,
+    });
+
+    // The committed event projected a real stored row.
+    const stored = db.prepare('SELECT * FROM Invitation WHERE id = ?').get(inv.id);
+    assert.ok(stored, 'invitation row was written by the committed-log projection');
+    assert.equal(stored.token, inv.token);
+
+    // createdAt is a JSON-safe ISO string, not a Date: on the returned row,
+    // in storage, and in the persisted action payload.
+    assert.equal(typeof inv.createdAt, 'string');
+    assert.equal(typeof stored.createdAt, 'string');
+    assert.equal(stored.createdAt, new Date(stored.createdAt).toISOString());
+
+    // The committed-log receipt was written for the action, and its actionData
+    // is plain JSON (canonicalStringify did not reject a non-JSON-safe value).
+    const receipts = db.prepare('SELECT actionId, actionType, actionData FROM _ActionReceipt').all();
+    assert.ok(receipts.length > 0, 'a committed-log receipt exists');
+    const receipt = receipts.find((row) => String(row.actionData).includes(inv.token));
+    assert.ok(receipt, 'the create action has a committed-log receipt');
+    assert.ok(receipt.actionId, 'the receipt is bound to a durable action id');
+    const actions = JSON.parse(receipt.actionData);
+    assert.equal(actions[0].type, 'Invitation.create');
+    assert.equal(typeof actions[0].payload.createdAt, 'string');
+    assert.equal(actions[0].payload.createdAt, new Date(actions[0].payload.createdAt).toISOString());
+  } finally {
+    db.close();
+  }
+});
+
 test('create link-type invitation (no targetUser)', async () => {
   const { db, createInvitation } = await setupDb();
   try {

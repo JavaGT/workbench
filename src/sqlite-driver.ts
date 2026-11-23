@@ -32,6 +32,7 @@
 
 import { existsSync, rmSync, statSync } from 'node:fs';
 import type { DatabaseSync as NodeDatabaseSync, DatabaseSyncOptions as NodeDatabaseSyncOptions } from 'node:sqlite';
+import { setForeignKeys, type DbHandle } from './driver.ts';
 
 export type SqliteRuntime = 'bun' | 'node';
 
@@ -221,7 +222,7 @@ class BunSqliteDatabase implements SqliteDatabase {
       this.#raw.exec(`PRAGMA busy_timeout = ${Math.floor(options.timeout)}`);
     }
     if (options?.enableForeignKeyConstraints === false) {
-      this.#raw.exec('PRAGMA foreign_keys = OFF');
+      setForeignKeys(this.#raw as unknown as DbHandle, false);
     }
     if (typeof this.#raw.setAuthorizer === 'function') {
       this.setAuthorizer = (callback) => {

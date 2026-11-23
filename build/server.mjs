@@ -44,7 +44,20 @@ export { operationalConsumerAdmin } from './operational-consumer.mjs';
 // export is for custom wiring only.
 export { createPostCommitEffectRunner } from './post-commit-effects.mjs';
 export { pendingBlobStager, declaredBlobField, readClaimedBlob, claimedBlobLifecycle, stagedBlobReader } from './pending-blob.mjs';
-export { readBlob, readBlobStream, BlobReadDeniedError,                                            } from './authorized-blob-read.mjs';
+export {
+  readBlob,
+  readBlobStream,
+  BlobReadDeniedError,
+  parseByteRange,
+  serveAuthorizedBlob,
+  handleAuthorizedBlobRequest,
+
+
+
+
+
+
+} from './authorized-blob-read.mjs';
 export { BlobSlotNotFoundError, BlobTooLargeError } from './fs-blobs.mjs';
 export { createHistoryReader } from './history-read.mjs';
 // Search plugins are server-only: they receive constrained source and

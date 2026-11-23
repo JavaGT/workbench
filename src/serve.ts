@@ -50,7 +50,7 @@ import { createResponseFacade } from './http-response-factory.ts';
 import { dispatchCrud } from './http-crud-dispatch.ts';
 import { failure } from './outcome.ts';
 import { sendFailure, type SendJson } from './http-failure.ts';
-import { handleResyncRoute, handleBlobUploadRoute, handleJobRoute, handleClientSdkRoute } from './http-framework-routes.ts';
+import { handleResyncRoute, handleBlobUploadRoute, handleBlobReadRoute, handleJobRoute, handleClientSdkRoute } from './http-framework-routes.ts';
 import { handleApplicationActionHttp } from './application-action-http.ts';
 
 // sendJson's strict Http response param is wider than the transport's loose
@@ -131,8 +131,8 @@ function resolveCorsPolicy(cors: any, origin: string | undefined): { allowOrigin
   return null;
 }
 
-// Framework-owned routes — handleResyncRoute, handleBlobUploadRoute, handleJobRoute
-// — live in http-framework-routes.mjs and are imported above.
+// Framework-owned routes — handleResyncRoute, handleBlobUploadRoute, handleBlobReadRoute,
+// handleJobRoute — live in http-framework-routes.mjs and are imported above.
 // The standard stateless CSRF guard (eng-review §8 Tier-2 ops bundle, #13). A
 // state-MUTATING request (anything but a safe method) carrying a FOREIGN Origin
 // or Referer is rejected; the browser always sends a foreign Origin on a
@@ -334,6 +334,14 @@ export function makeRequestHandler(source: any, { principalOf = anonymousPrincip
       match: (req: any, _url: URL) => isApp && req.method === 'GET',
       handle: async (req: any, res: any) => {
         const handled = await handleClientSdkRoute(source, req, res);
+        return handled || responseHasStarted(res);
+      },
+    },
+    // Authorized blob read: GET/HEAD /blobs/:entity/:id/:field (#287)
+    {
+      match: (req: any, url: URL) => isApp && (req.method === 'GET' || req.method === 'HEAD') && url.pathname.startsWith('/blobs/'),
+      handle: async (req: any, res: any) => {
+        const handled = await handleBlobReadRoute(source, req, res, principalOfAdmitted(req));
         return handled || responseHasStarted(res);
       },
     },

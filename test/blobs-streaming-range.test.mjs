@@ -41,17 +41,14 @@ import {
   BlobTooLargeError,
   createBlobStore,
   declaredBlobField,
+  handleAuthorizedBlobRequest,
+  parseByteRange,
   pendingBlobStager,
+  serveAuthorizedBlob,
 } from '../build/server.mjs';
 import { DEFAULT_BLOB_MAX_BYTES } from '../build/blob-store.mjs';
 import { fsBlobs } from '../build/fs-blobs.mjs';
 import { generateFrameworkDDL } from '../build/ddl.mjs';
-import {
-  handleAuthorizedBlobRequest,
-  parseByteRange,
-  serveAuthorizedBlob,
-} from '../build/authorized-blob-read.mjs';
-import { handleBlobReadRoute } from '../build/http-framework-routes.mjs';
 import { createAuthorizationAdapter } from '../build/authorization-adapter.mjs';
 
 const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
@@ -499,13 +496,6 @@ test('GET and HEAD authorized media playback with membership() + inherit(Project
   const app = workbench({ db, entities: [Project, Artifact], blobs: { root } });
   app.mount('/projects', Project);
   app.mount('/artifacts', Artifact);
-  // Mount HEAD handler alongside the built-in GET /blobs/:entity/:id/:field route
-  // so both GET and HEAD are exercised over a real HTTP socket.
-  app.use('/blobs', async (req, res) => {
-    if (req.method === 'HEAD') {
-      await handleBlobReadRoute(app, req.raw, res.raw, req.principal);
-    }
-  });
   await app.ddl();
   app.listen(0, {
     principalOf: (req) => {
@@ -726,4 +716,65 @@ test('serveAuthorizedBlob / handleAuthorizedBlobRequest works directly as a reus
     headers: { 'x-user': 'bob', range: 'bytes=0-5' },
   });
   assert.equal(denied.status, 403);
+});
+
+test('HEAD /blobs/:entity/:id/:field works directly on app.listen(0) without app.use()', async (t) => {
+  const db = new DatabaseSync(':memory:');
+  const root = mkdtempSync(path.join(tmpdir(), 'wb-direct-head-'));
+
+  const Clip = entity('Clip', {
+    title: text(),
+    audio: blob(),
+    owner: ref('User', { role: 'owner', readonly: true }),
+    grant: () => [
+      scope(({ is }) => is.owner()).can(async ({ is }) =>
+        (await is.owner()) ? grant(read, write, subscribe) : grant(read)),
+    ],
+  });
+
+  const alice = principal({ type: 'user', id: 'alice' });
+  const app = workbench({ db, entities: [Clip], blobs: { root } });
+  app.mount('/clips', Clip);
+  await app.ddl();
+  app.listen(0, { principalOf: () => alice });
+  await app.ready;
+  const { port } = app.httpServer.address();
+  const base = `http://127.0.0.1:${port}`;
+  t.after(async () => {
+    await app.shutdown();
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const payload = Buffer.from('direct-head-media-bytes-01234567');
+  const uploadRes = await fetch(`${base}/blobs`, {
+    method: 'POST',
+    headers: { 'content-type': 'audio/mpeg' },
+    body: payload,
+  });
+  assert.equal(uploadRes.status, 201);
+  const uploaded = await uploadRes.json();
+
+  const createRes = await fetch(`${base}/clips`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ title: 'Direct HEAD clip', audio: uploaded.id }),
+  });
+  assert.equal(createRes.status, 201);
+  const clip = await createRes.json();
+
+  let streamOpens = 0;
+  const origReadRangeStream = app.blobs.readRangeStream.bind(app.blobs);
+  app.blobs.readRangeStream = (...args) => {
+    streamOpens += 1;
+    return origReadRangeStream(...args);
+  };
+
+  const headRes = await fetch(`${base}/blobs/Clip/${clip.id}/audio`, { method: 'HEAD' });
+  assert.equal(headRes.status, 200);
+  assert.equal(headRes.headers.get('accept-ranges'), 'bytes');
+  assert.equal(headRes.headers.get('content-length'), String(payload.length));
+  assert.equal(headRes.headers.get('etag'), `"${uploaded.sha256}"`);
+  assert.equal((await headRes.arrayBuffer()).byteLength, 0);
+  assert.equal(streamOpens, 0, 'direct HEAD must not open a byte stream');
 });

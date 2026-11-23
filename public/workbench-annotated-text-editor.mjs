@@ -46,6 +46,20 @@ export function changedRange(before, after) {
   return { from, to: scalarEnd(before, beforeEnd), text: after.slice(from, scalarEnd(after, afterEnd)) };
 }
 
+// Project a caret offset through the single edit between `before` and `after`.
+// Offsets before the edit are unchanged, offsets after it shift by the length
+// delta, and an offset inside a replaced range collapses to the edit start. Used
+// to keep a pending caret in place when a render rebases the visible draft onto
+// a foreign change (issue #250).
+function projectCaretOffset(offset, before, after) {
+  if (before === after) return offset;
+  const edit = changedRange(before, after);
+  const delta = after.length - before.length;
+  if (offset <= edit.from) return offset;
+  if (offset >= edit.to) return offset + delta;
+  return edit.from;
+}
+
 // NodeFilter.SHOW_TEXT is 4 per spec; jsdom does not expose a global
 // NodeFilter, so use the numeric constant to walk text nodes in any host.
 const SHOW_TEXT = 4;
@@ -974,6 +988,12 @@ export function bindAnnotatedTextEditor({ element, session, onError = () => {}, 
     // caret before touching the DOM and restore it when the render did not
     // intentionally relocate it (a draft move sets the caret directly instead).
     const caretBeforeRender = closed ? null : getSelection();
+    // The caret offset is captured in the wire text currently displayed — which
+    // includes a pending queued/submitted draft. A remote change rebases that
+    // draft, so the displayed wire text changes under the caret; project the
+    // captured offset through that change when restoring (issue #250).
+    const spanBeforeRender = caretBeforeRender ? rootSpan(element) : null;
+    const wireBeforeRender = spanBeforeRender ? wireDocumentOf(spanBeforeRender).text : null;
 
     // Reconcile the in-flight edit against the authoritative text. The server
     // folds the edit at the absolute offsets it captured; when a compatible
@@ -1041,7 +1061,11 @@ export function bindAnnotatedTextEditor({ element, session, onError = () => {}, 
 
     if (domMutated && caretBeforeRender?.from && caretBeforeRender.to
       && caretBeforeRender.from.offset === caretBeforeRender.to.offset) {
-      setCaret(caretBeforeRender.from.offset, caretBeforeRender.from.affinity, currentRedactions());
+      const wireAfterRender = wireDocumentOf(span).text;
+      const restoredOffset = wireBeforeRender === null
+        ? caretBeforeRender.from.offset
+        : projectCaretOffset(caretBeforeRender.from.offset, wireBeforeRender, wireAfterRender);
+      setCaret(restoredOffset, caretBeforeRender.from.affinity, currentRedactions());
     }
     if (queued && current.text === queued.baseText && !submitting && isLive()) flushQueued();
     if (!queued && !submitted && !submitting) {

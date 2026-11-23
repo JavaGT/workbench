@@ -982,6 +982,70 @@ test('empty move receipt prevents the same retry id from moving later history', 
   assert.partialDeepStrictEqual(await server.history.cursor({ scope, principal, session: 'tab-a' }), { undo: 1, redo: 0 });
 });
 
+test('empty-cursor undo returns a receipt-shaped no-op instead of a missing receipt (#230)', async () => {
+  const db = new DatabaseSync(':memory:'); executeFrameworkDDL(db); const server = makeServer(db);
+  const cursor = await server.history.cursor({ scope, principal, session: 'tab-a' });
+  const result = await server.history.undo({ scope, principal, session: 'tab-a', actionId: 'empty-receipt-u1', revision: cursor.revision });
+
+  assert.equal(result.empty, true);
+  assert.equal(result.deduped, false);
+  assert.deepEqual(Object.keys(result.resultData).sort(), ['actionId', 'confirmedThrough']);
+  assert.equal(result.resultData.actionId, 'empty-receipt-u1');
+  assert.ok(Number.isSafeInteger(result.resultData.confirmedThrough));
+
+  // The HTTP skin reconciles against resultData; the same values are persisted on
+  // the $history.empty receipt so a retry also answers cleanly.
+  const row = db.prepare("SELECT actionType, resultData FROM _ActionReceipt WHERE actionId = 'empty-receipt-u1'").get();
+  assert.equal(row.actionType, '$history.empty');
+  assert.deepEqual(JSON.parse(row.resultData), {
+    actionId: 'empty-receipt-u1',
+    confirmedThrough: result.resultData.confirmedThrough,
+  });
+  const retry = await server.history.undo({ scope, principal, session: 'tab-a', actionId: 'empty-receipt-u1', revision: cursor.revision });
+  assert.equal(retry.empty, true);
+  assert.deepEqual(retry.resultData, result.resultData);
+});
+
+test('history move retry preserves extended receipt fields and unwraps mixed-replay fence (#230)', async () => {
+  const db = new DatabaseSync(':memory:'); executeFrameworkDDL(db); const server = makeServer(db);
+  await set(server, { actionId: 'ext-a1', value: 1, before: 0, session: 'tab-a' });
+  const c1 = await server.history.cursor({ scope, principal, session: 'tab-a' });
+  await server.history.undo({ scope, principal, session: 'tab-a', actionId: 'ext-u1', revision: c1.revision });
+  const extendedReceipt = { version: 1, actionId: 'ext-u1', confirmedThrough: 2, authoring: { marker: 'issued' } };
+  db.prepare('UPDATE _ActionReceipt SET resultData = ? WHERE actionId = ?').run(JSON.stringify(extendedReceipt), 'ext-u1');
+  const retryExt = await server.history.undo({ scope, principal, session: 'tab-a', actionId: 'ext-u1', revision: c1.revision });
+  assert.equal(retryExt.deduped, true);
+  assert.deepEqual(retryExt.resultData, extendedReceipt);
+
+  // Mixed-replay envelope stores the original confirmedThrough nested inside
+  // __workbenchMixedReplay.resultData; retry must unwrap it even after later
+  // events advance scope seq.
+  const mixedEnvelope = {
+    __workbenchMixedReplay: {
+      durableIndexes: [0],
+      liveIndexes: [],
+      liveEvents: [],
+      resultData: { actionId: 'ext-u1', confirmedThrough: 2 },
+    },
+  };
+  db.prepare('UPDATE _ActionReceipt SET resultData = ? WHERE actionId = ?').run(JSON.stringify(mixedEnvelope), 'ext-u1');
+  await set(server, { actionId: 'ext-a2', value: 2, before: 0, session: 'tab-a' });
+  const retryMixed = await server.history.undo({ scope, principal, session: 'tab-a', actionId: 'ext-u1', revision: c1.revision });
+  assert.equal(retryMixed.deduped, true);
+  assert.deepEqual(retryMixed.resultData, { actionId: 'ext-u1', confirmedThrough: 2 });
+
+  // undoToPoint empty retry also returns stored resultData symmetrically.
+  const c2 = await server.history.cursor({ scope, principal, session: 'tab-a' });
+  const seq = 3;
+  const utp = await server.history.undoToPoint({ scope, principal, session: 'tab-a', actionId: 'utp-empty-1', revision: c2.revision, seq });
+  assert.equal(utp.empty, true);
+  assert.deepEqual(utp.resultData, { actionId: 'utp-empty-1', confirmedThrough: seq });
+  const utpRetry = await server.history.undoToPoint({ scope, principal, session: 'tab-a', actionId: 'utp-empty-1', revision: c2.revision, seq });
+  assert.equal(utpRetry.deduped, true);
+  assert.equal(utpRetry.empty, true);
+  assert.deepEqual(utpRetry.resultData, utp.resultData);
+});
+
 test('malformed persisted cursor fails closed without a history write', async () => {
   const db = new DatabaseSync(':memory:'); executeFrameworkDDL(db); const server = makeServer(db);
   await set(server, { actionId: 'malformed-a1', value: 1, before: 0, session: 'tab-a' });

@@ -515,6 +515,20 @@ export function createDurableHistoryRuntime({
     return Object.freeze(result);
   }
 
+  function replayRetryResultData(scope        , retry               )          {
+    const stored = retry.resultData;
+    if (stored && typeof stored === 'object') {
+      const envelope = stored                                                         ;
+      if (envelope.__workbenchMixedReplay && typeof envelope.__workbenchMixedReplay === 'object'
+        && 'resultData' in envelope.__workbenchMixedReplay) {
+        return envelope.__workbenchMixedReplay.resultData;
+      }
+      return stored;
+    }
+    if (stored !== null && stored !== undefined) return stored;
+    return Object.freeze({ actionId: retry.actionId, confirmedThrough: readSeq(db, scope) });
+  }
+
   async function move(operation                 , args           = {})                   {
     const key = identity(args);
     await admitted(historyDescriptor, { operation, scope: key.scope, session: args.session, principal: args.principal });
@@ -552,7 +566,16 @@ export function createDurableHistoryRuntime({
           principal: args.principal,
         });
       }
-      const retried                                                                                  = { ok: true, deduped: true, events: Object.freeze(eventsFromReceipt(db, retry, parseEventType)) };
+      // A retried move must carry the same receipt the HTTP skin reconciles
+      // against, including extended receipts (e.g. annotated-text authoring
+      // receipts), mixed-replay envelopes, and benign $history.empty no-ops (#230).
+      const resultData = replayRetryResultData(key.scope, retry);
+      const retried                                                                                                       = {
+        ok: true,
+        deduped: true,
+        events: Object.freeze(eventsFromReceipt(db, retry, parseEventType)),
+        resultData,
+      };
       if (retry.actionType === '$history.empty') retried.empty = true;
       return Object.freeze(retried);
     }
@@ -566,16 +589,22 @@ export function createDurableHistoryRuntime({
     const targetId = targetFrame?.headActionId;
     if (!targetFrame) {
       const now = new Date().toISOString();
+      // A no-op move still commits a $history.empty receipt. Give it the same
+      // { actionId, confirmedThrough } result every other receipt carries so the
+      // HTTP skin can answer "nothing to undo" with a clean 200 instead of a 500
+      // 'Action receipt is unavailable' (#230).
+      const confirmedThrough = readSeq(db, key.scope);
+      const resultData = Object.freeze({ actionId: operationId, confirmedThrough });
       await txn(db, async () => {
         await admitted(historyDescriptor, { operation, scope: key.scope, session: args.session, principal: args.principal });
         const current = currentCursor(db, key);
         if (!sameCursor(current, expected)) throw conflict('history cursor changed during dispatch');
         insertReceipt(db, key.scope, operationId, now, [], {
           actionType: '$history.empty', actionData: { version: 1 }, principalKey: key.principalKey,
-          sessionId: key.sessionId, operation,
+          sessionId: key.sessionId, operation, resultData,
         });
       });
-      return Object.freeze({ ok: true, deduped: false, events: [], empty: true });
+      return Object.freeze({ ok: true, deduped: false, events: [], empty: true, resultData });
     }
     const originReceipt = receiptFor(db, key.scope, targetFrame.rootActionId);
     const receipt = receiptFor(db, key.scope, targetId ?? '');
@@ -723,7 +752,15 @@ export function createDurableHistoryRuntime({
       if (retry.operation !== 'undoToPoint' || retry.principalKey !== key.principalKey || retry.sessionId !== key.sessionId) {
         throw conflict('history action id is already bound to another operation');
       }
-      return Object.freeze({ ok: true, deduped: true, events: Object.freeze(eventsFromReceipt(db, retry, parseEventType)) });
+      const resultData = replayRetryResultData(key.scope, retry);
+      const retried                                                                                                       = {
+        ok: true,
+        deduped: true,
+        events: Object.freeze(eventsFromReceipt(db, retry, parseEventType)),
+        resultData,
+      };
+      if (retry.actionType === '$history.empty') retried.empty = true;
+      return Object.freeze(retried);
     }
     const expected = currentCursor(db, key);
     if (revisionArg !== revision(expected)) throw conflict('history cursor is stale');
@@ -740,15 +777,18 @@ export function createDurableHistoryRuntime({
     }
     if (sourceActionIds.length === 0) {
       const now = new Date().toISOString();
+      // Same clean no-op receipt contract as an ordinary empty move (#230).
+      const confirmedThrough = readSeq(db, key.scope);
+      const resultData = Object.freeze({ actionId: operationId, confirmedThrough });
       await txn(db, async () => {
         await admitted(historyDescriptor, { operation: 'undo', scope: key.scope, session: args.session, principal: args.principal });
         if (!sameCursor(currentCursor(db, key), expected)) throw conflict('history cursor changed during dispatch');
         insertReceipt(db, key.scope, operationId, now, [], {
           actionType: '$history.empty', actionData: { version: 1, boundarySeq: seq, sourceActionIds }, principalKey: key.principalKey,
-          sessionId: key.sessionId, operation: 'undoToPoint',
+          sessionId: key.sessionId, operation: 'undoToPoint', resultData,
         });
       });
-      return Object.freeze({ ok: true, deduped: false, events: [], empty: true });
+      return Object.freeze({ ok: true, deduped: false, events: [], empty: true, resultData });
     }
     const translated                     = [];
     for (const sourceActionId of sourceActionIds) {

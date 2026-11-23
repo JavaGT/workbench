@@ -318,7 +318,8 @@ test('B3 GATE WIRING: the #157 structural-counter gates pass (re-run of the targ
   // test/composite-patch-targeted-capture.test.mjs (#157). This suite does not
   // duplicate them — it RE-RUNS them in a child process and fails if their
   // invariant regresses, making them part of the benchmark gate set.
-  const output = execFileSync(process.execPath, ['--test', 'test/composite-patch-targeted-capture.test.mjs'], {
+  const node = process.versions.bun ? (process.env.WORKBENCH_NODE_BIN ?? 'node') : process.execPath;
+  const output = execFileSync(node, ['--test', 'test/composite-patch-targeted-capture.test.mjs'], {
     // node --test runs this file from the package root; the child re-runs in
     // the same root so its relative specifiers resolve identically.
     cwd: process.cwd(),

@@ -18,10 +18,12 @@ test('nested runs join the current ownership context exactly once', async () => 
   const q = createWriteQueue();
   const events = [];
   let detached;
+  let releaseDetached;
+  const afterTurn = new Promise((resolve) => { releaseDetached = resolve; });
 
   const result = await q.run(async () => {
     events.push(['outer', q.owned]);
-    detached = new Promise((resolve) => setImmediate(() => resolve(q.owned)));
+    detached = new Promise((resolve) => setImmediate(async () => { await afterTurn; resolve(q.owned); }));
     const nested = await q.run(async () => {
       events.push(['nested', q.owned]);
       await delay(1);
@@ -38,6 +40,7 @@ test('nested runs join the current ownership context exactly once', async () => 
     ['outer-after-nested', true],
   ]);
   assert.strictEqual(q.owned, false);
+  releaseDetached();
   assert.strictEqual(await detached, false);
   assert.strictEqual(await q.run(() => q.owned), true);
   assert.strictEqual(q.owned, false);

@@ -120,7 +120,7 @@ test('serveStatic refuses a symlink from an allowed static dir into the owned di
   }
 });
 
-test('workbench refuses a blobs.root that overlaps the owned directory (both directions)', () => {
+test('workbench refuses a blobs.root that overlaps the owned directory (both directions)', async () => {
   const root = tempRoot();
   const owned = path.join(root, 'owned');
   const sibling = path.join(root, 'sibling');
@@ -146,7 +146,7 @@ test('workbench refuses a blobs.root that overlaps the owned directory (both dir
     // The retired pathFor survives as the explicit internal/test handle; an
     // explicit root keeps the legacy single-root layout (<root>/<id>.pending).
     assert.equal(ok.blobs._pathFor('any-id', { pending: true }).startsWith(sibling), true);
-    ok.shutdown();
+    await ok.shutdown();
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

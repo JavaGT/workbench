@@ -26,6 +26,22 @@ jobs:
           name: test-log
           path: /tmp/workbench-test-*/node-test.log
 
+  test-bun:
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: npm ci
+      - run: npm run emit:ts
+      - run: bun test test/sqlite-cross-runtime.test.mjs test/db-adapter-contract.test.mjs test/migration-ledger.test.mjs test/read-mirror.test.mjs test/backup-app.test.mjs
+
   lint:
     runs-on: ubuntu-latest
     steps:

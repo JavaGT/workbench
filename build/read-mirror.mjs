@@ -18,7 +18,7 @@
 // the rejection is enforced, not merely documented. The mirror never exposes
 // write authority or a write path — no txn/begin/commit/upsert surface.
 
-import { DatabaseSync,                    } from 'node:sqlite';
+import { openSqliteDatabase,                      } from './sqlite-driver.mjs';
 
 
 
@@ -253,10 +253,10 @@ export function openReadMirror(description                       )              
   // Engine layer 1: mode=ro via the connectionString plus the readOnly option.
   // Engine layer 2: query_only pins the connection so even a statement the
   // rejector does not recognize cannot write.
-  const raw = new DatabaseSync(description.connectionString, { readOnly: true });
+  const raw = openSqliteDatabase(description.connectionString, { readOnly: true });
   raw.exec('PRAGMA query_only = ON');
   const handle                   = {
-    prepare(sql        )                {
+    prepare(sql        )                  {
       assertReadOnlyStatement(sql);
       return raw.prepare(sql);
     },

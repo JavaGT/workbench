@@ -41,7 +41,7 @@
 // foreign coordinator is refused, because a capture that does not exclude
 // writes is no consistency boundary at all.
 
-import { DatabaseSync } from 'node:sqlite';
+import { openSqliteDatabase, type SqliteDatabase } from './sqlite-driver.ts';
 import { createHash, randomBytes } from 'node:crypto';
 import {
   chmodSync,
@@ -831,7 +831,7 @@ function validateBlobSource(blobs: BackupBlobSource): void {
 // then removes the `-shm`/`-wal` sidecars a clean read leaves behind — the
 // backup directory holds exactly `snapshot.sqlite` + `manifest.json` + `blobs/`.
 function readSnapshotState(snapshotPath: string): Omit<CapturedState, 'pages' | 'blobGenerations'> {
-  const snapshot = new DatabaseSync(snapshotPath);
+  const snapshot = openSqliteDatabase(snapshotPath);
   try {
     return {
       integrityResult: quickCheckOf(snapshot),
@@ -856,11 +856,11 @@ function readSnapshotState(snapshotPath: string): Omit<CapturedState, 'pages' | 
 
 // A schema is blob-capable when it declares the framework blob-metadata ledger:
 // adopted blob generations may exist, so a census-less backup must refuse.
-function hasBlobLedger(db: DatabaseSync): boolean {
+function hasBlobLedger(db: SqliteDatabase): boolean {
   return Boolean(db.prepare('SELECT 1 FROM sqlite_master WHERE type = ? AND name = ?').get('table', BLOB_METADATA_LEDGER));
 }
 
-function quickCheckOf(db: DatabaseSync): IntegrityReport {
+function quickCheckOf(db: SqliteDatabase): IntegrityReport {
   const rows = db.prepare('PRAGMA quick_check').all() as Array<{ quick_check: string }>;
   const findings: IntegrityFinding[] = [];
   for (const row of rows) {
@@ -873,7 +873,7 @@ function quickCheckOf(db: DatabaseSync): IntegrityReport {
 // framework-owned table (the schema-table census); the app schema is one
 // fingerprint per remaining table (sorted by name). Ledger tables are handled
 // by migrationLedgerState, not here.
-function schemaIdentityOf(db: DatabaseSync): { platformSchemaIdentity: string; appSchemaIdentity: string[] } {
+function schemaIdentityOf(db: SqliteDatabase): { platformSchemaIdentity: string; appSchemaIdentity: string[] } {
   const rows = db
     .prepare("SELECT name, sql FROM sqlite_master WHERE type = 'table' AND sql IS NOT NULL")
     .all() as Array<{ name: string; sql: string }>;
@@ -888,7 +888,7 @@ function schemaIdentityOf(db: DatabaseSync): { platformSchemaIdentity: string; a
   return { platformSchemaIdentity, appSchemaIdentity };
 }
 
-function migrationLedgerOf(db: DatabaseSync): BackupMigrationLedgerState {
+function migrationLedgerOf(db: SqliteDatabase): BackupMigrationLedgerState {
   const hasTable = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(MIGRATION_LEDGER));
   if (!hasTable) return { table: MIGRATION_LEDGER, appliedVersions: [], maxVersion: 0 };
   const rows = db

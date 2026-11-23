@@ -649,7 +649,10 @@ const channel = new LiveChannel('https://example.test', {
   socketFactory: (url) => new WebSocket(url),
 });
 const liveFailureError = new WorkbenchFailureError(expectedFailure);
-const liveFailure: WorkbenchFailure = liveFailureError.failure;
+// The browser client recognizes one more failure category than this server
+// declaration lists (`not-acceptable`, #256 parity), so compare the shared
+// failure surface rather than the wider category union.
+const liveFailure: Omit<WorkbenchFailure, 'category'> = liveFailureError.failure;
 channel.subscribe('Project', 'project-1', {
   fields: { cursor: true },
   pace: { profile: '15fps' },
@@ -1001,6 +1004,19 @@ const familyQueryPage: Promise<ClientQueryPage> = queryClient.queryFamily('note-
   sort: { field: 'id', direction: 'asc' },
   dynamicFilters: [{ fieldId: 'f-status', op: 'eq', value: 'open' }],
 });
+// The Row generic types page.rows, not just the page envelope: a caller-supplied
+// row shape must surface on each row's declared fields.
+interface NoteQueryRow extends Record<string, unknown> {
+  readonly id: string;
+  readonly title: string;
+}
+const typedEntityPage: Promise<ClientQueryPage<NoteQueryRow>> = queryClient.queryEntity<NoteQueryRow>('Note', entityQueryRequest);
+const typedFamilyPage: Promise<ClientQueryPage<NoteQueryRow>> = queryClient.queryFamily<NoteQueryRow>('note-facets', {
+  pageSize: 10,
+  sort: { field: 'id', direction: 'asc' },
+});
+const typedEntityTitles: Promise<string[]> = typedEntityPage.then((page) => page.rows.map((row) => row.title));
+const typedFamilyTitles: Promise<string[]> = typedFamilyPage.then((page) => page.rows.map((row) => row.title));
 const ftsSearchRequest: QuerySearchRequest = { mode: 'fts', index: 'note-fts', query: 'hello', limit: 5, scopeId: 'project-1' };
 const hybridSearchRequest: QuerySearchRequest = {
   mode: 'hybrid',
@@ -1016,4 +1032,4 @@ const querySearchResponse: Promise<QuerySearchResponse> = queryClient.search(fts
 const queryHybridResponse: Promise<QuerySearchResponse> = queryClient.search(hybridSearchRequest, { signal: new AbortController().signal });
 // @ts-expect-error search modes are a closed union
 queryClient.search({ mode: 'semantic' });
-void [queryClient, entityQueryPage, familyQueryPage, querySearchResponse, queryHybridResponse];
+void [queryClient, entityQueryPage, familyQueryPage, typedEntityPage, typedFamilyPage, typedEntityTitles, typedFamilyTitles, querySearchResponse, queryHybridResponse];

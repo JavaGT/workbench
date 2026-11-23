@@ -202,6 +202,12 @@ export function makeRequestHandler(source: any, { principalOf = anonymousPrincip
   // the framework default wraps the row-grant so behavior is unchanged. The
   // route gate AND the REST CRUD dispatch below both consult this one adapter.
   const authorizationAdapter: AuthorizationAdapter = authorization ?? createAuthorizationAdapter();
+  // The framework-owned query/search routes read the injected adapter from the
+  // app (app._authorization, see routeAuthorization in http-framework-routes).
+  // Stash it here too so a directly constructed handler — with no listen() —
+  // consults the SAME instance for its route gate and row admission. An
+  // un-injected server keeps its framework default; this adds no second engine.
+  if (isApp && authorization) (source as any)._authorization = authorization;
 
   // The operation category label a route-gate admission carries (informational
   // metadata on the decision; the per-verb gate function is the authority).
@@ -372,7 +378,8 @@ export function makeRequestHandler(source: any, { principalOf = anonymousPrincip
     // Query / query-family / search endpoints (#312): POST /query/:entity,
     // POST /query-families/:name, POST /search. Framework-owned (like /blobs and
     // /snapshot), each running the SAME admission collapse and authorization
-    // engine as REST before executing the compiled read/search.
+    // adapter as REST (route gate + row/hit admission) before returning the
+    // compiled read/search result.
     {
       match: (req: any, url: URL) => isApp && req.method === 'POST'
         && (url.pathname === '/search'

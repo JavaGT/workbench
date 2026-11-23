@@ -1596,6 +1596,7 @@ const FAILURE_CATEGORIES = new Set([
   'denied',
   'unknown-action',
   'not-found',
+  'not-acceptable',
   'conflict',
   'internal',
 ]);

@@ -303,6 +303,7 @@ export type FailureCategory =
   | 'denied'
   | 'unknown-action'
   | 'not-found'
+  | 'not-acceptable'
   | 'conflict'
   | 'internal';
 
@@ -991,12 +992,12 @@ export interface QueryClient {
     entity: string,
     request: QueryEntityRequest,
     opts?: QueryRequestOptions,
-  ): Promise<QueryPage>;
+  ): Promise<QueryPage<Row>>;
   queryFamily<Row extends Record<string, unknown> = Record<string, unknown>>(
     name: string,
     request: QueryFamilyRequest,
     opts?: QueryRequestOptions,
-  ): Promise<QueryPage>;
+  ): Promise<QueryPage<Row>>;
   search(request: QuerySearchRequest, opts?: QueryRequestOptions): Promise<QuerySearchResponse>;
 }
 

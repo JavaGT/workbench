@@ -48,7 +48,7 @@ const SQLITE_AUTHORIZER = typeof globalThis.Bun === 'undefined'
 // Boot a real listening app whose principal is injected from the `x-test-user`
 // request header (absent → anonymous, fail closed). Every route runs through the
 // same admission collapse and authorization engine as production.
-async function bootApp(t, { entities = [], setup } = {}) {
+async function bootApp(t, { entities = [], setup, authorization } = {}) {
   const app = workbench({ db: ':memory:', entities });
   if (setup) setup(app);
   app.listen(0, {
@@ -58,6 +58,7 @@ async function bootApp(t, { entities = [], setup } = {}) {
         ? principal({ type: 'user', id: user })
         : principal({ type: 'anonymous' });
     },
+    authorization,
   });
   await app.ready;
   const { port } = app.httpServer.address();
@@ -82,6 +83,34 @@ async function postJson(origin, path, body, user) {
   return { status: res.status, body: payload };
 }
 
+// A custom policy adapter that denies either the route gate (principal) or
+// every entity row, delegating every other category to the framework default.
+// `calls` proves the injected instance was actually consulted by the route —
+// a bypassed route would leave it empty.
+function denyingAuthorizationAdapter({ denyPrincipal = false, denyEntity = false } = {}) {
+  const inner = createAuthorizationAdapter();
+  const calls = [];
+  const denied = (input, reasonCode) => ({
+    admitted: false,
+    operation: 'read',
+    resourceCategory: input.category,
+    resourceId: null,
+    reasonCode,
+    capabilities: [],
+    trace: null,
+  });
+  return {
+    calls,
+    admit: async (input) => {
+      calls.push(input);
+      if (denyPrincipal && input.category === 'principal') return denied(input, 'anonymous');
+      if (denyEntity && input.category === 'entity') return denied(input, 'no-capability');
+      return inner.admit(input);
+    },
+    registerResource: (input) => inner.registerResource(input),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // POST /query/:entity
 // ---------------------------------------------------------------------------
@@ -97,9 +126,9 @@ function noteEntity() {
   });
 }
 
-async function bootNoteServer(t) {
+async function bootNoteServer(t, authorization) {
   const Note = noteEntity();
-  const { app, origin } = await bootApp(t, { entities: [Note] });
+  const { app, origin } = await bootApp(t, { entities: [Note], authorization });
   const insert = app.db.prepare(
     'INSERT INTO Note (id, title, status, rank, projectId, owner) VALUES (?, ?, ?, ?, ?, ?)',
   );
@@ -195,6 +224,9 @@ test('POST /query/:entity: keyset and offset pagination walk the same page', asy
   assert.deepEqual(first.body.rows.map((row) => row.id), ['n1', 'n2']);
   assert.equal(first.body.hasMore, true);
   assert.equal(first.body.nextCursor.id, 'n2');
+  // The page discloses the queryIdentity its cursor is bound to.
+  assert.equal(typeof first.body.queryIdentity, 'string');
+  assert.equal(first.body.queryIdentity, first.body.nextCursor.queryIdentity);
 
   const second = await postJson(origin, '/query/Note', {
     ...base,
@@ -257,10 +289,11 @@ function familySlice() {
   return { Artefact, ValueSet, ValueElement };
 }
 
-async function bootFamilyServer(t) {
+async function bootFamilyServer(t, authorization) {
   const slice = familySlice();
   const { app, origin } = await bootApp(t, {
     entities: [slice.Artefact, slice.ValueSet, slice.ValueElement],
+    authorization,
     setup: (application) => {
       application.queryFamily({
         name: 'artefactsByProperty',
@@ -326,6 +359,7 @@ test('POST /query-families/:name: dynamic multi-filter + element-level authz', a
   assert.equal(res.status, 200);
   assert.deepEqual(res.body.rows.map((row) => row.id), ['a2']);
   assert.equal(res.body.count, 1);
+  assert.equal(typeof res.body.queryIdentity, 'string');
 
   // The bob-owned element is invisible to alice even though it references her row.
   const leak = await postJson(origin, '/query-families/artefactsByProperty', {
@@ -374,7 +408,7 @@ function searchNoteEntity() {
   });
 }
 
-async function bootSearchServer(t) {
+async function bootSearchServer(t, authorization) {
   const Note = searchNoteEntity();
   const adapter = createAuthorizationAdapter();
   const admission = (pluginId) => {
@@ -409,6 +443,7 @@ async function bootSearchServer(t) {
   });
   const { app, origin } = await bootApp(t, {
     entities: [Note],
+    authorization,
     setup: (application) => {
       application.registerSearchPlugin(fts);
       application.registerSearchPlugin(vector);
@@ -513,6 +548,69 @@ test('POST /search: unknown index 404 and malformed payload 400', { skip: SQLITE
 
   const badMode = await postJson(origin, '/search', { mode: 'semantic', index: 'note-fts' }, 'alice');
   assert.equal(badMode.status, 400);
+});
+
+// ---------------------------------------------------------------------------
+// Injected authorization adapter (finding 1) — every framework-owned read
+// route must honor the SAME adapter REST does: a principal denial is a 401,
+// and an entity denial omits rows/hits just like REST list's post-filter.
+// ---------------------------------------------------------------------------
+
+const noteQuery = { sort: { field: 'rank', direction: 'asc' }, pageSize: 10 };
+const familyQuery = { sort: { field: 'rank', direction: 'asc' }, pageSize: 10 };
+
+test('injected adapter: /query and /query-families honor the principal route gate', async (t) => {
+  const denyGate = denyingAuthorizationAdapter({ denyPrincipal: true });
+  const note = await bootNoteServer(t, denyGate);
+  const family = await bootFamilyServer(t, denyGate);
+
+  const queryRes = await postJson(note.origin, '/query/Note', noteQuery, 'alice');
+  const familyRes = await postJson(family.origin, '/query-families/artefactsByProperty', familyQuery, 'alice');
+  assert.equal(queryRes.status, 401);
+  assert.equal(familyRes.status, 401);
+  assert.ok(denyGate.calls.some((call) => call.category === 'principal'), 'route gate ran through the injected adapter');
+});
+
+test('injected adapter: /query and /query-families post-filter denied rows', async (t) => {
+  const denyRows = denyingAuthorizationAdapter({ denyEntity: true });
+  const note = await bootNoteServer(t, denyRows);
+  const family = await bootFamilyServer(t, denyRows);
+
+  const queryRes = await postJson(note.origin, '/query/Note', noteQuery, 'alice');
+  const familyRes = await postJson(family.origin, '/query-families/artefactsByProperty', familyQuery, 'alice');
+  assert.equal(queryRes.status, 200);
+  assert.equal(familyRes.status, 200);
+  assert.deepEqual(queryRes.body.rows, []);
+  assert.deepEqual(familyRes.body.rows, []);
+  assert.ok(denyRows.calls.some((call) => call.category === 'entity'), 'row admission ran through the injected adapter');
+});
+
+test('injected adapter: /search honors the principal route gate', { skip: SQLITE_AUTHORIZER }, async (t) => {
+  const denyGate = denyingAuthorizationAdapter({ denyPrincipal: true });
+  const search = await bootSearchServer(t, denyGate);
+  const res = await postJson(search.origin, '/search', { mode: 'fts', index: 'note-fts', query: 'coastal' }, 'alice');
+  assert.equal(res.status, 401);
+  assert.ok(denyGate.calls.some((call) => call.category === 'principal'), 'route gate ran through the injected adapter');
+});
+
+test('injected adapter: /search post-filters denied hits (FTS and hybrid)', { skip: SQLITE_AUTHORIZER }, async (t) => {
+  const denyRows = denyingAuthorizationAdapter({ denyEntity: true });
+  const search = await bootSearchServer(t, denyRows);
+
+  const fts = await postJson(search.origin, '/search', {
+    mode: 'fts', index: 'note-fts', query: 'coastal', scopeId: 'proj-a', limit: 10,
+  }, 'alice');
+  const hybrid = await postJson(search.origin, '/search', {
+    mode: 'hybrid',
+    sources: { fts: 'note-fts', vector: 'note-vec' },
+    query: 'coastal', vector: [1, 0, 0], model: 'embed-v1',
+    scopeId: 'proj-a', limit: 10,
+  }, 'alice');
+  assert.equal(fts.status, 200);
+  assert.equal(hybrid.status, 200);
+  assert.deepEqual(fts.body.hits, []);
+  assert.deepEqual(hybrid.body.hits, []);
+  assert.ok(denyRows.calls.some((call) => call.category === 'entity'), 'search hit admission ran through the injected adapter');
 });
 
 // ---------------------------------------------------------------------------

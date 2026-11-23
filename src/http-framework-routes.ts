@@ -62,6 +62,7 @@ import { createLiveEnvelopeBuilder } from './live-delivery-envelope.ts';
 import { hasAnnotatedTextFields, projectEntitySnapshot } from './entity-snapshot-projection.ts';
 import { projectRowForRecipient } from './entity/projection.ts';
 import { mayReadField, readableFieldNames } from './field-admission.ts';
+import type { EntityRecord } from './row-grant.ts';
 import {
   createAuthorizationAdapter,
   type AuthorizationAdapter,
@@ -71,7 +72,7 @@ import {
 import { resolveAnnotatedTextOwningScope } from './annotated-text-field.ts';
 import { anonymous, collapseForAdmission, type Principal } from './principal.ts';
 import { failure } from './outcome.ts';
-import { requireUser } from './route-gate.ts';
+import { requireUser, type Gate } from './route-gate.ts';
 import {
   compileQueryContract,
   executeQueryPage,
@@ -1281,27 +1282,84 @@ export function handleClientSdkRoute(
 //   POST /query-families/:name    — a registered query family page
 //   POST /search                  — FTS / vector / hybrid search
 //
-// Authorization is the SAME engine as every other transport: the entity's
-// default-on `read` route gate (requireUser unless the declaration names
-// allowAnonymous), then the compiled row grant inside the query/search
-// execution. There is no second auth path, and the request principal is already
-// collapsed for admission by the transport.
+// Authorization is the SAME engine as every other transport. Both default-on
+// layers run through the injected authorization adapter (app._authorization,
+// stashed by serve.ts), exactly as REST does:
+//   1. the route gate via `admit({ category: 'principal', ... })`, and
+//   2. row admission via `admit({ category: 'entity', ... })` on every returned
+//      row / search hit — the SQL scope inside query/search execution decides
+//      VISIBILITY, the adapter decides the read CAPABILITY, like REST list.
+// With no adapter injected, the framework default (the row-grant wrapper REST
+// uses) keeps behavior unchanged. There is no second auth path, and the request
+// principal is already collapsed for admission by the transport.
+
+// The framework default for these routes when the app injects no adapter. It is
+// the same adapter implementation REST dispatch falls back to, so an un-injected
+// server keeps its row-grant behavior.
+const DEFAULT_QUERY_AUTHORIZATION: AuthorizationAdapter = createAuthorizationAdapter();
+
+// The ONE admission engine each read route consults: an app-injected adapter is
+// final; with none, the framework default above runs (S5/A2).
+function queryAuthorization(app: FrameworkApp): AuthorizationAdapter {
+  return routeAuthorization(app) ?? DEFAULT_QUERY_AUTHORIZATION;
+}
+
+// The first default-on layer. The gate is evaluated by the adapter, so a custom
+// principal denial is an indistinguishable 401 here just as it is in REST.
+async function admitQueryGate(
+  authorization: AuthorizationAdapter,
+  gate: Gate,
+  principal: Principal,
+): Promise<boolean> {
+  const decision = await authorization.admit({ category: 'principal', operation: 'read', principal, gate });
+  return decision.admitted;
+}
+
+// The second default-on layer: post-filter a page through the SAME row admission
+// REST list uses. A row the adapter denies is omitted, identically to a denied
+// row being absent from a REST list response.
+async function admitQueryRows(
+  authorization: AuthorizationAdapter,
+  entity: CrudEntity,
+  rows: readonly Record<string, unknown>[],
+  principal: Principal,
+): Promise<Record<string, unknown>[]> {
+  const admitted: Record<string, unknown>[] = [];
+  for (const stored of rows) {
+    const row = typeof entity.deserializeRow === 'function'
+      ? entity.deserializeRow({ ...stored })
+      : stored;
+    const decision = await authorization.admit({
+      category: 'entity',
+      verb: 'list',
+      principal,
+      entity: entity as unknown as EntityRecord,
+      row,
+      resourceId: (stored as { id?: unknown }).id as string | undefined,
+    });
+    if (decision.admitted) admitted.push(stored);
+  }
+  return admitted;
+}
 
 // The per-entity read route gate (default-on requireUser). An allowAnonymous
 // declaration relaxes only admission; the row grant still runs downstream.
-function entityReadGate(entity: CrudEntity): (principal: unknown) => boolean {
+function entityReadGate(entity: CrudEntity): Gate {
   const gate = (entity as { gate?: Record<string, unknown> }).gate?.read;
-  return (typeof gate === 'function' ? gate : requireUser()) as (principal: unknown) => boolean;
+  return (typeof gate === 'function' ? gate : requireUser()) as Gate;
 }
 
-// The standard page JSON. `count`/`filteredTotal` are omitted unless the
-// request asked for `includeCount`; `total` unless it asked for `includeTotal`.
+// The standard page JSON. `queryIdentity` is the stable handle the client uses
+// to bind a follow-up page token to this query; it is part of QueryPage and must
+// be disclosed. `count`/`filteredTotal` are omitted unless the request asked for
+// `includeCount`; `total` unless it asked for `includeTotal`.
 function queryPageBody(page: QueryPage): Record<string, unknown> {
   return {
     rows: page.rows,
     nextCursor: page.nextCursor,
     hasMore: page.hasMore,
     revision: page.revision,
+    queryIdentity: page.queryIdentity,
     ...(page.count !== undefined ? { count: page.count, filteredTotal: page.filteredTotal } : {}),
     ...(page.total !== undefined ? { total: page.total } : {}),
   };
@@ -1385,14 +1443,19 @@ export async function handleQueryRoute(
   if (!entity) { reject(res, 404, 'not found'); return true; }
 
   const admitted = collapseForAdmission(principal ?? anonymous);
-  if (!entityReadGate(entity)(admitted)) { reject(res, 401, 'unauthorized'); return true; }
+  const authorization = queryAuthorization(app);
+  if (!await admitQueryGate(authorization, entityReadGate(entity), admitted)) {
+    reject(res, 401, 'unauthorized');
+    return true;
+  }
 
   const body = await readJsonObjectBody(req, res);
   if (body === null) return true;
 
   try {
     const page = executeQueryScopedRead(app.db, entity, admitted, body);
-    sendJson(res, 200, queryPageBody(page));
+    const rows = await admitQueryRows(authorization, entity, page.rows, admitted);
+    sendJson(res, 200, queryPageBody({ ...page, rows }));
   } catch (err) {
     if (err instanceof QueryScopedReadError) {
       reject(res, 400, err.message);
@@ -1430,16 +1493,21 @@ export async function handleQueryFamilyRoute(
   if (!registry || !family) { reject(res, 404, 'not found'); return true; }
 
   const admitted = collapseForAdmission(principal ?? anonymous);
+  const authorization = queryAuthorization(app);
   const hostGate = (family.host as unknown as { gate?: Record<string, unknown> }).gate?.read;
-  const gate = (typeof hostGate === 'function' ? hostGate : requireUser()) as (principal: unknown) => boolean;
-  if (!gate(admitted)) { reject(res, 401, 'unauthorized'); return true; }
+  const gate = (typeof hostGate === 'function' ? hostGate : requireUser()) as Gate;
+  if (!await admitQueryGate(authorization, gate, admitted)) {
+    reject(res, 401, 'unauthorized');
+    return true;
+  }
 
   const body = await readJsonObjectBody(req, res);
   if (body === null) return true;
 
   try {
     const page = registry.execute(familyName, app.db as never, admitted, body);
-    sendJson(res, 200, queryPageBody(page));
+    const rows = await admitQueryRows(authorization, family.host as unknown as CrudEntity, page.rows, admitted);
+    sendJson(res, 200, queryPageBody({ ...page, rows }));
   } catch (err) {
     if (err instanceof QueryScopedReadError) {
       reject(res, 400, err.message);
@@ -1482,6 +1550,77 @@ function searchScope(body: Record<string, unknown>): Record<string, unknown> {
   return scope;
 }
 
+// Resolve the source entity a search hit came from. Framework plugins disclose
+// it through their registered source interests; a hit may also carry an explicit
+// `entity`. A custom registry disclosing neither has no entity row to re-check —
+// its plugin-owned search admission already ran, so nothing is added here.
+function searchHitSourceEntity(app: FrameworkApp, hit: unknown, indices: readonly string[]): CrudEntity | undefined {
+  if (!app.entities) return undefined;
+  const explicit = (hit as { entity?: unknown } | null)?.entity;
+  const candidates: string[] = [];
+  if (typeof explicit === 'string') candidates.push(explicit);
+  const plugins = (app as { searchPlugins?: SearchPluginRegistry }).searchPlugins;
+  for (const index of indices) {
+    const plugin = typeof plugins?.get === 'function' ? plugins.get(index) : undefined;
+    const interest = plugin?.sourceInterests?.[0];
+    if (interest && typeof interest.entity === 'string') candidates.push(interest.entity);
+  }
+  for (const name of candidates) {
+    const entity = app.entities.get(name);
+    if (entity) return entity;
+  }
+  return undefined;
+}
+
+// A hit's source row id. Plugin hits carry `id`; fused (hybrid) hits carry `key`
+// and wrap the plugin hit under `hit`. Either identifies the current source row.
+function searchHitId(hit: unknown): string | null {
+  if (!hit || typeof hit !== 'object') return null;
+  const record = hit as Record<string, unknown>;
+  const nested = record.hit && typeof record.hit === 'object' ? record.hit as Record<string, unknown> : null;
+  for (const candidate of [record.id, record.key, nested?.id, nested?.key]) {
+    if (typeof candidate === 'string' && candidate.length > 0) return candidate;
+    if (typeof candidate === 'number' && Number.isSafeInteger(candidate)) return String(candidate);
+  }
+  return null;
+}
+
+// Per-hit row admission through the SAME entity adapter REST uses. A hit whose
+// source entity cannot be resolved (or whose row is already gone) was already
+// admitted by its plugin and is left untouched; a resolvable row goes through
+// the adapter, so an injected denying adapter filters hits like a REST list.
+async function admitSearchHitsByEntity(
+  app: FrameworkApp,
+  authorization: AuthorizationAdapter,
+  hits: readonly unknown[],
+  principal: Principal,
+  indices: readonly string[],
+): Promise<unknown[]> {
+  const admitted: unknown[] = [];
+  for (const hit of hits) {
+    const entity = searchHitSourceEntity(app, hit, indices);
+    const id = searchHitId(hit);
+    const stored = entity && id !== null ? rawRow(app.db, entity.name, id) : undefined;
+    if (!entity || !stored) {
+      admitted.push(hit);
+      continue;
+    }
+    const row = typeof entity.deserializeRow === 'function'
+      ? entity.deserializeRow({ ...stored })
+      : stored;
+    const decision = await authorization.admit({
+      category: 'entity',
+      verb: 'read',
+      principal,
+      entity: entity as unknown as EntityRecord,
+      row,
+      resourceId: id,
+    });
+    if (decision.admitted) admitted.push(hit);
+  }
+  return admitted;
+}
+
 // POST /search — FTS5, Float32 vector, or hybrid RRF retrieval over the app's
 // registered search registry. Fail closed: requireUser admission, unknown index
 // → 404, malformed payload → 400. Results carry the registry-derived staleness
@@ -1505,7 +1644,11 @@ export async function handleSearchRoute(
   }
 
   const admitted = collapseForAdmission(principal ?? anonymous);
-  if (!requireUser()(admitted as never)) { reject(res, 401, 'unauthorized'); return true; }
+  const authorization = queryAuthorization(app);
+  if (!await admitQueryGate(authorization, requireUser(), admitted)) {
+    reject(res, 401, 'unauthorized');
+    return true;
+  }
 
   const body = await readJsonObjectBody(req, res);
   if (body === null) return true;
@@ -1565,11 +1708,12 @@ export async function handleSearchRoute(
       const result = typeof (registry as SearchRegistry).hybridSearch === 'function'
         ? await (registry as SearchRegistry).hybridSearch!(shared)
         : await hybridSearch({ registry: registry as SearchPluginRegistry, ...shared } as never);
+      const hits = await admitSearchHitsByEntity(app, authorization, result.hits ?? [], admitted, [ftsIndex, vectorIndex]);
       sendJson(res, 200, {
         ok: result.ok,
         mode: 'hybrid',
         staleness: result.staleness,
-        hits: result.hits ?? [],
+        hits,
         totalCandidates: result.totalCandidates,
         k: result.k,
         cancelled: result.cancelled === true,
@@ -1600,13 +1744,14 @@ export async function handleSearchRoute(
       reject(res, 400, outcome.lastError.message ?? 'invalid search request');
       return true;
     }
+    const hits = await admitSearchHitsByEntity(app, authorization, outcome.result?.hits ?? [], admitted, [index]);
     sendJson(res, 200, {
       ok: outcome.ok,
       mode,
       index,
       generation: outcome.generation,
       staleness: searchStalenessOf(outcome.state),
-      hits: outcome.result?.hits ?? [],
+      hits,
       cancelled: outcome.cancelled === true,
       timedOut: outcome.timedOut === true,
       ...(outcome.lastError ? { error: outcome.lastError.message } : {}),

@@ -1,5 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import * as annotatedTextRuntime from '../build/annotated-text-public.mjs';
 import {
   annotatedText as rootAnnotatedText,
   annotation as rootAnnotation,
@@ -24,6 +26,24 @@ import {
   readAnnotatedTextForRecipient,
 } from '../build/annotated-text-public.mjs';
 
+// The value names an `export { ... }` block declares in the subpath .d.ts.
+// `export type { ... }` blocks are type-only and must not appear at runtime.
+function declaredValueExports(declarationSource) {
+  const names = new Set();
+  const blockPattern = /export\s+(type\s+)?\{([\s\S]*?)\}/g;
+  let block;
+  while ((block = blockPattern.exec(declarationSource)) !== null) {
+    if (block[1]) continue;
+    for (const specifier of block[2].split(',')) {
+      const entry = specifier.trim();
+      if (!entry) continue;
+      const alias = /\bas\s+([A-Za-z_$][\w$]*)$/.exec(entry);
+      names.add(alias ? alias[1] : entry);
+    }
+  }
+  return [...names].sort();
+}
+
 const extension = 'packageEntryMeasurement';
 const token = (label) => `${label}${'x'.repeat(43)}`.slice(0, 43);
 registerAnnotatedTextContract(extension, Object.freeze({ kind: 'measurement' }));
@@ -34,6 +54,11 @@ registerAnnotatedTextStructuralExtension(extension, Object.freeze({
   partition: function partition() {},
   combine: function combine() {},
 }));
+
+test('annotated-text subpath .d.ts value exports match the runtime package entry', () => {
+  const declaration = readFileSync(new URL('../annotated-text.d.ts', import.meta.url), 'utf8');
+  assert.deepEqual(declaredValueExports(declaration), Object.keys(annotatedTextRuntime).sort());
+});
 
 test('annotated-text package entry shares declarations and registry authority with root', () => {
   assert.equal(annotatedText, rootAnnotatedText);

@@ -2,6 +2,8 @@
 
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import type { SearchPlugin, SearchPluginRegistry } from './src/server.js';
+import type { CensusEntry } from './src/schema-census.js';
+import type { MigrationLedgerState } from './src/migration-ledger.js';
 
 export interface WorkbenchStatement {
   run(...params: unknown[]): { changes: number | bigint };
@@ -55,6 +57,7 @@ export type FailureCategory =
   | 'denied'
   | 'unknown-action'
   | 'not-found'
+  | 'not-acceptable'
   | 'conflict'
   | 'internal';
 
@@ -63,6 +66,7 @@ export const FAILURE_CATEGORIES: readonly [
   'denied',
   'unknown-action',
   'not-found',
+  'not-acceptable',
   'conflict',
   'internal',
 ];
@@ -93,7 +97,7 @@ export function failureOutcome(workbenchFailure: WorkbenchFailure): FailureOutco
 export function forbidden(message?: string, code?: string): ForbiddenError;
 export function isWorkbenchFailure(value: unknown): value is WorkbenchFailure;
 export function sanitizeUnexpectedFailure(value?: unknown): WorkbenchFailure;
-export function statusForFailure(failure: WorkbenchFailure): 400 | 403 | 404 | 409 | 500;
+export function statusForFailure(failure: WorkbenchFailure): 400 | 403 | 404 | 406 | 409 | 500;
 
 export interface UserPrincipal extends Principal {
   readonly type: 'user';
@@ -2339,6 +2343,36 @@ export class ReadMirrorError extends Error {
 /** Open a read-mirror description as a rejector-wrapped, engine-read-only connection. */
 export function openReadMirror(description: ReadMirrorDescription): ReadMirrorHandle;
 
+/** The settled-schema report's lifecycle phases, in declaration order. */
+export type SchemaLifecyclePhase =
+  | 'framework-bases'
+  | 'entity-roots'
+  | 'entity-side-tables'
+  | 'indexes-and-constraints'
+  | 'plugin-derived-resources';
+
+/** One schema object as the report accounts for it: identity and lifecycle only, never row data. */
+export interface SchemaReportObject {
+  readonly name: string;
+  readonly kind: CensusEntry['objectKind'];
+  readonly ownerKind: CensusEntry['kind'] | 'undeclared';
+  readonly owner: string;
+  readonly lifecyclePhase: SchemaLifecyclePhase | 'undeclared';
+  readonly state: 'present' | 'absent';
+}
+
+/** A stable, machine-readable account of the settled schema and its migration ledger. */
+export interface SchemaReport {
+  readonly objects: readonly SchemaReportObject[];
+  readonly ledger: MigrationLedgerState;
+}
+
+/** Build the support/pin-verification report from the SQLite catalog and the ownership census. */
+export function createSchemaReport(
+  db: { prepare(sql: string): { all(...params: unknown[]): unknown[] } },
+  census: ReadonlyMap<string, CensusEntry>,
+): SchemaReport;
+
 export interface WorkbenchApp extends RouteBuilder {
   readonly db?: WorkbenchDatabase;
   readonly routes: readonly unknown[];
@@ -2382,6 +2416,8 @@ export interface WorkbenchApp extends RouteBuilder {
   register(...declarations: readonly (WorkbenchEntity | readonly WorkbenchEntity[])[]): this;
   auth(options?: { identifyBy?: readonly string[]; minimumPasswordLength?: number }): this;
   static(prefix: string, directory: string, options?: import('./src/server.js').ServeStaticOptions): this;
+  /** The schema report captured by the last completed `prepareSchema`, or null before it runs. */
+  schemaReport(): SchemaReport | null;
   prepareSchema(): Promise<this>;
   ddl(): Promise<this>;
   /** Attach package-owned HTTP/SSE delivery to this app before start or listen. */

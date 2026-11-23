@@ -30,12 +30,10 @@ import { installRemovalCascades } from './entity/removal-cascade.mjs';
 import { rawRow } from './entity/query.mjs';
 import { readDeletedRowAnchor } from './deleted-row-anchor.mjs';
 import { validateAnnotatedTextEntityActions } from './annotated-text-field.mjs';
-import { createAnnotatedTextKernelSeam } from './annotated-text-kernel.mjs';
+import { compileComposedAnnotatedTextAction, createAnnotatedTextKernelSeam } from './annotated-text-kernel.mjs';
 import { createAnnotatedTextMutationAdmission } from './annotated-text-admission.mjs';
-import { createHistoryContributionPolicyRegistry, compileCompoundContributionPolicy } from './history-contribution-policy.mjs';
+import { createHistoryContributionPolicyRegistry } from './history-contribution-policy.mjs';
 import { validateProtectedArtefactsDeclaration } from './protected-artefact-store.mjs';
-import { compileRegionFieldPolicy,                                   } from './annotated-text-region-operation.mjs';
-import { canonicalStringify } from './canonical-json.mjs';
 
 // Framework auth entities are always-available effect targets (an app's effect
 // may target Inbox without mounting it — auth entities are never request-facing
@@ -88,30 +86,10 @@ function collectAppEntities(app     ) {
     const protectedArtefactTables = validateProtectedArtefactsDeclaration(declaration.protectedArtefacts, declaration.type);
     if (handlers[declaration.type]) throw new Error(`action '${declaration.type}' is already registered`);
 
-    // Registered-action composition (scope#992 W2): a closed `operations`
-    // declaration of `annotatedTextOperation` handles. Compiled at load time
-    // into a transaction-bound field policy; the declaration is inert until
-    // `commitEvents` calls `admitAndPlan` inside the coordinated transaction.
-    const operations = declaration.operations === undefined ? [] : declaration.operations;
-    if (operations !== undefined && !Array.isArray(operations)) {
-      throw new Error(`registered action '${declaration.type}' operations must be an array`);
-    }
-    let compoundContributionPolicy = null;
-    if (operations.length > 0) {
-      if (operations.length > 1) {
-        throw new Error(`registered action '${declaration.type}' may declare at most one annotated operation (single-dispatch composition)`);
-      }
-      const handle = operations[0]                                ;
-      if (!handle || (handle                         ).__brand !== 'annotatedTextOperation') {
-        throw new Error(`registered action '${declaration.type}' operations must contain annotatedTextOperation handles`);
-      }
-      compoundContributionPolicy = compileRegionFieldPolicy(handle, entities, app.db);
-      // A composed action is single-dispatch and may never return a top-level
-      // privateFact; Workbench constructs the compound envelope.
-      if ((declaration                             ).privateFact === true) {
-        throw new Error(`registered action '${declaration.type}' is composed and cannot return a top-level privateFact`);
-      }
-    }
+    // Registered-action composition (scope#992 W2): delegated to the
+    // annotated-text kernel seam so kernel.ts stays a thin assembler.
+    const composedAnnotated = compileComposedAnnotatedTextAction(declaration, entities, app.db);
+    const compoundContributionPolicy = composedAnnotated?.compoundContributionPolicy ?? null;
     const handler = async (context     ) => {
       const lifecycle = app.pendingBlobLifecycle;
       const deletion = lifecycle?.fields.find((field     ) => field.purgeActionName === declaration.type);
@@ -233,26 +211,10 @@ function collectAppEntities(app     ) {
     Object.defineProperty(handler, 'privateFactProjection', {
       value: declaration.projections?.some((projection     ) => projection?.privateFact === true) ?? false,
     });
-    if (compoundContributionPolicy != null) {
-      Object.defineProperty(handler, 'compoundContributionPolicy', { value: compoundContributionPolicy });
-      // Compile one contribution-policy entry for this compound action (scope#992
-      // Finding 6/7): keyed by the outer action type + contribution handle. The
-      // registry drives history authorization ordering; the policy never decides
-      // grants itself.
-      compoundPolicies.push(compileCompoundContributionPolicy(
-        { entity: compoundContributionPolicy.entity, fieldName: compoundContributionPolicy.field },
-        declaration.type,
-        entities.get(compoundContributionPolicy.entity)?.fields?.[compoundContributionPolicy.field],
-      ));
-      // A declaration-generated receipt matcher compares the exact canonical
-      // outer payload (scope#992 W2): same actionId plus a different payload is
-      // a conflict, not a replay. Both the stored receipt payload (canonical
-      // at insert) and this comparison use the SAME canonical serializer, so
-      // equivalent payloads with different object-key insertion order dedupe.
-      Object.defineProperty(handler, 'dedupeReceiptMatches', {
-        value: (receipt     , request     ) =>
-          receipt.actionType === declaration.type && receipt.actionData === canonicalStringify(request.payload),
-      });
+    if (composedAnnotated != null) {
+      Object.defineProperty(handler, 'compoundContributionPolicy', { value: composedAnnotated.compoundContributionPolicy });
+      compoundPolicies.push(composedAnnotated.contributionPolicy);
+      Object.defineProperty(handler, 'dedupeReceiptMatches', { value: composedAnnotated.dedupeReceiptMatches });
     }
     // An action wrapped by `atomicOperation(...)` (S3/A6) carries its
     // in-transaction read + resolution registration on the raw handler. The
@@ -298,32 +260,13 @@ function collectAppEntities(app     ) {
         // gates the application transition. The translator registration is W2
         // compile work; the contribution-policy move execution rolls out under
         // W3 (#145).
-        if (compoundContributionPolicy != null && policy === 'eligible') {
-          historyActions[declaration.type] = {
-            inverse: (input     ) => compoundHistoryTranslation(declaration.type, input, 'undo'),
-            redo: (input     ) => compoundHistoryTranslation(declaration.type, input, 'redo'),
-          };
+        if (composedAnnotated != null && policy === 'eligible') {
+          historyActions[declaration.type] = composedAnnotated.historyAction;
         }
       }
     }
   }
   return { handlers, projections, entities, cursorPolicy, historyActions, compoundPolicies };
-}
-
-function compoundHistoryTranslation(type        , input     , direction                 ) {
-  // A composed action's undo/redo is ONE outer re-dispatch with handler-only
-  // compound input (scope#992 rev 3 §1). The outer payload is the origin's
-  // canonical payload; the handler input carries the expected/replacement
-  // application transition the package validator will check.
-  const fact = (input.fact ?? null)                                  ;
-  if (!fact) throw new Error(`compound history translation for '${type}' requires the origin application fact`);
-  void direction;
-  const origin = input.origin                                     ;
-  const payload = origin?.payload ?? {};
-  // Undo: expected = head.after, replacement = head.before. Redo mirrors it.
-  const expected = fact.after ?? null;
-  const replacement = fact.before ?? null;
-  return { type, payload, input: { version: 1, expected, replacement } };
 }
 
 function buildEffects(entities                  ) {
@@ -716,6 +659,8 @@ export function buildKernel(app     ) {
       return authorize({ ...context, db: app.db });
     },
     db: app.db,
+    writeQueue: app.writeQueue,
+    commitHook: annotatedKernel.commitHook,
     history: app._history,
     historyActions: generatedHistoryActions,
     cursorPolicy,

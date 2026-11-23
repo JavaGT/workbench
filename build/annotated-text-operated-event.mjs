@@ -329,6 +329,24 @@ function parseV15Ranges(value         , entity        , field        )          
   return Object.freeze(value.map((entry) => parseV15Range(entry, entity, field)));
 }
 
+function isStrictlySortedNonEmptyStrings(value         )                    {
+  if (!Array.isArray(value)) return false;
+  for (let index = 0; index < value.length; index += 1) {
+    const entry = value[index];
+    if (typeof entry !== 'string' || entry.length === 0) return false;
+    if (index > 0 && value[index - 1] >= entry) return false;
+  }
+  return true;
+}
+
+function parseOptionalLastRange(value         , entity        , field        )                                   {
+  if (value === null) return null;
+  if (!Array.isArray(value) || value.length !== 2 || !Number.isSafeInteger(value[0]) || !Number.isSafeInteger(value[1])) {
+    invalidEnvelope(entity, field, 16);
+  }
+  return value                                        ;
+}
+
 function parseV15CreateAnnotation(value         , entity        , field        )                             {
   if (!isPlainObject(value) || !exactKeys(value, CREATE_ANNOTATION_KEYS)) invalidEnvelope(entity, field, 15);
   const { id, family, fields, protectedTargetIds } = value
@@ -340,16 +358,14 @@ function parseV15CreateAnnotation(value         , entity        , field        )
   if (!isPlainObject(fields)) invalidEnvelope(entity, field, 15);
   const fieldNames = Object.keys(fields);
   if (fieldNames.some((name, index) => index > 0 && fieldNames[index - 1] >= name)) invalidEnvelope(entity, field, 15);
-  if (!Array.isArray(protectedTargetIds) || protectedTargetIds.some((entry) => typeof entry !== 'string' || entry.length === 0)) {
+  if (!isStrictlySortedNonEmptyStrings(protectedTargetIds)) {
     invalidEnvelope(entity, field, 15);
   }
-  const targets = protectedTargetIds            ;
-  if (targets.some((id2, index) => index > 0 && targets[index - 1] >= id2)) invalidEnvelope(entity, field, 15);
   return Object.freeze({
     id,
     family,
     fields: Object.freeze({ ...fields }),
-    protectedTargetIds: Object.freeze([...targets]),
+    protectedTargetIds: Object.freeze([...protectedTargetIds]),
   })                              ;
 }
 
@@ -490,13 +506,7 @@ function parseV16Emptied(value         , entity        , field        )         
     if (disposition.kind !== 'deleted' && disposition.kind !== 'orphaned') invalidEnvelope(entity, field, 16);
     if (typeof disposition.family !== 'string' || disposition.family.length === 0) invalidEnvelope(entity, field, 16);
     if (disposition.savedQuote !== null && typeof disposition.savedQuote !== 'string') invalidEnvelope(entity, field, 16);
-    if (disposition.lastRange !== null) {
-      const range = disposition.lastRange;
-      if (!Array.isArray(range) || range.length !== 2
-        || !Number.isSafeInteger(range[0]) || !Number.isSafeInteger(range[1])) {
-        invalidEnvelope(entity, field, 16);
-      }
-    }
+    const lastRange = parseOptionalLastRange(disposition.lastRange, entity, field);
     if (typeof entry.annotationId !== 'string' || entry.annotationId.length === 0) invalidEnvelope(entity, field, 16);
     return Object.freeze({
       annotationId: entry.annotationId,
@@ -504,7 +514,7 @@ function parseV16Emptied(value         , entity        , field        )         
         kind: disposition.kind,
         family: disposition.family,
         savedQuote: disposition.savedQuote                 ,
-        lastRange: disposition.lastRange                                    ,
+        lastRange,
       }),
     });
   }));
@@ -533,11 +543,10 @@ function parseV16WitnessImage(rawImage         , entity        , field        , 
   if (!isPlainObject(fields)) invalidEnvelope(entity, field, 16);
   const fieldNames = Object.keys(fields);
   if (fieldNames.some((name, index) => index > 0 && fieldNames[index - 1] >= name)) invalidEnvelope(entity, field, 16);
-  if (!Array.isArray(protectedTargetIds) || protectedTargetIds.some((entry) => typeof entry !== 'string' || entry.length === 0)) {
+  if (!isStrictlySortedNonEmptyStrings(protectedTargetIds)) {
     invalidEnvelope(entity, field, 16);
   }
-  const targets = protectedTargetIds            ;
-  if (targets.some((entry, index) => index > 0 && targets[index - 1] >= entry)) invalidEnvelope(entity, field, 16);
+  const targets = protectedTargetIds;
   if (empty !== 'delete' && empty !== 'orphan') invalidEnvelope(entity, field, 16);
   if (cardinality !== 'many' && cardinality !== 'one') invalidEnvelope(entity, field, 16);
   if (!Array.isArray(memberships)) invalidEnvelope(entity, field, 16);
@@ -556,16 +565,9 @@ function parseV16WitnessImage(rawImage         , entity        , field        , 
     if (!isPlainObject(orphan) || !exactKeys(orphan, V16_ORPHAN_KEYS)) invalidEnvelope(entity, field, 16);
     const record = orphan                           ;
     if (typeof record.savedQuote !== 'string') invalidEnvelope(entity, field, 16);
-    if (record.lastRange !== null) {
-      const range = record.lastRange;
-      if (!Array.isArray(range) || range.length !== 2
-        || !Number.isSafeInteger(range[0]) || !Number.isSafeInteger(range[1])) {
-        invalidEnvelope(entity, field, 16);
-      }
-    }
     parsedOrphan = Object.freeze({
       savedQuote: record.savedQuote,
-      lastRange: record.lastRange                                    ,
+      lastRange: parseOptionalLastRange(record.lastRange, entity, field),
     });
   }
   if (!Array.isArray(prerequisites)) invalidEnvelope(entity, field, 16);
@@ -606,7 +608,18 @@ function parseV16WitnessSide(value         , entity        , field        )     
   return Object.freeze(images)                                    ;
 }
 
-export function normalizeOperatedEvent(raw         , context                                   )                         {
+export function normalizeOperatedEvent(
+  raw         ,
+  context                                   ,
+)                         {
+  return normalizeOperatedEventInternal(raw, context, false);
+}
+
+function normalizeOperatedEventInternal(
+  raw         ,
+  context                                   ,
+  skipV16CanonicalCheck         ,
+)                         {
   const { entity, field } = context;
   const version = isPlainObject(raw) ? raw.version : undefined;
   if (version !== 13 && version !== 14 && version !== 15 && version !== 16) {
@@ -620,10 +633,9 @@ export function normalizeOperatedEvent(raw         , context                    
     invalidEnvelope(entity, field, version);
   }
   if (version === 15 || version === 16) preflightV15Payload(raw, raw.operation, entity, field);
-  if (version === 16) {
+  if (version === 16 && !skipV16CanonicalCheck) {
     // The complete persisted text must itself be canonically bounded before it
-    // is trusted for parse; parseStoredV16OperatedEvent re-derives the object
-    // and proves byte identity with the canonical form.
+    // is trusted for parse; parseStoredV16OperatedEvent already verified it.
     canonicalV16Json(raw, REGION_V16_MAX_EVENT_BYTES, `${entity}.${field}.operated v16`);
   }
   const facts = parseFacts(raw.facts, entity, field, version);
@@ -751,7 +763,7 @@ export function parseStoredV16OperatedEvent(eventDataText        , context      
   if (version !== 16) {
     throw new Error(`${entity}.${field}.operated event version ${version} is not supported: only operated versions 13, 14, 15, and 16 are replayable; pre-13 lattice rows were retired (issue #23)`);
   }
-  return normalizeOperatedEvent(parsed                        , context)                       ;
+  return normalizeOperatedEventInternal(parsed                        , context, true)                       ;
 }
 
 // Escape-aware JSON string-literal scanner. Returns the complete literal
@@ -857,7 +869,6 @@ function parseCanonicalJsonText(text        )          {
   return value;
 }
 
-export function constructV13OperatedEvent(data
 
 
 
@@ -873,7 +884,9 @@ export function constructV13OperatedEvent(data
 
 
 
- )                       {
+
+
+export function constructV13OperatedEvent(data                                                )                       {
   return Object.freeze({
     version: 13,
     id: data.id,
@@ -884,22 +897,7 @@ export function constructV13OperatedEvent(data
   });
 }
 
-export function constructV14OperatedEvent(data
-
-
-
-
-
-
-
-
-
-
-
-
-
-
- )                       {
+export function constructV14OperatedEvent(data                          )                       {
   return Object.freeze({
     version: 14,
     id: data.id,
@@ -1051,7 +1049,6 @@ export function serializeV16OperatedEvent(event                      )         {
 //    _Log insert. The claim table is a Map keyed by nonce with a hard bound;
 //    every path (success, failure, expiry) removes its entry.
 const V16_BRAND                = Symbol('workbench.annotated-text.v16.brand');
-const V16_BRAND_KEYS = ['after', 'before', 'facts', 'id', 'operation', 'version'];
 
 
 
@@ -1095,21 +1092,14 @@ export function readV16Brand(data         )                                     
   const record = data                                ;
   const brand = record[V16_BRAND];
   if (!brand || typeof brand !== 'object') return null;
-  const keys = Object.keys(record);
-  if (record.version !== 16 || keys.length !== V16_BRAND_KEYS.length
-    || !V16_BRAND_KEYS.every((key) => Object.hasOwn(record, key))) {
+  if (record.version !== 16 || !exactKeys(record, OPERATED_ENVELOPE_KEYS)) {
     return null;
   }
-  const stamp = brand                                                                      ;
+  const stamp = brand                                                ;
   if (typeof stamp.eventDataText !== 'string' || typeof stamp.nonce !== 'string') return null;
   return { eventDataText: stamp.eventDataText, nonce: stamp.nonce };
 }
 
-/**
- * Claim a minted nonce capability for one append. Consumes the entry — a
- * second claim of the same nonce fails (replay/reuse), and claims die with
- * the process (restart safety). Binding fields must match the mint.
- */
 /**
  * The deterministic single-use admission token: binds owning scope, entity,
  * field, document, exact canonical bytes, and the canonical action/append id.

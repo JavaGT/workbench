@@ -444,6 +444,13 @@ export type DispatchResult =
       status: 'outcome-unknown';
       opId: string;
       deliveryError: { message: string };
+    }
+  | {
+      /** A durable transport accepted the mutation; its completion settles the overlay later. */
+      ok: false;
+      status: 'queued';
+      opId: string;
+      actionId: string;
     };
 
 export type TextDispatchResult = DispatchResult
@@ -485,6 +492,10 @@ export interface PendingCreateEntry {
 
 export interface LiveStore<Row extends Record<string, unknown> = Record<string, unknown>> {
   subscribe: (id: string | number, options?: SubscribeOptions) => LiveList<Row>;
+  /** Cached LiveList for an id, or null — peek without creating a subscription. */
+  listFor: (id: string | number) => LiveList<Row> | null;
+  /** Release a binding-owned list once its last owner leaves; app subscriptions are untouched. */
+  release: (id: string | number) => void;
   /** Ids of every currently cached LiveList (read-only collection input). */
   listIds: () => Array<string | number>;
   dispatch: (type: string, payload: Record<string, unknown>) => Promise<DispatchResult>;

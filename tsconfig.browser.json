@@ -1,5 +1,5 @@
 {
-  "//": "Staged browser typechecking. checkJs is enabled only for zero-import browser leaves that currently pass with 0 errors; public/workbench-client.mjs stays out of scope until it is clean.",
+  "//": "Staged browser typechecking with checkJs on the public leaves owned by this lane. noResolve keeps the check on the leaves themselves: the re-export shims point at emitted build/ modules and another lane's editor, which are checked in their own lanes. public/workbench-client.mjs (the large façade) stays out of scope.",
   "compilerOptions": {
     "target": "ES2024",
     "module": "NodeNext",
@@ -9,10 +9,17 @@
     "checkJs": true,
     "noImplicitAny": false,
     "noEmit": true,
+    "noResolve": true,
     "skipLibCheck": true,
     "types": []
   },
   "include": [
+    "public/workbench-annotated-text-action.mjs",
+    "public/workbench-annotated-text-coords.mjs",
+    "public/workbench-annotated-text-redaction-coords.mjs",
+    "public/workbench-annotated-text-snapshot-internal.mjs",
+    "public/workbench-annotated-text.mjs",
+    "public/workbench-local-log.mjs",
     "public/workbench-ui-bindings.mjs"
   ],
   "exclude": ["node_modules", "build", "src", "test", "projects"]

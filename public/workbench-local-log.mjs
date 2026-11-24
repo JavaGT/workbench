@@ -43,9 +43,11 @@ function _openDb(name) {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(`workbench:local:${name}`, DB_VERSION);
     req.onupgradeneeded = (event) => {
-      const db = event.target.result;
+      const request = /** @type {IDBOpenDBRequest} */ (event.target);
+      const db = /** @type {IDBDatabase} */ (request.result);
+      const transaction = /** @type {IDBTransaction} */ (request.transaction);
       const store = db.objectStoreNames.contains(STORE_NAME)
-        ? event.target.transaction.objectStore(STORE_NAME)
+        ? transaction.objectStore(STORE_NAME)
         : db.createObjectStore(STORE_NAME, { keyPath: 'id', autoIncrement: true });
       if (!store.indexNames.contains('byScope')) {
         store.createIndex('byScope', ['scope', 'seq']);

@@ -47,6 +47,7 @@ export function displayToWirePosition(value, redactions = []) {
     if (value.offset < start) break;
     if (value.offset === start) return { ...value, offset: redaction.start, affinity: 'left' };
     if (value.offset < end) {
+      /** @type {TypeError & { code?: string }} */
       const error = new TypeError('annotated text placeholder is not editable');
       error.code = 'position-redacted';
       throw error;

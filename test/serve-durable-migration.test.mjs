@@ -32,7 +32,7 @@ test('HTTP create/update/remove flow through the durable kernel — every mutati
   const app = workbench({ db });
   const NoteDeclaration = ownedNote();
   app.mount('/notes', NoteDeclaration);
-  const Note = app.entity(NoteDeclaration);
+  const _Note = app.entity(NoteDeclaration);
   await app.ddl(); // framework _Log/_Cursor + Note table
   app.listen(0, { principalOf: () => ({ id: 'u1' }) });
   await app.ready;

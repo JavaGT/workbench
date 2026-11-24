@@ -63,7 +63,7 @@ function denyEntityRowsAdapter() {
 const json = (r) => r.json();
 
 test('injected adapter denial applies to snapshot and events-since', async (t) => {
-  const { app, db, base } = await harness(t, 'u1', denyEntityRowsAdapter());
+  const { app, db: _db, base } = await harness(t, 'u1', denyEntityRowsAdapter());
   app.entities.get('Note').insert({ id: 'n1', body: 'hello', owner: 'u1' });
   const snapshot = await fetch(`${base}/snapshot/Note/n1`);
   assert.equal(snapshot.status, 403);
@@ -72,7 +72,7 @@ test('injected adapter denial applies to snapshot and events-since', async (t) =
 });
 
 test('snapshot endpoint returns the materialized row + the per-scope seq, authorized', async (t) => {
-  const { app, db, base } = await harness(t);
+  const { app, db: _db, base } = await harness(t);
   // Seed a note owned by u1 via the trusted insert (no _Log append → scope seq 0).
   app.entities.get('Note').insert({ id: 'n1', body: 'hello', owner: 'u1' });
 

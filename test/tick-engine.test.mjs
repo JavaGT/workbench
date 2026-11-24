@@ -23,7 +23,7 @@ function seededDb() {
   return db;
 }
 
-function makeAppWithTick(entityDef, entityName) {
+function _makeAppWithTick(entityDef, entityName) {
   const db = seededDb();
   for (const sql of generateDDL(entityDef)) db.exec(sql);
 

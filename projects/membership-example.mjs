@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 
 import {
-  entity, map, ref, owner, text, read, write, subscribe, inherit, membership,
+  entity, map, ref, owner, text, read, write as _write, subscribe, inherit, membership,
 } from '../build/index.mjs';
 import workbench, { executeDDL } from '../build/internal.mjs';
 import { principal } from '../build/principal.mjs';
@@ -48,8 +48,8 @@ test('membership example: owner has full access', async (t) => {
     .run('doc-1', 'Alice document', 'proj-1');
 
   const alice = principal({ type: 'user', id: 'alice' });
-  const bob = principal({ type: 'user', id: 'bob' });
-  const carol = principal({ type: 'user', id: 'carol' });
+  const _bob = principal({ type: 'user', id: 'bob' });
+  const _carol = principal({ type: 'user', id: 'carol' });
 
   const app = workbench({ db });
   app.mount('/projects', Project);

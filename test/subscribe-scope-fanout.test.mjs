@@ -6,7 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 import workbench, { entity, text, generateDDL, grant, scope, read, write, subscribe as subVerb } from '../build/internal.mjs';
 import { createLiveFanout } from '../build/live-fanout.mjs';
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const _sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function makeConn(id, principalId = id) {
   const messages = [];

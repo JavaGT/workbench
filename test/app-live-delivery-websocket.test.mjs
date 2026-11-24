@@ -13,7 +13,7 @@ import { connect as tcpConnect } from 'node:net';
 import { randomBytes } from 'node:crypto';
 
 import workbench, {
-  annotatedText, annotation, anonymous, deny, entity, ephemeral, everyone, grant, read, ref, scope, subscribe, text, write, admin,
+  annotatedText as _annotatedText, annotation as _annotation, anonymous, deny, entity, ephemeral as _ephemeral, everyone, grant, read, ref as _ref, scope, subscribe, text, write as _write, admin as _admin,
 } from '../build/index.mjs';
 import { createAnnotatedDocApp } from '../projects/annotated-doc/server.mjs';
 
@@ -243,7 +243,7 @@ test('app-integrated WebSocket collapses a revoked principal to canonical anonym
   }
 });
 
-test('shutdown retracts caret presence over the app-integrated WebSocket', async (t) => {
+test('shutdown retracts caret presence over the app-integrated WebSocket', async (_t) => {
   const { app, principalOf } = createAnnotatedDocApp({ db: ':memory:' });
   app.listen(0, { principalOf });
   await app.ready;

@@ -250,7 +250,7 @@ function runOracleSeed(seed, { batches, batchOps }) {
   const annotations = new Map(); // id -> Annotation
   let trackedRanges = []; // latest planned AnnotationRange[]
   const collapseTally = { orphaned: 0, deleted: 0 };
-  let collapsedCount = 0;
+  let _collapsedCount = 0;
 
   // The plan builder mints [actor, 1] per text op and requires each actor's
   // next op to chain causally from its previous one — so every edit needs a
@@ -283,7 +283,7 @@ function runOracleSeed(seed, { batches, batchOps }) {
         );
       }
       collapseTally[emptied.disposition.kind] += 1;
-      collapsedCount += 1;
+      _collapsedCount += 1;
       spans.delete(emptied.annotationId);
       annotations.delete(emptied.annotationId);
       trackedRanges = trackedRanges.filter((entry) => entry.annotationId !== emptied.annotationId);

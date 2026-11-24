@@ -159,7 +159,7 @@ test('the error renderer keeps public JSON sanitized in development', async (t) 
   });
 });
 
-test('graceful shutdown closes the live server', async (t) => {
+test('graceful shutdown closes the live server', async (_t) => {
   const app = workbench().mount('/notes', makePublicListNote());
   app.listen(0);
   await new Promise((resolve) => {

@@ -2,7 +2,7 @@
 // Depends on: workbench-annotated-text.mjs (same directory)
 import {
   assertUtf16Offset, assertUtf16Range, assertWellFormedText,
-  assertFrontier, assertTextOp, canonicalTextOp,
+  assertFrontier, assertTextOp as _assertTextOp, canonicalTextOp,
   compareOpId, compareOpIdValidated, frontierCounter, materializeText,
 } from './workbench-annotated-text.mjs';
 

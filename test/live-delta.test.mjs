@@ -127,7 +127,7 @@ function openRawWS(port, userId = 'test') {
   });
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const _sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // --- bootstrap: direct createLiveServer (mirrors live-pace.test.mjs direct pattern) ---
 

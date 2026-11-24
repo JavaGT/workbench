@@ -17,7 +17,7 @@
 //   update PATCH  /base/:id
 //   remove DELETE /base/:id
 
-import { entity, text, ref, boolean, grant, read, write, subscribe, scope, allowAnonymous, requireUser, principal, anonymous } from '../build/index.mjs';
+import { entity, text, ref, boolean, grant, read, write, subscribe, scope, allowAnonymous, requireUser as _requireUser, principal, anonymous } from '../build/index.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 

@@ -3,7 +3,7 @@
 // Proves: member can read, member cannot write, non-member 404,
 // child entity inherits membership, member can subscribe to live events.
 
-import { entity, grant, inherit, map, read, ref, scope, subscribe, text, write, deny, membership } from '../build/index.mjs';
+import { entity, grant as _grant, inherit, map, read, ref, scope as _scope, subscribe, text, write as _write, deny as _deny, membership } from '../build/index.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
@@ -11,7 +11,7 @@ import { connect as tcpConnect } from 'node:net';
 import { randomBytes } from 'node:crypto';
 
 import workbench, {
-  anyOf, executeDDL, executeFrameworkDDL } from '../build/internal.mjs';
+  anyOf as _anyOf, executeDDL, executeFrameworkDDL as _executeFrameworkDDL } from '../build/internal.mjs';
 import { principal } from '../build/principal.mjs';
 
 const owner = principal({ type: 'user', id: 'owner-1' });
@@ -320,13 +320,13 @@ test('membership: members can subscribe to live events on inherited child rows',
 
 test('membership: entity.checks.member works as a direct runtime check', () => {
   const { Project } = seedProjectDocuments();
-  const { db } = { db: new DatabaseSync(':memory:') };
+  const { db: _db } = { db: new DatabaseSync(':memory:') };
   // The check runs through the registry — verifies it exists and is callable
   assert.equal(typeof Project.checks.member, 'function', 'member check is a function');
   assert.equal(typeof Project.checks.owner, 'function', 'owner check exists');
 });
 
-test('membership: loading error when no map field exists', (t) => {
+test('membership: loading error when no map field exists', (_t) => {
   const Empty = entity('Empty', {
     title: text(),
     owner: ref('User', { role: 'owner', readonly: true }),
@@ -339,7 +339,7 @@ test('membership: loading error when no map field exists', (t) => {
   );
 });
 
-test('membership: loading error when config has no can', (t) => {
+test('membership: loading error when config has no can', (_t) => {
   const HasMap = entity('HasMap', {
     owner: ref('User', { role: 'owner', readonly: true }),
     members: map(ref('User'), { role: ['viewer'], default: {} }),

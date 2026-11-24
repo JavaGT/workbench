@@ -1,7 +1,7 @@
 // LiveStore tests — pure JS, NO real server. Injects a fake channel + fake fetch.
-import { describe, it, before, after } from 'node:test';
+import { describe, it, before as _before, after as _after } from 'node:test';
 import assert from 'node:assert/strict';
-import { createLiveStore, LiveList, LiveChannel, decodeResult } from '../public/workbench-client.mjs';
+import { createLiveStore, LiveList, LiveChannel as _LiveChannel, decodeResult } from '../public/workbench-client.mjs';
 import { makeFakeChannel, makeFakeFetch } from './fixtures/fake-transport.mjs';
 
 // ---------------------------------------------------------------------------
@@ -299,7 +299,7 @@ describe('LiveStore', () => {
     const channel = makeFakeChannel();
     let rejectCount = 0;
 
-    const fetch = async (url, opts) => {
+    const fetch = async (url, _opts) => {
       if (url.includes('/snapshot')) {
         return { ok: true, json: async () => ({ snapshot: { id: '1', title: 'x' }, seq: 1 }) };
       }
@@ -624,7 +624,7 @@ describe('LiveStore', () => {
 
     // Register another action
     store.action('ping', { method: 'GET', path: '/health' });
-    const result2 = await store.ping();
+    const _result2 = await store.ping();
 
     assert.equal(actionUrl, 'http://test/health');
     assert.equal(actionMethod, 'GET');

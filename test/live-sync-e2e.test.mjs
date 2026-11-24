@@ -10,7 +10,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { connect as tcpConnect } from 'node:net';
-import { randomBytes, createHash } from 'node:crypto';
+import { randomBytes, createHash as _createHash } from 'node:crypto';
 
 import workbench, { entity, generateDDL } from '../build/internal.mjs';
 

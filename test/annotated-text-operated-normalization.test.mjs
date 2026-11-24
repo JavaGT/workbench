@@ -160,7 +160,7 @@ test('v16 region.edit normalizes through the production constructor', () => {
   assert.equal(canonical.text.kind, 'replace');
 });
 
-const externalReferences = defineSqliteSchema({
+const _externalReferences = defineSqliteSchema({
   name: 'annotated-text-operated-normalization',
   tables: [],
   externalTables: [{ name: 'Project', columns: ['id'] }],

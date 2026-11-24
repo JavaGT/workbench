@@ -248,7 +248,7 @@ test('requestCount in /health/stats increments per request', async (t) => {
 });
 
 // Piece 3: onShutdown deadline registry
-test('onShutdown: registered hooks run on shutdown', async (t) => {
+test('onShutdown: registered hooks run on shutdown', async (_t) => {
   const db = new DatabaseSync(':memory:');
   const app = workbench({ db });
   app.mount('/notes', ownedNote());
@@ -266,7 +266,7 @@ test('onShutdown: registered hooks run on shutdown', async (t) => {
   db.close();
 });
 
-test('onShutdown: hooks run in registration order', async (t) => {
+test('onShutdown: hooks run in registration order', async (_t) => {
   const db = new DatabaseSync(':memory:');
   const app = workbench({ db });
   app.mount('/notes', ownedNote());
@@ -284,7 +284,7 @@ test('onShutdown: hooks run in registration order', async (t) => {
   db.close();
 });
 
-test('onShutdown: hook exceeding timeout is force-abandoned', async (t) => {
+test('onShutdown: hook exceeding timeout is force-abandoned', async (_t) => {
   const db = new DatabaseSync(':memory:');
   const app = workbench({ db });
   app.mount('/notes', ownedNote());

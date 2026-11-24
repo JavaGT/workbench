@@ -1101,7 +1101,7 @@ test('reconcileProjectedRecovery leaves current scopes untouched', async () => {
     hotRank: projected.async({ compute: async (row) => (row.score ?? 0) * 2 }),
     grant: () => [scope(() => everyone()).can(() => grant(read, write, subscribe))],
   });
-  const entities = new Map([[Post.name, Post]]);
+  const _entities = new Map([[Post.name, Post]]);
 
   // Scope is fully caught up: recovery cursor at head.
   db.prepare("INSERT INTO Post (id, title, score, hotRank) VALUES ('p1','t',7,'14')").run();

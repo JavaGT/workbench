@@ -89,7 +89,7 @@ test('the /blobs route and app surface read bytes by id — pathFor is retired (
 });
 
 test('POST /blobs is fail-closed for anonymous', async (t) => {
-  const { base } = await harness(t);
+  const { base: _base } = await harness(t);
   // No principal wiring override here would be the way, but the harness pins u1;
   // exercise the anonymous path with a bare app whose principalOf returns nobody.
   const db = new DatabaseSync(':memory:');

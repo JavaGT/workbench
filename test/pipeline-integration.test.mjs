@@ -119,7 +119,7 @@ test('pipeline and direct CRUD coexist — one does not subsume the other', asyn
 
   // Pipeline path: a custom action that also writes a note.
   const Draft = action('note.draft');
-  const Drafted = event('note.drafted', (state, e) => ({ ...state, body: e.data.body }));
+  const _Drafted = event('note.drafted', (state, e) => ({ ...state, body: e.data.body }));
 
   const server = createServer({
     handlers: {

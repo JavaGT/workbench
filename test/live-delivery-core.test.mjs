@@ -1283,7 +1283,7 @@ test('(R5) core rejected nested dirty rerun does not become unhandled and closes
     scope: 'Note:n1',
     after: 0,
     signal: null,
-    deliver: async (batch) => {
+    deliver: async (_batch) => {
       inDelivery = true;
       await deliveryGate;
     },

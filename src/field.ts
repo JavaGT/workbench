@@ -65,7 +65,7 @@ function makeDescriptor(props: FieldOptions): FieldDescriptor {
     // time, not at request time (ADR #16 static guard). The runtime backstop
     // in check.ts stays as defense in depth.
     assertGuarded(fn as (...args: unknown[]) => unknown, { where: 'field .can body' });
-    const { can, ...fields } = descriptor;
+    const { can: _can, ...fields } = descriptor;
     return makeDescriptor({ ...fields, access: fn });
   };
   return Object.freeze(descriptor) as unknown as FieldDescriptor;

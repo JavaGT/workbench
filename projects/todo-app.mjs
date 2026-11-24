@@ -8,7 +8,7 @@
 // CREATE TABLE DDL for the system and product entities run automatically during
 // app.ready), error handling, and graceful shutdown — nothing to mount here.
 
-import workbench, { User } from 'workbench';
+import workbench, { User as _User } from 'workbench';
 
 import { Todo, TodoList, SharedTodo } from './todo.mjs';
 

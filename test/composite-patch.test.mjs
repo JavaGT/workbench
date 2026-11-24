@@ -11,8 +11,8 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 
-import workbench, { entity, inherit, ref, text, grant, read, subscribe, write, scope, everyone, snapshot } from '../build/index.mjs';
-const { object, select, include, keyed, many, one, count, orderBy } = snapshot;
+import workbench, { entity, inherit, ref, text, grant, read, subscribe, write as _write, scope, everyone, snapshot } from '../build/index.mjs';
+const { object, select, include: _include, keyed, many, one: _one, count, orderBy } = snapshot;
 import { executeDDL } from '../build/internal.mjs';
 import { createLiveDeliverySession } from '../public/workbench-client.mjs';
 
@@ -274,7 +274,7 @@ function applyPatches(initial, envelopes) {
   return state;
 }
 
-async function drivePatches({ t, principal, authorization, mutations, initialSetup, initialSnapshotState }) {
+async function drivePatches({ t, principal, authorization, mutations, initialSetup, initialSnapshotState: _initialSnapshotState }) {
   const { app, db, delivery } = await setup(t, { principal, authorization });
   for (const mutation of initialSetup) await dispatchOk(app, mutation);
   const boot = await delivery.bootstrap({ principal, scope: 'Project:p1', capabilities: ['snapshot-patch/v1'] });
@@ -506,7 +506,7 @@ test('parity oracle: keyed child lifecycle + anchor rename + nested removal deep
 });
 
 test('cursor decisions: duplicate ignored, gap falls back, stale duplicate ignored', async (t) => {
-  const { app, db, delivery } = await setup(t);
+  const { app, db: _db, delivery } = await setup(t);
   await dispatchOk(app, { actionId: 'p0', type: 'project.write', scope: 'Project:p1', payload: { exists: false, row: { id: 'p1', name: 'S' } }, principal: alice });
   const boot = await delivery.bootstrap({ principal: alice, scope: 'Project:p1', capabilities: ['snapshot-patch/v1'] });
   assert.equal(boot.kind, 'snapshot');
@@ -732,7 +732,7 @@ test('RED-LINE forged fact: cross-entity fact neither routes nor suppresses inva
   assert.equal(routedClean, false, 'forged fact does not route');
   assert.ok(out.some((entry) => entry.invalidating), 'invalidation NOT suppressed by the forged fact');
 });
-test('RED-LINE replace-fields preserves untouched relation branches while deleting omitted scalars', async (t) => {
+test('RED-LINE replace-fields preserves untouched relation branches while deleting omitted scalars', async (_t) => {
   const probe = {};
   const session = createLiveDeliverySession({
     // Response-gated negotiation (#156): the bootstrap result must advertise

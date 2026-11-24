@@ -17,7 +17,8 @@ import { readSnapshotTxn } from './driver.mjs';
 import { compileSnapshots, captureSnapshot, authorizeSnapshot, projectSnapshot } from './snapshot-projection.mjs';
 import { compilePatchPlans } from './composite-patch-plan.mjs';
 
-import { createCompositePatchDelivery, parseRequestedCapabilities, SNAPSHOT_PATCH_CAPABILITY } from './composite-patch-delivery.mjs';
+
+import { createCompositePatchDelivery, parseRequestedCapabilities } from './composite-patch-delivery.mjs';
 import { hasAnnotatedTextFields, projectEntitySnapshot } from './entity-snapshot-projection.mjs';
 import { resolveAnnotatedTextOwningScope } from './annotated-text-field.mjs';
 import { rawRow } from './entity/query.mjs';

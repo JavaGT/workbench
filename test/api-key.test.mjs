@@ -30,7 +30,7 @@ function sha256hex(s) {
 }
 
 // Seed the framework tables for tests that need a db.
-function seed(tables = []) {
+function _seed(tables = []) {
   const db = new DatabaseSync(':memory:');
   const baseTables = ['User', 'Session'];
   for (const t of [...baseTables, ...tables]) {
@@ -205,7 +205,7 @@ test('apiKeyPrincipalOf resolves a valid Bearer token to an apiKey principal', (
 
 test('apiKeyPrincipalOf returns anonymous for no Authorization header', () => {
   const app = bootApp();
-  const ApiKey_b = app.entity(ApiKey);
+  const _ApiKey_b = app.entity(ApiKey);
 
   const resolver = apiKeyPrincipalOf(app.db);
   const p = resolver({ headers: {} });
@@ -487,7 +487,7 @@ test('HTTP: revoke key → subsequent Bearer request returns 401', async (t) => 
   assert.equal(revokeRes.status, 204);
 
   // Key should no longer work
-  const afterRes = await fetch(`${origin}/health`, {
+  const _afterRes = await fetch(`${origin}/health`, {
     headers: { authorization: `Bearer ${apiToken}` },
   });
   // With no valid session cookie AND a revoked key, the principal is anonymous.

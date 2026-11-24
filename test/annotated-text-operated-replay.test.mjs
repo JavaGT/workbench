@@ -17,7 +17,7 @@ import workbench, {
 import { defineSqliteSchema } from '../build/server.mjs';
 import { rowToEvent } from '../build/committed-log.mjs';
 import { txn } from '../build/driver.mjs';
-import { materializeText, restoreTextFamily, projectEndpointToOffset, textFamilyCheckpoint } from '../build/annotated-text-continuous.mjs';
+import { materializeText, restoreTextFamily, projectEndpointToOffset, textFamilyCheckpoint as _textFamilyCheckpoint } from '../build/annotated-text-continuous.mjs';
 import { materializeAnnotatedTextSnapshot } from '../public/workbench-client.mjs';
 import { projectAnnotatedTextSnapshot } from '../build/annotated-text-snapshot.mjs';
 import { withAuthoringBinding } from './annotated-text-authoring-fixture.mjs';

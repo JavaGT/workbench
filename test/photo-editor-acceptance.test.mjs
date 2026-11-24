@@ -11,7 +11,7 @@
 //   projected.async render pipeline,
 //   raster.crdt and blob field constructors (slice 14).
 
-import { text, number, date, ref, map, boolean, blob, raster, projected, scope, grant, deny, read, write, subscribe, anyOf, never, inherit } from '../build/index.mjs';
+import { text, number, date, ref, map, boolean, blob as _blob, raster, projected, scope, grant, deny, read, write, subscribe, anyOf, never as _never, inherit } from '../build/index.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
@@ -31,7 +31,7 @@ function scopedIds(db, entityRecord, prin) {
     .map((r) => r.id);
 }
 
-async function serve(t, db, routes, who) {
+async function _serve(t, db, routes, who) {
   const app = workbench({ db });
   for (const { path, entity: e } of routes) app.mount(path, e);
   app.listen(0, { principalOf: () => who });

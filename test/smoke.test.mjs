@@ -4,13 +4,13 @@
 // database, auto-creates tables via generateDDL, seeds a User, and exercises
 // the core CRUD path end-to-end through the HTTP server.
 
-import { text, ref, grant, read, write, subscribe, scope, User } from '../build/index.mjs';
+import { text as _text, ref as _ref, grant as _grant, read as _read, write as _write, subscribe as _subscribe, scope as _scope, User as _User } from '../build/index.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 
 import workbench, {
-  entity, generateDDL } from '../build/internal.mjs';
+  entity as _entity, generateDDL } from '../build/internal.mjs';
 
 // Re-create the doc.mjs Doc entity inline (avoids the exemplar import cycle
 // that's now lazily resolved — this test is the real-usage smoke).

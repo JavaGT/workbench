@@ -84,7 +84,7 @@ function makeGatedTransport(server) {
 
 const OUTBOX_TUNING = { retryBaseMs: 5, retryMaxMs: 40 };
 
-function makeStore({ db = freshDbName(), server, kinds, locks, seedRows } = {}) {
+function makeStore({ db = freshDbName(), server, kinds, locks: _locks, seedRows } = {}) {
   server ??= makeCrudServer({ kinds });
   for (const [id, row] of Object.entries(seedRows ?? {})) {
     server.state.rows.set(id, { ...row });

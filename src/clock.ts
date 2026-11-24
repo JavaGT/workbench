@@ -79,7 +79,7 @@ export function createClock({ now = Date.now }: ClockStarter = {}): Clock {
   function _fireDue(nowVal: number): void {
     for (const w of watchers.values()) {
       while (w.lastFiredAt + w.intervalMs <= nowVal) {
-        try { w.fn(); } catch (_) { /* noop */ }
+        try { w.fn(); } catch { /* noop */ }
         w.lastFiredAt += w.intervalMs;
         if (w.intervalMs <= 0) break;
       }

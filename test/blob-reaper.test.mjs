@@ -61,7 +61,7 @@ function backdate(db, id, agoMs) {
 
 test('blob reaper sweeps stale orphan .pending blobs', async (t) => {
   const { app, db, root } = await harness(t);
-  const up = app.blobs.upload({ bytes: Buffer.from('orphaned upload'), id: 'orph1' });
+  const _up = app.blobs.upload({ bytes: Buffer.from('orphaned upload'), id: 'orph1' });
   assert.ok(existsSync(path.join(root, 'orph1.pending')), 'the .pending file landed');
   backdate(db, 'orph1', 2 * 3600_000); // older than the default 1h TTL
 
@@ -124,7 +124,7 @@ test('application runtime registers the construction-level blob reaper interval'
 
 test('blob reaper runs under the writeQueue mutex — waits for an in-flight dispatch', async (t) => {
   const { app, db, root } = await harness(t);
-  const up = app.blobs.upload({ bytes: Buffer.from('orphaned upload'), id: 'orph2' });
+  const _up = app.blobs.upload({ bytes: Buffer.from('orphaned upload'), id: 'orph2' });
   backdate(db, 'orph2', 2 * 3600_000);
 
   // Hold the writeQueue — a stand-in for an in-flight dispatch whose txn spans an

@@ -26,8 +26,8 @@ import http from 'node:http';
 import { once } from 'node:events';
 import { DatabaseSync } from 'node:sqlite';
 
-import workbench, { entity, inherit, ref, text, grant, read, subscribe, write, scope, everyone, snapshot } from '../build/index.mjs';
-const { object, select, include, keyed, orderBy } = snapshot;
+import workbench, { entity, inherit, ref, text, grant, read, subscribe, write as _write, scope, everyone, snapshot } from '../build/index.mjs';
+const { object, select, include: _include, keyed, orderBy } = snapshot;
 import { executeDDL } from '../build/internal.mjs';
 import { createLiveDeliveryHttpHandler } from '../build/server.mjs';
 import { createLiveDeliveryHttpSession } from '../public/workbench-client.mjs';
@@ -127,7 +127,7 @@ async function serve(handler) {
 }
 
 // node has no global EventSource; read the real SSE stream via fetch streaming.
-function sseSource(url, options) {
+function sseSource(url, _options) {
   const controller = new AbortController();
   const source = {
     onmessage: null,

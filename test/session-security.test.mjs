@@ -1,6 +1,6 @@
 // Priority 4 SLICE C — Session security fixes (cso M1, M2).
 
-import { text, ref, scope, grant, read, write, subscribe } from '../build/index.mjs';
+import { text, ref as _ref, scope, grant, read, write, subscribe as _subscribe } from '../build/index.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';

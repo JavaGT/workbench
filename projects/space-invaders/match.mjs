@@ -7,7 +7,7 @@
 //
 // Where a construct does not yet exist in the API surface, the code imports
 // it from 'workbench' as an idealized handle and documents the gap.
-import { entity, text, number, date, ref, map, state, grant, deny, read, write, subscribe, anyOf, never, scope, now, everyone, self } from 'workbench';
+import { entity, text, number, date, ref, map, state, grant, deny as _deny, read, write, subscribe, anyOf, never as _never, scope, now, everyone, self } from 'workbench';
 
 // ────────────────────────────────────────────────────────────────────────────
 // Capability bundles — typed, imported, never strings.
@@ -154,7 +154,7 @@ export const Match = entity('Match', {
   // OR for truly ephemeral (no DB row):
   //   persist: false,  // entire entity in-memory only,
 
-  routes: (r, Match) => {
+  routes: (r, _Match) => {
     r.resource();                                // CRUD through grant
 
     // ── player actions (aspirational RPC) ────────────────────────────────────
@@ -165,7 +165,7 @@ export const Match = entity('Match', {
     // Current workaround: raw POST routes with opaque JSON payloads, validated
     // in the handler, queued into the tick's pending-input array.
     r.post('/:matchId/move', async (req, res) => {
-      const { direction } = req.body;            // -1, 0, or 1
+      const { direction: _direction } = req.body;            // -1, 0, or 1
       // GAP: no typed validation — direction is any value
       // GAP: no queue into the tick — must use a side channel (in-memory map)
       res.json({ queued: true });

@@ -142,7 +142,7 @@ function shutdown(app, db) {
 
 // === Helper: validate the contract shape ===
 
-function assertErrorContract(msg, { expectedCategory, expectedRequestId } = {}) {
+function assertErrorContract(msg, { expectedCategory: _expectedCategory, expectedRequestId } = {}) {
   assert.ok(msg, 'server must respond');
   // The envelope MUST have type:'error'
   assert.equal(msg.type, 'error', 'envelope type must be "error"');
@@ -168,7 +168,7 @@ function assertErrorContract(msg, { expectedCategory, expectedRequestId } = {}) 
 
 // --- 1. Invalid frame content ---
 
-test('invalid JSON produces error with invalid-input category', async (t) => {
+test('invalid JSON produces error with invalid-input category', async (_t) => {
   const { app, db } = bootNote();
   await app.ready;
   const { port } = app.httpServer.address();
@@ -188,7 +188,7 @@ test('invalid JSON produces error with invalid-input category', async (t) => {
 
 // --- 2. Unmasked frame (protocol-level frame error) ---
 
-test('an unmasked frame closes the WebSocket with protocol-error code 1002', async (t) => {
+test('an unmasked frame closes the WebSocket with protocol-error code 1002', async (_t) => {
   const { app, db } = bootNote();
   await app.ready;
   const { port } = app.httpServer.address();
@@ -217,7 +217,7 @@ test('an unmasked frame closes the WebSocket with protocol-error code 1002', asy
 
 // --- 3. Unknown message type ---
 
-test('unknown message type produces error with unknown-action category', async (t) => {
+test('unknown message type produces error with unknown-action category', async (_t) => {
   const { app, db } = bootNote();
   await app.ready;
   const { port } = app.httpServer.address();
@@ -254,7 +254,7 @@ test('valid JSON primitives produce an invalid-input failure', async () => {
 
 // --- 4. Denied subscribe (anonymous) ---
 
-test('anonymous subscribe denied produces error with denied category', async (t) => {
+test('anonymous subscribe denied produces error with denied category', async (_t) => {
   const { app, db } = bootNote();
   await app.ready;
   const { port } = app.httpServer.address();
@@ -273,7 +273,7 @@ test('anonymous subscribe denied produces error with denied category', async (t)
 
 // --- 5. Read-only principal denied subscribe ---
 
-test('read-only principal denied subscribe produces error with denied category', async (t) => {
+test('read-only principal denied subscribe produces error with denied category', async (_t) => {
   const { app, db } = bootNote();
   await app.ready;
   const { port } = app.httpServer.address();
@@ -292,7 +292,7 @@ test('read-only principal denied subscribe produces error with denied category',
 
 // --- 6. Missing entity fields (invalid input) ---
 
-test('subscribe without entity/id produces error with invalid-input category', async (t) => {
+test('subscribe without entity/id produces error with invalid-input category', async (_t) => {
   const { app, db } = bootNote();
   await app.ready;
   const { port } = app.httpServer.address();
@@ -312,7 +312,7 @@ test('subscribe without entity/id produces error with invalid-input category', a
 
 // --- 7. Unknown entity name ---
 
-test('subscribe to unknown entity produces error with denied category (no existence oracle)', async (t) => {
+test('subscribe to unknown entity produces error with denied category (no existence oracle)', async (_t) => {
   const { app, db } = bootNote();
   await app.ready;
   const { port } = app.httpServer.address();
@@ -357,7 +357,7 @@ test('anonymous invalid-field probes cannot reveal whether an entity exists', as
 
 // --- 8. Subscribe to a valid entity but non-existent id ---
 
-test('subscribe to non-existent row produces error with denied category (no existence oracle)', async (t) => {
+test('subscribe to non-existent row produces error with denied category (no existence oracle)', async (_t) => {
   const { app, db } = bootNote();
   await app.ready;
   const { port } = app.httpServer.address();
@@ -376,7 +376,7 @@ test('subscribe to non-existent row produces error with denied category (no exis
 
 // --- 9. requestId is a string in addition to number ---
 
-test('error envelope preserves string requestId', async (t) => {
+test('error envelope preserves string requestId', async (_t) => {
   const { app, db } = bootNote();
   await app.ready;
   const { port } = app.httpServer.address();
@@ -394,7 +394,7 @@ test('error envelope preserves string requestId', async (t) => {
 
 // --- 10. No requestId on error when subscribe had none ---
 
-test('error without requestId omits the field', async (t) => {
+test('error without requestId omits the field', async (_t) => {
   const { app, db } = bootNote();
   await app.ready;
   const { port } = app.httpServer.address();
@@ -426,7 +426,7 @@ test('all six failure categories are valid in WebSocket error envelopes', () => 
 
 // --- 12. Unexpected internal errors are sanitized ---
 
-test('unexpected internal error sanitized to {category:"internal", message:"Internal error."}', async (t) => {
+test('unexpected internal error sanitized to {category:"internal", message:"Internal error."}', async (_t) => {
   const lines = [];
   const secret = 'database password leaked';
   const { app, db } = bootNote({
@@ -459,7 +459,7 @@ test('unexpected internal error sanitized to {category:"internal", message:"Inte
 
 // --- 13. Error envelope must not contain fields from other message types ---
 
-test('error envelope has no event-like fields', async (t) => {
+test('error envelope has no event-like fields', async (_t) => {
   const { app, db } = bootNote();
   await app.ready;
   const { port } = app.httpServer.address();

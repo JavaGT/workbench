@@ -12,20 +12,20 @@ import { DatabaseSync } from 'node:sqlite';
 
 import workbench, {
   annotatedText, annotation, entity, everyone, executeDDL, executeFrameworkDDL,
-  grant, read, ref, scope, text, write,
+  grant, read, ref, scope, text as _text, write,
 } from '../build/internal.mjs';
 import { defineSqliteSchema } from '../build/server.mjs';
 import {
   importTextToFamily,
   materializeText,
   projectEndpointToOffset,
-  resolveOffsetToEndpoint,
+  resolveOffsetToEndpoint as _resolveOffsetToEndpoint,
   restoreTextFamilySerialized,
   serializeCompactTextFamilyCheckpoint,
   textFamilyBasis,
 } from '../build/annotated-text-continuous.mjs';
 import { readAnnotatedTextFamilyCheckpoint } from '../build/annotated-text-authoring-stream.mjs';
-import { attachAnnotationRange, loadAnnotationImages } from '../build/annotated-text-storage.mjs';
+import { attachAnnotationRange as _attachAnnotationRange, loadAnnotationImages } from '../build/annotated-text-storage.mjs';
 import {
   computeAffectedClosure,
   digestAffectedClosure,
@@ -316,7 +316,7 @@ test('native edit blocked mid-coordinator: composed waits, then native commits a
   sharedDb = null;
 });
 
-function buildAppWithDescriptor(db, descriptor) {
+function _buildAppWithDescriptor(db, descriptor) {
   void db;
   void descriptor;
   throw new Error('buildAppWithDescriptor is superseded by the single-app reverse-order race');

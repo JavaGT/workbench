@@ -1,5 +1,5 @@
 import 'fake-indexeddb/auto';
-import { describe, it, before, after } from 'node:test';
+import { describe, it, before as _before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { openLocalLog } from '../public/workbench-local-log.mjs';
 

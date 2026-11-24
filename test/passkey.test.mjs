@@ -376,7 +376,7 @@ test('verifyAuthentication accepts a valid assertion', () => {
 });
 
 test('verifyAuthentication rejects bad signature', () => {
-  const { keypair, spki } = generateTestKeypair();
+  const { keypair: _keypair, spki } = generateTestKeypair();
   const challenge = generateChallenge();
   const rp = rpConfig({});
   const credentialId = generateChallenge(32);
@@ -540,7 +540,7 @@ test('passkey register + authenticate + list + delete round-trip', async (t) => 
   const { challenge: regChallenge } = await regChallengeRes.json();
 
   // 3. Build synthetic registration credential
-  const { keypair, spki } = generateTestKeypair();
+  const { keypair, spki: _spki } = generateTestKeypair();
   const rp = rpConfig({});
   const credentialId = generateChallenge(32);
   const cosePk = cosePublicKeyFromKeyPair(keypair);
@@ -869,7 +869,7 @@ test('authenticate with a wrong credential ID fails', async (t) => {
 
   // Try to authenticate with a wrong credential ID
   const authChRes = await fetch(`${origin}/auth/passkey/challenge`);
-  const { challenge: authCh } = await authChRes.json();
+  const { challenge: _authCh } = await authChRes.json();
 
   const res = await fetch(`${origin}/auth/passkey/authenticate`, {
     method: 'POST',

@@ -13,8 +13,8 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 
-import workbench, { entity, inherit, ref, text, grant, read, subscribe, write, scope, everyone, snapshot, one } from '../build/index.mjs';
-const { object, select, include, keyed, many, orderBy } = snapshot;
+import workbench, { entity, inherit, ref, text, grant, read, subscribe, write as _write, scope, everyone, snapshot, one } from '../build/index.mjs';
+const { object, select, include: _include, keyed, many, orderBy } = snapshot;
 import { executeDDL } from '../build/internal.mjs';
 import { projectCompositePatch } from '../build/composite-patch-projector.mjs';
 import { compositeFragmentAddressKey, compilePatchPlans } from '../build/composite-patch-plan.mjs';
@@ -617,7 +617,7 @@ test('GATE: stale FIRST-level ledger address fails closed against the anchor (fi
   // no post-state row, so addressing falls back to the ledger; at chain
   // length 1 the ANCHOR link is the only link, and pre-fix it was never
   // validated (the spine loop started at level > 0).
-  const { app, db, delivery, projectSnapshotDeclaration, compiledDeclaration, projectPlan } = await setup(t);
+  const { app, db, delivery, projectSnapshotDeclaration: _projectSnapshotDeclaration, compiledDeclaration, projectPlan } = await setup(t);
   await dispatchOk(app, { actionId: 'p0', type: 'project.write', scope: 'Project:p1', payload: { exists: false, row: { id: 'p1', name: 'Research' } }, principal: alice });
   await dispatchOk(app, { actionId: 'c0a', type: 'code.write', scope: 'Project:p1', payload: { exists: false, projectId: 'p1', row: { id: 'codeA', projectId: 'p1', label: 'Identity', colour: '#334155', position: '1' } }, principal: alice });
   await dispatchOk(app, { actionId: 'e0', type: 'entry.write', scope: 'Project:p1', payload: { exists: false, projectId: 'p1', row: { id: 'e1', codeId: 'codeA', projectId: 'p1', term: 'gloss' } }, principal: alice });

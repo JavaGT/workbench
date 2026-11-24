@@ -10,7 +10,7 @@
 // default-on route gate then denies it. This is the SAME admission path as the
 // `principalOf` default it replaces, never a second auth path.
 
-import { text, ref, scope, grant, deny, read, write, subscribe } from '../build/index.mjs';
+import { text, ref, scope, grant, deny as _deny, read, write, subscribe } from '../build/index.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';

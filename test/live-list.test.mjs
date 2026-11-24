@@ -311,7 +311,7 @@ describe('LiveList', () => {
     const channel = makeFakeChannel();
     const ack = deferred();
     channel.subscribe = (entity, id, options, onEvent) => {
-      const key = `${entity}\0${String(id)}`;
+      const _key = `${entity}\0${String(id)}`;
       channel._setAck({ currentSeq: 1 });
       // Register before holding the acknowledgement so the operation queues.
       const original = makeFakeChannel();

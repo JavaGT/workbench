@@ -12,7 +12,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import http from 'node:http';
+import _http from 'node:http';
 import { createHash } from 'node:crypto';
 
 import { upgradeWebSocket, FrameSender, FrameParser } from '../build/websocket.mjs';

@@ -20,7 +20,7 @@
 //   - Effects = `{ mutate, with }`; in-transaction effect-principal reentrancy.
 //   - NO DEFAULT GRANT: entity with no grant = LOAD-TIME ERROR.
 
-import { entity, text, number, date, ref, owner, map, boolean, blob, raster, projected, ephemeral, grant, deny, read, write, subscribe, admin, anyOf, scope, never, inherit, router } from 'workbench';
+import { entity, text, number, date, ref, owner, map, boolean, blob as _blob, raster, projected, ephemeral, grant, deny, read, write, subscribe, admin, anyOf, scope, never as _never, inherit, router } from 'workbench';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CAPABILITY BUNDLES — typed, imported, never strings.
@@ -199,7 +199,7 @@ function layerRoutes() {
 
   // Reorder endpoint — expressible via list() with ordered:true (DEFERRED).
   r.post('/:layerId/move', async (req, res) => {
-    const { newIndex } = req.body;
+    const { newIndex: _newIndex } = req.body;
     res.json({ moved: true });
   });
 
@@ -210,6 +210,6 @@ function layerRoutes() {
 // Stub compositor — would use sharp/canvas in a real implementation.
 // ═══════════════════════════════════════════════════════════════════════════════
 
-async function compositeToPng(layers, width, height) {
+async function compositeToPng(_layers, _width, _height) {
   return Buffer.alloc(0);
 }

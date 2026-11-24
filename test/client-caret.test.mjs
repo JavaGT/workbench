@@ -137,7 +137,7 @@ test('scope carets interest and callback are retained and resent on reconnect', 
 // --- exact outbound grammar ---
 
 test('updateCaret sends exact caret.update message', () => {
-  const { channel, sockets } = harness();
+  const { channel, sockets: _sockets } = harness();
   const result = channel.updateCaret({ entity: 'Doc', id: 'a', field: 'body', offset: 5 });
   assert.equal(result, false); // offline
 });

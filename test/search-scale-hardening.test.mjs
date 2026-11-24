@@ -768,7 +768,7 @@ describe('disk-backed bounded-page vector search (#288)', () => {
     assert.deepEqual(scoped.result.hits.map((h) => h.id), ['own-1', 'own-2']);
   });
 
-  test('restart serves bounded pages from BLOBs without rebuild or slab hydration', async (t) => {
+  test('restart serves bounded pages from BLOBs without rebuild or slab hydration', async (_t) => {
     const root = mkdtempSync(join(tmpdir(), 'wb-vector-bounded-'));
     const dbPath = join(root, 'vectors.db');
     try {

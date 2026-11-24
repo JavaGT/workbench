@@ -131,7 +131,7 @@ function openRawWS(port, userId) {
   });
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const _sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const principalOf = (req) => {
   const u = req.headers?.['x-test-user'];
   return u ? { type: 'user', id: u } : { type: 'anonymous', id: null };

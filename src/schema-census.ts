@@ -755,6 +755,12 @@ export function classifyObservedObject(
     const entry = census.get(key);
     if (entry !== undefined) return { kind: 'owned', owner: entry };
   }
+  if (observed.type === 'virtual-table') {
+    const external = census.get(censusKey('table', observed.name));
+    if (external !== undefined && external.kind === 'schema') {
+      return { kind: 'owned', owner: external };
+    }
+  }
   return { kind: 'undeclared', object: observed };
 }
 

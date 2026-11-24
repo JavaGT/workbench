@@ -377,3 +377,105 @@ test('reactive runtime members match their client.d.ts declarations', () => {
     assert.equal(typeof client[name], 'function', `${name} missing at runtime`);
   }
 });
+
+// --- Wave 8 client-hardening shape parity -----------------------------------
+//
+// New runtime surfaces are only useful if TypeScript authors see the same
+// shape. Pin both directions: the LiveChannel status getter, the binding
+// lifecycle options, and the foldability predicate must exist at runtime AND
+// in the declaration.
+
+test('LiveChannel.status getter and ConnectionStatus vocabulary match', () => {
+  const dts = readFileSync(dtsPath, 'utf8');
+  const channelDecl = dts.slice(dts.indexOf('export class LiveChannel'), dts.indexOf('export interface LiveChannelOptions'));
+  assert.match(channelDecl, /readonly status:\s*ConnectionStatus/, 'LiveChannel.status missing from client.d.ts');
+  const connectionStatus = dts.slice(dts.indexOf('export type ConnectionStatus'), dts.indexOf('export type OnEvent'));
+  for (const status of ['connected', 'connecting', 'disconnected', 'reconnecting']) {
+    assert.match(connectionStatus, new RegExp(`'${status}'`), `ConnectionStatus missing '${status}'`);
+  }
+  const channelProto = client.LiveChannel.prototype;
+  const descriptor = Object.getOwnPropertyDescriptor(channelProto, 'status')
+    ?? Object.getOwnPropertyDescriptor(Object.getPrototypeOf(channelProto), 'status');
+  assert.equal(descriptor?.get?.constructor, Function, 'LiveChannel.status must be a getter');
+  assert.equal(descriptor?.set, undefined, 'LiveChannel.status must be read-only');
+});
+
+test('LiveList.canFold and status getter are declared and implemented', () => {
+  const dts = readFileSync(dtsPath, 'utf8');
+  const listDecl = dts.slice(dts.indexOf('export class LiveList'), dts.indexOf('export interface LiveListConfig'));
+  assert.match(listDecl, /get status\(\):\s*LiveListStatus/, 'LiveList.status getter missing from client.d.ts');
+  assert.match(listDecl, /canFold\(type:\s*string\):\s*boolean/, 'LiveList.canFold missing from client.d.ts');
+  assert.equal(typeof client.LiveList.prototype.canFold, 'function', 'LiveList.canFold missing at runtime');
+  for (const [type, expected] of [
+    ['Doc.created', true], ['Doc.updated', true], ['Doc.removed', true],
+    ['Doc.body.applied', true], ['Doc.items.inserted', true], ['Doc.items.moved', true],
+    ['Doc.items.reordered', true], ['Doc.log.appended', true], ['Doc.members.added', true],
+    ['Doc.members.changed', true], ['Doc.members.removed', true],
+    ['Doc.unknown', false], ['Doc.body.unhandled', false], ['Doc', false], ['', false],
+  ]) {
+    const list = Object.create(client.LiveList.prototype);
+    assert.equal(list.canFold(type), expected, `canFold(${JSON.stringify(type)}) drifted`);
+  }
+});
+
+test('binding option and return shapes match between runtime and client.d.ts', () => {
+  const dts = readFileSync(dtsPath, 'utf8');
+  assert.match(dts, /export interface BindingLifecycleOptions \{\s*signal\?: AbortSignal;\s*\}/,
+    'bindings must declare the optional AbortSignal lifecycle option');
+  for (const name of ['BindFieldOptions', 'BindListOptions', 'BindActionOptions']) {
+    assert.match(dts, new RegExp(`export interface ${name} extends BindingLifecycleOptions`),
+      `${name} must accept the shared lifecycle options`);
+  }
+  const connectionDecl = dts.slice(dts.indexOf('export function bindConnection'), dts.indexOf('// ---', dts.indexOf('export function bindConnection')));
+  assert.match(connectionDecl, /options\?:\s*BindingLifecycleOptions/,
+    'bindConnection must accept an optional AbortSignal lifecycle option');
+
+  const store = {
+    subscribe: () => ({ state: null, status: 'idle' }),
+    overlayFor: () => null,
+    overlayStatusFor: () => null,
+    dispatch: async () => ({ ok: true }),
+    onRender: () => () => {},
+    onChange: () => () => {},
+    onStatusChange: () => () => {},
+  };
+  for (const [name, args] of [
+    ['bindField', [store, { id: '1', field: 'title' }]],
+    ['bindList', [store, { id: '1' }]],
+    ['bindAction', [store, { id: '1', action: 'Doc.update' }]],
+  ]) {
+    const handle = client[name](...args);
+    assert.equal(typeof handle.get, 'function', `${name}.get missing at runtime`);
+    assert.equal(typeof handle.subscribe, 'function', `${name}.subscribe missing at runtime`);
+    assert.equal(typeof handle.destroy, 'function', `${name}.destroy missing at runtime`);
+    assert.deepEqual(Object.keys(handle.get()), ['value', 'provenance', 'status'],
+      `${name} projection shape drifted`);
+    handle.destroy();
+  }
+  const connection = client.bindConnection({ onConnectionChange: () => () => {}, status: 'connected' });
+  assert.deepEqual(connection.get(), { value: 'connected', provenance: 'confirmed', status: 'connected' },
+    'bindConnection must immediately reflect an already-connected channel');
+  connection.destroy();
+});
+
+test('ScopeLiveStore.status matches its client.d.ts declaration', async () => {
+  const dts = readFileSync(dtsPath, 'utf8');
+  const storeDecl = dts.slice(dts.indexOf('export interface ScopeLiveStore<'), dts.indexOf('export function createScopeLiveStore'));
+  assert.match(storeDecl, /readonly status:\s*ScopeLiveStoreStatus/, 'ScopeLiveStore.status missing from client.d.ts');
+  const channel = {
+    subscribeScope: async () => ({ currentSeq: 0 }),
+    unsubscribeScope: async () => {},
+    close() {},
+  };
+  const store = client.createScopeLiveStore({
+    baseUrl: 'https://example.test', scope: 'Contract:p1', channel,
+    fetchImpl: async () => ({ ok: true, json: async () => ({ snapshot: { id: 'n1' }, seq: 0 }) }),
+    validateSnapshot: (snapshot) => snapshot,
+    fold: (snapshot) => snapshot,
+    sendAction: async () => ({ ok: true }),
+  });
+  await store.ready;
+  assert.equal(store.status, 'idle');
+  store.close();
+  assert.equal(store.status, 'closed');
+});

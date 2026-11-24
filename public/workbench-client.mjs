@@ -795,9 +795,24 @@ class LiveSyncSession {
     this._reconnectAttempt = 0;
   }
 
+  /**
+   * Current connection status as one stable vocabulary:
+   * 'disconnected' | 'connecting' | 'connected' | 'reconnecting'.
+   *
+   * Derived from the live state machine rather than stored separately, so a
+   * consumer that binds an already-connected channel sees 'connected' on its
+   * first read instead of waiting for a future transition callback.
+   */
+  get status() {
+    if (this._state === 'online') return 'connected';
+    if (this._state === 'connecting') return 'connecting';
+    if (this._state === 'backoff' || this._reconnectTimer) return 'reconnecting';
+    return 'disconnected';
+  }
+
   // Public connection-state emitter. Registers a callback that receives the
-  // connection status ('connected' | 'disconnected' | 'reconnecting') on every
-  // transition. Returns an unsubscribe function.
+  // connection status ('connected' | 'connecting' | 'disconnected' |
+  // 'reconnecting') on every transition. Returns an unsubscribe function.
   onConnectionChange(cb) {
     this._connCallbacks.add(cb);
     return () => { this._connCallbacks.delete(cb); };
@@ -814,6 +829,20 @@ class LiveSyncSession {
 // do not become package API, while existing LiveChannel consumers retain the
 // small subscribe/unsubscribe/close surface.
 export class LiveChannel extends LiveSyncSession {}
+
+// The one foldability vocabulary for LiveList. `_applyEvent` dispatches CRUD
+// verbs and field operations through these exact cases; a type outside them
+// cannot be folded and must never silently advance the replay cursor. Keeping
+// the sets beside the reducer makes the predicate derive from what is actually
+// handled instead of from a hand-maintained guess about type shapes.
+const HANDLED_CRUD_VERBS = new Set(['created', 'updated', 'removed']);
+const HANDLED_FIELD_OPS = new Set([
+  'applied', 'inserted', 'moved', 'reordered', 'appended', 'added', 'changed', 'removed',
+]);
+
+// Bounded resync escalation: at most one forced snapshot per unresolved gap,
+// then capped backoff instead of an unbounded microtask/fetch loop.
+const MAX_RESYNC_ATTEMPTS = 8;
 
 // LiveList — tracks ONE document's live state: a single (entity, id) row,
 // including its sub-collection fields. Bootstraps from a REST snapshot, then
@@ -863,6 +892,11 @@ export class LiveList {
     this._maxResyncBackoff = maxResyncBackoff;
     this._resyncAttempt = 0;
     this._resyncRetryTimer = null;
+    // Gap escalation state. A snapshot is forced at most once per unresolved
+    // gap; if it cannot move the cursor past the buffered gap the list goes
+    // stale and retries with capped backoff rather than looping synchronously.
+    this._snapshotEscalated = false;
+    this._gapFloor = null;
     this._snapshotRequiredSeq = 0;
     this._snapshotRecovery = false;
     this._forceSnapshotRequested = false;
@@ -1198,7 +1232,18 @@ export class LiveList {
       // after the resync fills the gap, the queue drain will re-process it
       // through _ingest when the cursor is caught up.
       this._bufferEnvelope({ seq: normalized.seq, seqSpan, event, delta, reducers });
+      try { this._noteGapFloor(normalizeSeqSpan(seqSpan ?? normalized.seq)[1]); } catch { /* scalar */ }
       this._resync().catch(() => {});
+      return;
+    }
+    if (!this.canFold(event?.type)) {
+      // Fail closed: an unhandled type has no reducer projection. Advancing
+      // the cursor here would record a fold that never happened. Keep the
+      // envelope buffered and force an authoritative snapshot instead.
+      this._bufferEnvelope({ seq: normalized.seq, seqSpan, event, delta, reducers });
+      try { this._noteGapFloor(normalizeSeqSpan(seqSpan ?? normalized.seq)[1]); } catch { /* scalar */ }
+      this._forceSnapshotRequested = true;
+      this._resync(true).catch(() => {});
       return;
     }
     // next — apply and advance cursor to span hi (shared Replay decision)
@@ -1228,6 +1273,7 @@ export class LiveList {
     if (this._resyncing) return; // prevent re-entrancy
     this._resyncing = true;
     this._setStatus('resyncing');
+    const startCursor = this._cursor;
     const snapshotRequested = forceSnapshot || this._forceSnapshotRequested;
     this._forceSnapshotRequested = false;
     this._snapshotRecovery = snapshotRequested;
@@ -1342,17 +1388,46 @@ export class LiveList {
       this._scheduleResync();
       return;
     }
+
+    if (this._hasUnresolvedGap()) {
+      // An events-since answer with no rows (or a snapshot that still sits
+      // below the gap) is NOT progress. Escalate to ONE forced snapshot, then
+      // fail closed with capped backoff instead of re-issuing resync from the
+      // queue drain forever.
+      const progressed = this._cursor > startCursor;
+      if (progressed && !snapshotRequested && this._snapshotEscalated) this._snapshotEscalated = false;
+      if (!this._snapshotEscalated) {
+        this._snapshotEscalated = true;
+        await this._resync(true);
+        return;
+      }
+      this._setStatus('stale');
+      this._scheduleResync();
+      return;
+    }
+
+    this._snapshotEscalated = false;
     if (this._forceSnapshotRequested) {
       await this._resync(true);
       return;
     }
     this._resyncAttempt = 0;
 
-    // Drain any envelopes that arrived during the resync.
+    // Drain any envelopes that arrived during the resync. Unfoldable types
+    // stay buffered: they are fail-closed blockers, never silent cursor jumps.
     const queue = this._queue;
     this._queue = [];
     for (const envelope of queue) {
-      this._ingest(this._normalizeLive(envelope));
+      const normalized = this._normalizeLive(envelope);
+      if (!this.canFold(normalized.event?.type)) {
+        let hi = normalized.seq;
+        try { hi = normalizeSeqSpan(normalized.seqSpan ?? normalized.seq)[1]; } catch { /* keep scalar */ }
+        if (this._cursor >= hi) continue; // the authoritative snapshot superseded it
+        this._queue.push(envelope);
+        this._noteGapFloor(hi);
+        continue;
+      }
+      this._ingest(normalized);
     }
     await this._textReducerReady;
 
@@ -1361,8 +1436,46 @@ export class LiveList {
     this._setStatus(this._removed ? 'removed' : 'idle');
   }
 
+  /** Remember the lowest seq still blocked by a gap or an unfoldable event. */
+  _noteGapFloor(seq) {
+    if (!Number.isFinite(seq)) return;
+    this._gapFloor = this._gapFloor == null ? seq : Math.min(this._gapFloor, seq);
+  }
+
+  /**
+   * A resync made no useful progress while buffered events still sit ahead of
+   * the cursor. Buffered unfoldable types count as blockers too, so an
+   * unhandled event type can never be drained into a silent cursor advance.
+   */
+  _hasUnresolvedGap() {
+    let floor = null;
+    for (const envelope of this._queue) {
+      let span;
+      try { span = normalizeSeqSpan(envelope.seqSpan ?? envelope.seq); } catch { continue; }
+      const decision = decideReplay(this._cursor, span);
+      if (decision.kind === 'gap' || !this.canFold(envelope?.event?.type)) {
+        floor = floor == null ? span[1] : Math.min(floor, span[1]);
+      }
+    }
+    // A forced snapshot clears the queue; the remembered floor still tells us
+    // whether that snapshot actually covered the gap we escalated for. A
+    // non-empty queue with no blocker means the gap was filled by replay, so
+    // the floor is obsolete and must not force a needless snapshot.
+    if (floor === null && this._queue.length === 0) floor = this._gapFloor;
+    if (floor === null || this._cursor >= floor) {
+      this._gapFloor = null;
+      return false;
+    }
+    this._gapFloor = floor;
+    return true;
+  }
+
   _scheduleResync() {
     if (this._closed || this._resyncRetryTimer) return;
+    if (this._resyncAttempt >= MAX_RESYNC_ATTEMPTS) {
+      this._setStatus('stale');
+      return;
+    }
     const delay = backoffDelay(this._resyncAttempt, this._resyncBackoffBase, this._maxResyncBackoff);
     this._resyncAttempt++;
     this._resyncRetryTimer = setTimeout(() => {
@@ -1382,18 +1495,23 @@ export class LiveList {
     let expected = this._cursor + 1;
     for (const row of rows) {
       if (row.seq !== expected) return false;
-      if (!this._isKnownEventType(row.type)) return false;
+      if (!this.canFold(row.type)) return false;
       expected += 1;
     }
     return true;
   }
 
-  _isKnownEventType(type) {
-    if (typeof type !== 'string' || type.length === 0) return false;
+  /** True only for a type the one `_applyEvent` reducer actually handles. */
+  canFold(type) {
+    if (typeof type !== 'string') return false;
     const parts = type.split('.');
-    if (parts.length === 2) return parts[1] === 'created' || parts[1] === 'updated' || parts[1] === 'removed';
-    return parts.length === 3 && parts.every((part) => part.length > 0);
+    if (parts.some((part) => part.length === 0)) return false;
+    if (parts.length === 2) return HANDLED_CRUD_VERBS.has(parts[1]);
+    if (parts.length === 3) return HANDLED_FIELD_OPS.has(parts[2]);
+    return false;
   }
+
+  _isKnownEventType(type) { return this.canFold(type); }
 
   /**
    * Kind-aware reducer. Parse event.type by splitting on '.':
@@ -1401,9 +1519,8 @@ export class LiveList {
    *   3-part = entity.field.op  (field-specific: ordered, map, log ops)
    */
   _applyEvent(event, delta) {
-    if (!event || !event.type) return;
+    if (!this.canFold(event?.type)) return;
     const parts = event.type.split('.');
-    if (parts.length < 2) return;
 
     if (parts.length === 2) {
       this._applyCrud(parts[1], event, delta);
@@ -2033,13 +2150,30 @@ export function createLiveStore({ baseUrl, name, path, channel, fetchImpl, repli
 
   // --- Overlay helpers ---
 
+  function _sameRow(left, right) {
+    if (left === right) return true;
+    if (left == null || right == null) return false;
+    try {
+      return JSON.stringify(left) === JSON.stringify(right);
+    } catch {
+      return false;
+    }
+  }
+
   function _clearConfirmedOverlays(id) {
     const list = _listCache.get(id);
     if (!list) return;
 
     for (const [opId, entry] of _overlay) {
       if (entry.id !== id || entry.status !== 'confirmed') continue;
-      if (entry.confirmedSeq != null && list.cursor >= entry.confirmedSeq) {
+      if (entry.confirmedSeq != null) {
+        // Commit disclosed its seq: the authoritative fold has caught up.
+        if (list.cursor >= entry.confirmedSeq) _overlay.delete(opId);
+      } else if (list.cursor > (entry.confirmedAtCursor ?? 0) || _sameRow(list.state, entry.row)) {
+        // No x-workbench-seq header. Use authoritative fold evidence instead:
+        // a later seq landed, or the row already matches the committed value.
+        // Without this branch the overlay would never be released and
+        // bindField/bindList would disagree about provenance forever.
         _overlay.delete(opId);
       }
     }
@@ -2352,6 +2486,7 @@ export function createLiveStore({ baseUrl, name, path, channel, fetchImpl, repli
       entry.id = first.row?.id ?? entry.id;
       entry.row = first.row ?? null;
       entry.confirmedSeq = first.seq ?? null;
+      entry.confirmedAtCursor = _listCache.get(entry.id)?.cursor ?? null;
       if (kind === 'create') {
         _overlay.delete(opId);
       } else {
@@ -2404,6 +2539,7 @@ export function createLiveStore({ baseUrl, name, path, channel, fetchImpl, repli
         entry.id = final.row?.id ?? entry.id;
         entry.row = final.row ?? null;
         entry.confirmedSeq = final.seq ?? null;
+        entry.confirmedAtCursor = _listCache.get(entry.id)?.cursor ?? null;
         if (kind === 'create') {
           _overlay.delete(opId);
         } else {
@@ -5548,6 +5684,14 @@ export function createScopeLiveStore({
   let resyncPromise = null;
   let resyncAttempt = 0;
   let resyncRetryTimer = null;
+  // Gap escalation mirrors LiveList: one forced snapshot per unresolved gap,
+  // then a capped backoff. `stalled` stops the queue drain from re-issuing
+  // replay requests in a tight loop when the server cannot close the gap.
+  let snapshotEscalated = false;
+  let gapFloor = null;
+  let stalled = false;
+  let draining = false;
+  let storeStatus = 'idle';
   const queued = [];
   const listeners = new Set();
   const { operations, makeOperation, shouldReconcile, count } = createOpLifecycle();
@@ -5568,6 +5712,34 @@ export function createScopeLiveStore({
     for (const listener of listeners) {
       try { listener(visibleSnapshot); } catch { /* isolate consumers */ }
     }
+  }
+
+  function setStoreStatus(next) {
+    if (closed || storeStatus === next) return;
+    storeStatus = next;
+  }
+
+  function noteGapFloor(seq) {
+    if (!Number.isFinite(seq)) return;
+    gapFloor = gapFloor == null ? seq : Math.min(gapFloor, seq);
+  }
+
+  /** True when buffered events still sit behind an unresolved replay gap. */
+  function hasUnresolvedGap() {
+    let floor = null;
+    for (const event of queued) {
+      let span;
+      try { span = normalizeSeqSpan(event.seqSpan ?? event.seq); } catch { continue; }
+      const decision = decideReplay(cursor, span);
+      if (decision.kind === 'gap') floor = floor == null ? span[1] : Math.min(floor, span[1]);
+    }
+    if (floor === null && queued.length === 0) floor = gapFloor;
+    if (floor === null || cursor >= floor) {
+      gapFloor = null;
+      return false;
+    }
+    gapFloor = floor;
+    return true;
   }
 
   async function decodeJson(response) {
@@ -5618,7 +5790,8 @@ export function createScopeLiveStore({
     if (decision.kind === 'duplicate') return { status: 'duplicate' };
     if (decision.kind === 'gap') {
       queued.push(event);
-      resync().catch(() => {});
+      try { noteGapFloor(normalizeSeqSpan(event.seqSpan ?? event.seq)[1]); } catch { /* scalar */ }
+      if (!stalled && !draining) resync().catch(() => {});
       return { status: 'gap', expectedSeq: cursor + 1, receivedSeq: event.seqSpan?.[0] ?? event.seq };
     }
 
@@ -5646,42 +5819,95 @@ export function createScopeLiveStore({
     else ingest(event);
   }
 
-  async function resync() {
+  /** Drain buffered events without re-entering replay for a still-open gap. */
+  function drainQueued() {
+    const held = queued.splice(0);
+    draining = true;
+    let gapped = false;
+    try {
+      for (let index = 0; index < held.length; index += 1) {
+        if (stalled) {
+          queued.push(held[index]);
+          continue;
+        }
+        const result = ingest(held[index]);
+        if (result.status === 'gap') {
+          // `ingest` already re-queued this event; retain the untouched tail.
+          for (let rest = index + 1; rest < held.length; rest += 1) queued.push(held[rest]);
+          gapped = true;
+          break;
+        }
+      }
+    } finally {
+      draining = false;
+    }
+    if (gapped && !stalled) resync().catch(() => {});
+  }
+
+  async function resync(forceSnapshot = false) {
     if (closed) return;
     if (resyncPromise) return resyncPromise;
+    setStoreStatus('resyncing');
     resyncPromise = (async () => {
-      const response = await resolvedFetch(replayEndpoint(cursor), { credentials: 'include' });
-      const body = await decodeJson(response);
-      if (body.resync === 'stale') {
+      const startCursor = cursor;
+      if (forceSnapshot) {
         await loadSnapshot();
       } else {
-        const rows = (body.events ?? []).filter((row) => row.seq > cursor);
-        let expected = cursor + 1;
-        for (const row of rows) {
-          if (row.scope !== undefined && row.scope !== scope) throw new Error('replay event belongs to another scope');
-          if (row.seq !== expected) throw new Error('replay batch is not contiguous');
-          expected += 1;
+        const response = await resolvedFetch(replayEndpoint(cursor), { credentials: 'include' });
+        const body = await decodeJson(response);
+        if (body.resync === 'stale') {
+          await loadSnapshot();
+        } else {
+          const rows = (body.events ?? []).filter((row) => row.seq > cursor);
+          let expected = cursor + 1;
+          for (const row of rows) {
+            if (row.scope !== undefined && row.scope !== scope) throw new Error('replay event belongs to another scope');
+            if (row.seq !== expected) throw new Error('replay batch is not contiguous');
+            expected += 1;
+          }
+          for (const row of rows) ingest(normalizeReplay(row));
         }
-        for (const row of rows) ingest(normalizeReplay(row));
+      }
+
+      if (hasUnresolvedGap()) {
+        const progressed = cursor > startCursor;
+        if (progressed && !forceSnapshot && snapshotEscalated) snapshotEscalated = false;
+        if (!snapshotEscalated) {
+          // One escalation to an authoritative snapshot for this gap.
+          snapshotEscalated = true;
+          await loadSnapshot();
+        } else {
+          // Snapshot also failed to pass the gap: fail closed and back off.
+          stalled = true;
+          setStoreStatus('stale');
+        }
+      } else {
+        snapshotEscalated = false;
+        stalled = false;
       }
     })();
     let succeeded = false;
     try {
       await resyncPromise;
       succeeded = true;
-      resyncAttempt = 0;
+      if (!stalled) resyncAttempt = 0;
     } catch {
       scheduleResync();
     } finally {
       resyncPromise = null;
     }
-    if (!succeeded) return;
-    const held = queued.splice(0);
-    for (const event of held) ingest(event);
+    if (!succeeded || stalled) return;
+    if (!closed && !hasUnresolvedGap()) setStoreStatus('idle');
+    drainQueued();
   }
 
   function scheduleResync() {
     if (closed || resyncRetryTimer) return;
+    if (resyncAttempt >= MAX_RESYNC_ATTEMPTS) {
+      stalled = true;
+      setStoreStatus('stale');
+      return;
+    }
     const delay = backoffDelay(resyncAttempt, resyncBackoffBase, maxResyncBackoff);
     resyncAttempt += 1;
     resyncRetryTimer = setTimeout(() => {
@@ -5706,8 +5932,8 @@ export function createScopeLiveStore({
     }, onLive);
     if (ack.currentSeq > cursor) await resync();
     ready = true;
-    const held = queued.splice(0);
-    for (const event of held) ingest(event);
+    drainQueued();
+    if (!closed && !stalled) setStoreStatus('idle');
     publish();
   }
 
@@ -5748,6 +5974,7 @@ export function createScopeLiveStore({
     get snapshot() { return visibleSnapshot; },
     get cursor() { return cursor; },
     get ready() { return readyPromise; },
+    get status() { return storeStatus; },
     dispatch,
     operations() { return [...operations.values()]; },
     pendingCount() { return count('pending'); },
@@ -5766,6 +5993,7 @@ export function createScopeLiveStore({
     close() {
       if (closed) return;
       closed = true;
+      storeStatus = 'closed';
       if (resyncRetryTimer) clearTimeout(resyncRetryTimer);
       void resolvedChannel.unsubscribeScope(scope);
       resolvedChannel.close();

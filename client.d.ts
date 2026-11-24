@@ -55,6 +55,8 @@ export class LiveChannel {
   updateCaret(input: CaretUpdate): boolean;
   clearCaret(input: CaretClear): boolean;
   close(): void;
+  /** Current connection status; reflects an already-connected channel on first read. */
+  readonly status: ConnectionStatus;
   onConnectionChange(cb: (status: ConnectionStatus) => void): () => void;
 }
 
@@ -97,7 +99,7 @@ export interface ScopeSubscribeOptions {
   onCheckpoint?: (checkpoint: SubscriptionCheckpoint) => void;
 }
 
-export type ConnectionStatus = 'connected' | 'disconnected' | 'reconnecting';
+export type ConnectionStatus = 'connected' | 'connecting' | 'disconnected' | 'reconnecting';
 
 export type OnEvent = (envelope: WsEnvelope) => void;
 export type OnCaret = (frame: AnnotatedTextCaretFrame) => void;
@@ -264,8 +266,11 @@ export class LiveList<Row extends Record<string, unknown> = Record<string, unkno
 
   get state(): Row | null;
   get cursor(): number;
+  get status(): LiveListStatus;
   get ready(): Promise<void>;
 
+  /** True only for event types the one `_applyEvent` reducer handles. */
+  canFold(type: string): boolean;
   /** The durable annotated-text reducer checkpoint for a field, or null. */
   textState(field: string): unknown;
   /** Resolves when every observed text reducer transaction has committed. */
@@ -538,7 +543,12 @@ export interface ReactiveActionHandle<Value = unknown> extends ReactiveHandle<Va
   dispatch(overridePayload?: Record<string, unknown>): Promise<DispatchResult>;
 }
 
-export interface BindActionOptions {
+/** Owner-aware teardown: aborting the signal destroys the handle (Solid onCleanup). */
+export interface BindingLifecycleOptions {
+  signal?: AbortSignal;
+}
+
+export interface BindActionOptions extends BindingLifecycleOptions {
   /** Row id whose optimistic overlay should be projected; omit for global actions. */
   id?: string | number;
   /** Fully-qualified action type, e.g. `Doc.update`. */
@@ -546,12 +556,12 @@ export interface BindActionOptions {
   payload?: Record<string, unknown>;
 }
 
-export interface BindFieldOptions {
+export interface BindFieldOptions extends BindingLifecycleOptions {
   id: string | number;
   field: string;
 }
 
-export interface BindListOptions {
+export interface BindListOptions extends BindingLifecycleOptions {
   /** Bind one row when present; otherwise bind all rows observed for the store. */
   id?: string | number;
   /** Project one sub-collection field instead of the whole row. */
@@ -573,7 +583,10 @@ export function bindList<Row extends Record<string, unknown> = Record<string, un
   options?: BindListOptions,
 ): ReactiveHandle<Row | readonly unknown[] | unknown>;
 
-export function bindConnection(channel: LiveChannel): ReactiveHandle<ConnectionStatus>;
+export function bindConnection(
+  channel: LiveChannel,
+  options?: BindingLifecycleOptions,
+): ReactiveHandle<ConnectionStatus>;
 
 // ---------------------------------------------------------------------------
 // createLiveDeliverySession — recipient-envelope delivery and recovery
@@ -993,9 +1006,13 @@ export interface ScopeLiveStoreConfig<Snapshot> {
   maxResyncBackoff?: number;
 }
 
+/** Delivery lifecycle of a composite scope store's replay engine. */
+export type ScopeLiveStoreStatus = 'idle' | 'resyncing' | 'stale' | 'closed';
+
 export interface ScopeLiveStore<Snapshot> {
   readonly snapshot: Snapshot | null;
   readonly cursor: number;
+  readonly status: ScopeLiveStoreStatus;
   readonly ready: Promise<void>;
   dispatch(type: string, payload: unknown): Promise<ScopeDispatchResult>;
   operations(): ScopeOperation[];

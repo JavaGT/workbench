@@ -1,0 +1,19 @@
+{
+  "//": "Staged browser typechecking. checkJs is enabled only for zero-import browser leaves that currently pass with 0 errors; public/workbench-client.mjs stays out of scope until it is clean.",
+  "compilerOptions": {
+    "target": "ES2024",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2024", "DOM", "DOM.Iterable"],
+    "allowJs": true,
+    "checkJs": true,
+    "noImplicitAny": false,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "types": []
+  },
+  "include": [
+    "public/workbench-ui-bindings.mjs"
+  ],
+  "exclude": ["node_modules", "build", "src", "test", "projects"]
+}

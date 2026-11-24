@@ -11,31 +11,48 @@
 //   onCleanup(() => handle.destroy());
 // — without keeping a second copy of optimistic state. The store remains the
 // single write and reconciliation authority; these are read-only projections.
+// An owner may instead pass `{ signal }` (from Solid's `onCleanup`) to any
+// binding; aborting the signal destroys the handle.
 
 const DEFAULT_CONNECTION_STATUS = 'disconnected';
 
 /**
  * Per-store index of ids that bindings have observed. `bindList(store)` with no
  * id projects every row a UI actually subscribed to; without this registry it
- * would have to reach into the store's private list cache.
+ * would have to reach into the store's private list cache. Ids are ref-counted
+ * so destroying one binding cannot evict an id another binding still uses.
  */
 const storeIndex = new WeakMap();
 
 function indexFor(store) {
   let index = storeIndex.get(store);
   if (!index) {
-    index = { ids: [], watchers: new Set() };
+    index = { ids: [], counts: new Map(), watchers: new Set() };
     storeIndex.set(store, index);
   }
   return index;
 }
 
 function rememberId(store, id) {
-  if (id === undefined || id === null) return;
+  if (id === undefined || id === null) return () => {};
   const index = indexFor(store);
-  if (index.ids.some((known) => String(known) === String(id))) return;
-  index.ids.push(id);
-  for (const watcher of index.watchers) watcher();
+  const key = String(id);
+  const prior = index.counts.get(key) ?? 0;
+  index.counts.set(key, prior + 1);
+  if (prior === 0) {
+    index.ids.push(id);
+    for (const watcher of index.watchers) watcher();
+  }
+  return () => {
+    const count = index.counts.get(key) ?? 0;
+    if (count <= 1) {
+      index.counts.delete(key);
+      index.ids = index.ids.filter((known) => String(known) !== key);
+      for (const watcher of index.watchers) watcher();
+    } else {
+      index.counts.set(key, count - 1);
+    }
+  };
 }
 
 function listFor(store, id) {
@@ -74,13 +91,50 @@ function hasField(row, field) {
   return row != null && typeof row === 'object' && Object.prototype.hasOwnProperty.call(row, field);
 }
 
-function signatureOf(projection) {
+/**
+ * Canonical key for any JS value, including values `JSON.stringify` rejects
+ * (cycles, bigints, symbols, maps, sets, class instances). A failed serialize
+ * must not be used as "always different": that would notify subscribers on
+ * every store tick for an unchanged non-JSON projection.
+ */
+function stableKey(value, seen = new Map(), refs = { next: 0 }) {
+  if (value === null) return 'null';
+  if (value === undefined) return 'undefined';
+  const type = typeof value;
+  if (type === 'number') return `number:${Object.is(value, -0) ? '-0' : String(value)}`;
+  if (type === 'string' || type === 'boolean') return `${type}:${JSON.stringify(value)}`;
+  if (type === 'bigint') return `bigint:${value.toString()}`;
+  if (type === 'symbol') return `symbol:${String(value.description)}`;
+  if (type === 'function') return `function:${value.name || ''}`;
+  if (seen.has(value)) return `@${seen.get(value)}`;
+  const ref = ++refs.next;
+  seen.set(value, ref);
   try {
-    return `${projection.status}\u0000${projection.provenance}\u0000${JSON.stringify(projection.value)}`;
+    if (value instanceof Date) return `date:${value.getTime()}`;
+    if (Array.isArray(value)) {
+      return `array(${ref}):[${value.map((child) => stableKey(child, seen, refs)).join(',')}]`;
+    }
+    if (value instanceof Map) {
+      const entries = [...value.entries()].map(
+        ([key, child]) => `${stableKey(key, seen, refs)}:${stableKey(child, seen, refs)}`,
+      ).sort();
+      return `map(${ref}):{${entries.join(',')}}`;
+    }
+    if (value instanceof Set) {
+      const members = [...value.values()].map((child) => stableKey(child, seen, refs)).sort();
+      return `set(${ref}):{${members.join(',')}}`;
+    }
+    const keys = Reflect.ownKeys(value).map((key) => String(key)).sort();
+    return `object(${ref}):{${keys.map((key) => `${JSON.stringify(key)}:${stableKey(value[key], seen, refs)}`).join(',')}}`;
   } catch {
-    // Non-JSON values cannot be compared structurally; always notify for them.
-    return {};
+    // An exotic proxy or throwing getter cannot be compared structurally; a
+    // type-tag marker is still stable across otherwise identical reads.
+    return `opaque(${ref}):${Object.prototype.toString.call(value)}`;
   }
+}
+
+function signatureOf(projection) {
+  return `${projection.status}\u0000${projection.provenance}\u0000${stableKey(projection.value)}`;
 }
 
 /**
@@ -88,8 +142,14 @@ function signatureOf(projection) {
  * sources and returns a detach function. Duplicate synchronous notifications
  * (a fold fires onChange, onStatusChange and the store render in one turn)
  * collapse to one subscriber call via the value signature.
+ *
+ * `release` frees per-handle bookkeeping (remembered ids) on destroy, and a
+ * supplied `signal` destroys the handle on abort for owner-aware teardown.
+ *
+ * @param {{ release?: () => void, signal?: AbortSignal }} [options]
  */
-function createHandle(compute, attach) {
+function createHandle(compute, attach, options = {}) {
+  const { release, signal } = options;
   const listeners = new Set();
   let destroyed = false;
   let current = compute();
@@ -121,32 +181,62 @@ function createHandle(compute, attach) {
       if (destroyed) return;
       destroyed = true;
       listeners.clear();
+      if (release) release();
+      if (onAbort) signal?.removeEventListener('abort', onAbort);
       detach();
     },
   };
+
+  const onAbort = signal ? () => handle.destroy() : null;
+  if (signal?.aborted) handle.destroy();
+  else if (onAbort && signal) signal.addEventListener('abort', onAbort, { once: true });
   return { handle, refresh };
 }
 
 function attachStore(handleRefresh, store, field, source) {
   const unsubs = [];
+  // A single fold notifies render, change and status surfaces in one turn.
+  // Run the first notification synchronously (so a read right after emit is
+  // fresh) and coalesce the rest into one microtask refresh.
+  let flushing = false;
+  let pending = false;
+  const notify = () => {
+    if (!flushing) {
+      flushing = true;
+      try {
+        handleRefresh();
+      } finally {
+        queueMicrotask(() => {
+          flushing = false;
+          if (pending) {
+            pending = false;
+            handleRefresh();
+          }
+        });
+      }
+      return;
+    }
+    pending = true;
+  };
+
   if (typeof store?.onRender === 'function') {
-    unsubs.push(store.onRender(handleRefresh));
+    unsubs.push(store.onRender(notify));
   }
   if (typeof store?.onChange === 'function') {
     unsubs.push(store.onChange((change) => {
-      if (field === undefined || !change?.fields || change.fields.includes(field)) handleRefresh();
+      if (field === undefined || !change?.fields || change.fields.includes(field)) notify();
     }));
   }
   if (typeof store?.onStatusChange === 'function') {
-    unsubs.push(store.onStatusChange(handleRefresh));
+    unsubs.push(store.onStatusChange(notify));
   }
   if (source && typeof source.onChange === 'function') {
     unsubs.push(source.onChange((change) => {
-      if (field === undefined || !change?.fields || change.fields.includes(field)) handleRefresh();
+      if (field === undefined || !change?.fields || change.fields.includes(field)) notify();
     }));
   }
   if (source && typeof source.onStatusChange === 'function') {
-    unsubs.push(source.onStatusChange(handleRefresh));
+    unsubs.push(source.onStatusChange(notify));
   }
   return () => { for (const unsub of unsubs) unsub(); };
 }
@@ -161,35 +251,50 @@ function aggregateStatus(statuses) {
 }
 
 /**
+ * The ONE evidence rule shared by bindField and bindList. Only a pending
+ * overlay wins over authoritative state; a confirmed overlay is evidence that
+ * the store already has an authoritative answer, so it never outranks that
+ * answer on provenance. When the answer has not folded yet the overlay is a
+ * projected placeholder, identically for field and row bindings.
+ */
+function projectValue(store, id, state, field) {
+  const overlay = overlayFor(store, id);
+  const status = overlayStatusFor(store, id);
+  const overlayHasValue = overlay != null && (field === undefined || hasField(overlay, field));
+  if (status?.status === 'pending' && overlayHasValue) {
+    return { value: field === undefined ? overlay : overlay[field], provenance: 'projected', pending: true };
+  }
+  if (field === undefined ? state != null : hasField(state, field)) {
+    return { value: field === undefined ? state : state[field], provenance: 'confirmed', pending: false };
+  }
+  if (overlayHasValue) {
+    return { value: field === undefined ? overlay : overlay[field], provenance: 'projected', pending: false };
+  }
+  return { value: undefined, provenance: 'unknown', pending: false };
+}
+
+/**
  * Bind one field of one row. The projected value is the optimistic overlay
  * value while that overlay is pending, then the authoritative LiveList value;
  * provenance tells a component which one it is rendering.
  */
 export function bindField(store, options = {}) {
-  const { id, field } = options;
+  const { id, field, signal } = options;
   if (id === undefined || id === null) throw new TypeError('bindField requires an id');
   if (typeof field !== 'string' || field.length === 0) throw new TypeError('bindField requires a field');
-  rememberId(store, id);
+  const release = rememberId(store, id);
   const list = listFor(store, id);
 
   const compute = () => {
-    const overlay = overlayFor(store, id);
-    const status = overlayStatusFor(store, id);
-    const state = list ? list.state : null;
-    if (status?.status === 'pending' && hasField(overlay, field)) {
-      return { value: overlay[field], provenance: 'projected', status: 'pending' };
-    }
-    if (hasField(state, field)) {
-      return { value: state[field], provenance: 'confirmed', status: list?.status ?? 'idle' };
-    }
-    if (hasField(overlay, field)) {
-      // Confirmed overlay awaiting the list fold is still optimistic evidence.
-      return { value: overlay[field], provenance: 'projected', status: list?.status ?? 'idle' };
-    }
-    return { value: undefined, provenance: 'unknown', status: list?.status ?? 'idle' };
+    const projection = projectValue(store, id, list ? list.state : null, field);
+    return {
+      value: projection.value,
+      provenance: projection.provenance,
+      status: projection.pending ? 'pending' : (list?.status ?? 'idle'),
+    };
   };
 
-  return createHandle(compute, (refresh) => attachStore(refresh, store, field, list)).handle;
+  return createHandle(compute, (refresh) => attachStore(refresh, store, field, list), { release, signal }).handle;
 }
 
 /**
@@ -198,28 +303,15 @@ export function bindField(store, options = {}) {
  * it is omitted.
  */
 export function bindList(store, options = {}) {
-  const { id, field } = options;
-  rememberId(store, id);
+  const { id, field, signal } = options;
+  const release = rememberId(store, id);
   const single = id !== undefined && id !== null;
   const list = single ? listFor(store, id) : null;
 
   const compute = () => {
     if (single) {
-      const overlay = overlayFor(store, id);
-      const status = overlayStatusFor(store, id);
-      const state = list ? list.state : null;
-      let value = state;
-      let provenance = state == null ? 'unknown' : 'confirmed';
-      if (status != null && overlay != null) {
-        // An overlay exists only while the store still treats it as evidence;
-        // it is not authoritative until the live fold lands and clears it.
-        value = field === undefined ? overlay : (hasField(overlay, field) ? overlay[field] : state?.[field]);
-        provenance = 'projected';
-      } else if (field !== undefined) {
-        value = hasField(state, field) ? state[field] : undefined;
-        provenance = value === undefined ? 'unknown' : 'confirmed';
-      }
-      return { value, provenance, status: list?.status ?? 'idle' };
+      const projection = projectValue(store, id, list ? list.state : null, field);
+      return { value: projection.value, provenance: projection.provenance, status: list?.status ?? 'idle' };
     }
 
     const rows = [];
@@ -228,19 +320,12 @@ export function bindList(store, options = {}) {
     let any = false;
     for (const key of observedIds(store)) {
       const rowList = listFor(store, key);
-      const overlay = overlayFor(store, key);
-      const status = overlayStatusFor(store, key);
-      const state = rowList ? rowList.state : null;
       if (rowList) statuses.add(rowList.status);
-      if (state != null || overlay != null) any = true;
-      let row = state;
-      if (status != null && overlay != null) {
-        row = overlay;
-        projected = true;
-      }
-      if (row == null) continue;
-      if (field === undefined) rows.push(row);
-      else if (hasField(row, field)) rows.push(row[field]);
+      const projection = projectValue(store, key, rowList ? rowList.state : null, field);
+      if (projection.provenance === 'unknown') continue;
+      any = true;
+      if (projection.provenance === 'projected') projected = true;
+      if (field === undefined || projection.value !== undefined) rows.push(projection.value);
     }
     return {
       value: rows,
@@ -256,7 +341,7 @@ export function bindList(store, options = {}) {
       unsubs();
       if (!single) indexFor(store).watchers.delete(refresh);
     };
-  }).handle;
+  }, { release, signal }).handle;
 }
 
 /**
@@ -265,10 +350,11 @@ export function bindList(store, options = {}) {
  * optimistic overlay is still outstanding.
  */
 export function bindAction(store, options = {}) {
-  const { id, action, payload } = options;
+  const { id, action, payload, signal } = options;
   if (typeof action !== 'string' || action.length === 0) throw new TypeError('bindAction requires an action type');
-  rememberId(store, id);
+  const release = rememberId(store, id);
   const list = listFor(store, id);
+  /** @type {any} */
   let result = null;
 
   const compute = () => {
@@ -285,7 +371,11 @@ export function bindAction(store, options = {}) {
     return { value: result, provenance, status };
   };
 
-  const { handle, refresh } = createHandle(compute, (notify) => attachStore(notify, store, undefined, list));
+  const { handle, refresh } = createHandle(
+    compute,
+    (notify) => attachStore(notify, store, undefined, list),
+    { release, signal },
+  );
   handle.dispatch = async (overridePayload) => {
     const body = { ...(payload ?? {}) };
     if (id !== undefined && id !== null) body.id = id;
@@ -298,10 +388,11 @@ export function bindAction(store, options = {}) {
 }
 
 /** Bind a LiveChannel's connection lifecycle into the same handle shape. */
-export function bindConnection(channel) {
+export function bindConnection(channel, options = {}) {
   if (!channel || typeof channel.onConnectionChange !== 'function') {
     throw new TypeError('bindConnection requires a channel with onConnectionChange');
   }
+  const { signal } = options;
   let value = typeof channel.status === 'string' ? channel.status : DEFAULT_CONNECTION_STATUS;
   const compute = () => ({ value, provenance: 'confirmed', status: value });
   return createHandle(compute, (refresh) => {
@@ -310,5 +401,5 @@ export function bindConnection(channel) {
       refresh();
     });
     return () => { unsub(); };
-  }).handle;
+  }, { signal }).handle;
 }

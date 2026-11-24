@@ -5,7 +5,7 @@ import { txn, upsert,               } from './driver.mjs';
 import { tryParseScopeKey } from './scope-handle.mjs';
 import { applicationPrivateFactView, parseCompoundContributionFact, compoundKindOf } from './compound-contribution-fact.mjs';
 
-import { writeQueueForDatabase } from './pipeline.mjs';
+import { writeQueueForDatabase } from './pipeline-write-queue.mjs';
 import { forbidden } from './outcome.mjs';
 
 // Structural shape of the one platform write coordinator. The no-op undo/redo

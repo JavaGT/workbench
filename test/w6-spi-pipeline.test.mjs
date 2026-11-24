@@ -171,14 +171,16 @@ test('kernel attaches one typed policy and pipeline reads only through the acces
   for (const field of ALL_POLICY_FIELDS) {
     assert.doesNotMatch(kernel, new RegExp(`Object\\.defineProperty\\(handler, ['"]${field}['"]`), field);
   }
-  const pipeline = sourceOf('src/pipeline.ts');
-  assert.match(pipeline, /export const HANDLER_POLICY = Symbol/);
-  assert.match(pipeline, /export function readHandlerPolicy/);
+  // The typed policy kernel lives in its own sibling module after the pipeline
+  // split; the barrel still exposes the same public surface.
+  const policyKernel = sourceOf('src/pipeline-kernel.ts');
+  assert.match(policyKernel, /export const HANDLER_POLICY = Symbol/);
+  assert.match(policyKernel, /export function readHandlerPolicy/);
   for (const field of ALL_POLICY_FIELDS) {
-    assert.doesNotMatch(pipeline, new RegExp(`handler\\.${field}\\b`), field);
+    assert.doesNotMatch(policyKernel, new RegExp(`handler\\.${field}\\b`), field);
   }
   assert.match(sourceOf('build/kernel.mjs'), /attachHandlerPolicy\(handler, \{/);
-  assert.match(sourceOf('build/pipeline.mjs'), /export function readHandlerPolicy/);
+  assert.match(sourceOf('build/pipeline-kernel.mjs'), /export function readHandlerPolicy/);
 });
 
 test('kernel dispatch honours the attached policy through readHandlerPolicy', async () => {

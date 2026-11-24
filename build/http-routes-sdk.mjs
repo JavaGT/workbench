@@ -25,6 +25,7 @@ const ANNOTATED_TEXT_REDACTION_COORDS_SDK_PATH = join(root, 'public', 'workbench
 const ANNOTATED_TEXT_ACTION_SDK_PATH = join(root, 'build', 'annotated-text-action-builder.mjs');
 const ANNOTATED_TEXT_EDITOR_SDK_PATH = join(root, 'public', 'workbench-annotated-text-editor.mjs');
 const ANNOTATED_TEXT_CONTINUOUS_SDK_PATH = join(root, 'public', 'workbench-annotated-text-continuous.mjs');
+const UI_BINDINGS_SDK_PATH = join(root, 'public', 'workbench-ui-bindings.mjs');
 
 export function handleClientSdkRoute(
   app                                 ,
@@ -88,6 +89,13 @@ export function handleClientSdkRoute(
   if (url.pathname === '/workbench-annotated-text-editor.mjs') {
     if (!app || !app.db) return false;
     const body = readFileSync(ANNOTATED_TEXT_EDITOR_SDK_PATH);
+    res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'content-length': Buffer.byteLength(body) });
+    res.end(body);
+    return true;
+  }
+  if (url.pathname === '/workbench-ui-bindings.mjs') {
+    if (!app || !app.db) return false;
+    const body = readFileSync(UI_BINDINGS_SDK_PATH);
     res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'content-length': Buffer.byteLength(body) });
     res.end(body);
     return true;

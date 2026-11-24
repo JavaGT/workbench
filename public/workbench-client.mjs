@@ -2970,16 +2970,8 @@ export function createLiveDeliverySession({
         const liveCycle = snapshotRecoveryCycle?.id === cycleId ? snapshotRecoveryCycle : null;
         const latestCoverage = liveCycle?.floor ?? null;
         const latestReceipt = liveCycle?.receiptFloor ?? receiptFloor;
-        // A coalesced recovery only needs a SECOND snapshot when the first one
-        // actually left a fence uncovered. Cursor can advance through live
-        // folds or catch-up without installing a snapshot, so a generation
-        // check alone would schedule a redundant full fetch even though the
-        // pending receipt fence and control anchor are already covered.
-        const fenceCovered = (latestCoverage == null || cursorAnchor(cursor) >= latestCoverage)
-          && (latestReceipt == null || cursorAnchor(cursor) >= latestReceipt);
         if (latestReceipt != null && !closed && status !== 'revoked' && status !== 'unavailable'
           && snapshotGeneration === snapshotGenerationAtStart
-          && !fenceCovered
           && liveCycle) {
           // A reconnect may supersede this request without installing its
           // result. Give the coalesced recovery one fresh attempt before

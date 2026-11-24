@@ -25,8 +25,11 @@ export { matchRoute } from './http-route-match.mjs';
 export { serveStatic } from './views.mjs';
 export { createJobQueue } from './job-queue.mjs';
 export { createBlobStore } from './blob-store.mjs';
-export { compileBlobCensus } from './blob-census.mjs';
+export { compileBlobCensus, EMPTY_BLOB_CENSUS } from './blob-census.mjs';
 export { runMigrations } from './migrations.mjs';
+// DDL helpers so app authors can set up schema through workbench/server alone —
+// they never need the private build/internal.mjs entrypoint.
+export { executeDDL, executeFrameworkDDL } from './ddl.mjs';
 export { defineSqliteSchema } from './sqlite-schema.mjs';
 export { createSchemaReport,                                                                       } from './schema-report.mjs';
 export { describeEntityStorage, describeSqliteStorage } from './sqlite-storage-description.mjs';

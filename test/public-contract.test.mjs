@@ -43,6 +43,8 @@ export const PUBLIC_API = Object.freeze({
        'readCommittedCursor', 'createLiveDelivery', 'createLiveDeliveryHttpHandler',
        'createSearchPluginRegistry', 'createSearchSourceReader',
        'createSearchOwnedIndexCapability', 'createVectorPlugin',
+        'executeDDL', 'executeFrameworkDDL', 'defineSqliteSchema',
+        'createSchemaReport', 'EMPTY_BLOB_CENSUS',
      ]),
   }),
   'workbench/client': Object.freeze({
@@ -77,7 +79,7 @@ export const PUBLIC_API = Object.freeze({
     named: Object.freeze([
       'ensureStream', 'ensureLease', 'issueAuthoringSnapshot', 'buildAuthoringEnvelope',
       'hashClientNonce', 'acknowledgeAndPruneSnapshot', 'readAnnotatedTextFamilyCheckpoint', 'readProjectedCursorFence',
-      'restoreTextFamilySerialized', 'textFamilyBasis', 'projectEndpointToOffset',
+      'restoreTextFamilySerialized', 'textFamilyBasis', 'projectEndpointToOffset', 'issueAuthoringBinding',
     ]),
   }),
 });

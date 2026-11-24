@@ -52,6 +52,50 @@ are declared actions; Workbench validates their relation, project, author, and
 capability at startup and performs the related row and annotation change as one
 authorized settlement. See [related-entity annotation authoring](./adr/0007-related-entity-annotation-authoring.md).
 
+## Creating a document from an import
+
+Document creation takes one authorized create action whose annotated-text
+payload is the ratified create-import shape. Its core is exactly
+`{ version: 1, blocks }`:
+
+```ts
+{
+  version: 1,
+  blocks: [
+    {
+      text: 'Hello world',
+      // optional: values for declared block fields
+      fields: { speakerName: 'Ada' },
+      // optional: one payload per declared measurement family
+      measurements: [{ family: 'words', payload: { count: 2 } }],
+    },
+  ],
+  // optional companion: initial annotation ranges
+  ranges: [
+    { annotationId: 's1', family: 'speakers', start: 0, end: 5, fields: { speaker: 'u1' } },
+  ],
+}
+```
+
+`version` is exactly `1`. `blocks` is a non-empty array; each `text` is
+well-formed, non-empty Unicode, `fields` satisfy the declared block fields
+(defaults and nullable/optional rules apply), and `measurements` are validated
+by their declared measurement extension. Unknown keys and duplicate measurement
+families are rejected.
+
+`ranges` is an optional companion that seeds the document's initial annotations.
+Its `start`/`end` are half-open offsets over the **concatenated source block
+texts** (the strings joined without their newline separators); Workbench
+translates them into document-absolute offsets when it materializes the import.
+`annotationId` is application-supplied and unique within the import, `family`
+must be declared, and `fields` are validated exactly like block fields. An
+import with no `ranges` creates a plain text document.
+
+The import shape is the public creation grammar. Workbench compiles it into its
+internal operated event and annotation rows inside the same authorized
+transaction; applications never construct checkpoints, RGA elements, or
+internal event versions to create a document.
+
 ## Editing a document
 
 The browser uses a document-bound session created with
@@ -184,11 +228,23 @@ annotation. `change.before` and `change.after` carry the annotation id, family,
 declared fields, range memberships, and protected edges; one side is null for a
 create or removal.
 
+`families` limits the snapshot to the families the application owns;
+unregistered families are never loaded. `includeWording` is an off-by-default
+privacy and performance opt-in: when true, each image also carries the exact
+visible UTF-16 slice of its active ranges. Interior text edits that leave
+structural memberships unchanged only reach the hook when wording is included;
+applications that do not need that signal should leave it off so confidential
+text is not copied into the admission image.
+
 The hook covers generated `.operation` and `.compensate` actions, declared
 annotation actions, composed registered actions, undo/redo, and document
-create/removal. Returning false (or throwing) refuses the whole commit with no
-`_Log` row, annotation row, or `_ActionReceipt`. `families` limits the snapshot
-to the families the application owns; unregistered families are never loaded.
+create/removal. Returning `false`, a typed `WorkbenchFailure`, or a
+`{ ok: false, failure }` outcome refuses the whole commit with no `_Log` row,
+annotation row, or `_ActionReceipt`. Throwing a typed failure (an error carrying
+a `WorkbenchFailure`) is recognized the same way, so a domain validation,
+conflict, or denial keeps its category and message instead of collapsing into a
+generic internal error. Returns of `void`/`undefined`/`true` admit, and a thrown
+plain `Error` keeps the existing sanitized-internal behavior.
 
 ## History and recovery
 

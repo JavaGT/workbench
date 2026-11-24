@@ -1070,6 +1070,30 @@ export function defineSqliteSchema(spec: {
   migrations?: readonly NamespacedMigration[];
 }): SqliteSchemaResult;
 
+// DDL helpers (also on the root `workbench` grammar surface through
+// build/internal.mjs) are public on `workbench/server` so app authors never
+// reach a private entrypoint just to set up schema.
+export function executeDDL(
+  entity: {
+    name: string;
+    fields?: unknown;
+    schedule?: Record<string, unknown>;
+    indexes?: readonly { fields: readonly string[]; unique: boolean }[];
+    unique?: readonly (readonly string[])[];
+  },
+  db: WorkbenchDatabase,
+): void;
+export function executeFrameworkDDL(db: WorkbenchDatabase): void;
+
+/** A machine-readable account of the settled schema (identifiers only, never rows). */
+export type SchemaLifecyclePhase = import('../index.d.ts').SchemaLifecyclePhase;
+export type SchemaReportObject = import('../index.d.ts').SchemaReportObject;
+export type SchemaReport = import('../index.d.ts').SchemaReport;
+export function createSchemaReport(
+  db: { prepare(sql: string): { all(...params: unknown[]): unknown[] } },
+  census: ReadonlyMap<string, import('../index.d.ts').CensusEntry>,
+): SchemaReport;
+
 export interface SqliteStorageColumnDescription {
   readonly name: string;
   readonly type: string;

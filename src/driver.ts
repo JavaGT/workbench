@@ -64,6 +64,10 @@ export type DbHandle = {
   commit?: () => void;
   rollback?: () => void;
   upsert?: (opts: UpsertOptions) => void;
+  /** Live transaction-state flag. `node:sqlite` exposes this directly; a raw
+   *  `bun:sqlite` handle exposes `inTransaction` and gets a live alias below. */
+  readonly isTransaction?: boolean;
+  readonly inTransaction?: boolean;
 };
 
 export type UpsertOptions = {
@@ -302,11 +306,26 @@ export function attachDriverHelpers(dbOrDriver: DbHandle): DbHandle {
 // so a mock/stub db without a working .exec is a no-op. This path is a THIN
 // back-compat bootstrap for raw-handle callers: the PRAGMA SQL itself lives in
 // CONNECTION_PRAGMA_SQL above, and the sqlite adapter does not rely on it.
+//
+// Raw `bun:sqlite` Database handles name the same live flag `inTransaction`
+// while every consumer (query-scoped-read.ts, job-queue.ts) reads
+// `isTransaction`. When the handle does not already declare `isTransaction`
+// (`node:sqlite` does), attach a LIVE getter backed by `inTransaction` so those
+// consumers see the real state without forcing callers through
+// openSqliteDatabase. A getter — not a copied boolean — keeps nested BEGIN /
+// COMMIT transitions visible to the read-snapshot and job-queue seams.
 export function wrapDriver(dbOrDriver: DbHandle | null | undefined): DbHandle | null | undefined {
   if (dbOrDriver == null) return dbOrDriver;
   const isConformingDriver =
     typeof dbOrDriver.txn === 'function' && typeof dbOrDriver.upsert === 'function';
   if (isConformingDriver) return dbOrDriver;
+  if (!('isTransaction' in dbOrDriver) && 'inTransaction' in dbOrDriver) {
+    Object.defineProperty(dbOrDriver, 'isTransaction', {
+      configurable: true,
+      enumerable: false,
+      get: () => Boolean((dbOrDriver as { inTransaction?: unknown }).inTransaction),
+    });
+  }
   attachDriverHelpers(dbOrDriver);
   if (typeof dbOrDriver.exec === 'function') {
     try {

@@ -25,8 +25,11 @@ export { matchRoute } from './http-route-match.ts';
 export { serveStatic } from './views.ts';
 export { createJobQueue } from './job-queue.ts';
 export { createBlobStore } from './blob-store.ts';
-export { compileBlobCensus } from './blob-census.ts';
+export { compileBlobCensus, EMPTY_BLOB_CENSUS } from './blob-census.ts';
 export { runMigrations } from './migrations.ts';
+// DDL helpers so app authors can set up schema through workbench/server alone —
+// they never need the private build/internal.mjs entrypoint.
+export { executeDDL, executeFrameworkDDL } from './ddl.ts';
 export { defineSqliteSchema } from './sqlite-schema.ts';
 export { createSchemaReport, type SchemaReport, type SchemaReportObject, type SchemaLifecyclePhase } from './schema-report.ts';
 export { describeEntityStorage, describeSqliteStorage } from './sqlite-storage-description.ts';

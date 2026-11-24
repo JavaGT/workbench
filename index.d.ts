@@ -736,12 +736,25 @@ export interface AnnotatedTextMutationChange {
   readonly after: AnnotatedTextAnnotationImage | null;
 }
 
-/** Return false (or throw) to refuse the whole commit. The callback runs inside
- *  the committing SQLite transaction after projection and before the receipt,
- *  so a refusal leaves no log row, annotation row, or `_ActionReceipt`. */
+/** What an admission callback may return. `false` keeps the original refusal
+ *  shorthand; a `WorkbenchFailure` (or a `{ ok: false, failure }` outcome) is a
+ *  typed refusal whose category and message reach the caller instead of being
+ *  sanitized into a generic internal failure. `void`/`undefined`/`true` admit. */
+export type AnnotatedTextAdmissionResult =
+  | boolean
+  | void
+  | WorkbenchFailure
+  | FailureOutcome;
+
+/** Return false, a typed failure, or reject to refuse the whole commit. A thrown
+ *  `WorkbenchFailure` (or an error carrying one) is recognized and propagated
+ *  unchanged; a plain `Error` keeps the legacy sanitized-internal path. The
+ *  callback runs inside the committing SQLite transaction after projection and
+ *  before the receipt, so a refusal leaves no log row, annotation row, or
+ *  `_ActionReceipt`. */
 export type AnnotatedTextAdmission = (
   change: AnnotatedTextMutationChange,
-) => boolean | void | Promise<boolean | void>;
+) => AnnotatedTextAdmissionResult | Promise<AnnotatedTextAdmissionResult>;
 
 /** Register a commit-time guard for every annotated-text mutation. `families`
  *  limits which annotation families are loaded; absent loads every declared
@@ -1113,6 +1126,10 @@ export interface AnnotatedTextAnnotation {
   /** Principal id of the user who applied this annotation; absent on legacy/interop snapshots that predate attribution. */
   readonly owner?: string;
 }
+/**
+ * Document-scoped measurement. Blockless model: measurements belong to the
+ * whole document — there is no blockId (issue #33).
+ */
 export interface AnnotatedTextMeasurement {
   readonly id: string;
   readonly family: string;
@@ -1164,16 +1181,6 @@ export interface AnnotatedTextOrphan {
   readonly savedQuote: string;
   readonly savedRange: readonly [number, number];
   readonly owner?: string;
-}
-/**
- * Document-scoped measurement. Blockless model: measurements belong to the
- * whole document — there is no blockId (issue #33).
- */
-export interface AnnotatedTextMeasurement {
-  readonly id: string;
-  readonly family: string;
-  readonly formatVersion: number;
-  readonly payload: unknown;
 }
 export interface AnnotatedTextCanonicalDocument {
   readonly kind: 'workbench.annotatedText.canonical';

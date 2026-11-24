@@ -28,6 +28,7 @@ import {
 } from './annotated-text-continuous.mjs';
 
 
+import { isWorkbenchFailure,                                            } from './outcome.mjs';
 
 
 
@@ -103,9 +104,22 @@ import {
 
 
 
-/** Return false (or reject) to refuse the whole commit. A thrown error is
- *  propagated unchanged; a false return becomes a typed admission refusal with
- *  no receipt or projected row. */
+/** What an admission callback may return. `false` keeps the original refusal
+ *  shorthand; a `WorkbenchFailure` (or a `{ ok: false, failure }` outcome) is a
+ *  typed refusal whose category and message reach the caller instead of being
+ *  sanitized into a generic internal failure. `void`/`undefined`/`true` admit. */
+
+
+
+
+
+
+/**
+ * Return false, a typed failure, or reject to refuse the whole commit. A thrown
+ * `WorkbenchFailure` (or an error carrying one) is recognized and propagated
+ * unchanged; a plain `Error` keeps the legacy sanitized-internal path. A typed
+ * refusal leaves no log row, projected row, or receipt.
+ */
 
 
 
@@ -265,6 +279,18 @@ function refusal()        {
 }
 
 /**
+ * Recognize a typed refusal whether it arrives as a callback RESULT or as a
+ * THROWN value. An error that carries a canonical `failure` (for example
+ * `forbidden()`) is normalized to that failure; anything else is left alone so
+ * a plain Error keeps the sanitized-internal path at the HTTP boundary.
+ */
+function typedAdmissionFailure(value         )                          {
+  if (isWorkbenchFailure(value)) return value;
+  const candidate = (value                                            )?.failure;
+  return isWorkbenchFailure(candidate) ? candidate : null;
+}
+
+/**
  * Every authored action type that can reach the admission hook for this
  * application: generated annotated operations/compensations, declared
  * annotation actions, and registered actions that declare an annotated-text
@@ -377,20 +403,29 @@ export function createAnnotatedTextMutationAdmission({
           const beforeImage = target.images.get(annotationId) ?? null;
           const afterImage = after.get(annotationId) ?? null;
           if (sameImage(beforeImage, afterImage)) continue;
-          const admitted = await registration.admit(Object.freeze({
-            entity: target.field.entity,
-            field: target.field.field,
-            documentId: target.documentId,
-            scope: target.scope,
-            actionId,
-            actionType: typeof actionType === 'string' ? actionType : '',
-            principal: principal                                ,
-            family: (afterImage ?? beforeImage)?.family ?? '',
-            annotationId,
-            before: beforeImage,
-            after: afterImage,
-          }));
-          if (admitted === false) refusal();
+          let result                              ;
+          try {
+            result = await registration.admit(Object.freeze({
+              entity: target.field.entity,
+              field: target.field.field,
+              documentId: target.documentId,
+              scope: target.scope,
+              actionId,
+              actionType: typeof actionType === 'string' ? actionType : '',
+              principal: principal                                ,
+              family: (afterImage ?? beforeImage)?.family ?? '',
+              annotationId,
+              before: beforeImage,
+              after: afterImage,
+            }));
+          } catch (error) {
+            // A thrown typed failure is client-visible by intent; a plain Error
+            // propagates unchanged and is sanitized to 'internal' downstream.
+            throw typedAdmissionFailure(error) ?? error;
+          }
+          if (result === false) refusal();
+          const typedFailure = typedAdmissionFailure(result);
+          if (typedFailure !== null) throw typedFailure;
         }
       }
     },

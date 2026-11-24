@@ -35,8 +35,10 @@ import { grant, deny, read, write, subscribe, admin } from '../grant.ts';
 import type { Capability, GrantDecision } from '../grant.ts';
 import type { FieldDescriptor } from '../field-strategy.ts';
 
-// Owner always receives the full capability set.
-const OWNER_CAPABILITIES: readonly Capability[] = Object.freeze([read, write, subscribe, admin]);
+// Owner always receives the full capability set. This is the ONE authoring of
+// that list: the `owner.only()` convenience in owner.ts imports it, so the
+// sugared and membership paths cannot confer different capability sets.
+export const OWNER_CAPABILITIES: readonly Capability[] = Object.freeze([read, write, subscribe, admin]);
 
 // A membership declaration: one named role → the capabilities it confers on the
 // rows it belongs to, plus an optional explicit field selector. `can` is the

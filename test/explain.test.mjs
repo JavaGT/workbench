@@ -107,10 +107,14 @@ test('explain on an entity with no .can returns grant type none', async () => {
   const row = { id: 'r1', body: 'x', owner: 'alice' };
   const result = await explain({ entity: NoCan, row, principal: alice, verb: 'read' });
 
-  // Scopeless grants admit by default (mayRow returns true for no-own-can).
+  // A scope-only grant confers exactly the read-class capabilities mayRow uses:
+  // read/list/subscribe admitted, every write denied. explain reports the SAME
+  // decision, not an unconditional admit.
   assert.equal(result.admitted, true);
   assert.equal(result.grant.type, 'scope-only');
-  assert.deepStrictEqual(result.grant.capabilities, []);
+  assert.deepStrictEqual(result.grant.capabilities, ['read', 'subscribe']);
+  assert.equal(result.grant.verbAdmitted, true);
+  assert.equal(result.grant.verbRequired, 'read');
 });
 
 test('explain with field name returns field-level decision', async () => {

@@ -1,5 +1,6 @@
 import { begin, commit, rollback,               } from './driver.mjs';
 import { runMigrations, validateMigrations } from './migrations.mjs';
+import { frameworkReservedNamesWithoutAuthCompile as FRAMEWORK_RESERVED_NAMES } from './framework-table-names.mjs';
 
 const ALLOWED_TYPES = new Set(['text', 'integer', 'real', 'blob']);
 const ALLOWED_FK_ACTIONS = new Set(['cascade', 'set null', 'set default', 'restrict', 'no action']);
@@ -15,27 +16,6 @@ const ALLOWED_TRIGGER_TIMING = new Set(['before', 'after', 'instead of']);
 const ALLOWED_TRIGGER_EVENTS = new Set(['insert', 'update', 'delete']);
 
 const IDENTIFIER_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
-
-// Fail-fast mirror of schema-table-census.frameworkReservedNames (folded). The
-// census is the authority and re-checks reserved names at boot with the derived
-// registry; this local copy exists only because importing the registry here
-// would create an initialization cycle through ddl.ts (which calls
-// defineSqliteSchema at module top level). Keep the two sets in lockstep.
-const FRAMEWORK_RESERVED_NAMES                      = Object.freeze(new Set(
-  (`blobstore _operationalconsumerdeclaration _operationalconsumerfailure _pendingblob
-    _log _v16capabilityclaim _cursor _actionreceipt _historyordercounter
-    _committedrevision _historycursor _nohistoryreceipt _liverevision
-    _invalidationledger _compositechange _compositechangecursor _schedulereceipt
-    _job _privateactionfact _privateactionfactdependency _postcommiteffect
-    _projectedcursor _consumercursor _worker _principalsnapshotrevision
-    _deletedrowanchor _schemamigration _searchstaleness _derivedresource
-    _schemamaintenance idx_blob_status idx__log_actionid
-    idx__actionreceipt_scope_history idx__compositechange_actionid
-    idx__private_action_fact_dependency_entity idx__post_commit_effect_claim
-    idx__post_commit_effect_key_order idx__job_claim idx__job_scope_status
-    user session idx_session_schedule_createdat inbox credential invitation
-    apikey twofactor`).split(/\s+/),
-));
 
 function requireName(value         , label        )         {
   if (typeof value !== 'string' || value.length === 0 || value.includes('\0')) {
@@ -56,8 +36,11 @@ function folded(name        )         {
   return name.toLowerCase();
 }
 
-function quoteIdent(name        )         {
-  return `"${name.replace(/"/g, '""')}"`;
+// The ONE SQL identifier quoting helper, shared with DDL generation and both
+// schema validators. Identifiers are always double-quoted and embedded quotes
+// doubled; no other module may carry its own spelling of this rule.
+export function quoteIdent(name        )         {
+  return `"${String(name).replace(/"/g, '""')}"`;
 }
 
 function quoteDefault(value                 )         {

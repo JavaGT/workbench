@@ -1,6 +1,7 @@
 import { ref } from './field.mjs';
 import { scope } from './scope.mjs';
-import { grant, deny, read, write, subscribe, admin } from './grant.mjs';
+import { grant, deny } from './grant.mjs';
+import { OWNER_CAPABILITIES } from './auth/membership.mjs';
 
 
 
@@ -12,7 +13,7 @@ export function owner()          {
   scope(({ is }          ) => is.owner()).can(
     async ({ is }          ) =>
       (await is.owner())
-        ? grant(read, write, subscribe, admin)
+        ? grant(...OWNER_CAPABILITIES)
         : deny('not the owner'),
   ),
 ];

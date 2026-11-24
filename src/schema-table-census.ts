@@ -4,15 +4,16 @@
 // migration table, and the main tables of the seven always-registered auth
 // entities. No DB, no mutable registry, no Scope nouns, no workbench/internal.
 
-import { generateFrameworkDDL, generateDDL } from './ddl.ts';
+import { generateDDL } from './ddl.ts';
 import {
   User, Session, Inbox, Credential, Invitation, ApiKey, TwoFactor,
 } from './auth/entities.ts';
-import { MIGRATION_DDL } from './migrations.ts';
-import { OPERATIONAL_LEDGER_DDL } from './operational-ledger-ddl.ts';
 import {
   collectTableNamesFromDdl as collectNames,
   collectObjectNamesFromDdl,
+  frameworkDeclarationEntries,
+  frameworkReservedNamesWithoutAuthCompile,
+  FRAMEWORK_CURSOR_TABLE_NAMES,
   stripSqlComments,
   type DdlEntry,
   type ObjectKind,
@@ -56,11 +57,9 @@ function folded(name: string): string {
   return name.toLowerCase();
 }
 
-export function collectTableNamesFromDdl(entries: DdlEntry[]): readonly string[] {
-  const names = collectNames(entries);
-
+function sortTableNames(names: readonly string[]): readonly string[] {
   return Object.freeze(
-    names.sort((a, b) => {
+    [...names].sort((a, b) => {
       const ga = a.startsWith('_') ? 0 : 1;
       const gb = b.startsWith('_') ? 0 : 1;
       if (ga !== gb) return ga - gb;
@@ -71,23 +70,20 @@ export function collectTableNamesFromDdl(entries: DdlEntry[]): readonly string[]
   );
 }
 
-function collectFrameworkTableNames(): readonly string[] {
-  const entries: DdlEntry[] = [];
+export function collectTableNamesFromDdl(entries: DdlEntry[]): readonly string[] {
+  return sortTableNames(collectNames(entries));
+}
 
-  for (const sql of generateFrameworkDDL()) {
-    entries.push({ source: 'framework DDL', sql });
-  }
-  entries.push({ source: 'migration DDL', sql: MIGRATION_DDL });
-  for (const sql of OPERATIONAL_LEDGER_DDL) {
-    entries.push({ source: 'operational ledger DDL', sql });
-  }
+function collectFrameworkTableNames(): readonly string[] {
+  const entries: DdlEntry[] = frameworkDeclarationEntries().map((entry) => ({ source: entry.source, sql: entry.sql }));
+
   for (const entity of AUTH_ENTITIES) {
     for (const sql of generateDDL(entity)) {
       entries.push({ source: `auth entity ${entity.name}`, sql });
     }
   }
 
-  return collectTableNamesFromDdl(entries);
+  return sortTableNames([...collectNames(entries), ...FRAMEWORK_CURSOR_TABLE_NAMES]);
 }
 
 export function declaredTableNames(entities: readonly { name: string }[]): readonly string[] {
@@ -159,18 +155,14 @@ function collectFrameworkObjectsList(): readonly FrameworkOwnedObject[] {
     }
   };
 
-  const frameworkEntries: DdlEntry[] = [];
-  for (const sql of generateFrameworkDDL()) {
-    frameworkEntries.push({ source: 'framework DDL', sql });
-  }
-  frameworkEntries.push({ source: 'migration DDL', sql: MIGRATION_DDL });
-  for (const sql of OPERATIONAL_LEDGER_DDL) {
-    frameworkEntries.push({ source: 'operational ledger DDL', sql });
-  }
+  const frameworkEntries: DdlEntry[] = frameworkDeclarationEntries();
   pushSet('tables', 'table', frameworkEntries, 'framework');
   pushSet('indexes', 'index', frameworkEntries, 'framework');
   pushSet('triggers', 'trigger', frameworkEntries, 'framework');
   pushSet('virtualTables', 'virtual-table', frameworkEntries, 'framework');
+  // The cursor schema is declared as plain data in the leaf module; its tables
+  // are named from that declaration, never from a hand-mirrored list.
+  for (const name of FRAMEWORK_CURSOR_TABLE_NAMES) push('table', name, 'framework');
 
   for (const entity of AUTH_ENTITIES) {
     const entries: DdlEntry[] = [];
@@ -187,12 +179,17 @@ function collectFrameworkObjectsList(): readonly FrameworkOwnedObject[] {
 
 export const frameworkObjects: readonly FrameworkOwnedObject[] = collectFrameworkObjectsList();
 
-// The FULL reserved-framework-namespace registry (folded lower-case). This is
-// framework-table-names' without-auth-compile registry extended with the auth
-// entities' generated objects (their schedules/refs/unique indexes), which
-// require the auth compile graph.
+// The FULL reserved-framework-namespace registry (folded lower-case). The leaf
+// registry from framework-table-names.ts is the authority for everything
+// derivable without the auth compile graph; only the auth entities' generated
+// objects (their schedules/refs/unique indexes) are added here.
 export const frameworkReservedNames: ReadonlySet<string> = Object.freeze(
-  new Set(frameworkObjects.map((object) => folded(object.name))),
+  new Set([
+    ...frameworkReservedNamesWithoutAuthCompile,
+    ...frameworkObjects
+      .filter((object) => object.fromAuthEntity !== undefined)
+      .map((object) => folded(object.name)),
+  ]),
 );
 
 const FRAMEWORK_TABLE_NAME_SET = new Set(

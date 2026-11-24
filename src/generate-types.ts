@@ -1,4 +1,4 @@
-import { structCellColumn } from './field-strategy.ts';
+import { isMainTableField, storedColumnsOf, storedValueTsType } from './field-strategy.ts';
 
 interface Descriptor {
   kind: string;
@@ -19,16 +19,10 @@ function descriptorTsType(descriptor: Descriptor | undefined): string | null {
 
   const { kind, type } = descriptor;
 
-  if (kind === 'value' || kind === 'crdt' || kind === 'projected' || (kind === 'computed' && descriptor.mode === 'stored')) {
-    switch (type) {
-      case 'boolean': return 'boolean';
-      case 'number': return 'number';
-      default: return 'string';
-    }
-  }
+  // The same storage-shape authority the DDL and census use decides which
+  // descriptors are stored columns and what their public value type is.
+  if (isMainTableField(descriptor)) return storedValueTsType(descriptor);
 
-  if (kind === 'hash') return 'string';
-  if (kind === 'state') return 'string';
   if (kind === 'struct') return 'Record<string, string>';
   if (kind === 'store' && type === 'map') return 'MapFieldHandle';
   if (kind === 'store' && type === 'log') return 'LogFieldHandle';
@@ -38,25 +32,16 @@ function descriptorTsType(descriptor: Descriptor | undefined): string | null {
   return 'unknown';
 }
 
-function isStoredColumn(descriptor: Descriptor | undefined): boolean {
-  if (!descriptor) return false;
-  const { kind } = descriptor;
-  if (kind === 'computed' && descriptor.mode === 'pull') return false;
-  if (['value', 'crdt', 'hash', 'state', 'projected'].includes(kind)) return true;
-  if (kind === 'computed' && descriptor.mode === 'stored') return true;
-  return false;
-}
-
 function rowProperties(fields: Readonly<Record<string, Descriptor>>): string[] {
   const lines = ['id: string'];
   for (const [name, desc] of Object.entries(fields)) {
     if (desc.kind === 'struct') {
-      for (const [cellName] of Object.entries(desc.cells || {})) {
-        lines.push(`${structCellColumn(name, cellName)}: string`);
+      for (const column of storedColumnsOf(name, desc)) {
+        lines.push(`${column.name}: string`);
       }
       continue;
     }
-    if (!isStoredColumn(desc)) continue;
+    if (!isMainTableField(desc)) continue;
     lines.push(`${name}: ${descriptorTsType(desc)}`);
   }
   return lines;

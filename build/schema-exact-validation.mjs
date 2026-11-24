@@ -23,7 +23,7 @@
 // is being validated is a conflicting-ownership drift (consideration #8/#9).
 
 import { censusKey, classifyObservedObject,                                                   } from './schema-census.mjs';
-
+import { quoteIdent,                              } from './sqlite-schema.mjs';
 
 
 
@@ -66,10 +66,6 @@ import { censusKey, classifyObservedObject,                                     
 
 function folded(name        )         {
   return name.toLowerCase();
-}
-
-function quoteIdent(name        )         {
-  return `"${name.replace(/"/g, '""')}"`;
 }
 
 // SQLite storage-affinity rules (the declared-type grammar of CREATE TABLE).

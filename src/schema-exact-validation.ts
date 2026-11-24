@@ -23,7 +23,7 @@
 // is being validated is a conflicting-ownership drift (consideration #8/#9).
 
 import { censusKey, classifyObservedObject, type CensusEntry, type ObjectKind, type OwnerKind } from './schema-census.ts';
-import type { SqliteSchemaDescription } from './sqlite-schema.ts';
+import { quoteIdent, type SqliteSchemaDescription } from './sqlite-schema.ts';
 
 export interface ExactSchemaError {
   readonly code: string;
@@ -66,10 +66,6 @@ type CatalogObject = {
 
 function folded(name: string): string {
   return name.toLowerCase();
-}
-
-function quoteIdent(name: string): string {
-  return `"${name.replace(/"/g, '""')}"`;
 }
 
 // SQLite storage-affinity rules (the declared-type grammar of CREATE TABLE).

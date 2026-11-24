@@ -26,7 +26,7 @@ import {
   type FrameworkOwnedObject,
 } from './schema-table-census.ts';
 import type { OwnedObjectSet } from './framework-table-names.ts';
-import { structCellColumn } from './field-strategy.ts';
+import { storedColumnsOf, type StorageShapeDescriptor } from './field-strategy.ts';
 import { migrationIdentityKey } from './migration-identity.ts';
 
 export type ObjectKind = 'table' | 'index' | 'trigger' | 'virtual-table';
@@ -266,25 +266,15 @@ function affinityOf(type: string | undefined): string {
   return 'NUMERIC';
 }
 
-// The columns an entity main table declares (mirrors the entity DDL generator:
-// id TEXT PRIMARY KEY plus stored fields).
+// The columns an entity main table declares: id TEXT PRIMARY KEY plus the
+// columns the one storage-shape authority assigns to its stored fields. No
+// local kind/type mirrors — the census and the DDL generator ask the same helper.
 function entityMainColumns(entity: EntityDeclaration): ColumnInfo[] {
   const columns: ColumnInfo[] = [{ name: 'id', type: 'TEXT', primaryKey: true }];
   for (const [name, descriptor] of Object.entries(entity.fields ?? {})) {
-    const field = descriptor as Readonly<Record<string, unknown>>;
-    if (field.kind === 'computed' && field.mode === 'pull') continue;
-    if (field.kind === 'struct') {
-      for (const cell of Object.keys((field.cells ?? {}) as Record<string, unknown>)) {
-        columns.push({ name: structCellColumn(name, cell), type: 'TEXT' });
-      }
-      continue;
+    for (const column of storedColumnsOf(name, descriptor as StorageShapeDescriptor)) {
+      columns.push({ name: column.name, type: column.type });
     }
-    if (!['value', 'crdt', 'hash', 'state', 'projected'].includes(String(field.kind))
-      && !(field.kind === 'computed' && field.mode === 'stored')) {
-      continue;
-    }
-    const type = field.type === 'boolean' || field.type === 'date' ? 'INTEGER' : field.type === 'number' ? 'REAL' : 'TEXT';
-    columns.push({ name, type });
   }
   return columns;
 }

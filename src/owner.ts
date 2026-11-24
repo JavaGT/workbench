@@ -1,6 +1,7 @@
 import { ref } from './field.ts';
 import { scope } from './scope.ts';
-import { grant, deny, read, write, subscribe, admin } from './grant.ts';
+import { grant, deny } from './grant.ts';
+import { OWNER_CAPABILITIES } from './auth/membership.ts';
 
 type IsHandle = { is: Record<string, (...args: unknown[]) => unknown> };
 
@@ -12,7 +13,7 @@ export function owner(): unknown {
   scope(({ is }: IsHandle) => is.owner()).can(
     async ({ is }: IsHandle) =>
       (await is.owner())
-        ? grant(read, write, subscribe, admin)
+        ? grant(...OWNER_CAPABILITIES)
         : deny('not the owner'),
   ),
 ];

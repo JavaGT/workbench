@@ -1,4 +1,4 @@
-import { rowCapabilities, mayVerb, fieldCapabilities } from './row-grant.ts';
+import { rowCapabilities, mayVerb, mayRow, fieldCapabilities } from './row-grant.ts';
 import { isRuntimeGrantClause } from './scope.ts';
 
 interface CheckEntry {
@@ -159,7 +159,19 @@ export async function explain({ entity, row, principal, verb, field }: ExplainIn
   let admitted = false;
 
   if (grantInfo.type === 'scope-only') {
-    admitted = true;
+    // Scope-only means row VISIBILITY, not an implicit CRUD grant. Report the
+    // exact decision mayRow makes (Wave 1): list/read/subscribe are admitted,
+    // create/update/remove/admin are denied. Both the capability list and the
+    // verb verdict come from the row-grant engine — never a second list here.
+    try {
+      const capabilities = await rowCapabilities(entity, row, principal);
+      grantInfo.capabilities = (capabilities.capabilities || []).map((c: { capability: string }) => c.capability);
+      grantInfo.verbAdmitted = await mayRow(entity, verb, row, principal);
+      grantInfo.verbRequired = verb;
+      admitted = grantInfo.verbAdmitted;
+    } catch {
+      admitted = false;
+    }
   } else if (grantInfo.type === 'own-scope') {
     try {
       const capabilities = await rowCapabilities(entity, row, principal);

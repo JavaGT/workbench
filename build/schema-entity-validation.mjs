@@ -1,9 +1,6 @@
-import { structCellColumn } from './field-strategy.mjs';
+import { storedColumnsOf,                             } from './field-strategy.mjs';
+import { quoteIdent } from './sqlite-schema.mjs';
 import { censusKey,                  } from './schema-census.mjs';
-
-function quoteIdent(name        )         {
-  return `"${name.replace(/"/g, '""')}"`;
-}
 
 function folded(name        )         {
   return name.toLowerCase();
@@ -34,18 +31,9 @@ function defaultValue(column                   )                {
 function entityColumns(entity              )                              {
   const columns = new Map                                                   ([['id', { type: 'TEXT', notNull: false, primaryKey: true }]]);
   for (const [name, field] of Object.entries(entity.fields ?? {})) {
-    if (field.kind === 'computed' && field.mode === 'pull') continue;
-    if (field.kind === 'struct') {
-      for (const cellName of Object.keys(field.cells ?? {})) {
-        columns.set(structCellColumn(name, cellName), { type: 'TEXT', notNull: !(field.nullable || field.optional) });
-      }
-      continue;
+    for (const column of storedColumnsOf(name, field                          )) {
+      columns.set(column.name, { type: column.type, notNull: !(field.nullable || field.optional) });
     }
-    if (!['value', 'crdt', 'hash', 'state', 'projected'].includes(field.kind ?? '') && !(field.kind === 'computed' && field.mode === 'stored')) continue;
-    const type = field.type === 'boolean' || field.type === 'date'
-      ? 'INTEGER'
-      : field.type === 'number' ? 'REAL' : 'TEXT';
-    columns.set(name, { type, notNull: !(field.nullable || field.optional) });
   }
   return columns                               ;
 }

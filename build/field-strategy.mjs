@@ -509,6 +509,151 @@ export const STRATEGIES                                          = Object.freeze
   }),
 });
 
+// ---------------------------------------------------------------------------
+// The storage-shape authority.
+//
+// DDL generation, the ownership census, schema-owned entity-table validation,
+// and generated app types all need the SAME answer to three questions: which
+// field kinds contribute a main-table column, what SQL type that column has,
+// and which columns a declared field contributes. These helpers are that ONE
+// authority — the mirrors that used to live in ddl.ts / schema-census.ts /
+// schema-entity-validation.ts / generate-types.ts now call them.
+// ---------------------------------------------------------------------------
+
+// kind → the discriminator values DDL accepts. For the two mode-only kinds the
+// set holds MODES (there is no `type`). The non-strategy kinds are listed here
+// explicitly so a kind can never be accepted by DDL while being silently
+// unsupported at runtime: ephemeral engages the pace seam (side-table cell, no
+// persistence strategy); annotatedText owns its own DDL (no strategy).
+export const SUPPORTED_FIELD_TYPES                                                = Object.freeze({
+  value: Object.freeze(new Set(['text', 'boolean', 'date', 'number', 'json', 'vector', 'ref'])),
+  crdt: Object.freeze(new Set(['text', 'raster', 'polyline'])),
+  hash: Object.freeze(new Set(['hash'])),
+  store: Object.freeze(new Set(['map', 'log'])),
+  ordered: Object.freeze(new Set(['list'])),
+  ephemeral: Object.freeze(new Set(['ephemeral'])),
+  state: Object.freeze(new Set(['state'])),
+  struct: Object.freeze(new Set(['link'])),
+  annotatedText: Object.freeze(new Set(['annotatedText'])),
+  computed: Object.freeze(new Set(['pull', 'stored'])),
+  projected: Object.freeze(new Set(['async'])),
+});
+
+export const MODE_ONLY_FIELD_KINDS                      = Object.freeze(new Set(['computed', 'projected']));
+
+// DDL accepts these kinds but they have NO entry in STRATEGIES — their storage
+// is owned by a seam other than the field strategy table (documented above).
+export const NON_STRATEGY_FIELD_KINDS                      = Object.freeze(new Set(['ephemeral', 'annotatedText']));
+
+// Load-time invariant: the DDL authority and the strategy table cannot drift.
+// Every strategy-backed kind must be accepted by DDL, and every DDL-accepted
+// kind must be either strategy-backed or an explicitly documented non-strategy
+// storage seam. Fail closed (throw at module load) if someone adds one side.
+{
+  const accepted = new Set(Object.keys(SUPPORTED_FIELD_TYPES));
+  for (const kind of Object.keys(STRATEGIES)) {
+    if (!accepted.has(kind)) {
+      throw new Error(`storage-shape authority is missing strategy-backed kind '${kind}'`);
+    }
+  }
+  for (const kind of accepted) {
+    if (!Object.hasOwn(STRATEGIES, kind) && !NON_STRATEGY_FIELD_KINDS.has(kind)) {
+      throw new Error(
+        `storage-shape authority accepts '${kind}' with neither a strategy nor a documented non-strategy storage seam`,
+      );
+    }
+  }
+}
+
+// The loose shape every storage derivation reads. Field descriptors from
+// field.ts and the compiled entity carry more, but these are the only keys the
+// storage decision consults.
+
+
+
+
+
+
+
+
+
+// Validate a descriptor against the authority. Returns the REASON (without a
+// field location) or null; the DDL layer adds `at Entity.field` for context.
+export function fieldShapeError(descriptor                                           )                {
+  if (descriptor === null || typeof descriptor !== 'object') return 'invalid field descriptor';
+  const kind = descriptor.kind;
+  const supported = kind === undefined ? undefined : SUPPORTED_FIELD_TYPES[kind];
+  if (supported === undefined) return `unknown field kind '${String(kind)}'`;
+  if (MODE_ONLY_FIELD_KINDS.has(kind )) {
+    const mode = descriptor.mode;
+    if (mode === undefined || !supported.has(mode)) return `unknown ${kind} field mode '${String(mode)}'`;
+    return null;
+  }
+  const type = descriptor.type;
+  if (type === undefined || !supported.has(type)) return `unknown ${kind} field type '${String(type)}'`;
+  return null;
+}
+
+// Kinds whose value lives in ONE main-table column named after the field.
+// `struct` is NOT here: it contributes one column per declared cell instead
+// (storedColumnsOf). `computed` qualifies only in its `stored` mode.
+export const STORED_FIELD_KINDS                      = Object.freeze(
+  new Set(['value', 'crdt', 'hash', 'state', 'projected', 'computed']),
+);
+
+export function isMainTableField(descriptor                                           )          {
+  const kind = descriptor?.kind;
+  if (kind === 'computed') return descriptor?.mode === 'stored';
+  return kind !== undefined && STORED_FIELD_KINDS.has(kind);
+}
+
+// SQLite column type for a stored field. Decided by the value type, never by
+// the kind: every kind that reaches this helper has already been checked
+// against SUPPORTED_FIELD_TYPES by fieldShapeError.
+export function sqlTypeOf(descriptor                        )                              {
+  switch (descriptor.type) {
+    case 'boolean':
+    case 'date':
+      return 'INTEGER';
+    case 'number':
+      return 'REAL';
+    default:
+      return 'TEXT';
+  }
+}
+
+
+
+
+
+
+// The main-table column(s) one declared field contributes. Struct fields
+// flatten into their per-cell columns; every other stored field has one column
+// named after the field. Non-stored kinds (side tables, pull-computed,
+// ephemeral, annotatedText) contribute nothing.
+export function storedColumnsOf(fieldName        , descriptor                                           )                          {
+  if (!descriptor) return [];
+  if (descriptor.kind === 'struct') {
+    return Object.freeze(
+      Object.keys(descriptor.cells ?? {}).map((cell) =>
+        Object.freeze({ name: structCellColumn(fieldName, cell), type: 'TEXT'          })),
+    );
+  }
+  if (!isMainTableField(descriptor)) return [];
+  return Object.freeze([Object.freeze({ name: fieldName, type: sqlTypeOf(descriptor) })]);
+}
+
+// The public TS type of a stored value (generated row types). Kept beside the
+// storage mapping so a new value type cannot be added to DDL without also
+// being represented in the generated surface.
+export function storedValueTsType(descriptor                        )                                  {
+  switch (descriptor.type) {
+    case 'boolean': return 'boolean';
+    case 'number': return 'number';
+    default: return 'string';
+  }
+}
+
 // The generated column name for a structured field's sub-cell. Derived from the
 // declared shape (no magic strings): `<field>__<cell>`. The double underscore is
 // a visibly-generated separator; a load-time guard (entity compiler) forbids a
@@ -538,17 +683,17 @@ export function flattenStruct(fieldName        , descriptor                 , va
 // no silent default strategy (the kind names the contract; an unknown kind is a
 // declaration error).
 export function resolveStrategy(kind        )                {
-  if (kind === 'ephemeral') {
+  if (NON_STRATEGY_FIELD_KINDS.has(kind)) {
     throw new Error(
-      `ephemeral fields do not persist — no persistence strategy ` +
-        `(they engage the pace seam, not the persist seam)`,
+      `${kind} fields do not use a persistence strategy — ` +
+        `${kind === 'ephemeral' ? 'they engage the pace seam, not the persist seam' : 'they own their DDL in annotated-text-field.ts'}`,
     );
   }
   const strategy = STRATEGIES[kind];
   if (!strategy) {
     throw new Error(
       `unknown field kind '${kind}'. The field kinds are: ` +
-        `value, crdt, hash, store, ordered, computed, projected, struct, state.`,
+        `${Object.keys(SUPPORTED_FIELD_TYPES).sort().join(', ')}.`,
     );
   }
   return strategy;

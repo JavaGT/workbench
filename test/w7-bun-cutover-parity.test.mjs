@@ -23,6 +23,8 @@ import workbench, {
   entity,
   everyone,
   grant,
+  map,
+  membership,
   principal,
   read,
   ref,
@@ -290,5 +292,81 @@ test('live fan-out resolves the reason through the SPI, with no hardcoded kind s
     assert.doesNotMatch(source, /['"]annotated-text-snapshot-required['"]/, path);
     assert.match(source, /\bfieldKindSnapshotControlReason\b/, `${path} never queries the SPI`);
     assert.match(source, /['"]recipient-snapshot-required['"]/, `${path} lost its generic fallback`);
+  }
+});
+
+test('membership and map-role checks fail closed when Statement.get() returns null on miss (bun:sqlite)', async () => {
+  const rawDb = openSqliteDatabase(':memory:');
+  const db = new Proxy(rawDb, {
+    get(target, prop, receiver) {
+      if (prop === 'prepare') {
+        return (sql) => {
+          const stmt = target.prepare(sql);
+          return new Proxy(stmt, {
+            get(st, sProp, sRecv) {
+              if (sProp === 'get') {
+                return (...args) => {
+                  const res = st.get(...args);
+                  return res === undefined ? null : res;
+                };
+              }
+              const v = Reflect.get(st, sProp, sRecv);
+              return typeof v === 'function' ? v.bind(st) : v;
+            },
+          });
+        };
+      }
+      const v = Reflect.get(target, prop, receiver);
+      return typeof v === 'function' ? v.bind(target) : v;
+    },
+  });
+
+  const Project = entity('MemberProject', {
+    title: text(),
+    owner: ref('User', { role: 'owner', readonly: true }),
+    members: map(text()),
+    grant: () => [scope(({ is }) => is.owner()).can(() => grant(read, write))],
+  });
+  membership(Project, {
+    editor: { can: [read, write] },
+    viewer: { can: [read] },
+  });
+  const app = workbench({ db, entities: [Project] });
+  app.mount('/member-projects', Project);
+
+  try {
+    app.start();
+    await app.ready;
+    const handler = createFetchHandler(app, {
+      db,
+      principalOf: (req) => {
+        const bearer = String(req.headers.authorization ?? '').replace(/^Bearer\s+/i, '').trim();
+        if (bearer === 'alice') return principal({ type: 'user', id: 'alice' });
+        if (bearer === 'bob') return principal({ type: 'user', id: 'bob' });
+        return principal({ type: 'anonymous' });
+      },
+    });
+
+    const created = await handler(bearerRequest('/member-projects', {
+      method: 'POST', token: 'alice', body: { title: 'Private' },
+    }));
+    assert.equal(created.status, 201);
+    const createdRow = await parseJson(created);
+
+    const strangerPatch = await handler(bearerRequest(`/member-projects/${createdRow.id}`, {
+      method: 'PATCH', token: 'bob', body: { title: 'Hijacked' },
+    }));
+    assert.ok(
+      strangerPatch.status === 403 || strangerPatch.status === 404,
+      `stranger must be denied PATCH even when Statement.get() returns null (got ${strangerPatch.status})`,
+    );
+    assert.equal(rawDb.prepare('SELECT title FROM MemberProject WHERE id = ?').get(createdRow.id).title, 'Private');
+
+    const bound = app.entities.get('MemberProject');
+    assert.equal(await bound.findByIdFor(createdRow.id, principal({ type: 'user', id: 'bob' })), null);
+    assert.equal((await bound.findByIdFor(createdRow.id, principal({ type: 'user', id: 'alice' })))?.title, 'Private');
+  } finally {
+    await app.shutdown();
+    rawDb.close();
   }
 });

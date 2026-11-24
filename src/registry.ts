@@ -228,7 +228,7 @@ export function buildCheckRegistry({ fields = {}, declaredChecks = {}, entityNam
               `SELECT 1 FROM ${table} WHERE ${ownerCol} = :owner AND ${MEMBER_COLUMN} = :member AND role = :role`,
             );
             return (
-              stmt.get({ owner: row.id, member: principal.id, role: roleName }) !== undefined
+              stmt.get({ owner: row.id, member: principal.id, role: roleName }) != null
             );
           },
         };
@@ -255,7 +255,7 @@ function membershipHandle(
       if (ownerId == null) return false;
       return dbOf().prepare(
         `SELECT 1 FROM ${table} WHERE ${ownerCol} = :owner AND ${MEMBER_COLUMN} = :member`,
-      ).get({ owner: ownerId, member: memberId }) !== undefined;
+      ).get({ owner: ownerId, member: memberId }) != null;
     },
     get: (memberId: unknown): Record<string, unknown> | undefined => {
       const ownerId = ownerIdOf();

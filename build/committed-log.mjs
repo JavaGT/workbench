@@ -560,7 +560,7 @@ export function logRetentionReport(db          , retentionDays        , nowMs   
   const cutoffIso = new Date(nowMs - retentionDays * 86_400_000).toISOString();
   const logTotal = columnBytes(db, '_Log', 'eventData');
   const logPruned = columnBytes(db, '_Log', 'eventData', cutoffIso);
-  const oldestRow = db.prepare('SELECT 1 FROM sqlite_schema WHERE type = \'table\' AND name = \'_Log\'').get() !== undefined
+  const oldestRow = db.prepare('SELECT 1 FROM sqlite_schema WHERE type = \'table\' AND name = \'_Log\'').get() != null
     ? db.prepare('SELECT MIN(committedAt) AS oldest FROM _Log').get()
     : { oldest: null };
   const receiptTotal = columnBytes(db, '_ActionReceipt', 'actionData');
@@ -600,7 +600,7 @@ function pruneObsoleteV16Claims(db          )         {
   const exists = db.prepare(
     "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = '_V16CapabilityClaim'",
   ).get();
-  if (exists === undefined) return 0;
+  if (exists == null) return 0;
   const rows = db.prepare('SELECT scope, seq, eventType, eventData, actionId FROM _Log').all()
 
     ;
@@ -681,7 +681,7 @@ export function retentionPrune(db          , cutoffIso        ) {
     // Scopes with no cursor have no lagging consumer and may prune by age alone.
     const hasCursors = db.prepare(
       "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = '_ConsumerCursor'",
-    ).get() !== undefined;
+    ).get() != null;
     const logDelete = hasCursors
       ? `DELETE FROM _Log
          WHERE committedAt < :cutoff

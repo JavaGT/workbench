@@ -505,7 +505,7 @@ export async function serveAuthorizedBlob({
         return;
       }
       const headers = buildMediaHeaders(resolvedMeta, (resolvedMeta as BlobMediaMetadata).size);
-      const webStream = Readable.toWeb(nodeStream) as ReadableStream<Uint8Array>;
+      const webStream = Readable.toWeb(nodeStream) as unknown as ReadableStream<Uint8Array>;
       await pumpWebStreamToResponse(
         res,
         { status: 200, headers: new Headers(headers), body: webStream },
@@ -549,7 +549,7 @@ export async function serveAuthorizedBlob({
     const headers = isPartial
       ? buildMediaHeaders(meta, parsed.length, parsed.contentRange)
       : buildMediaHeaders(meta, meta.size);
-    const webStream = Readable.toWeb(nodeStream) as ReadableStream<Uint8Array>;
+    const webStream = Readable.toWeb(nodeStream) as unknown as ReadableStream<Uint8Array>;
     await pumpWebStreamToResponse(
       res,
       { status, headers: new Headers(headers), body: webStream },

@@ -419,6 +419,7 @@ test('a non-entity resource with a non-compilable scope FAILS at registration', 
 test('a compilable resource registers and admits through the same seam', async () => {
   const adapter = createAuthorizationAdapter();
   adapter.registerResource({
+    allowRowScopeFallback: true, // legitimate DB-less policy test: evaluate the supplied row
     category: 'search',
     name: 'articles',
     scope: ({ fields }) => fields.title.is('published'),
@@ -457,6 +458,7 @@ test('a non-null row without a resource name fails closed', async () => {
 test('blob/policy resources admit through the same generic seam', async () => {
   const adapter = createAuthorizationAdapter();
   adapter.registerResource({
+    allowRowScopeFallback: true, // legitimate DB-less policy test: evaluate the supplied row
     category: 'blob',
     name: 'assets',
     scope: ({ fields }) => fields.public.is(1),
@@ -475,6 +477,7 @@ test('blob/policy resources admit through the same generic seam', async () => {
 test('a registered scope denies a row that does not satisfy it (no-row-scope)', async () => {
   const adapter = createAuthorizationAdapter({ trace: true });
   adapter.registerResource({
+    allowRowScopeFallback: true, // legitimate DB-less policy test: evaluate the supplied row
     category: 'search',
     name: 'articles',
     scope: ({ fields }) => fields.status.is('published'),
@@ -495,6 +498,7 @@ test('a registered scope denies a row that does not satisfy it (no-row-scope)', 
 test('a registered scope binds the principal — the owner admits, a stranger is denied', async () => {
   const adapter = createAuthorizationAdapter();
   adapter.registerResource({
+    allowRowScopeFallback: true, // legitimate DB-less policy test: evaluate the supplied row
     category: 'search',
     name: 'mydocs',
     scope: ({ is }) => is.owner(),
@@ -514,6 +518,7 @@ test('a registered scope binds the principal — the owner admits, a stranger is
 test('a scope this seam cannot verify against a single row fails closed (membership check)', async () => {
   const adapter = createAuthorizationAdapter();
   adapter.registerResource({
+    allowRowScopeFallback: true, // legitimate DB-less policy test: evaluate the supplied row
     category: 'search',
     name: 'docs',
     scope: ({ is }) => is.collaborator(),
@@ -532,6 +537,7 @@ test('a scope this seam cannot verify against a single row fails closed (members
 test('a NEGATED membership scope still fails closed — not(...) cannot flip an unverifiable predicate to true', async () => {
   const adapter = createAuthorizationAdapter();
   adapter.registerResource({
+    allowRowScopeFallback: true, // legitimate DB-less policy test: evaluate the supplied row
     category: 'search',
     name: 'docs',
     scope: ({ is }) => is.collaborator().not(),
@@ -551,6 +557,7 @@ test('a NEGATED membership scope still fails closed — not(...) cannot flip an 
 test('a scope combining a satisfiable eq with an unverifiable FTS match denies', async () => {
   const adapter = createAuthorizationAdapter();
   adapter.registerResource({
+    allowRowScopeFallback: true, // legitimate DB-less policy test: evaluate the supplied row
     category: 'search',
     name: 'articles',
     scope: ({ fields }) => fields.status.is('published').and(fields.body.matches('needle')),
@@ -569,6 +576,7 @@ test('a scope combining a satisfiable eq with an unverifiable FTS match denies',
 test('an in-list containing NULL follows SQLite semantics — never an admit on null == null', async () => {
   const adapter = createAuthorizationAdapter();
   adapter.registerResource({
+    allowRowScopeFallback: true, // legitimate DB-less policy test: evaluate the supplied row
     category: 'search',
     name: 'articles',
     scope: ({ fields }) => fields.status.in([null]),
@@ -586,6 +594,7 @@ test('an in-list containing NULL follows SQLite semantics — never an admit on 
 test('a missing row field does not satisfy isNull — an incomplete caller row denies', async () => {
   const adapter = createAuthorizationAdapter();
   adapter.registerResource({
+    allowRowScopeFallback: true, // legitimate DB-less policy test: evaluate the supplied row
     category: 'search',
     name: 'articles',
     scope: ({ fields }) => fields.deletedAt.isNull(),
@@ -640,6 +649,7 @@ test('entity admission runs .can (rowCapabilities) exactly once per admitted req
 test('DB-less three-valued anyOf(is.owner(), is.collaborator()) admits owner and fails closed for non-owners', async () => {
   const adapter = createAuthorizationAdapter();
   adapter.registerResource({
+    allowRowScopeFallback: true, // legitimate DB-less policy test: evaluate the supplied row
     category: 'search',
     name: 'docs',
     scope: ({ is }) => anyOf(is.owner(), is.collaborator()),

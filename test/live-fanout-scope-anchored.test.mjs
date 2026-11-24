@@ -139,7 +139,7 @@ test('normal same-entity event still gets delta projection and delivery', async 
   const entity = {
     name: 'Doc',
     fields: {},
-    grant: () => [{ can: () => true }],
+    grant: () => [scope(() => true)],
     findById(id) { return { id, title: 'v1' }; },
   };
 

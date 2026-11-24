@@ -77,7 +77,9 @@ test('anyOf(is.owner(), is.member()) admits owners and authorized members on ent
     name: 'project-index',
     table: 'Project',
     scope: ({ is }) => anyOf(is.owner(), is.editor(), is.viewer()),
-    fields: Project.fields,
+    // The precompiled registry is the one source of truth for these checks
+    // (including membership's harvest faces). Also passing `fields` would
+    // re-derive `owner` and collide — checks must have exactly one source.
     registry: Project.registry,
   });
   adapter.registerResource({

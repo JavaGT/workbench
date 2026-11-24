@@ -15,6 +15,8 @@
 // state machine), `struct` (nested structure). Each is deferred-incremental: the
 // descriptor ships at import; its persistence/merge/diff strategy fires later.
 
+import { assertGuarded } from './guard/static.mjs';
+
 // The descriptor's runtime access function (a field `.can(fn)` body). The shape
 // is deliberately loose: the row-grant engine invokes it as
 // `access({ is, entity: row }, defaults)` and a protecting annotation as
@@ -58,6 +60,11 @@
 function makeDescriptor(props              )                  {
   const descriptor                          = { access: undefined, ...props };
   descriptor.can = (fn               )                  => {
+    // A field `.can` body is a runtime authorization body exactly like an
+    // entity grant `.can`: reject an un-awaited `is.*` check at DECLARATION
+    // time, not at request time (ADR #16 static guard). The runtime backstop
+    // in check.ts stays as defense in depth.
+    assertGuarded(fn                                   , { where: 'field .can body' });
     const { can, ...fields } = descriptor;
     return makeDescriptor({ ...fields, access: fn });
   };

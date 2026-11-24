@@ -33,7 +33,7 @@
 // there, never falling back to loading every row and filtering in JS.
 
 import { getLog } from './log.mjs';
-import { read, write, subscribe, admin,                 } from './grant.mjs';
+
 import { operationCategory,                        } from './operation.mjs';
 import { collapseForAdmission, statusOf,                } from './principal.mjs';
 
@@ -43,6 +43,7 @@ import {
   mayRow as moduleMayRow,
   fieldCapabilities as moduleFieldCapabilities,
   rowCapabilities,
+  VERB_CAPABILITY,
 
 } from './row-grant.mjs';
 import { buildCheckRegistry } from './registry.mjs';
@@ -175,9 +176,10 @@ import { DecisionTrace } from './decision-trace.mjs';
 // admitting: when a database handle is available (on the adapter, registered
 // resource, or entity runtime), admission executes the compiled SQL scopeFilter
 // (`SELECT 1 FROM <entity> AS t0 WHERE (<scopeSql>) AND t0.id = :__wb_id LIMIT 1`)
-// — the one compiled SQL authz engine; when no database is available, admission
-// falls back to single-row evaluation (`rowMatchesScope`), where `row` carries
-// stored cell values.
+// — the one compiled SQL authz engine. If no SQL evaluation is possible (no DB
+// handle, or a missing table), admission FAILS CLOSED unless the registration
+// explicitly opts in with `allowRowScopeFallback: true` (single-row
+// `rowMatchesScope` evaluation, for purely in-memory/policy resources).
 
 
 
@@ -201,6 +203,11 @@ import { DecisionTrace } from './decision-trace.mjs';
 // registration, never a silent load-all-then-filter fallback). `fields`/`checks`
 // supply the compile registry the scope may use; `entity`/`table`/`entityName`/
 // `db` bind the SQL evaluation target when a database is available.
+// `registry` is a precompiled check registry; a name it supplies must not
+// collide with a check already derived from `fields`/`checks`/`entity`.
+// `allowRowScopeFallback` is an explicit opt-in to single-row JS evaluation
+// when SQL is unavailable — production registrations leave it off and deny.
+
 
 
 
@@ -240,18 +247,6 @@ function traceDefault()          {
 const RESOURCE_KEY_SEPARATOR = '\u0000';
 const resourceKey = (category                        , name        )         => `${category}${RESOURCE_KEY_SEPARATOR}${name}`;
 const SQL_IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
-
-const VERB_CAPABILITY                                       = Object.freeze(
-  Object.assign(Object.create(null), {
-    list: read,
-    read,
-    create: write,
-    update: write,
-    remove: write,
-    subscribe,
-    admin,
-  }),
-);
 
 
 
@@ -438,18 +433,23 @@ export function createAuthorizationAdapter(options                              
         const hit = prepareCached(db, sql).get({ ...bound.params, __wb_id: rowId });
         return hit !== undefined;
       } catch (error) {
-        // If no table/entity was explicitly bound (e.g. a field-named blob
-        // resource registered on a shared DB-backed adapter whose name is not a
-        // SQL table), fall back to single-row evaluation; explicit tables fail
-        // closed (rethrow -> policy-error).
-        if (!registered.explicitTable && !input.entity && isMissingTableError(error)) {
+        // A missing table used to silently fall back to single-row JS
+        // evaluation, which let a SQL-unverifiable scope be admitted from
+        // caller-supplied cell values. Fail closed unless the registration
+        // explicitly opted in to the row fallback (in-memory policy resource).
+        if (registered.allowRowScopeFallback && isMissingTableError(error)) {
           return rowMatchesScope(registered.template, input.row                           , collapsed);
         }
         throw error;
       }
     }
 
-    return rowMatchesScope(registered.template, input.row                           , collapsed);
+    // No DB handle (or no bindable table/id) means the compiled SQL scope could
+    // not be consulted. Failing open here would let a forged row decide its own
+    // admission; only an explicit opt-in permits single-row evaluation.
+    return registered.allowRowScopeFallback
+      ? rowMatchesScope(registered.template, input.row                           , collapsed)
+      : false;
   }
 
   function admitResource(input                    , collapsed           , trace               , operation                          )                    {
@@ -559,7 +559,21 @@ export function createAuthorizationAdapter(options                              
         }
       }
       if (input.registry) {
-        Object.assign(mergedRegistry, input.registry);
+        for (const [key, entry] of Object.entries(input.registry)) {
+          // A check with a harvest face is a canonical SQL-side source (a
+          // ref-role, a declared check, or an earlier registry). Letting a
+          // caller overwrite it would rewrite the compiled row filter — fail
+          // closed, exactly as compileEntityAuthz does for check collisions.
+          // A runtime-only entry (e.g. a map-role name) may still be completed
+          // by a paired harvest+run face from the supplied registry.
+          if ((mergedRegistry[key]                                     )?.harvest) {
+            throw new Error(
+              `resource '${input.category}/${input.name}' registry check '${key}' collides with an existing ` +
+                'ref-role, declared, or registry check; authorization checks must have one source',
+            );
+          }
+          mergedRegistry[key] = entry;
+        }
       }
       template = compileReadScope(scopeInput, {
         fields,
@@ -589,8 +603,8 @@ export function createAuthorizationAdapter(options                              
     resources.set(resourceKey(input.category, input.name), {
       template,
       tableName,
-      explicitTable: explicitTableName !== null,
       useEntityScopeFilter,
+      allowRowScopeFallback: input.allowRowScopeFallback === true,
       entity: input.entity,
       db: resourceDb,
     });

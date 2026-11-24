@@ -203,12 +203,19 @@ export async function rowCapabilities(
   // handwritten thunk and the `owner.only()` expansion run the identical code.
   // Inherit directives were handled and returned above.
   const clauses = grantClauses(entityRecord);
+  const is = makeIs(entityRecord, row, principal);
+  // A scope-only grant confers exactly the read-class capabilities. Keeping
+  // this here (not just in mayRow) is what makes fieldCapabilities agree: a
+  // field with no own `.can` strong-inherits these, so row reads and field
+  // reads share one authority while every write stays denied.
+  if (isScopeOnlyClauses(clauses)) {
+    return { granted: true, capabilities: SCOPE_ONLY_CAPABILITIES, is };
+  }
   const clause = Array.isArray(clauses)
     ? clauses.find((c) => isRuntimeGrantClause(c))
     : null;
-  if (!clause) return { granted: false, capabilities: [], is: makeIs(entityRecord, row, principal) };
+  if (!clause) return { granted: false, capabilities: [], is };
 
-  const is = makeIs(entityRecord, row, principal);
   // resolveDecision awaits the body once and rejects an escaped (un-awaited)
   // check; here the body returns a grant()/deny() object, not a boolean, so we
   // run the body directly under the same backstop by inspecting its result.
@@ -323,7 +330,7 @@ function capabilityFor(verb: string): Capability {
   return required;
 }
 
-const VERB_CAPABILITY: Readonly<Record<string, Capability>> = Object.freeze({
+export const VERB_CAPABILITY: Readonly<Record<string, Capability>> = Object.freeze({
   list: capabilityFor('list'),
   read: capabilityFor('read'),
   create: capabilityFor('create'),
@@ -332,6 +339,26 @@ const VERB_CAPABILITY: Readonly<Record<string, Capability>> = Object.freeze({
   subscribe: capabilityFor('subscribe'),
   admin: capabilityFor('admin'),
 });
+
+// A scope-only grant (`scope(predicate)` with NO `.can`) declares row VISIBILITY
+// through the SQL read-scope and nothing else. It is NOT an implicit CRUD grant:
+// the framework must never invent a write capability the author did not confer.
+// The ONLY authority such a grant carries is read-class — the row was admitted
+// to the result set by its scope, so list/read/subscribe stay coherent with the
+// visible set; create/update/remove/admin are denied because no capability
+// confers them. These three decision surfaces share this ONE constant:
+// `rowCapabilities` (what the row confers), `fieldCapabilities` (which inherits
+// it for fields with no own `.can`), and `mayRow` (the transport admission).
+const SCOPE_ONLY_CAPABILITIES: readonly Capability[] = Object.freeze([read, subscribe]);
+
+// True when the resolved grant is a clause array with a scope predicate but no
+// runtime `.can` body. An empty/absent grant is NOT scope-only (it denies); an
+// inherit directive is handled by its own recursion before this is consulted.
+function isScopeOnlyClauses(clauses: unknown): boolean {
+  return Array.isArray(clauses)
+    && !clauses.some((c) => isRuntimeGrantClause(c))
+    && clauses.some((c) => c && typeof (c as { predicate?: unknown }).predicate === 'function');
+}
 
 // True iff the entity's grant carries its OWN `.can` body (a scope(...).can(fn)
 // clause). Inherit children (grant is an `inherit` directive) and scope-only
@@ -398,9 +425,11 @@ function principalId(principal: unknown): unknown {
 //   - Inherit directive → load the parent row through the declared FK and recurse
 //     into the parent's mayRow decision, so inherited visibility and inherited
 //     capabilities stay one concept.
-//   - Scope-only grant → return true (admit) for existing transport verbs: the
-//     read-scope alone decided visibility. `admin` is not a transport default;
-//     it requires an explicit `.can` capability grant.
+//   - Scope-only grant → the read-scope alone decided VISIBILITY, which confers
+//     only read-class verbs (list/read/subscribe) via SCOPE_ONLY_CAPABILITIES.
+//     A scope predicate is NOT an implicit CRUD grant: create/update/remove and
+//     admin are denied unless an explicit `.can` body confers `write`/`admin`.
+//     This is the same authority rowCapabilities/fieldCapabilities report.
 //   - Own `.can` grant → run mayVerb inside a try/catch and fail CLOSED on throw
 //     (return false). A thrown `.can` body is a server bug; fail-closed denies
 //     rather than leaking the row.
@@ -457,7 +486,15 @@ export async function mayRow(
       }
       return true;
     }
-    if (!hasOwnCanGrant(entityRecord)) return verb !== 'admin';
+    if (!hasOwnCanGrant(entityRecord)) {
+      // Fail CLOSED on writes: a `scope(predicate)` with no `.can` never
+      // silently admits create/update/remove (or admin). It admits only the
+      // read-class verbs its read-scope visibility implies, using the SAME
+      // capability set rowCapabilities/fieldCapabilities report for this row.
+      if (!isScopeOnlyClauses(grantClauses(entityRecord))) return false;
+      const required = VERB_CAPABILITY[verb];
+      return required ? SCOPE_ONLY_CAPABILITIES.includes(required) : false;
+    }
     return await authz(entityRecord, verb, row, principal);
   } catch {
     return false;

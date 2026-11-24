@@ -35,6 +35,7 @@ const ownerRow = { id: 'avatar-1', owner: 'alice' };
 function avatarAdapter() {
   const adapter = createAuthorizationAdapter();
   adapter.registerResource({
+    allowRowScopeFallback: true, // legitimate DB-less policy test: evaluate the supplied row
     category: 'blob',
     name: 'avatar',
     scope: ({ is }) => is.owner(),

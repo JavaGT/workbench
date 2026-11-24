@@ -307,17 +307,20 @@ test('D5 inherited rows delegate every transport decision to the parent row gran
   }
 });
 
-test('D5 scope-only rows stay admitted by mayRow across transports', async (t) => {
+test('D5 scope-only rows admit read-class verbs across transports but deny writes', async (t) => {
   const ScopeOnly = scopeOnlyRecord();
-  const { app, origin, port } = await boot(t, [['/open-records', ScopeOnly]]);
+  const { app, db, origin, port } = await boot(t, [['/open-records', ScopeOnly]]);
 
+  // A scope-only grant is NOT an implicit CRUD grant, so the row cannot be
+  // created over HTTP. Seed it directly — the same setup list-authz uses.
   const created = await fetch(`${origin}/open-records`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-test-user': bob.id },
     body: JSON.stringify({ title: 'Open' }),
   });
-  assert.equal(created.status, 201);
-  const row = await created.json();
+  assert.equal(created.status, 403, 'a scope predicate does not confer create');
+  db.prepare('INSERT INTO D5ScopeOnlyRecord (id, title) VALUES (?, ?)').run('open-1', 'Open');
+  const row = { id: 'open-1' };
 
   const list = await fetch(`${origin}/open-records`, { headers: { 'x-test-user': bob.id } });
   assert.equal(list.status, 200);
@@ -329,6 +332,9 @@ test('D5 scope-only rows stay admitted by mayRow across transports', async (t) =
   const snapshot = await fetch(`${origin}/snapshot/D5ScopeOnlyRecord/${row.id}`, { headers: { 'x-test-user': bob.id } });
   assert.equal(snapshot.status, 200);
 
+  // The row was seeded directly (no create event), so append one for the
+  // events-since read to exercise the same scope-only admission path.
+  appendLiveEvent(app, `D5ScopeOnlyRecord:${row.id}`, 'D5ScopeOnlyRecord.created');
   const events = await fetch(`${origin}/events-since/D5ScopeOnlyRecord/${row.id}?cursor=0`, { headers: { 'x-test-user': bob.id } });
   assert.equal(events.status, 200);
   assert.ok((await events.json()).events.length >= 1);
@@ -348,8 +354,8 @@ test('D5 scope-only rows stay admitted by mayRow across transports', async (t) =
     headers: { 'content-type': 'application/json', 'x-test-user': bob.id },
     body: JSON.stringify({ title: 'Edited' }),
   });
-  assert.equal(update.status, 200);
+  assert.equal(update.status, 403, 'a scope predicate does not confer write');
 
   const remove = await fetch(`${origin}/open-records/${row.id}`, { method: 'DELETE', headers: { 'x-test-user': bob.id } });
-  assert.equal(remove.status, 204);
+  assert.equal(remove.status, 403, 'a scope predicate does not confer remove');
 });

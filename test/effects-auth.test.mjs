@@ -388,13 +388,16 @@ test('#4 boot: valid effects resolve app.ready + fire through the wired kernel',
   const Target = entity('Target', {
         name: text(),
 
-    grant: () => grant(read, write, subscribe),
+    // The kernel dispatch below runs the real row grant: declare the scope +
+    // capability clauses explicitly instead of a bare decision thunk (which
+    // relied on a scope-less grant silently admitting every write).
+    grant: () => [scope(() => everyone()).can(() => grant(read, write, subscribe))],
     admitsEffects: () => true,
   });
   const Source = entity('Source', {
         title: text(),
 
-    grant: () => grant(read, write, subscribe),
+    grant: () => [scope(() => everyone()).can(() => grant(read, write, subscribe))],
     effects: (Source) => [[Source.created, { mutate: Target, with: { name: 'wired' } }]],
   });
 

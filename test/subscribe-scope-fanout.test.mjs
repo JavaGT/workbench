@@ -23,7 +23,7 @@ function makeConn(id, principalId = id) {
 test('scope-keyed fanout: add by scope string delivers to that scope', async () => {
   const fanout = createLiveFanout({ mayVerb: async () => true });
   const conn = makeConn('c1');
-  const entity = { name: 'Doc', fields: {}, grant: () => [{ can: () => true }], findById(id) { return { id, title: 'v1' }; } };
+  const entity = { name: 'Doc', fields: {}, grant: () => [scope(() => true)], findById(id) { return { id, title: 'v1' }; } };
 
   fanout.addSubscription('Doc:d1', conn);
   assert.equal(fanout.subscriptionCount(conn), 1);
@@ -40,7 +40,7 @@ test('scope-keyed fanout: add by scope string delivers to that scope', async () 
 test('scope-keyed fanout: legacy addSubscription(entity, id, conn) still works', async () => {
   const fanout = createLiveFanout({ mayVerb: async () => true });
   const conn = makeConn('c1');
-  const entity = { name: 'Note', fields: {}, grant: () => [{ can: () => true }], findById(id) { return { id, title: 'v1' }; } };
+  const entity = { name: 'Note', fields: {}, grant: () => [scope(() => true)], findById(id) { return { id, title: 'v1' }; } };
 
   fanout.addSubscription('Note', 'n1', conn);
   assert.equal(fanout.subscriptionCount(conn), 1);
@@ -53,7 +53,7 @@ test('scope-keyed fanout: legacy addSubscription(entity, id, conn) still works',
 test('scope-keyed fanout: coarse scope subscription receives all events for that scope', async () => {
   const fanout = createLiveFanout({ mayVerb: async () => true });
   const conn = makeConn('c1');
-  const entity = { name: 'Card', fields: {}, grant: () => [{ can: () => true }], findById(id) { return { id, title: 'v1' }; } };
+  const entity = { name: 'Card', fields: {}, grant: () => [scope(() => true)], findById(id) { return { id, title: 'v1' }; } };
 
   fanout.addSubscription('project:p1', conn);
 
@@ -69,7 +69,7 @@ test('scope-keyed fanout: coarse scope subscription receives all events for that
 test('scope-keyed fanout: event with wrong scope does not deliver', async () => {
   const fanout = createLiveFanout({ mayVerb: async () => true });
   const conn = makeConn('c1');
-  const entity = { name: 'Doc', fields: {}, grant: () => [{ can: () => true }], findById(id) { return { id, title: 'v1' }; } };
+  const entity = { name: 'Doc', fields: {}, grant: () => [scope(() => true)], findById(id) { return { id, title: 'v1' }; } };
 
   fanout.addSubscription('Doc:d1', conn);
 

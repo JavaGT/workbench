@@ -1,4 +1,4 @@
-import { state, text, date, schedule, scope, everyone, grant, read } from '../build/index.mjs';
+import { state, text, date, schedule, scope, everyone, grant, read, write } from '../build/index.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
@@ -164,7 +164,9 @@ import { executeFrameworkDDL, createServer, durableMutationVariant, buildEffects
 
 function setupDoc() {
   const Doc = entity('DocState', {
-    grant: scope(() => everyone()).can(() => grant(read)),
+    // The runtime tests below perform updates: declare `write` explicitly
+    // instead of relying on a read-only grant silently admitting mutations.
+    grant: () => [scope(() => everyone()).can(() => grant(read, write))],
         title: text(),
     status: state({
       values: ['draft', 'shared', 'archived'],
@@ -320,7 +322,7 @@ test('state.effects runs only for its declared transition and defaults to the sa
       values: ['draft', 'shared'],
       transitions: { draft: ['shared'] },
     }),
-    grant: scope(() => everyone()).can(() => grant(read)),
+    grant: () => [scope(() => everyone()).can(() => grant(read, write))],
   });
   for (const sql of generateDDL(Doc)) db.exec(sql);
   const app = workbench({ db, entities: [Doc] });

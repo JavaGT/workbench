@@ -54,6 +54,7 @@
 // exposes.
 
 import { txn,               } from './driver.mjs';
+import { runPostCommitTurn } from './write-queue.mjs';
 import { sweepBehindCursor, upsertConsumerCursor } from './consumer-cursor.mjs';
 import { decodeConsumerLogRowData,                 } from './committed-log.mjs';
 import { getLog } from './log.mjs';
@@ -710,12 +711,12 @@ async function recordSourceChangeAndAdvance(
   change                                ,
   cursor                                ,
 )                {
-  await txn(db, () => {
+  await runPostCommitTurn(db, () => txn(db, () => {
     if (change !== null) notify(change);
     // Advance even for an event that maps to no source change: leaving such an
     // event behind the cursor would replay it on every boot forever.
     upsertConsumerCursor(db, { consumer: SEARCH_STALENESS_CURSOR, scope: cursor.scope, lastSeq: cursor.seq });
-  });
+  }));
 }
 
 // The S3 post-commit consumer that FEEDS this bridge (review #109 finding 2).

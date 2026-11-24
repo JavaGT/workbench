@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { runPostCommitTurn } from './write-queue.ts';
 import { sweepBehindCursor, upsertConsumerCursor } from './consumer-cursor.ts';
 import type { DbHandle } from './driver.ts';
 import { txn } from './driver.ts';
@@ -275,10 +276,13 @@ export function createOperationalConsumers(consumers: readonly unknown[] = [], {
       return false;
     }
     if (result.kind === 'ack') {
-      await txn(db, () => {
+      // The cursor checkpoint shares the coordinator's post-commit lane with
+      // every other consumer: two `BEGIN IMMEDIATE` on this connection must
+      // never overlap, even when a nested dispatch re-enters the same turn.
+      await runPostCommitTurn(db, () => txn(db, () => {
         db.prepare('DELETE FROM _OperationalConsumerFailure WHERE consumer = ? AND scope = ? AND committedEventId = ?').run(consumer.name, row.scope, `${row.scope}:${row.seq}`);
         upsertConsumerCursor(db, { consumer: cursorName(consumer.name), scope: row.scope, lastSeq: row.seq });
-      });
+      }));
       return true;
     }
     await recordFailure(db, consumer, row, declarationFingerprint, result, result.detail ?? 'consumer did not acknowledge');
@@ -291,19 +295,21 @@ export function createOperationalConsumers(consumers: readonly unknown[] = [], {
     // thrown errors may carry payload text and never reach the durable row.
     const code = terminal ? String(result.code ?? 'terminal') : retryReason(result.code);
     const safeDetail = terminal ? (result.code ? failureDetail(String(result.code)) : detail) : failureDetail(code);
-    await txn(db, () => db.prepare(`INSERT INTO _OperationalConsumerFailure
+    await runPostCommitTurn(db, () => txn(db, () => db.prepare(`INSERT INTO _OperationalConsumerFailure
       (consumer, scope, committedEventId, declarationFingerprint, code, detail, status, nextAttemptAt)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(consumer, scope, committedEventId) DO UPDATE SET code = excluded.code, detail = excluded.detail, status = excluded.status, nextAttemptAt = excluded.nextAttemptAt`)
-      .run(consumer.name, row.scope, `${row.scope}:${row.seq}`, declarationFingerprint, code, safeDetail, terminal ? 'terminal' : 'retry', terminal ? null : now() + Math.max(0, Math.ceil(Number(result.afterMs) || 0))));
+      .run(consumer.name, row.scope, `${row.scope}:${row.seq}`, declarationFingerprint, code, safeDetail, terminal ? 'terminal' : 'retry', terminal ? null : now() + Math.max(0, Math.ceil(Number(result.afterMs) || 0)))));
   }
 
   async function reconcile(db: DbHandle): Promise<void> {
     // A consumer may dispatch another Workbench action (for example, a
     // durable notification) while its current delivery is still in flight.
     // The nested post-commit hook must not sweep the same cursor row again
-    // before the outer delivery has acknowledged it. Defer one follow-up
-    // sweep until the outer cursor update completes instead.
+    // before the outer delivery has acknowledged it. It only ARMED a follow-up;
+    // this call runs that follow-up itself, awaited, instead of detaching it
+    // onto the write queue — ownership would let a detached sweep interleave
+    // its transaction with the next post-commit consumer's transaction.
     if (reconciling) {
       reconcileAgain = true;
       return;
@@ -311,20 +317,18 @@ export function createOperationalConsumers(consumers: readonly unknown[] = [], {
     reconciling = true;
     engage(db);
     try {
-      for (const consumer of declared) {
-        await sweepBehindCursor(db, cursorName(consumer.name), async (row) => {
-          if (row.eventType !== consumer.event.eventType) return 'skip';
-          return (await deliver(db, consumer, row)) ? 'done' : 'block';
-        });
-      }
+      do {
+        reconcileAgain = false;
+        for (const consumer of declared) {
+          await sweepBehindCursor(db, cursorName(consumer.name), async (row) => {
+            if (row.eventType !== consumer.event.eventType) return 'skip';
+            return (await deliver(db, consumer, row)) ? 'done' : 'block';
+          });
+        }
+      } while (reconcileAgain && !stopped);
     } finally {
       reconciling = false;
       armRetryScheduler(db);
-      if (reconcileAgain && !stopped) {
-        reconcileAgain = false;
-        const queued = writeQueue ? writeQueue.run(() => reconcile(db)) : Promise.resolve().then(() => reconcile(db));
-        queued.catch(() => {}).finally(() => armRetryScheduler(db));
-      }
     }
   }
 

@@ -337,10 +337,31 @@ async function bootApplication(app: RuntimeApp): Promise<RuntimeApp> {
     });
   }
 
+  // Cursor-backed recovery is durability work, not maintenance: a failed sweep
+  // means a committed mutation may never reach its projection/ledger/effect.
+  // Collect every failure, run the remaining sweeps so the report is complete,
+  // then refuse to serve. Only genuinely best-effort work (blob recycle seam
+  // assembly above, pending-blob lifecycle below) stays warn-and-continue.
+  const bootReconcileFailures: Array<{ name: string; err: unknown }> = [];
+  // Fail-closed applies to conforming durable handles — ones with the driver's
+  // `exec` surface and therefore framework tables to reconcile. An injected
+  // non-conforming stub (e.g. a handle whose prepare always throws to exercise
+  // the dispatch error renderer) has no durable schema; its sweep failures keep
+  // the historical warn-only degradation rather than blocking a synthetic app.
+  const conformingBootDb = Boolean(app.db && typeof app.db.exec === 'function');
+  const failBootReconcile = (name: string, err: unknown) => {
+    if (!conformingBootDb) {
+      log.warn('system', `${name} recovery sweep failed`, { err });
+      return;
+    }
+    bootReconcileFailures.push({ name, err });
+    log.error('system', `${name} recovery sweep failed`, { err });
+  };
+
   try {
     await app.writeQueue.run(() => reconcileProjectedRecovery(app.db as never, app.entities as never));
   } catch (err) {
-    log.warn('system', 'projected recovery sweep failed', { err });
+    failBootReconcile('projected.async', err);
   }
   if (app._shutdownStarted) return app;
   const reconcileBlobFinalize = app.reconcileBlobFinalize;
@@ -348,7 +369,7 @@ async function bootApplication(app: RuntimeApp): Promise<RuntimeApp> {
     try {
       await app.writeQueue.run(() => reconcileBlobFinalize(app.db));
     } catch (err) {
-      log.warn('system', 'blob finalize recovery sweep failed', { err });
+      failBootReconcile('blob.finalize', err);
     }
   }
   const pendingBlobLifecycle = app.pendingBlobLifecycle;
@@ -365,7 +386,7 @@ async function bootApplication(app: RuntimeApp): Promise<RuntimeApp> {
     try {
       await app.writeQueue.run(() => reconcileEmailDelivery(app.db));
     } catch (err) {
-      log.warn('system', 'email delivery recovery sweep failed', { err });
+      failBootReconcile('email', err);
     }
   }
   const reconcileOperationalConsumers = app.reconcileOperationalConsumers;
@@ -373,20 +394,19 @@ async function bootApplication(app: RuntimeApp): Promise<RuntimeApp> {
     try {
       await app.writeQueue.run(() => reconcileOperationalConsumers());
     } catch (err) {
-      log.warn('system', 'operational consumer recovery sweep failed', { err });
+      failBootReconcile('operational consumers', err);
     }
   }
   if (app._shutdownStarted) return app;
   // Search staleness is cursor-backed: replay any _Log row committed before a
   // crash in the commit→notify window so the source-change ledger is complete
-  // before the app serves searches. Same write-queue wrapping and degradation
-  // policy as the other cursor-backed reconcilers above.
+  // before the app serves searches.
   const reconcileSearchStaleness = app.reconcileSearchStaleness;
   if (app.db && reconcileSearchStaleness) {
     try {
       await app.writeQueue.run(() => reconcileSearchStaleness());
     } catch (err) {
-      log.warn('system', 'search staleness recovery sweep failed', { err });
+      failBootReconcile('search staleness', err);
     }
   }
   if (app._shutdownStarted) return app;
@@ -400,8 +420,18 @@ async function bootApplication(app: RuntimeApp): Promise<RuntimeApp> {
         }),
       );
     } catch (err) {
-      log.warn('system', 'durable effects recovery sweep failed', { err });
+      failBootReconcile('effect.durable', err);
     }
+  }
+
+  // Fail closed BEFORE maintenance, reapers, clocks, or the "serving" log line.
+  // startApplication's catch marks the app failed and runs the start-failure
+  // shutdown path, so no half-recovered app can answer a request.
+  if (bootReconcileFailures.length > 0) {
+    const detail = bootReconcileFailures
+      .map(({ name, err }) => `${name}: ${err instanceof Error ? err.message : String(err)}`)
+      .join('; ');
+    throw new Error(`boot reconciliation failed: ${detail}`);
   }
 
   engageMaintenance(app, log);

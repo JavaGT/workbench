@@ -34,7 +34,7 @@ import { executeAtomicOperations, isAtomicOperation, type AtomicExecution, type 
 import { admitRowTransition } from './field-admission.ts';
 import { writeInvalidationInTxn } from './invalidation-ledger.ts';
 import { ownedResourcesCapability } from './owned-resource-purge.ts';
-import { createWriteQueue, type WriteQueue } from './write-queue.ts';
+import { createWriteQueue, postCommitTurnsDrained, type WriteQueue } from './write-queue.ts';
 
 // ---- Typed handler policy -------------------------------------------------
 //
@@ -673,9 +673,15 @@ function createMutationVariant<TState>({
       const consumerErrorHook = onConsumerError
         ?? (context as { onConsumerError?: PostCommitConsumerErrorHook | null } | null)?.onConsumerError
         ?? null;
+      const dbForPostCommit = (context as { db?: object } | null)?.db;
       for (const [consumerIndex, consumer] of postCommitConsumers.entries()) {
         try {
           await consumer(events, context);
+          // A consumer may leave a cursor/ledger turn on the coordinator's
+          // post-commit lane (a nested dispatch re-entering this same mutex
+          // turn is the common case). Drain it before the next consumer so no
+          // two consumers ever hold an open BEGIN IMMEDIATE on this connection.
+          await postCommitTurnsDrained(dbForPostCommit);
         } catch (err) {
           // A post-commit fan-out failure never undoes the committed dispatch.
           // It is no longer silent: structured log + an optional app hook give
@@ -1392,6 +1398,10 @@ async function commitEvents(db: any, events: any, {
     getLog().error('dispatch', 'post-commit delivery failed', { err, actionId, phase: 'live-delivery' });
     reportConsumerError(onConsumerError, err, 'live-delivery', actionId);
   }
+  // The dispatch must not return with a post-commit DB turn still queued: that
+  // turn would run later on the same connection, outside the fan-out's ordering
+  // and potentially inside the next dispatch's transaction.
+  await postCommitTurnsDrained(db as object | null | undefined);
   return Object.freeze({ ...successOutcome(committed.events), resultData: committed.resultData });
 }
 

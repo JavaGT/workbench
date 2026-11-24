@@ -54,6 +54,7 @@
 // exposes.
 
 import { txn, type DbHandle } from './driver.ts';
+import { runPostCommitTurn } from './write-queue.ts';
 import { sweepBehindCursor, upsertConsumerCursor } from './consumer-cursor.ts';
 import { decodeConsumerLogRowData, type LogRowLike } from './committed-log.ts';
 import { getLog } from './log.ts';
@@ -710,12 +711,12 @@ async function recordSourceChangeAndAdvance(
   change: SearchSourceChangeInput | null,
   cursor: { scope: string; seq: number },
 ): Promise<void> {
-  await txn(db, () => {
+  await runPostCommitTurn(db, () => txn(db, () => {
     if (change !== null) notify(change);
     // Advance even for an event that maps to no source change: leaving such an
     // event behind the cursor would replay it on every boot forever.
     upsertConsumerCursor(db, { consumer: SEARCH_STALENESS_CURSOR, scope: cursor.scope, lastSeq: cursor.seq });
-  });
+  }));
 }
 
 // The S3 post-commit consumer that FEEDS this bridge (review #109 finding 2).

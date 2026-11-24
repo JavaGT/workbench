@@ -51,6 +51,9 @@ interface BunWebSocketLike {
   ping?(): void;
   pong?(): void;
   readyState?: number;
+  /** Real Bun sockets expose a method, not a property. */
+  getBufferedAmount?(): number;
+  /** Fake/legacy sockets may expose a plain property instead. */
   bufferedAmount?: number;
   data?: unknown;
   remoteAddress?: string;
@@ -135,13 +138,22 @@ function isWebSocketUpgrade(request: BunRequestLike): boolean {
 function createSocketFacade(socket: BunWebSocketLike) {
   const emitter = createEmitter();
   let readyState = 1;
+  // Local fallback for sockets that expose neither getBufferedAmount() nor a
+  // bufferedAmount property (e.g. test doubles). It counts ONLY bytes queued
+  // under backpressure and is cleared on drain — accumulating every send would
+  // grow monotonically and eventually trip LiveConnection's byte queue limit.
   let bufferedBytes = 0;
+  let closeEmitted = false;
+
+  const readBufferedAmount = (): number => {
+    if (typeof socket.getBufferedAmount === 'function') return socket.getBufferedAmount();
+    if (typeof socket.bufferedAmount === 'number') return socket.bufferedAmount;
+    return bufferedBytes;
+  };
 
   const facade: any = {
     get readyState() { return readyState; },
-    get bufferedAmount() {
-      return typeof socket.bufferedAmount === 'number' ? socket.bufferedAmount : bufferedBytes;
-    },
+    get bufferedAmount() { return readBufferedAmount(); },
     on(event: string, listener: Listener) { emitter.on(event, listener); return facade; },
     off(event: string, listener: Listener) { emitter.off(event, listener); return facade; },
     once(event: string, listener: Listener) { emitter.once(event, listener); return facade; },
@@ -154,12 +166,16 @@ function createSocketFacade(socket: BunWebSocketLike) {
       try {
         const text = String(payload);
         const written = socket.send(text);
-        if (written === -1) throw new Error('Bun WebSocket send was backpressured');
-        bufferedBytes += text.length;
+        // Bun's -1 means ENQUEUED WITH BACKPRESSURE — the peer is slow, not
+        // gone. The transport stays open and resumes when Bun calls drain().
+        if (written === 0) throw new Error('Bun WebSocket dropped the message (socket closed)');
+        if (written === -1) bufferedBytes += Buffer.byteLength(text, 'utf8');
         queueMicrotask(() => callback?.(undefined));
       } catch (err) {
-        readyState = 3;
         emitter.emit('error', err);
+        // Mark closed through the one idempotent seam so a fatal write also
+        // presents 'close' exactly once (never set readyState before it).
+        markClosed();
         queueMicrotask(() => callback?.(err instanceof Error ? err : new Error(String(err))));
       }
     },
@@ -169,18 +185,22 @@ function createSocketFacade(socket: BunWebSocketLike) {
     },
     close(code = 1000, reason = '') {
       if (readyState === 3) return;
+      // Send the RFC 6455 close frame first, then present the ws-shaped 'close'
+      // synchronously so shared LiveConnection cleanup never waits out its
+      // 250 ms handshake grace timer (Bun owns the real handshake).
       try { socket.close(code, reason); } catch { /* ignore */ }
+      markClosed(code, reason);
     },
     terminate() {
       if (readyState === 3) return;
-      readyState = 3;
       try { socket.terminate(); } catch { /* ignore */ }
-      markClosed();
+      markClosed(1006, '');
     },
   };
 
   function markClosed(code?: number, reason?: string): void {
-    if (readyState === 3) return;
+    if (closeEmitted) return;
+    closeEmitted = true;
     readyState = 3;
     bufferedBytes = 0;
     emitter.emit('close', code, reason);
@@ -192,7 +212,10 @@ function createSocketFacade(socket: BunWebSocketLike) {
     markError(error: unknown) { emitter.emit('error', error); },
     message(data: unknown, isBinary: boolean) { emitter.emit('message', data, isBinary); },
     pong() { emitter.emit('pong'); },
-    drain() { emitter.emit('drain'); },
+    drain() {
+      bufferedBytes = 0;
+      emitter.emit('drain');
+    },
   };
 }
 
@@ -311,15 +334,26 @@ export function createBunServerHandlers(app: any, {
   };
   const isReady = ready ?? (() => Promise.resolve(app?.ready ?? undefined));
 
-  // Reuse an existing authority when the app already attached one. Otherwise
-  // create exactly one and publish it on both seams before startup, so the
-  // Kernel registers this consumer and shutdown closes this delivery.
-  const existing = app?._applicationLiveDelivery ?? app?.liveDelivery ?? app?.live;
-  const ownsCore = !existing?.core && !injectedCore;
+  // Reuse the ONE authority the app already owns. An application-integrated
+  // delivery (_applicationLiveDelivery) and the framework WS seam (app.live)
+  // both expose `.core`. An injected core never overrides an app-owned one:
+  // building over an active listen() transport would create a second committed
+  // authority, which is exactly the split this seam must prevent.
+  const existing = app?._applicationLiveDelivery ?? app?.live ?? null;
+  const existingCore = (existing?.core as LiveDeliveryCore | undefined) ?? null;
+  const ownsCore = !existingCore && !injectedCore;
   const built = ownsCore ? createSharedCore({ db: db as LiveDatabase, resolveEntity, mayVerb, authorization, log }) : null;
   const envelopeBuilder = built?.envelopeBuilder ?? null;
-  const core: LiveDeliveryCore = injectedCore ?? existing?.core ?? built!.core;
-  if (ownsCore) {
+  const core: LiveDeliveryCore = existingCore ?? injectedCore ?? built!.core;
+
+  // kernel.ts registers the live post-commit consumer from app.live. Whenever
+  // a core exists — injected, app-owned, or just built here — make sure app.live
+  // exposes that SAME core and a consumer. Without this, a core reachable only
+  // through a transport-side field left the app with no live consumer at all.
+  const liveIsWired = Boolean(
+    app?.live && app.live.core === core && typeof app.live.createConsumer === 'function',
+  );
+  if (!liveIsWired) {
     const delivery = {
       core,
       createConsumer() {
@@ -337,7 +371,6 @@ export function createBunServerHandlers(app: any, {
       close() { core.close(); envelopeBuilder?.clear(); },
     };
     app.live = delivery;
-    app.liveDelivery = delivery;
   }
 
   const resources = createLiveTransportResources({
@@ -432,11 +465,19 @@ export function createBunServerHandlers(app: any, {
     closePromise = (async () => {
       closed = true;
       if (heartbeatTimer !== null) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
-      for (const socket of [...connections.keys()]) {
-        try { socket.terminate(); } catch { /* ignore */ }
+      // Close the attached connections FIRST, while the registry is intact:
+      // each shared connection issues a clean RFC 6455 close handshake through
+      // its socket facade, which presents 'close' synchronously and therefore
+      // resolves without the 250 ms grace timer. Terminating sockets before
+      // this point suppressed that event and left the handshake unflushed.
+      await resources.closeConnections();
+      for (const [socket, state] of [...connections]) {
+        if (!state.attached()) {
+          try { socket.terminate(); } catch { /* ignore */ }
+        }
+        state.markClosed(1001, 'Server shutting down');
       }
       connections.clear();
-      await resources.closeConnections();
       if (ownsCore) {
         core.close();
         envelopeBuilder?.clear();

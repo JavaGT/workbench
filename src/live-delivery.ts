@@ -46,7 +46,7 @@ import type { LiveDatabase } from './live-fanout.ts';
  * @param {Function|null} [options.resolveEntity] — name → entity record
  * @param {Function} [options.ready] — resolves when protocol admission is safe
  * @param {object|null} [options.log] — application-owned structured logger
- * @returns {{ count: Function, close: Function, createConsumer: Function, wake: Function }}
+ * @returns {{ count: Function, close: Function, createConsumer: Function, wake: Function, core: LiveDeliveryCore }}
  */
 export function createWebSocketLiveDelivery(httpServer: Server, {
   path = '/events',
@@ -149,6 +149,10 @@ export function createWebSocketLiveDelivery(httpServer: Server, {
     close,
     createConsumer,
     wake,
+    // The one committed authority behind this transport. Published so a second
+    // transport skin (e.g. createBunServerHandlers) can reuse it instead of
+    // building a second core over an already-listening app.
+    core,
   };
 }
 

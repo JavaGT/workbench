@@ -113,6 +113,8 @@ interface RuntimeApp {
   batch: (actions: unknown, options?: { principal?: unknown; clientId?: unknown; scope?: unknown }) => Promise<unknown>;
   entities: ReadonlyMap<string, LiveEntityRecord>;
   db?: RuntimeDatabase | null;
+  /** The DB lifecycle owner; a file-mode adapter knows its path before its lazy open. */
+  _dbAdapter?: { root?: string | null } | null;
   prepareSchema(): Promise<unknown>;
   resolveRoutes(): Promise<unknown>;
   clock: RuntimeClock;
@@ -283,18 +285,19 @@ async function bootApplication(app: RuntimeApp): Promise<RuntimeApp> {
   if (app._shutdownStarted) return app;
   await app.resolveRoutes();
   if (app._shutdownStarted) return app;
-  if (app.db && typeof app.db.exec === 'function') await app.prepareSchema();
-  if (app._shutdownStarted) return app;
 
   // Optional recovery/backup probe. When an app wires one (e.g. the sqlite
   // adapter's read-only file probe, or a backup/recovery manager), boot runs it
   // BEFORE the kernel and any writer, so a database that needs recovery fails
   // closed instead of serving a commit log SQLite cannot be trusted to keep.
   // A probe failure is a boot failure, never a degradation.
-  if (typeof app.probeRecovery === 'function') {
+  const probeRecovery = typeof app.probeRecovery === 'function' ? app.probeRecovery : null;
+  let probed = false;
+  const runRecoveryProbe = async () => {
+    probed = true;
     let probeResult: RuntimeRecoveryProbeResult;
     try {
-      probeResult = await app.probeRecovery();
+      probeResult = await probeRecovery!();
     } catch (err) {
       log.error('system', 'recovery probe threw during boot', { err });
       throw err;
@@ -305,7 +308,24 @@ async function bootApplication(app: RuntimeApp): Promise<RuntimeApp> {
       log.error('system', 'recovery probe failed — refusing to boot', { reason, findings });
       throw new Error(`recovery probe failed: ${reason}${findings.length > 0 ? ` (${findings.join('; ')})` : ''}`);
     }
-  }
+  };
+
+  // A database whose path is already known must be integrity-checked BEFORE
+  // prepareSchema() runs DDL/migrations, so a corrupt file fails closed before
+  // anything writes to it. An installed handle (including :memory:) or a
+  // file-mode adapter's owned root counts as known; a lazy adapter's path is
+  // known from its root even before the handle opens (its file probe treats a
+  // not-yet-created file as healthy). Memory-only/handle-less apps keep the
+  // probe after schema so no file path is ever inferred for them.
+  const dbPathKnown = Boolean(
+    (app.db && typeof app.db.exec === 'function')
+    || (typeof app._dbAdapter?.root === 'string' && app._dbAdapter.root.length > 0),
+  );
+  if (probeRecovery && dbPathKnown) await runRecoveryProbe();
+  if (app._shutdownStarted) return app;
+  if (app.db && typeof app.db.exec === 'function') await app.prepareSchema();
+  if (app._shutdownStarted) return app;
+  if (probeRecovery && !probed) await runRecoveryProbe();
   if (app._shutdownStarted) return app;
 
   app.kernel = buildKernel(app) as unknown as RuntimeKernel;

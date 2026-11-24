@@ -429,3 +429,230 @@ test('real Bun.serve + WebSocket smoke test', async (t) => {
     try { db.close(); } catch { /* already closed */ }
   }
 });
+
+// ---------------------------------------------------------------------------
+// 4. Wave 9 regressions: Bun backpressure, bufferedAmount, close handshake,
+//    single live authority, and recovery probe ordering at boot.
+// ---------------------------------------------------------------------------
+
+function fakeBunSocketWith(server, {
+  sendResult = (text) => text.length,
+  bufferedAmount,
+  getBufferedAmount,
+} = {}) {
+  const sent = [];
+  let amountCalls = 0;
+  let closeCalls = 0;
+  let terminateCalls = 0;
+  const socket = {
+    sent,
+    data: server.data,
+    readyState: 1,
+    send(text) { sent.push(JSON.parse(text)); return sendResult(text); },
+    ping() {},
+    pong() {},
+    close() { closeCalls += 1; },
+    terminate() { terminateCalls += 1; },
+  };
+  if (bufferedAmount !== undefined) socket.bufferedAmount = bufferedAmount;
+  if (typeof getBufferedAmount === 'function') {
+    socket.getBufferedAmount = () => { amountCalls += 1; return getBufferedAmount(); };
+  }
+  return {
+    socket,
+    sent,
+    get amountCalls() { return amountCalls; },
+    get closeCalls() { return closeCalls; },
+    get terminateCalls() { return terminateCalls; },
+  };
+}
+
+async function bootBunHandlers(t) {
+  const db = new DatabaseSync(':memory:');
+  const app = workbench({ db, entities: [projectEntity()], actions: [projectAction()] });
+  const handlers = bunFromServe(app, { principalOf: () => W8_USER });
+  app.start();
+  await app.ready;
+  t.after(async () => {
+    try { await handlers.close(); } catch { /* best effort */ }
+    try { await app.shutdown(); } catch { /* best effort */ }
+    try { db.close(); } catch { /* already closed */ }
+  });
+  return { app, db, handlers };
+}
+
+async function seedProject(app, id) {
+  await app.dispatch({
+    actionId: `w9-seed-${id}`, type: 'project.write', scope: `Project:${id}`,
+    payload: { id, name: 'before', authorized: true }, principal: W8_USER,
+  });
+}
+
+test('Bun send() -1 means backpressure: the socket stays open and keeps delivering after drain()', async (t) => {
+  const { app, handlers } = await bootBunHandlers(t);
+  await seedProject(app, 'bp1');
+  const server = fakeBunServer();
+  assert.equal(await handlers.fetch(upgradeRequest(), server), undefined);
+  const probe = fakeBunSocketWith(server, { sendResult: () => -1 });
+  handlers.websocket.open(probe.socket);
+  handlers.websocket.message(probe.socket, JSON.stringify({ type: 'subscribe', entity: 'Project', id: 'bp1' }));
+  await waitFor(() => probe.sent.some((frame) => frame.type === 'subscribed'), {
+    message: `backpressured socket never acknowledged the subscription: ${JSON.stringify(probe.sent)}`,
+  });
+
+  await app.dispatch({
+    actionId: 'w9-bp-1', type: 'project.write', scope: 'Project:bp1',
+    payload: { id: 'bp1', name: 'first', exists: true, authorized: true }, principal: W8_USER,
+  });
+  await waitFor(() => probe.sent.some((frame) => frame.type === 'event' && frame.event?.data?.name === 'first'), {
+    message: `backpressure was treated as fatal: ${JSON.stringify(probe.sent)}`,
+  });
+
+  handlers.websocket.drain(probe.socket);
+  await app.dispatch({
+    actionId: 'w9-bp-2', type: 'project.write', scope: 'Project:bp1',
+    payload: { id: 'bp1', name: 'second', exists: true, authorized: true }, principal: W8_USER,
+  });
+  await waitFor(() => probe.sent.some((frame) => frame.type === 'event' && frame.event?.data?.name === 'second'), {
+    message: `socket stopped delivering after drain(): ${JSON.stringify(probe.sent)}`,
+  });
+  assert.equal(probe.sent.filter((frame) => frame.type === 'event').length, 2);
+  handlers.websocket.close(probe.socket, 1000, '');
+});
+
+test('Bun getBufferedAmount() is consulted ahead of a stale bufferedAmount property', async (t) => {
+  const { app, handlers } = await bootBunHandlers(t);
+  await seedProject(app, 'amount1');
+  const server = fakeBunServer();
+  assert.equal(await handlers.fetch(upgradeRequest(), server), undefined);
+  // A property that says "50 MB buffered" would close the connection on the
+  // first send if the method were ignored. The method's 0 must win.
+  const probe = fakeBunSocketWith(server, {
+    bufferedAmount: 50_000_000,
+    getBufferedAmount: () => 0,
+  });
+  handlers.websocket.open(probe.socket);
+  handlers.websocket.message(probe.socket, JSON.stringify({ type: 'subscribe', entity: 'Project', id: 'amount1' }));
+  await waitFor(() => probe.sent.some((frame) => frame.type === 'subscribed'), {
+    message: `socket closed despite a healthy getBufferedAmount(): ${JSON.stringify(probe.sent)}`,
+  });
+  await app.dispatch({
+    actionId: 'w9-amount-1', type: 'project.write', scope: 'Project:amount1',
+    payload: { id: 'amount1', name: 'after', exists: true, authorized: true }, principal: W8_USER,
+  });
+  await waitFor(() => probe.sent.some((frame) => frame.type === 'event' && frame.event?.data?.name === 'after'), {
+    message: `committed event was not delivered: ${JSON.stringify(probe.sent)}`,
+  });
+  assert.ok(probe.amountCalls > 0, 'socket.getBufferedAmount() was consulted');
+  handlers.websocket.close(probe.socket, 1000, '');
+});
+
+test('fallback bufferedAmount resets on drain so >5 MB of traffic stays connected', { timeout: 30_000 }, async (t) => {
+  const { app, handlers } = await bootBunHandlers(t);
+  await seedProject(app, 'heavy');
+  const server = fakeBunServer();
+  assert.equal(await handlers.fetch(upgradeRequest(), server), undefined);
+  // Neither getBufferedAmount() nor a bufferedAmount property: the facade's
+  // own counter is the authority. Every send reports backpressure, and drain()
+  // must clear the counter instead of letting it grow forever.
+  const probe = fakeBunSocketWith(server, { sendResult: () => -1 });
+  handlers.websocket.open(probe.socket);
+  handlers.websocket.message(probe.socket, JSON.stringify({ type: 'subscribe', entity: 'Project', id: 'heavy' }));
+  await waitFor(() => probe.sent.some((frame) => frame.type === 'subscribed'));
+
+  const chunk = 'x'.repeat(600_000);
+  for (let i = 0; i < 10; i += 1) {
+    const name = `${i}:${chunk}`;
+    await app.dispatch({
+      actionId: `w9-heavy-${i}`, type: 'project.write', scope: 'Project:heavy',
+      payload: { id: 'heavy', name, exists: true, authorized: true }, principal: W8_USER,
+    });
+    await waitFor(() => probe.sent.some((frame) => frame.type === 'event' && frame.event?.data?.name === name), {
+      message: `frame ${i} was not delivered — cumulative buffered bytes were not reset on drain()`,
+    });
+    handlers.websocket.drain(probe.socket);
+  }
+  assert.equal(probe.sent.filter((frame) => frame.type === 'event').length, 10, 'all 6 MB of traffic was delivered');
+  handlers.websocket.close(probe.socket, 1000, '');
+});
+
+test('graceful handlers.close() sends a close frame immediately without a 250 ms stall', async (t) => {
+  const { handlers } = await bootBunHandlers(t);
+  const server = fakeBunServer();
+  assert.equal(await handlers.fetch(upgradeRequest(), server), undefined);
+  const probe = fakeBunSocketWith(server);
+  handlers.websocket.open(probe.socket);
+  assert.equal(probe.closeCalls, 0);
+
+  const startedAt = Date.now();
+  await handlers.close();
+  const elapsed = Date.now() - startedAt;
+  assert.ok(elapsed < 250, `graceful close stalled for ${elapsed}ms (250 ms grace timer)`);
+  assert.equal(probe.closeCalls, 1, 'one RFC 6455 close frame was sent');
+  assert.equal(probe.terminateCalls, 0, 'the open connection was not terminated abruptly');
+  handlers.websocket.close(probe.socket, 1000, '');
+  assert.equal(probe.closeCalls, 1, 'a repeated close event does not send a second frame');
+});
+
+test('an existing app.live core is reused without overwriting the live handle', async (t) => {
+  const db = new DatabaseSync(':memory:');
+  t.after(() => { try { db.close(); } catch { /* already closed */ } });
+  const app = workbench({ db, entities: [] });
+  const sentinelCore = { wake() {}, close() {} };
+  const live = {
+    core: sentinelCore,
+    createConsumer: () => async () => {},
+    wake() {},
+    close() {},
+  };
+  app.live = live;
+  const handlers = bunFromServe(app, { principalOf: () => W8_USER });
+  assert.equal(handlers.core, sentinelCore, 'the app-owned core is the one authority');
+  assert.equal(app.live, live, 'the existing app.live handle is not replaced');
+  assert.equal('liveDelivery' in app, false, 'no write-only split liveDelivery field is published');
+  await handlers.close();
+});
+
+test('an injected core is published on app.live so the kernel registers its consumer', async (t) => {
+  const db = new DatabaseSync(':memory:');
+  t.after(() => { try { db.close(); } catch { /* already closed */ } });
+  const app = workbench({ db, entities: [] });
+  const injectedCore = { wake() {}, close() {} };
+  const handlers = bunFromServe(app, { core: injectedCore, principalOf: () => W8_USER });
+  assert.equal(handlers.core, injectedCore);
+  assert.equal(app.live.core, injectedCore);
+  assert.equal(typeof app.live.createConsumer, 'function', 'kernel.ts can register the live consumer');
+  await handlers.close();
+});
+
+test('probeRecovery runs before prepareSchema writes DDL/migrations', async (t) => {
+  const db = new DatabaseSync(':memory:');
+  const app = workbench({ db, entities: [] });
+  const order = [];
+  const prepareSchema = app.prepareSchema.bind(app);
+  app.prepareSchema = async () => { order.push('schema'); return prepareSchema(); };
+  app.probeRecovery = () => { order.push('probe'); return { ok: true, checkedAt: new Date().toISOString() }; };
+  t.after(async () => {
+    try { await app.shutdown(); } catch { /* best effort */ }
+    try { db.close(); } catch { /* already closed */ }
+  });
+
+  await app.start();
+  assert.deepEqual(order.slice(0, 2), ['probe', 'schema'], 'the integrity check precedes schema DDL');
+});
+
+test('a failing recovery probe prevents prepareSchema from writing anything', async (t) => {
+  const db = new DatabaseSync(':memory:');
+  const app = workbench({ db, entities: [] });
+  let schemaCalls = 0;
+  const prepareSchema = app.prepareSchema.bind(app);
+  app.prepareSchema = async () => { schemaCalls += 1; return prepareSchema(); };
+  app.probeRecovery = () => ({ ok: false, reason: 'corrupt file', findings: ['page 1 is damaged'] });
+  t.after(async () => {
+    try { await app.shutdown(); } catch { /* best effort */ }
+    try { db.close(); } catch { /* already closed */ }
+  });
+
+  await assert.rejects(app.start(), /recovery probe failed: corrupt file \(page 1 is damaged\)/);
+  assert.equal(schemaCalls, 0, 'no DDL or migration ran against the unhealthy database');
+});

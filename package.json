@@ -55,6 +55,7 @@
 		"setup:hooks": "sh scripts/setup-hooks.sh",
 		"lint": "eslint .",
 		"test": "pnpm emit:ts && node scripts/run-tests.mjs",
+		"test:bun": "bun test test/w8-bun-ws-streaming.test.mjs test/w7-bun-cutover-parity.test.mjs",
 		"bench": "node bench/hot-path.mjs",
 		"bench:quick": "node bench/hot-path.mjs --sizes small --samples 3",
 		"bench:compile": "node bench/hot-path.mjs --benchmarks compile",
@@ -71,10 +72,13 @@
 		"typecheck:browser": "tsc -p tsconfig.browser.json --noEmit",
 		"check:annotated-text-single-authority": "node scripts/check-annotated-text-single-authority.mjs",
 		"check:architecture-map": "node scripts/check-architecture-map.mjs",
+		"check:dep-graph": "node scripts/check-dep-graph.mjs",
+		"check:file-sizes": "node scripts/check-file-sizes.mjs",
+		"check:dts-parity": "node scripts/check-dts-parity.mjs",
 		"test:deletion:annotated-text-composition": "node scripts/deletion-test-annotated-text-composition.mjs",
 		"benchmark:annotated-text-composite-resync": "node benchmark/annotated-text-composite-resync.mjs",
 		"benchmark:annotated-text-composite-resync:acceptance": "node benchmark/annotated-text-composite-resync-runner.mjs",
-		"verify:concise": "pnpm lint && pnpm typecheck && pnpm typecheck:browser && pnpm check:annotated-text-single-authority && pnpm check:architecture-map && pnpm test"
+		"verify:concise": "pnpm lint && pnpm typecheck && pnpm typecheck:browser && pnpm check:annotated-text-single-authority && pnpm check:architecture-map && pnpm check:dep-graph && pnpm check:file-sizes && pnpm check:dts-parity && pnpm test"
 	},
 	"devDependencies": {
 		"@playwright/test": "^1.62.1",

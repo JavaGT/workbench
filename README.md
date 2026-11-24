@@ -49,6 +49,7 @@ schedule/tick, email).
 | Document | Job |
 | --- | --- |
 | **[docs/quickstart.md](docs/quickstart.md)** | **Start here** — prereqs, minimal app, chat sample |
+| **[docs/AGENT-QUICKSTART.md](docs/AGENT-QUICKSTART.md)** | **Start here for agents** — entrypoints, invariants, checks, RPI/lane/P0-P1 workflow |
 | **[docs/functionality.md](docs/functionality.md)** | **Public API reference** — intended library functionality for apps |
 | **[AGENTS.md](AGENTS.md)** | Binding design values (naming, architecture, auth, live) |
 | **[CONTEXT.md](CONTEXT.md)** | Domain glossary (Entity, Grant, Scope handle, Kernel, …) |
@@ -58,9 +59,9 @@ schedule/tick, email).
 | **[docs/performance-benchmarks.md](docs/performance-benchmarks.md)** | Repeatable performance workloads, reports, and regression comparison |
 | **[docs/performance-results.md](docs/performance-results.md)** | Latest generated benchmark parameters and runtime reference |
 | **[SPEC.md](SPEC.md)** | Long-form specification (some historical roadmap wording remains) |
-| **[DECISIONLOG.md](DECISIONLOG.md)** | Append-only decision ledger |
+| **[DECISIONLOG.md](DECISIONLOG.md)** | Pointer to the archived decision ledger (`docs/archive/DECISIONLOG.md`) — grep, never read whole |
 | **[docs/adr/](docs/adr/)** | Numbered ADRs for settled seams |
-| **[PLANS.md](PLANS.md)** | Historical execution ledger |
+| **[PLANS.md](PLANS.md)** | Pointer to the archived execution ledger (`docs/archive/PLANS.md`) — grep, never read whole |
 | **[SCOPE-FINDINGS.md](SCOPE-FINDINGS.md)** | What the shipped Scope app proved |
 | **[projects/STRESS-TEST-FINDINGS.md](projects/STRESS-TEST-FINDINGS.md)** | Stress-test app synthesis |
 

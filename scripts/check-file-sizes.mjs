@@ -22,7 +22,6 @@ const BASELINE_LIMITS = Object.freeze({
   'public/workbench-annotated-text-continuous.mjs': 714,
   'public/workbench-annotated-text-editor.mjs': 1402,
   'public/workbench-annotated-text-snapshot.mjs': 588,
-  'public/workbench-client.mjs': 6338,
   'public/workbench-local-store.mjs': 1096,
   'src/annotated-text-admit.ts': 815,
   'src/annotated-text-authoring-stream.ts': 665,

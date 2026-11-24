@@ -65,7 +65,7 @@ function makeDescriptor(props              )                  {
     // time, not at request time (ADR #16 static guard). The runtime backstop
     // in check.ts stays as defense in depth.
     assertGuarded(fn                                   , { where: 'field .can body' });
-    const { can, ...fields } = descriptor;
+    const { can: _can, ...fields } = descriptor;
     return makeDescriptor({ ...fields, access: fn });
   };
   return Object.freeze(descriptor)                              ;

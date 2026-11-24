@@ -30,7 +30,7 @@ import { execFileSync } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
 
 import workbench, { entity, inherit, ref, text, grant, read, subscribe, scope, everyone, snapshot } from '../build/index.mjs';
-const { object, select, include, keyed, many, orderBy } = snapshot;
+const { object, select, include: _include, keyed, many, orderBy } = snapshot;
 import { executeDDL } from '../build/internal.mjs';
 import { mayVerb } from '../build/row-grant.mjs';
 import { createCompositePatchDelivery } from '../build/composite-patch-delivery.mjs';
@@ -149,7 +149,7 @@ async function buildProject(size) {
     if (process.env.BENCH_TIMINGS) console.error(`[bench ${size}] ${label}: ${(performance.now() - start).toFixed(0)}ms`);
     return performance.now();
   };
-  let t = performance.now();
+  let _t = performance.now();
   const db = new DatabaseSync(':memory:');
   buildGraph(db);
   const { Project, Code, Note, Entry, User } = entities();
@@ -193,7 +193,7 @@ async function buildProject(size) {
   await app.ddl();
   app.listen(0);
   await app.ready;
-  t = phase('app-ready', t);
+  _t = phase('app-ready', _t);
 
   // Additional patch-capable recipients are minted through the package's OWN
   // bootstrapFromSnapshot seam (the exact function the public bootstrap path
@@ -225,7 +225,7 @@ async function buildProject(size) {
     insertEntry.run(`entry${index}`, `code${index}`, 'p1', `term-${index}`);
   }
   db.exec('COMMIT');
-  t = phase('bulk-seed', t);
+  _t = phase('bulk-seed', _t);
 
   return {
     app,
@@ -548,7 +548,7 @@ test('B3 server CPU: one rename fanned out to K patch recipients, sizes × K', a
 
 // ---- B4: per-recipient memory + ledger-eviction demotion ----------------------
 
-test('B4 DEMOTION: an evicted projection token falls back to a full snapshot on next catch-up', async (t) => {
+test('B4 DEMOTION: an evicted projection token falls back to a full snapshot on next catch-up', async (_t) => {
   const fixture = await getProject(5000);
   const holder = principalFor('b4-holder');
   // Quiet-journal setup: every bootstrap below registers against the SAME

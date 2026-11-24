@@ -12,7 +12,7 @@ export default [
 			},
 		},
 		rules: {
-			'no-unused-vars': ['warn', { argsIgnorePattern: '^_', varsIgnorePattern: '^_' }],
+			'no-unused-vars': ['error', { argsIgnorePattern: '^_', varsIgnorePattern: '^_' }],
 			'no-undef': 'error',
 			'no-console': 'off',
 		},
@@ -28,9 +28,10 @@ export default [
 			},
 		},
 		rules: {
-			'no-unused-vars': ['warn', { argsIgnorePattern: '^_', varsIgnorePattern: '^_' }],
+			'no-unused-vars': ['error', { argsIgnorePattern: '^_', varsIgnorePattern: '^_' }],
 			'no-undef': 'error',
 			'no-console': 'off',
+			'no-restricted-imports': ['error', { patterns: [{ group: ['node:*'], message: 'Browser modules under public/ must not import Node built-ins.' }] }],
 		},
 	},
 	{
@@ -44,7 +45,7 @@ export default [
 			},
 		},
 		rules: {
-			'no-unused-vars': ['warn', { argsIgnorePattern: '^_', varsIgnorePattern: '^_' }],
+			'no-unused-vars': ['error', { argsIgnorePattern: '^_', varsIgnorePattern: '^_' }],
 			'no-undef': 'error',
 			'no-console': 'off',
 		},

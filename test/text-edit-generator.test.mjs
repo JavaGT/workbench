@@ -3,9 +3,9 @@ import { test } from 'node:test';
 
 import {
   applyTextOp, createTextState, materializeText,
-  assertAnchor, assertFrontier, assertOpId, compareOpId,
-  assertTextOp, assertUtf16Offset, assertUtf16Range, assertWellFormedText,
-  canonicalTextOp, scalarCount,
+  assertAnchor as _assertAnchor, assertFrontier as _assertFrontier, assertOpId as _assertOpId, compareOpId as _compareOpId,
+  assertTextOp as _assertTextOp, assertUtf16Offset as _assertUtf16Offset, assertUtf16Range as _assertUtf16Range, assertWellFormedText as _assertWellFormedText,
+  canonicalTextOp, scalarCount as _scalarCount,
 } from '../build/annotated-text.mjs';
 import {
   resolveUtf16ToAnchor, collectVisibleScalarIds, insertText, deleteText,
@@ -24,7 +24,7 @@ function id(actor = A, counter = 1, lamport = 1) {
 }
 
 const ROOT_LEFT = ['point', ['root'], 'left'];
-const ROOT_RIGHT = ['point', ['root'], 'right'];
+const _ROOT_RIGHT = ['point', ['root'], 'right'];
 
 // --- resolveUtf16ToAnchor ---
 

@@ -25,7 +25,7 @@ function vecEntity(dimensions = 3) {
   });
 }
 
-function vecEntityNoScope(dimensions = 3) {
+function _vecEntityNoScope(dimensions = 3) {
   return entity('VecItemNoScope', {
         label: text(),
         embedding: vector(dimensions),
@@ -36,7 +36,7 @@ function vecEntityNoScope(dimensions = 3) {
   });
 }
 
-async function serveVecItems(t, { dimensions = 3, Entity = vecEntity(dimensions), name = 'VecItem' } = {}) {
+async function serveVecItems(t, { dimensions = 3, Entity = vecEntity(dimensions), name: _name = 'VecItem' } = {}) {
   const db = new DatabaseSync(':memory:');
   const app = workbench({ db });
   app.mount('/vec-items', Entity);
@@ -122,21 +122,21 @@ test('nearest helpers break equal scores with locale-independent ids', async (t)
 // ---- validation tests ----
 
 test('reject vector of wrong dimensions at mutation time', async (t) => {
-  const { db, Entity } = await serveVecItems(t, { dimensions: 3 });
+  const { db: _db, Entity } = await serveVecItems(t, { dimensions: 3 });
   assert.throws(() => {
     Entity.create({ label: 'test', embedding: [1, 2] });
   }, /expected vector of length 3, got 2/);
 });
 
 test('reject non-array value at mutation time', async (t) => {
-  const { db, Entity } = await serveVecItems(t, { dimensions: 3 });
+  const { db: _db, Entity } = await serveVecItems(t, { dimensions: 3 });
   assert.throws(() => {
     Entity.create({ label: 'test', embedding: 'not a vector' });
   }, /expected a.*vector/);
 });
 
 test('reject vector with non-finite numbers', async (t) => {
-  const { db, Entity } = await serveVecItems(t, { dimensions: 3 });
+  const { db: _db, Entity } = await serveVecItems(t, { dimensions: 3 });
   assert.throws(() => {
     Entity.create({ label: 'test', embedding: [1, NaN, 3] });
   }, /finite numbers/);

@@ -15,7 +15,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import workbench from '../build/app.mjs';
-import { createLiveStore, LiveChannel, decodeResult } from '../public/workbench-client.mjs';
+import { createLiveStore, LiveChannel as _LiveChannel, decodeResult as _decodeResult } from '../public/workbench-client.mjs';
 import { SESSION_COOKIE } from '../build/auth/session.mjs';
 import { canUndoField, undoableFieldKinds } from '../build/field-laws.mjs';
 import { makeFakeChannel, makeFakeFetch } from './fixtures/fake-transport.mjs';

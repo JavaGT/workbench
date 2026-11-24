@@ -196,7 +196,7 @@ test('trusted local peer with a `local` window exceeds the remote cap without 42
   const now = () => t;
 
   // Remote cap of 3; local (trusted) cap of 1000.
-  const limiter = await createLimiter(
+  const _limiter = await createLimiter(
     { windowMs: 1000, max: 3 },
     null,
     now,

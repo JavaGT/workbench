@@ -188,7 +188,7 @@ test('anonymous principal used when none set on connection', async () => {
 });
 
 test('emit skips when entity record has no name', async () => {
-  const Note = ownedNote();
+  const _Note = ownedNote();
   const fanout = createLiveFanout();
   const c1 = makeStubConn('c1', 'u1');
   fanout.addSubscription('Note', 'note-1', c1);

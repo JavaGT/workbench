@@ -569,7 +569,7 @@ test('HTTP: create invitation + accept + verify membership', async (t) => {
 });
 
 test('HTTP: accept by wrong user for direct invite → 403', async (t) => {
-  const { origin, db } = await setupApp(t);
+  const { origin, db: _db } = await setupApp(t);
 
   // Create a direct invitation for member-1
   const createRes = await fetchJson(`${origin}/auth/invitation/create`, {

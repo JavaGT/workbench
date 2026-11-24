@@ -45,7 +45,7 @@ test('accepts a writer-shaped single-image transition', () => {
 });
 
 test('accepts images without the optional rangeOffsets', () => {
-  const { rangeOffsets, ...without } = image('ann-1');
+  const { rangeOffsets: _rangeOffsets, ...without } = image('ann-1');
   assert.ok(without.rangeOffsets === undefined);
   const parsed = parseAnnotationTransition({ before: [without], after: [] });
   assert.equal(parsed.before.length, 1);
@@ -58,7 +58,7 @@ test('rejects non-transitions fail-closed', () => {
 });
 
 test('rejects images with wrong keys or values', () => {
-  const { family, ...noFamily } = image('ann-1');
+  const { family: _family, ...noFamily } = image('ann-1');
   assert.ok(noFamily.family === undefined);
   assert.throws(() => parseAnnotationTransition({ before: [noFamily], after: [] }), TypeError);
   assert.throws(() => parseAnnotationTransition({ before: [image('ann-1', { empty: 'keep' })], after: [] }), TypeError);

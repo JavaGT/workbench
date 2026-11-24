@@ -11,7 +11,7 @@ import workbench, {
   annotatedText, annotation, entity, everyone, executeDDL, executeFrameworkDDL,
   grant, number, parseEventType, read, ref, scope, text, write,
 } from '../build/internal.mjs';
-import { defineSqliteSchema } from '../build/server.mjs';
+import { defineSqliteSchema as _defineSqliteSchema } from '../build/server.mjs';
 import {
   importTextToFamily,
   materializeText,
@@ -25,7 +25,7 @@ import { constructV16RegionEvent } from '../build/annotated-text-operated-event.
 import {
   computeAffectedClosure,
   digestAffectedClosure,
-  reduceRegionPostimage,
+  reduceRegionPostimage as _reduceRegionPostimage,
   regionDeclarationFingerprint,
 } from '../build/annotated-text-region-reducer.mjs';
 import { planRegionEdit } from '../build/annotated-text-region-plan.mjs';
@@ -886,7 +886,7 @@ test('tampered _Log eventData fails closed through readSince, rowToEvent, and du
 });
 
 test('over-limit serialization aborts at the first over-limit token', async () => {
-  const mod = await import('../build/annotated-text-operated-event.mjs');
+  const _mod = await import('../build/annotated-text-operated-event.mjs');
   const family = importTextToFamily('doc-1', ACTOR, 'hello world');
   const annotations = [stored(family, { id: 'note-1', start: 0, end: 5 })];
   const plan = planOf(family, annotations, {

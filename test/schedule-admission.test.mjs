@@ -24,7 +24,7 @@ import {
 // the durable variant's afterProjection create row-grant — NOT a widened
 // admitsEffects, NOT a second auth path (same dispatch spine, branch on principal kind).
 
-function setupEntity(now) {
+function setupEntity(_now) {
   const db = new DatabaseSync(':memory:');
   executeFrameworkDDL(db);
   const publishedAt = date();
@@ -253,7 +253,7 @@ function setupAppServer() {
     pipeline: durableMutationVariant({
       projectionConsumers: [Blog_b.projection],
       admission: {
-        beforeProjection: async ({ entityName, verb, principal: p, event, payload, db: hookDb, now }) => {
+        beforeProjection: async ({ entityName: _entityName, verb, principal: p, event, payload, db: hookDb, now }) => {
           if (p?.type !== 'system' || !p.attributes?.source) return true;
           return admitSystemMutation({
             entity: Blog_b, verb, rowId: event?.data?.id,
@@ -512,7 +512,7 @@ test('a denied deadline payload does not consume its one-shot receipt', () => {
 });
 
 test('e2e: a bound scheduler dispatch is ADMITTED through the wired dispatch hook', async () => {
-  const { db, Blog, server } = setupAppServer();
+  const { db, Blog: _Blog, server } = setupAppServer();
   const now = Date.now();
   db.prepare('INSERT INTO BlogE2E (id, publishedAt, status) VALUES (?, ?, ?)').run('b1', now - 1000, 'draft');
 

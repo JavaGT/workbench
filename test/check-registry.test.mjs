@@ -12,7 +12,7 @@
 // must agree. This file tests the registry directly (unit) and via entity()
 // (integration for load-time guards).
 
-import { ref, text, map, scope, grant, read, write, subscribe, deny, anyOf, never } from '../build/index.mjs';
+import { ref, text, map, scope, grant, read, write, subscribe as _subscribe, deny, anyOf as _anyOf, never } from '../build/index.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
@@ -21,7 +21,7 @@ import { buildCheckRegistry } from '../build/registry.mjs';
 import workbench from '../build/app.mjs';
 import {
   entity, mayVerb, NonCompilableError } from '../build/internal.mjs';
-import { principal, anonymous } from '../build/principal.mjs';
+import { principal, anonymous as _anonymous } from '../build/principal.mjs';
 
 const norm = (sql) => sql.replace(/\s+/g, ' ').trim();
 
@@ -296,7 +296,7 @@ test('ref handle thenable resolves to target scalar fields and map handles', asy
   });
 
   const app = workbench({ db, entities: [Canvas, RasterLayer] });
-  const CanvasBound = app.entity(Canvas);
+  const _CanvasBound = app.entity(Canvas);
   const RasterLayerBound = app.entity(RasterLayer);
 
   const row = RasterLayerBound.getOrFail('L1');
@@ -349,7 +349,7 @@ test('entity key is available alongside entity-name key in check context', () =>
 
   const app = workbench({ db, entities: [Doc, Target] });
   const DocBound = app.entity(Doc);
-  const TargetBound = app.entity(Target);
+  const _TargetBound = app.entity(Target);
 
   const row = DocBound.getOrFail('d1');
   assert.equal(DocBound.registry.labelIsHello.run({

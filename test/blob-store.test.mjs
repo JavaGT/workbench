@@ -34,7 +34,7 @@ async function setupBlobStore() {
 }
 
 test('upload streams to .pending + computes md5+sha256 one-pass', async () => {
-  const { root, db, store } = await setupBlobStore();
+  const { root, db: _db, store } = await setupBlobStore();
   
   const content = 'hello world';
   const bytes = Buffer.from(content);
@@ -127,7 +127,7 @@ test('range read [start,end)', async () => {
 });
 
 test('adopt in caller txn — commit → adopted + renamed; rollback → pending + .pending', async () => {
-  const { root, db, store } = await setupBlobStore();
+  const { root: _root, db, store } = await setupBlobStore();
   
   const { id } = store.upload({ bytes: Buffer.from('test') });
   const pendingPath = store._pathFor(id, { pending: true });

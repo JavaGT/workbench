@@ -13,7 +13,7 @@ import { DatabaseSync } from 'node:sqlite';
 
 import workbench, {
   annotatedText, annotation, durableHistory, entity, everyone, executeDDL, executeFrameworkDDL,
-  grant, read, ref, scope, text, write,
+  grant, read, ref, scope, text as _text, write,
 } from '../build/internal.mjs';
 import { readCommittedCursor, defineSqliteSchema } from '../build/server.mjs';
 import {
@@ -32,7 +32,7 @@ import {
   digestAffectedClosure,
 } from '../build/annotated-text-region-reducer.mjs';
 import { annotatedTextOperation } from '../build/annotated-text-region-operation.mjs';
-import { annotatedTextHistorySession } from '../build/annotated-text-field.mjs';
+import { annotatedTextHistorySession as _annotatedTextHistorySession } from '../build/annotated-text-field.mjs';
 import { sha256Utf8 } from '../build/annotated-text-region-limits.mjs';
 
 const ACTOR = 'a'.repeat(32);
@@ -186,7 +186,7 @@ function makeRegionHandle() {
   return annotatedTextOperation(transcript, { fieldName: 'body' });
 }
 
-function composedAppFactory(db) {
+function _composedAppFactory(_db) {
   const region = makeRegionHandle();
   const actions = [{
     type: 'correction.apply',

@@ -2,7 +2,7 @@
 // Tests for: tick.hz / tick.every frozen shape, while/with validation,
 // entity-mission compile for tick triggers, empty-while guard, 'when' rejection.
 
-import { date, text, scope, everyone, grant, read } from '../build/index.mjs';
+import { date as _date, text, scope, everyone, grant, read } from '../build/index.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { entity, generateDDL } from '../build/internal.mjs';
@@ -86,7 +86,7 @@ test('tick.hz with while: "not a fn" throws at constructor', () => {
 });
 
 test('tick.hz with while: ({is, fields}) => fields.status.is("alive") passes at constructor', () => {
-  const t = tick.hz(30, { while: ({ is, fields }) => fields.status.is('alive') });
+  const t = tick.hz(30, { while: ({ is: _is, fields }) => fields.status.is('alive') });
   assert.strictEqual(typeof t.while, 'function');
 });
 

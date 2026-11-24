@@ -3,7 +3,7 @@
 // route. A missing parent row is a 404 (the resource the handler operates on
 // does not exist), not an opaque 500 from a null deref.
 
-import { text, ref, map, grant, read, write, scope, allowAnonymous } from '../build/index.mjs';
+import { text, ref, map, grant, read, write, scope, allowAnonymous as _allowAnonymous } from '../build/index.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';

@@ -252,7 +252,7 @@ test('FTS delete sync: removed event deletes FTS rows via projectionApply', () =
 
 test('FTS MATCH query returns matching rows', () => {
   const db = new DatabaseSync(':memory:');
-  const sql = `
+  const _sql = `
     CREATE TABLE IF NOT EXISTS Doc (id TEXT PRIMARY KEY, title TEXT, body TEXT, status TEXT, owner TEXT);
     CREATE VIRTUAL TABLE IF NOT EXISTS Doc_title_fts USING fts5(title, Doc_id UNINDEXED);
     CREATE VIRTUAL TABLE IF NOT EXISTS Doc_body_fts USING fts5(body, Doc_id UNINDEXED);

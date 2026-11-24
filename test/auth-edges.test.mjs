@@ -1,5 +1,5 @@
 // Hardening: auth edge cases — gate rejection, row-grant denial, validation errors.
-import { text, ref, computed, date, grant, read, write, scope, requireUser, allowAnonymous } from '../build/index.mjs';
+import { text, ref, computed, date, grant, read, write, scope, requireUser as _requireUser, allowAnonymous } from '../build/index.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';

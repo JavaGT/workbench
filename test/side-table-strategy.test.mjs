@@ -19,7 +19,7 @@ import {
 } from '../build/side-table-strategy.mjs';
 
 import * as eventHandle from '../build/event-handle.mjs';
-import { membershipTable, membershipOwnerCol, MEMBER_COLUMN } from '../build/scope-sql.mjs';
+import { membershipTable as _membershipTable, membershipOwnerCol as _membershipOwnerCol, MEMBER_COLUMN as _MEMBER_COLUMN } from '../build/scope-sql.mjs';
 
 // ---- helpers ----
 

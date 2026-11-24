@@ -4,9 +4,9 @@ import { test } from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 
 import workbench, {
-  annotatedText, annotation, entity, everyone, executeDDL, executeFrameworkDDL,
-  protectingAnnotation, grant, admin, read, write, subscribe, ref, scope, map,
-  inherit, text,
+  annotatedText, annotation, entity, everyone as _everyone, executeDDL, executeFrameworkDDL,
+  protectingAnnotation, grant, admin, read, write, subscribe, ref, scope as _scope, map,
+  inherit, text as _text,
 } from '../build/internal.mjs';
 import { membership } from '../build/index.mjs';
 import { materializeText, restoreTextFamily, importTextToFamily, textFamilyCheckpoint, resolveOffsetToEndpoint } from '../build/annotated-text-continuous.mjs';

@@ -4,8 +4,8 @@ import { DatabaseSync } from 'node:sqlite';
 
 import {
   createHistoryReader,
-  createLiveDelivery,
-  readCommittedCursor,
+  createLiveDelivery as _createLiveDelivery,
+  readCommittedCursor as _readCommittedCursor,
 } from '../build/server.mjs';
 import { executeFrameworkDDL } from '../build/ddl.mjs';
 import { read, grant, subscribe, text, everyone } from '../build/index.mjs';
@@ -361,7 +361,7 @@ test('projector omits secret eventData from result', async () => {
   appendEvent(db, 'Note:n1', 1, 'Note.updated', { title: 'visible', secret: 'hidden-secret', email: 'test@example.com' });
 
   const safeProjector = ({ event, scope }) => {
-    const { secret, ...safe } = event.data || {};
+    const { secret: _secret, ...safe } = event.data || {};
     return [{ type: event.eventType ?? event.type, seq: event.seq, data: safe, scope }];
   };
 

@@ -1,7 +1,7 @@
 // Local store tests — log + broadcast relay tests.
 // Uses fake-indexeddb for IndexedDB, Node 26's built-in BroadcastChannel.
 import 'fake-indexeddb/auto';
-import { describe, it, after } from 'node:test';
+import { describe, it, after as _after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createLocalStore, createLocalRelay, normalizeEnvelope } from '../public/workbench-local-store.mjs';
 import { openLocalLog } from '../public/workbench-local-log.mjs';
@@ -19,7 +19,7 @@ function freshDbName() {
 }
 
 /** Yield control to the event loop. */
-function tick() {
+function _tick() {
   return new Promise(r => setTimeout(r, 0));
 }
 
@@ -290,7 +290,7 @@ describe('createLocalStore', () => {
       { match: '/snapshot', response: { snapshot: { id: null }, seq: 0 } },
       {
         match: '/todos',
-        responseFn: (url) => {
+        responseFn: (_url) => {
           return { id: 'new-1', title: 'from-rest', status: 'active' };
         },
       },

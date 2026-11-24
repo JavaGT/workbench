@@ -21,7 +21,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createServer, action } from '../build/internal.mjs';
+import { createServer, action as _action } from '../build/internal.mjs';
 
 // A minimal handler registry: an action type maps to a handler that returns the
 // events it emits. The handler is pure here (no I/O) so the test pins the

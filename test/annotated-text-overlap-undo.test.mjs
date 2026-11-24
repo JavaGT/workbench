@@ -116,7 +116,7 @@ function annotationIds(ctx) {
   return rows;
 }
 
-function annotationField(ctx, annotationId, fieldName) {
+function _annotationField(ctx, annotationId, fieldName) {
   const row = ctx.db.prepare(`SELECT * FROM ${PREFIX}_annotation_timing WHERE annotation_id = ?`).get(annotationId);
   if (!row) return undefined;
   return row[fieldName];

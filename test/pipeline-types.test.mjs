@@ -23,7 +23,7 @@ test('action(type) declares an action with that type', () => {
 });
 
 test('event(type, reducer) declares an event carrying its reducer', () => {
-  const reducer = (state, payload) => ({ ...state, published: true });
+  const reducer = (state, _payload) => ({ ...state, published: true });
   const Published = event('post.published', reducer);
   assert.equal(Published.type, 'post.published');
   assert.equal(Published.reduce, reducer);

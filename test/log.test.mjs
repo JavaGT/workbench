@@ -193,7 +193,7 @@ test('channel-specific levels override global floor', () => {
   assert.equal(lines[2].msg, 'warn system');
 });
 
-test('json format produces parseable JSON lines', (t) => {
+test('json format produces parseable JSON lines', (_t) => {
   const chunks = [];
   const output = { write: (chunk) => chunks.push(chunk) };
   const log = createLog({ level: 'info', format: 'json', output });

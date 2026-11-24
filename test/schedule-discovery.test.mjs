@@ -30,7 +30,7 @@ function fireDeadline(db, entities, now) {
 }
 
 function deadlinePayload(call) {
-  const { id, ...rest } = call.payload ?? {};
+  const { id: _id, ...rest } = call.payload ?? {};
   return rest;
 }
 

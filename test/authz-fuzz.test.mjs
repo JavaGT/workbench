@@ -62,7 +62,7 @@ test('dual-face conformance: anyOf scope (published OR author)', async () => {
       scope(({ is, fields }) => anyOf(
         fields.published.is(true),
         is.author(),
-      )).can(async ({ is }) => grant(read)),
+      )).can(async ({ is: _is }) => grant(read)),
     ],
   });
 
@@ -143,7 +143,7 @@ test('dual-face conformance: inherit child scope', async () => {
     body: text(),
     owner: ref('User', { role: 'owner', readonly: true }),
     grant: () => [
-      scope(({ is }) => is.owner()).can(async ({ is }) => grant(read)),
+      scope(({ is }) => is.owner()).can(async ({ is: _is }) => grant(read)),
     ],
   });
 

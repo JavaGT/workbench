@@ -45,7 +45,7 @@ function declarations() {
   }));
 }
 
-const externalReferences = defineSqliteSchema({
+const _externalReferences = defineSqliteSchema({
   name: 'annotated-text-region-postimage',
   tables: [],
   externalTables: [{ name: 'Project', columns: ['id'] }],

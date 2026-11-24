@@ -125,7 +125,7 @@ function parseRuntimeValueDeclarations(source) {
   for (const match of source.matchAll(/^\s*export\s+(?:declare\s+)?(?:abstract\s+)?(?:async\s+)?(?:class|function|const|let|var|enum|namespace)\s+([A-Za-z0-9_$]+)/gm)) {
     values.add(match[1]);
   }
-  for (const match of source.matchAll(/^\s*export\s+default\s+(?:(?:async\s+)?(?:function|class)\s+)?[A-Za-z0-9_$]+/gm)) {
+  for (const _match of source.matchAll(/^\s*export\s+default\s+(?:(?:async\s+)?(?:function|class)\s+)?[A-Za-z0-9_$]+/gm)) {
     values.add('default');
   }
   for (const match of source.matchAll(/^\s*export\s*\{([^}]*)\}/gm)) {

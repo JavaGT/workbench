@@ -691,6 +691,16 @@ export interface AnnotatedTextOptions {
   carets?: Readonly<{ field: string; cell: string }>;
 }
 
+/** Exact UTF-16 wording of one projected active membership range. `text` is
+ *  the visible slice covered by the range, in membership-ordinal order.
+ *  Offsets are a snapshot and do not participate in change detection. */
+export interface AnnotatedTextAnnotationWording {
+  readonly ordinal: number;
+  readonly start: number;
+  readonly end: number;
+  readonly text: string;
+}
+
 /** One stored annotation image as commit-time admission sees it. `before` is
  *  null for a create; `after` is null for a removal. */
 export interface AnnotatedTextAnnotationImage {
@@ -703,6 +713,9 @@ export interface AnnotatedTextAnnotationImage {
   readonly empty?: 'delete' | 'orphan';
   readonly cardinality?: 'many' | 'one';
   readonly orphan?: Readonly<{ savedQuote: string; lastRange: readonly [number, number] | null }> | null;
+  /** Present only when the registration opts in with `includeWording: true`.
+   *  Stored orphan state stays in `orphan`, never folded into this wording. */
+  readonly wording?: readonly AnnotatedTextAnnotationWording[];
 }
 
 /** One annotation whose stored image changed in the committing transaction.
@@ -737,6 +750,10 @@ export type AnnotatedTextAdmission = (
  *  (initial annotation capture and retirement). */
 export interface AnnotatedTextAdmissionDeclaration {
   readonly families?: readonly string[];
+  /** Off by default: keep the before/after images structural-only. Opt in to
+   *  also capture each annotation's projected active-range wording, so interior
+   *  text edits that leave structural memberships unchanged still reach `admit`. */
+  readonly includeWording?: boolean;
   readonly admit: AnnotatedTextAdmission;
 }
 

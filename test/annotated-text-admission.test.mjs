@@ -22,6 +22,7 @@ import {
 import { attachAnnotationRange, loadAnnotationImages } from '../build/annotated-text-storage.mjs';
 import { computeAffectedClosure, digestAffectedClosure } from '../build/annotated-text-region-reducer.mjs';
 import { sha256Utf8 } from '../build/annotated-text-region-limits.mjs';
+import { issueAuthoringBinding } from '../build/annotated-text-authoring-public.mjs';
 import { withAuthoringBinding } from './annotated-text-authoring-fixture.mjs';
 
 const SCOPE = 'Project:p1';
@@ -78,7 +79,7 @@ function installSchema(db, { withSpeaker = true } = {}) {
   return { Project, SpeakerProfile, Document };
 }
 
-async function setup({ admit } = {}) {
+async function setup({ admit, includeWording = false } = {}) {
   const db = new DatabaseSync(':memory:');
   const { Document } = installSchema(db);
   const changes = [];
@@ -90,6 +91,7 @@ async function setup({ admit } = {}) {
     history: durableHistory({ authorize: () => true, actions: {} }),
     annotatedTextAdmission: {
       families: ['speakers'],
+      includeWording,
       admit(change) {
         changes.push(change);
         if (state.refuse) return false;
@@ -199,6 +201,66 @@ test('admission sees the old and new speakers image for apply, update, and empty
 
   // Non-registered families never reach the hook.
   assert.equal(ctx.changes.every((entry) => entry.family === 'speakers'), true);
+});
+
+test('the public authoring-binding helper dispatches a v9 operation with includeWording', async (t) => {
+  const ctx = await setup({ includeWording: true });
+  t.after(async () => { await ctx.app.shutdown(); ctx.db.close(); });
+
+  const entity = ctx.app.entities.get('AdmissionDoc');
+  const row = ctx.db.prepare('SELECT * FROM AdmissionDoc WHERE id = ?').get('d1');
+  // No `descriptor` passed: the helper defaults it to entity.fields[fieldName].
+  const binding = await issueAuthoringBinding({
+    db: ctx.db, entity, row, principal: ALICE, fieldName: 'body',
+  });
+  assert.equal(typeof binding.streamToken, 'string');
+  assert.equal(binding.leaseToken, binding.leaseId);
+  assert.equal(typeof binding.documentPositionToken, 'string');
+  assert.equal(binding.snapshot.authoring.positionFrames[0]?.positionToken, binding.documentPositionToken);
+
+  const applied = await ctx.app.dispatch({
+    actionId: 'public-binding', principal: ALICE, scope: SCOPE, type: 'AdmissionDoc.body.operation',
+    payload: {
+      version: 9, id: 'd1',
+      authoring: {
+        version: 1, stream: binding.streamToken, lease: binding.leaseToken, mutationId: 'public-binding',
+      },
+      edit: {
+        kind: 'annotation.apply',
+        annotation: { id: 's1', family: 'speakers', fields: { speaker: 'sp1' } },
+        from: { positionToken: binding.documentPositionToken, offset: 0, affinity: 'left' },
+        to: { positionToken: binding.documentPositionToken, offset: 5, affinity: 'right' },
+      },
+    },
+  });
+  assert.equal(applied.ok, true, applied.failure?.message);
+  const change = ctx.changes.at(-1);
+  assert.equal(change.actionType, 'AdmissionDoc.body.operation');
+  assert.equal(change.annotationId, 's1');
+  assert.deepEqual(change.after.wording, [{ ordinal: 0, start: 0, end: 5, text: 'hello' }]);
+});
+
+test('issueAuthoringBinding reports missing inputs before touching storage', async (t) => {
+  const db = new DatabaseSync(':memory:');
+  const { Document } = installSchema(db);
+  t.after(() => db.close());
+
+  await assert.rejects(
+    () => issueAuthoringBinding({ db, entity: null, row: { id: 'd1' }, fieldName: 'body' }),
+    /requires an entity/,
+  );
+  await assert.rejects(
+    () => issueAuthoringBinding({ db, entity: Document, row: null, fieldName: 'body' }),
+    /requires a row/,
+  );
+  await assert.rejects(
+    () => issueAuthoringBinding({ db, entity: Document, row: { id: 'd1' }, fieldName: '' }),
+    /requires a non-empty fieldName/,
+  );
+  await assert.rejects(
+    () => issueAuthoringBinding({ db, entity: Document, row: { id: 'd1' }, fieldName: 'missing' }),
+    /requires an annotatedText descriptor/,
+  );
 });
 
 test('a refusal leaves no log row, annotation row, or receipt', async (t) => {

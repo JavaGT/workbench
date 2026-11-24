@@ -17,6 +17,7 @@ import workbench, {
   type OperationalConsumerName, type OperationalEffectResult,
   type ActionHandle, type BatchAction, type CommittedEvent, type DispatchRequest,
   type DispatchResult, type EventHandle, type FailureCategory, type FailureOutcome,
+  type AnnotatedTextAdmissionDeclaration, type AnnotatedTextAnnotationImage, type AnnotatedTextAnnotationWording,
   type InheritDirective, type Principal, type WorkbenchFailure,
   type AuditActor, type AuditClassification, type AuditEvent, type AuditInput, type AuditOutcome,
   type AuditSink, type Auditor, type AuditorOptions, type DenialAuditor, type DenialInput,
@@ -69,10 +70,10 @@ import {
 } from 'workbench/annotated-text-coords';
 import {
   acknowledgeAndPruneSnapshot, buildAuthoringEnvelope, ensureLease, ensureStream,
-  hashClientNonce, issueAuthoringSnapshot, projectEndpointToOffset,
+  hashClientNonce, issueAuthoringBinding, issueAuthoringSnapshot, projectEndpointToOffset,
   restoreTextFamilySerialized, textFamilyBasis,
   type AuthoringDatabase, type AuthoringFrontier, type AuthoringSnapshot,
-  type ContinuousTextFamily, type AuthoringStructuralEndpoint,
+  type ContinuousTextFamily, type AuthoringStructuralEndpoint, type IssuedAuthoringBinding,
 } from 'workbench/annotated-text-authoring';
 import { DatabaseSync } from 'node:sqlite';
 import { Readable } from 'node:stream';
@@ -156,6 +157,33 @@ registerAnnotatedTextStructuralExtension('invalidAsyncMeasurement', {
   },
 });
 void [annotatedTextHandle, protecting];
+
+// ── annotated-text admission wording ───────────────────────────────────────
+// The published declaration and image types mirror the runtime includeWording
+// seam, so consumers need no local duplicate of the projected wording shape.
+const wordingAdmission: AnnotatedTextAdmissionDeclaration = {
+  includeWording: true,
+  families: ['speakers'],
+  admit(change) {
+    const beforeWording: readonly AnnotatedTextAnnotationWording[] | undefined = change.before?.wording;
+    const afterWording: readonly AnnotatedTextAnnotationWording[] | undefined = change.after?.wording;
+    const first: AnnotatedTextAnnotationWording | undefined = afterWording?.[0];
+    const ordinal: number | undefined = first?.ordinal;
+    const start: number | undefined = first?.start;
+    const end: number | undefined = first?.end;
+    const text: string | undefined = first?.text;
+    void [beforeWording, afterWording, ordinal, start, end, text];
+  },
+};
+const structuralOnlyAdmission: AnnotatedTextAdmissionDeclaration = { admit: () => true };
+const invalidWordingAdmission: AnnotatedTextAdmissionDeclaration = {
+  // @ts-expect-error includeWording is a boolean, not a string
+  includeWording: 'all',
+  admit: () => true,
+};
+declare const admittedImage: AnnotatedTextAnnotationImage;
+const admittedWording: readonly AnnotatedTextAnnotationWording[] | undefined = admittedImage.wording;
+void [wordingAdmission, structuralOnlyAdmission, invalidWordingAdmission, admittedWording];
 
 // ── ScopeDispatchResult carries an optional settlement (workbench#72) ───────
 // A legacy literal without a settlement must keep compiling (Scope deprecation
@@ -958,6 +986,21 @@ const basisVersion: 1 = basis.version;
 const basisFrontier: AuthoringFrontier = basis.frontier;
 const endpoint: AuthoringStructuralEndpoint = { point: ['point', ['root'], 'left'], basisFrontier: [] };
 const endpointOffset: number = projectEndpointToOffset(family, endpoint);
+
+// One-shot public authoring binding: stream + lease + document position token,
+// plus the recipient snapshot carrying the blockless authoring envelope.
+declare const authoringEntity: WorkbenchEntity;
+declare const authoringRow: { id: string };
+const issuedBinding: Promise<IssuedAuthoringBinding> = issueAuthoringBinding({
+  db: authoringDb, entity: authoringEntity, row: authoringRow,
+  principal: actor, fieldName: 'body',
+});
+const issuedPositionToken: Promise<string> = issuedBinding.then((binding) => binding.documentPositionToken);
+const issuedFrameCount: Promise<number> = issuedBinding.then((binding) => binding.snapshot.authoring.positionFrames.length);
+// @ts-expect-error fieldName is required
+issueAuthoringBinding({ db: authoringDb, entity: authoringEntity, row: authoringRow });
+void [issuedBinding, issuedPositionToken, issuedFrameCount];
+
 const authoringSnapshotId: string | undefined = authoringSnapshot?.snapshot.id;
 const authoringSnapshotShape: AuthoringSnapshot | undefined = authoringSnapshot?.snapshot;
 void [authoringLeaseFence, authoringEnvelopeVersion, authoringEnvelopeToken, acknowledgedFence, basisVersion, basisFrontier, endpointOffset, authoringSnapshotId, authoringSnapshotShape, nativeAuthoringDb];

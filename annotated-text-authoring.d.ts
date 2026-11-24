@@ -20,6 +20,48 @@ export interface AuthoringDatabase {
   exec(sql: string): unknown;
 }
 
+/** One issued binding: a stream, a lease, and the document-scoped position
+ *  frame that anchors a v9 annotated-text operation. The caller supplies the
+ *  mutation id at dispatch time; this helper never mints one. */
+export interface IssueAuthoringBindingOptions {
+  readonly db: AuthoringDatabase;
+  readonly entity: {
+    readonly name: string;
+    readonly fields?: Readonly<Record<string, { readonly kind?: unknown; readonly [property: string]: unknown }>>;
+    readonly [property: string]: unknown;
+  };
+  readonly row: { readonly id: string; readonly [property: string]: unknown };
+  readonly principal?: {
+    readonly type?: string;
+    readonly id?: string | null;
+  } | null;
+  readonly fieldName: string;
+  /** Defaults to `entity.fields[fieldName]` when omitted. */
+  readonly descriptor?: { readonly kind?: unknown; readonly [property: string]: unknown } | null;
+}
+
+export interface IssuedAuthoringBindingSnapshot {
+  readonly authoring: {
+    readonly version: 1;
+    readonly stream: string;
+    readonly lease: string;
+    readonly snapshot: string;
+    readonly acknowledgementFence: number;
+    readonly positionFrames: readonly { readonly positionToken: string }[];
+  };
+  readonly [property: string]: unknown;
+}
+
+export interface IssuedAuthoringBinding {
+  readonly streamToken: string;
+  readonly leaseToken: string;
+  readonly leaseId: string;
+  readonly snapshot: IssuedAuthoringBindingSnapshot;
+  readonly documentPositionToken: string;
+}
+
+export function issueAuthoringBinding(options: IssueAuthoringBindingOptions): Promise<IssuedAuthoringBinding>;
+
 export interface AuthoringPositionInput {
   readonly familyCheckpoint: unknown;
   readonly visibleAtIssue?: boolean;

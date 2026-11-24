@@ -30,11 +30,16 @@ export function cosineSimilarityFloat32(
 ): number {
   const denom = queryNorm * targetNorm;
   if (denom === 0 || dimensions <= 0) return 0;
+  // A corrupt BLOB or a mismatched query cannot be scored: never let an
+  // out-of-bounds read turn into NaN (which would sort as a false tie).
+  if (!Number.isFinite(denom) || targetOffset < 0
+    || query.length !== dimensions || target.length !== targetOffset + dimensions) return 0;
   let dot = 0;
   for (let i = 0; i < dimensions; i += 1) {
     dot += query[i] * target[targetOffset + i];
   }
-  return dot / denom;
+  const score = dot / denom;
+  return Number.isFinite(score) ? score : 0;
 }
 
 // cosineSimilarity(a, b) — the core vector comparator. Pure JS, zero runtime
@@ -44,18 +49,28 @@ export function cosineSimilarityFloat32(
 // vector returns 0 to avoid division by zero.
 export function cosineSimilarity(a: unknown, b: unknown): number {
   if (!isNumericVector(a) || !isNumericVector(b)) return 0;
-  const len = Math.min(a.length, b.length);
+  // Different-length vectors describe different spaces: treating a shared
+  // prefix as comparable would make unrelated rows look like exact ties.
+  if (a.length !== b.length) return 0;
+  const len = a.length;
   if (len === 0) return 0;
   let dot = 0, magA = 0, magB = 0;
   for (let i = 0; i < len; i++) {
-    const ai = Number(a[i]) || 0;
-    const bi = Number(b[i]) || 0;
+    const rawA = a[i];
+    const rawB = b[i];
+    // A non-finite component is corrupt data, not a zero. Coercing it would
+    // turn a broken vector into a false exact match.
+    if ((typeof rawA === 'number' && !Number.isFinite(rawA)) || (typeof rawB === 'number' && !Number.isFinite(rawB))) return 0;
+    const ai = Number(rawA) || 0;
+    const bi = Number(rawB) || 0;
     dot += ai * bi;
     magA += ai * ai;
     magB += bi * bi;
   }
   const denom = Math.sqrt(magA) * Math.sqrt(magB);
-  return denom === 0 ? 0 : dot / denom;
+  if (denom === 0 || !Number.isFinite(denom)) return 0;
+  const score = dot / denom;
+  return Number.isFinite(score) ? score : 0;
 }
 
 // Rank already-owned vector entries without coupling the comparator to storage.
@@ -428,6 +443,9 @@ export class Float32VectorSlab {
         }
         score = dot / denom;
       }
+      // Corrupt slot data produces NaN/±Infinity. Such a row is not a match:
+      // admitting it would create false ties at the top of the ranking.
+      if (!Number.isFinite(score)) continue;
       if (heap.length < limit) {
         push({ id: keys[slot], score });
       } else {

@@ -189,7 +189,13 @@ function blobToFloat32(blob         , dimensions        )               {
   }
   const copy = new ArrayBuffer(expectedBytes);
   new Uint8Array(copy).set(blob);
-  return new Float32Array(copy);
+  const vector = new Float32Array(copy);
+  for (let i = 0; i < vector.length; i += 1) {
+    if (!Number.isFinite(vector[i])) {
+      throw new VectorPluginValidationError('non-finite-value', 'persisted vector BLOB contains a non-finite value');
+    }
+  }
+  return vector;
 }
 
 function scopeValueOf(row                                   , scopeField                    )         {
@@ -421,11 +427,20 @@ export function createVectorPlugin(options                     )               {
     return [...head, ...tail];
   }
 
-  function scorePersistedRow(queryVec              , queryNorm        , row                                   )              {
-    const vector = blobToFloat32(row.embedding, modelSpace.dimensions);
+  function scorePersistedRow(queryVec              , queryNorm        , row                                   )                     {
+    let vector              ;
+    try {
+      vector = blobToFloat32(row.embedding, modelSpace.dimensions);
+    } catch {
+      // A corrupt BLOB is not a candidate. Never surface it as a NaN score:
+      // NaN comparisons make every corrupt row look like an equal top hit.
+      return null;
+    }
     const storedNorm = row.norm;
     const norm = typeof storedNorm === 'number' && Number.isFinite(storedNorm) ? storedNorm : vectorNorm(vector);
-    return { id: String(row.source_key), score: cosineSimilarityFloat32(queryVec, queryNorm, vector, norm) };
+    const score = cosineSimilarityFloat32(queryVec, queryNorm, vector, norm);
+    if (!Number.isFinite(score)) return null;
+    return { id: String(row.source_key), score };
   }
 
   // Arbitrary-predicate fallback: drive from bounded source pages and fetch the
@@ -464,7 +479,10 @@ export function createVectorPlugin(options                     )               {
           sql: `SELECT source_key, norm, embedding FROM ${table} WHERE source_key IN (${placeholders}) LIMIT ${PERSISTED_LOOKUP_CHUNK}`,
           params: chunk,
         });
-        for (const row of rows) topK.offer(scorePersistedRow(queryVec, queryNorm, row));
+        for (const row of rows) {
+          const scored = scorePersistedRow(queryVec, queryNorm, row);
+          if (scored !== null) topK.offer(scored);
+        }
       }
       if (page.length < SOURCE_PAGE_SIZE) break;
       const lastId = String(page[page.length - 1]?.id ?? '');
@@ -514,7 +532,10 @@ export function createVectorPlugin(options                     )               {
             params: [scopeId, afterKey],
           }));
       if (rows.length === 0) break;
-      for (const row of rows) topK.offer(scorePersistedRow(queryVec, queryNorm, row));
+      for (const row of rows) {
+        const scored = scorePersistedRow(queryVec, queryNorm, row);
+        if (scored !== null) topK.offer(scored);
+      }
       if (rows.length < PERSISTED_SCAN_PAGE_SIZE) break;
       afterKey = String(rows[rows.length - 1].source_key);
       pages += 1;
@@ -622,20 +643,28 @@ export function createVectorPlugin(options                     )               {
   async function rebuild(ctx                     )                                   {
     const persistent = hasBoundIndex(ctx);
     if (!claimGeneration(ctx)) return { counts: { vectors: materializedCount(ctx) } };
-    const table = targetTable(ctx);
-    const next = persistent ? null : targetSlab();
-    if (next !== null) next.clear();
-    await clearTable(ctx, table);
+    // Always build into the INACTIVE generation. A3 shadow rebuilds already
+    // selected it in beginShadow(); a direct rebuild chooses it here. The
+    // active generation is never cleared first, so a failed scan leaves the
+    // last known-good index searchable.
+    const shadowActive = buildingGen !== null;
+    const active = currentActiveGeneration(ctx);
+    // Before the first materialization the "active" pointer names an empty
+    // table, so that table IS the shadow. Once rows are searchable, a direct
+    // rebuild always targets the opposite generation.
+    const activeIsEmpty = persistent && countTable(ctx, tables[active]) === 0;
+    const destination        = buildingGen ?? (activeIsEmpty ? active : (active === 0 ? 1 : 0));
+    const table = tables[destination];
+    const next = persistent ? null : (shadowSlab ?? new Float32VectorSlab(modelSpace.dimensions));
+    if (next !== null) {
+      next.clear();
+      // Direct searches/reconciles during the build target the shadow, never
+      // the last good generation. On failure the emptied shadow is discarded
+      // by the next rebuild; the active generation stays intact either way.
+      shadowSlab = next;
+    }
+    await clearTable(ctx, table, true);
     try {
-      if (persistent && buildingGen === null && !isSuperseded(ctx)) {
-        await ctx.index.write({
-          expectedFence: ctx.fence,
-          statements: [{
-            sql: `INSERT INTO ${stateTable} (slot, active, previous, model, dimensions) VALUES ('active', ?, ?, ?, ?) ON CONFLICT(slot) DO UPDATE SET model = excluded.model, dimensions = excluded.dimensions`,
-            params: [activeGen, activeGen, modelSpace.model, modelSpace.dimensions],
-          }],
-        });
-      }
       let afterId                    ;
       while (!isSuperseded(ctx)) {
         const page = ctx.reader.rows(options.source.entity, {
@@ -647,7 +676,7 @@ export function createVectorPlugin(options                     )               {
         const parsedPage                                                                                                            = [];
         for (const row of page) {
           const parsed = parseAndValidateRow(row);
-          if (next !== null) next.set(parsed.id, parsed.vector, parsed.norm, parsed.scopeId);
+          next?.set(parsed.id, parsed.vector, parsed.norm, parsed.scopeId);
           parsedPage.push(parsed);
         }
         await flushUpserts(ctx, table, parsedPage);
@@ -657,14 +686,41 @@ export function createVectorPlugin(options                     )               {
         afterId = lastId;
       }
     } catch (err) {
-      // Do not leave a partially rebuilt direct index or shadow generation.
+      // Clean up the shadow only. The active generation (pointer, table and
+      // model-space stamp) is untouched, so the failure is atomic from a
+      // reader's point of view.
       if (!isSuperseded(ctx)) {
-        if (next !== null) next.clear();
-        await clearTable(ctx, table);
+        next?.clear();
+        await clearTable(ctx, table, true);
       }
       throw err;
     }
-    return { counts: { vectors: next === null ? countTable(ctx, table) : next.size } };
+    // A3 shadows are activated by commitShadow after parity validation; only a
+    // direct rebuild flips the pointer itself, in one statement, after the
+    // full scan succeeded.
+    if (!shadowActive && !isSuperseded(ctx)) {
+      if (persistent) {
+        const previous = currentActiveGeneration(ctx);
+        await ctx.index.write({
+          expectedFence: ctx.fence,
+          statements: [{
+            sql: `INSERT INTO ${stateTable} (slot, active, previous, model, dimensions) VALUES ('active', ?, ?, ?, ?) ON CONFLICT(slot) DO UPDATE SET previous = excluded.previous, active = excluded.active, model = excluded.model, dimensions = excluded.dimensions`,
+            params: [destination, previous, modelSpace.model, modelSpace.dimensions],
+          }],
+        });
+        activeGen = destination;
+      } else {
+        activeSlab = next ;
+        shadowSlab = null;
+      }
+    }
+    return {
+      counts: {
+        vectors: persistent
+          ? countTable(ctx, tables[currentActiveGeneration(ctx)])
+          : (shadowActive ? next .size : activeSlab.size),
+      },
+    };
   }
 
   async function reconcile(ctx                     , changes                         )                                   {

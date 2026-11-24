@@ -12,7 +12,7 @@ import {
 } from './search-plugin.mjs';
 import { censusOfRows,                                                                           } from './search-reconcile.mjs';
 import { admitSearchHits } from './search-auth.mjs';
-import { searchStalenessOf } from './search-response.mjs';
+import { SEARCH_MAX_RESULTS_CAP, searchStalenessOf } from './search-response.mjs';
 
 
 
@@ -190,6 +190,115 @@ function extractScopeId(
   return String(value);
 }
 
+const FTS_QUERY_MAX_LENGTH = 4096;
+const FTS_QUERY_MAX_TERMS = 128;
+const FTS_OPERATORS = new Set(['AND', 'OR', 'NOT']);
+const FTS_WHITESPACE = /\s/;
+
+function quoteFtsTerm(term        )         {
+  // A double-quoted FTS5 string is a literal phrase: punctuation, colons,
+  // hyphens and stray operators inside it can never be parsed as syntax.
+  return `"${term.replaceAll('"', '""')}"`;
+}
+
+/**
+ * Turn a raw caller query into a safe FTS5 MATCH expression.
+ *
+ * Every term is quoted, so punctuation and FTS5 metacharacters in user text
+ * are literal content rather than syntax. The three boolean operators and
+ * prefix `*` are preserved only in their valid structural positions, so
+ * multi-term AND/OR and phrase/prefix search keep working. Malformed syntax
+ * (dangling/adjacent operators, unbalanced quotes, stray wildcards) is
+ * rejected here instead of reaching SQLite as a parser error.
+ */
+export function sanitizeFts5Query(query        )         {
+  if (typeof query !== 'string' || query.trim().length === 0) {
+    throw new Fts5QueryValidationError('FTS5 query must be a non-empty string');
+  }
+  if (query.length > FTS_QUERY_MAX_LENGTH) {
+    throw new Fts5QueryValidationError(`FTS5 query exceeds ${FTS_QUERY_MAX_LENGTH} characters`);
+  }
+  const parts           = [];
+  const kinds                          = [];
+  let terms = 0;
+  let index = 0;
+  while (index < query.length) {
+    const char = query[index];
+    if (FTS_WHITESPACE.test(char)) {
+      index += 1;
+      continue;
+    }
+    if (char === '"') {
+      let phrase = '"';
+      let cursor = index + 1;
+      let closed = false;
+      while (cursor < query.length) {
+        const part = query[cursor];
+        if (part === '"') {
+          if (query[cursor + 1] === '"') {
+            phrase += '""';
+            cursor += 2;
+            continue;
+          }
+          phrase += '"';
+          cursor += 1;
+          closed = true;
+          break;
+        }
+        phrase += part;
+        cursor += 1;
+      }
+      if (!closed) throw new Fts5QueryValidationError('FTS5 query has an unterminated quoted phrase');
+      // A quoted phrase may carry a prefix marker after its closing quote.
+      if (query[cursor] === '*') {
+        if (cursor + 1 < query.length && !FTS_WHITESPACE.test(query[cursor + 1])) {
+          throw new Fts5QueryValidationError('FTS5 query has a stray wildcard');
+        }
+        phrase += '*';
+        cursor += 1;
+      }
+      parts.push(phrase);
+      kinds.push('term');
+      terms += 1;
+      index = cursor;
+    } else {
+      let cursor = index;
+      while (cursor < query.length && !FTS_WHITESPACE.test(query[cursor]) && query[cursor] !== '"') cursor += 1;
+      let token = query.slice(index, cursor);
+      index = cursor;
+      if (FTS_OPERATORS.has(token)) {
+        parts.push(token);
+        kinds.push('operator');
+        continue;
+      }
+      let prefix = false;
+      if (token.endsWith('*')) {
+        prefix = true;
+        token = token.slice(0, -1);
+      }
+      if (token.length === 0 || token.includes('*')) {
+        throw new Fts5QueryValidationError('FTS5 query has a stray wildcard');
+      }
+      parts.push(`${quoteFtsTerm(token)}${prefix ? '*' : ''}`);
+      kinds.push('term');
+      terms += 1;
+    }
+    if (terms > FTS_QUERY_MAX_TERMS) {
+      throw new Fts5QueryValidationError(`FTS5 query exceeds ${FTS_QUERY_MAX_TERMS} terms`);
+    }
+  }
+  if (parts.length === 0) throw new Fts5QueryValidationError('FTS5 query must be a non-empty string');
+  if (kinds[0] === 'operator' || kinds[kinds.length - 1] === 'operator') {
+    throw new Fts5QueryValidationError('FTS5 query has a dangling operator');
+  }
+  for (let position = 1; position < kinds.length; position += 1) {
+    if (kinds[position] === 'operator' && kinds[position - 1] === 'operator') {
+      throw new Fts5QueryValidationError('FTS5 query has adjacent operators');
+    }
+  }
+  return parts.join(' ');
+}
+
 function resolveFtsQuery(
   request               ,
   scopeField                    ,
@@ -207,7 +316,7 @@ function resolveFtsQuery(
     throw new Fts5QueryValidationError('FTS5 query must be a non-empty string');
   }
   const scopeId = extractScopeId(request.scope ?? queryScope, request.scopeId ?? queryScopeId, scopeField);
-  return { queryText, scopeId };
+  return { queryText: sanitizeFts5Query(queryText), scopeId };
 }
 
 export function createFts5Plugin(options                   )             {
@@ -414,7 +523,7 @@ export function createFts5Plugin(options                   )             {
         const whereParams            = scopeId === undefined
           ? [queryText]
           : [queryText, scopeId];
-        const limit = Math.max(0, Math.floor(request.limit ?? 100));
+        const limit = Math.min(SEARCH_MAX_RESULTS_CAP, Math.max(0, Math.floor(request.limit ?? 100)));
         const snippetTokens = Math.min(64, snippetLength);
         const rows = ctx.index.query({
           sql: `SELECT ${idColumn} AS id, bm25(${table}) AS score, ${matchExprs}, ${snippetExprs} FROM ${table} WHERE ${whereClause} ORDER BY score ASC, ${idColumn} ASC LIMIT ?`,

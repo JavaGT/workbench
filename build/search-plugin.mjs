@@ -47,6 +47,7 @@ import {
   HYBRID_SEARCH_DEFAULT_RRF_K,
   SEARCH_DEFAULT_TIMEOUT_MS,
   searchPageWindow,
+  SearchWindowValidationError,
   searchStalenessOf,
   searchWithDeadline,
 
@@ -983,7 +984,31 @@ export function createSearchPluginRegistry(options                              
     const fence = entry.fence;
     const state = entry.state;
     const ctx = contextOf(id);
-    const { offset, limit } = searchPageWindow(request);
+    // An over-wide window is a validation rejection, not an index failure: it
+    // is closed BEFORE the plugin runs, without moving the fence or state.
+    let window                                                     ;
+    try {
+      window = searchPageWindow(request);
+    } catch (err) {
+      if (!(err instanceof SearchWindowValidationError)) throw err;
+      return {
+        ok: false,
+        generation,
+        fence,
+        state,
+        counts: entry.counts,
+        result: null,
+        lastError: Object.freeze({
+          message: err.message,
+          at: now(),
+          attempt: entry.attempts,
+          retryable: false,
+        }),
+        cancelled: false,
+        timedOut: false,
+      };
+    }
+    const { offset, limit } = window;
     const boundedRequest                = { ...request, offset: 0, limit: offset + limit };
     try {
       const run = await searchWithDeadline(

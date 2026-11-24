@@ -62,6 +62,13 @@ export const SEARCH_MAX_RESULTS_CAP = 1000;
 export const SEARCH_MAX_PAGE_SIZE = 100;
 // The default result bound when a request does not state one.
 export const SEARCH_DEFAULT_LIMIT = 50;
+// The hard upper bound on a caller's whole result window (`offset + limit`).
+// A plugin is always invoked from offset 0 with the full span, so this is the
+// bound on work a single search may ask a plugin to do — not just on the slice
+// finally disclosed. Windows past it are rejected before any plugin runs.
+export const SEARCH_MAX_WINDOW = 10_000;
+// Alias for callers that name the bound by its role rather than its namespace.
+export const MAX_SEARCH_WINDOW = SEARCH_MAX_WINDOW;
 // The default page size when a request pages without stating a size.
 export const SEARCH_DEFAULT_PAGE_SIZE = 25;
 // The default hard deadline for a search run, in milliseconds. The registry's
@@ -97,21 +104,42 @@ export interface SearchPageRequest {
   readonly offset?: number;
 }
 
+// A requested window exceeded the server-side bound. This is a caller mistake,
+// not a search feature: it is rejected before any plugin is invoked, never
+// silently clamped to a different result set.
+export class SearchWindowValidationError extends RangeError {
+  readonly name = 'SearchWindowValidationError';
+  readonly offset: number;
+  readonly limit: number;
+  constructor(offset: number, limit: number) {
+    super(`search window offset ${offset} + limit ${limit} exceeds the ${SEARCH_MAX_WINDOW} result bound`);
+    this.offset = offset;
+    this.limit = limit;
+  }
+}
+
 // Resolve a request's window to `{ offset, limit }`. Paging and flat
 // limit/offset are mutually exclusive: a page request wins (the page is the
-// bounded unit); otherwise the flat offset/limit apply. Both paths clamp so no
-// window exceeds the caps.
+// bounded unit); otherwise the flat offset/limit apply. Both paths clamp the
+// page/limit bounds, then reject any whole window past SEARCH_MAX_WINDOW.
 export function searchPageWindow(request: SearchPageRequest): { readonly offset: number; readonly limit: number } {
+  let offset: number;
+  let limit: number;
   if (typeof request.page === 'number' && Number.isFinite(request.page) && request.page >= 1) {
     const page = Math.floor(request.page);
     const size = boundSearchLimit(request.pageSize, SEARCH_DEFAULT_PAGE_SIZE, SEARCH_MAX_PAGE_SIZE);
-    const offset = Math.max(0, (page - 1) * size);
-    return { offset, limit: size };
+    offset = Math.max(0, (page - 1) * size);
+    limit = size;
+  } else {
+    offset = typeof request.offset === 'number' && Number.isFinite(request.offset) && request.offset > 0
+      ? Math.floor(request.offset)
+      : 0;
+    limit = boundSearchLimit(request.limit);
   }
-  const offset = typeof request.offset === 'number' && Number.isFinite(request.offset) && request.offset > 0
-    ? Math.floor(request.offset)
-    : 0;
-  return { offset, limit: boundSearchLimit(request.limit) };
+  if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(limit) || offset + limit > SEARCH_MAX_WINDOW) {
+    throw new SearchWindowValidationError(offset, limit);
+  }
+  return { offset, limit };
 }
 
 // ---- deterministic tie-breaking ----------------------------------------------

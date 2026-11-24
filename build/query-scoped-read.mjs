@@ -10,6 +10,7 @@
 // and not a row-patch fold.
 
 import { canonicalStringify } from './canonical-json.mjs';
+import { getLog } from './log.mjs';
 import { materializeStoredRow } from './entity/materialize-row.mjs';
 import { parseEventType, EventKind,                          } from './event-handle.mjs';
 
@@ -36,6 +37,10 @@ export const QUERY_OFFSET_MAX = 100_000;
 export const QUERY_EXPRESSION_MAX_DEPTH = 8;
 export const QUERY_EXPRESSION_MAX_LEAVES = 32;
 export const QUERY_REGISTRATION_MAX = 32;
+// Idle TTL: an untouched registration is dropped so a long-running server
+// cannot accumulate clients that stopped refetching. Reading a signal or
+// matching a notice renews it.
+export const QUERY_REGISTRATION_TTL_MS = 5 * 60_000;
 const IN_VALUES_MAX = 100;
 const FILTERS_MAX = 16;
 
@@ -824,7 +829,12 @@ export function selectAuthorizedPage(
   if (!Number.isSafeInteger(input.pageSize) || input.pageSize < QUERY_PAGE_SIZE_MIN || input.pageSize > maxPageSize) {
     fail(`pageSize must be an integer from ${QUERY_PAGE_SIZE_MIN} through ${maxPageSize}.`);
   }
-  if (input.cursor && input.offset !== undefined) {
+  // A caller that always sends an `offset: 0` alongside its keyset token is
+  // still advancing a keyset page; only a positive offset conflicts with a
+  // cursor. Treat zero as "no offset" so offset-based and cursor-based callers
+  // can share one request shape without a spurious rejection.
+  const hasOffset = input.offset !== undefined && input.offset !== 0;
+  if (input.cursor && hasOffset) {
     fail('cursor and offset cannot be combined.');
   }
   if (input.cursor) {
@@ -854,7 +864,7 @@ export function selectAuthorizedPage(
   const direction = sortDirection === 'desc' ? 'DESC' : 'ASC';
   params.query_limit = input.pageSize + 1;
   let offsetClause = '';
-  if (input.offset !== undefined) {
+  if (hasOffset) {
     params.query_offset = input.offset;
     offsetClause = ' OFFSET :query_offset';
   }
@@ -1038,6 +1048,8 @@ export function overlayOptimisticQueryPage(
 
 
 
+
+
 function eventHandleOf(event         )                             {
   if (!event || typeof event !== 'object') return null;
   const value = event                                        ;
@@ -1106,10 +1118,24 @@ function assertVisibleInScope(
   if (!row) fail('principal cannot see this query scope.');
 }
 
-export function createQueryInvalidationHub(options                                = {}) {
+export function createQueryInvalidationHub(options
+
+
+
+  = {}) {
   const maxRegistrations = options.maxRegistrations ?? QUERY_REGISTRATION_MAX;
   if (!Number.isSafeInteger(maxRegistrations) || maxRegistrations < 1) fail('maxRegistrations must be a positive integer.');
+  const ttlMs = options.ttlMs ?? QUERY_REGISTRATION_TTL_MS;
+  if (!Number.isSafeInteger(ttlMs) || ttlMs < 1) fail('ttlMs must be a positive integer.');
+  const now = options.now ?? Date.now;
   const registrations = new Map                           ();
+
+  function pruneExpired()       {
+    const at = now();
+    for (const [key, registration] of registrations) {
+      if (at - registration.lastTouchedMs >= ttlMs) registrations.delete(key);
+    }
+  }
 
   function slot(principalKey        , id        )         {
     return `${principalKey}\n${id}`;
@@ -1146,16 +1172,38 @@ export function createQueryInvalidationHub(options                              
         compiledEntity: input.entity,
         lastInvalidatedRevision: null,
         registeredAtRevision: input.revision,
+        // Replaced with the commit clock in commitPrepared (atomic batching).
+        registeredAtMs: 0,
+        lastTouchedMs: 0,
       },
     };
   }
 
   function commitPrepared(prepared                                                       )       {
+    pruneExpired();
     const newKeys = new Set(prepared.filter((entry) => !registrations.has(entry.key)).map((entry) => entry.key));
-    if (registrations.size + newKeys.size > maxRegistrations) {
+    // A single batch that cannot fit is refused atomically — never a partial
+    // family registration. Otherwise evict the least-recently-used entries to
+    // make room instead of leaking registrations forever.
+    if (newKeys.size > maxRegistrations) {
       fail(`at most ${maxRegistrations} query registrations may be active.`);
     }
-    for (const entry of prepared) registrations.set(entry.key, entry.record);
+    let overflow = registrations.size + newKeys.size - maxRegistrations;
+    if (overflow > 0) {
+      const incoming = new Set(prepared.map((entry) => entry.key));
+      const evictable = [...registrations.entries()]
+        .filter(([key]) => !incoming.has(key))
+        .sort((a, b) => a[1].lastTouchedMs - b[1].lastTouchedMs);
+      for (const [key] of evictable.slice(0, overflow)) registrations.delete(key);
+    }
+    const at = now();
+    for (const entry of prepared) {
+      registrations.set(entry.key, {
+        ...entry.record,
+        registeredAtMs: at,
+        lastTouchedMs: at,
+      });
+    }
   }
 
   function register(input
@@ -1186,6 +1234,8 @@ export function createQueryInvalidationHub(options                              
 
   function notice(events                    , revision        )       {
     if (!Number.isSafeInteger(revision)) fail('invalidation revision must be a safe integer.');
+    pruneExpired();
+    const at = now();
     for (const event of events) {
       const handle = eventHandleOf(event);
       const entity = eventEntityOf(event, handle);
@@ -1194,6 +1244,7 @@ export function createQueryInvalidationHub(options                              
         if (registration.entityName !== entity) continue;
         if (!eventScopeMatches(event, registration)) continue;
         if (!eventTouches(event, handle, registration.fields)) continue;
+        registration.lastTouchedMs = at;
         const previous = registration.lastInvalidatedRevision;
         if (previous !== null && revision < previous) continue;
         registration.lastInvalidatedRevision = previous === null ? revision : Math.max(previous, revision);
@@ -1212,6 +1263,7 @@ export function createQueryInvalidationHub(options                              
       fail('revision tokens must be safe integers.');
     }
     if (input.sinceRevision > input.revision) fail('sinceRevision is ahead of the commit lifecycle.');
+    pruneExpired();
     const registration = registrations.get(slot(principalKey, input.id));
     // Missing and foreign registrations share one signal so an id is not an
     // existence oracle. Revocation of *this* principal's registration is denied.
@@ -1221,6 +1273,7 @@ export function createQueryInvalidationHub(options                              
     if (!principalStillAdmitted(registration.compiledEntity, input.principal)) {
       return Object.freeze({ kind: 'denied', revision: input.revision });
     }
+    registration.lastTouchedMs = now();
     if (input.sinceRevision < registration.registeredAtRevision) {
       return Object.freeze({ kind: 'resync', revision: input.revision });
     }
@@ -1236,18 +1289,39 @@ export function createQueryInvalidationHub(options                              
     unregister,
     notice,
     changedSince,
-    get size() { return registrations.size; },
+    get size() {
+      pruneExpired();
+      return registrations.size;
+    },
   };
 }
 
 
 
-export function createQueryInvalidationConsumer(hub                      , db         ) {
+
+
+
+
+
+
+export function createQueryInvalidationConsumer(
+  hub                      ,
+  db         ,
+  options                                                                                            = {},
+) {
+  const onError = typeof options === 'function' ? options : options.onError;
   return async (events                    )                => {
     try {
       hub.notice(events, readCommittedRevision(db));
-    } catch {
-      // post-commit isolation: an invalidation failure never undoes the commit
+    } catch (err) {
+      // post-commit isolation: an invalidation failure never undoes the commit,
+      // but it must no longer be silent — clients may keep a stale page.
+      getLog().warn('system', 'query invalidation notice failed', { err });
+      try {
+        onError?.(err, events);
+      } catch (hookError) {
+        getLog().warn('system', 'query invalidation onError hook failed', { err: hookError });
+      }
     }
   };
 }

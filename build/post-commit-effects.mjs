@@ -3,7 +3,7 @@
 // application-owned runner claims immutable descriptors after commit.
 
 
-import { writeQueueForDatabase } from './pipeline.mjs';
+import { writeQueueForDatabase } from './pipeline-write-queue.mjs';
 import { recordFactDependencies } from './private-action-fact-dependency.mjs';
 import { isDeleteFact } from './annotated-text-delete-history.mjs';
 import { parseAnnotationTransition } from './annotation-transition.mjs';

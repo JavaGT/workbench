@@ -3,7 +3,7 @@
 // application-owned runner claims immutable descriptors after commit.
 
 import type { DbHandle } from './driver.ts';
-import { writeQueueForDatabase } from './pipeline.ts';
+import { writeQueueForDatabase } from './pipeline-write-queue.ts';
 import { recordFactDependencies } from './private-action-fact-dependency.ts';
 import { isDeleteFact } from './annotated-text-delete-history.ts';
 import { parseAnnotationTransition } from './annotation-transition.ts';

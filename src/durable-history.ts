@@ -5,7 +5,7 @@ import { txn, upsert, type DbHandle } from './driver.ts';
 import { tryParseScopeKey } from './scope-handle.ts';
 import { applicationPrivateFactView, parseCompoundContributionFact, compoundKindOf } from './compound-contribution-fact.ts';
 import type { HistoryContributionPolicy, HistoryContributionPolicyRegistry } from './history-contribution-policy.ts';
-import { writeQueueForDatabase } from './pipeline.ts';
+import { writeQueueForDatabase } from './pipeline-write-queue.ts';
 import { forbidden } from './outcome.ts';
 
 // Structural shape of the one platform write coordinator. The no-op undo/redo

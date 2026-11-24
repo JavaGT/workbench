@@ -74,6 +74,12 @@ export class VectorPluginValidationError extends Error {
 
 
 
+                                                  
+
+
+
+
+
 
 
 
@@ -831,9 +837,20 @@ export function createVectorPlugin(options                     )               {
         candidates,
       });
       for (const result of admitted.hits) hits.push(result.hit);
-    } else {
-      // The source reader is the framework's default grant-filtered reader.
+    } else if (options.unsafeAllowUnauthorizedSearch === true) {
+      // Explicit low-level unit-fixture opt-in ONLY. No adapter means no
+      // re-authorization of the current row: this path is unsafe by design and
+      // must never be used by an application serving protected content.
       for (const candidate of candidates) if (candidate.row !== null) hits.push(candidate.hit);
+    } else {
+      // Fail closed: without an admission adapter there is no proof that any
+      // candidate row is visible to this principal. Never fall back to the raw
+      // (grant-filtered-but-not-admitted) reader — index-time authorization is
+      // never current, so the disclosed hits would be unverified.
+      throw new VectorPluginValidationError(
+        'unauthorized-source-ownership',
+        'vector search requires a search admission adapter to re-authorize result rows',
+      );
     }
     return { hits };
   }

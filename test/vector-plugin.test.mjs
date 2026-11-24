@@ -270,6 +270,10 @@ test('vector search scope is a candidate-selection predicate, not a post-ranking
       owns: () => true,
     },
     modelSpace: { model: 'embed-v1', dimensions: 2 },
+    // Low-level unit fixture: this test exercises scope-based CANDIDATE
+    // SELECTION only, with no authorization adapter. Opting into the unsafe
+    // unadmitted path explicitly keeps the production default fail-closed.
+    unsafeAllowUnauthorizedSearch: true,
   });
   registry.register(plugin);
   registry.bindSource(db);
@@ -322,6 +326,33 @@ test('vector search scope is a candidate-selection predicate, not a post-ranking
   });
   assert.equal(invalidScope.ok, false);
   assert.match(invalidScope.lastError?.message ?? '', /source-row predicate/);
+});
+
+test('vector search fails closed without a search admission adapter', async (t) => {
+  const db = new DatabaseSync(':memory:');
+  t.after(() => db.close());
+  db.exec('CREATE TABLE Note (id TEXT PRIMARY KEY, embedding TEXT, embedding_model TEXT);');
+  const registry = createSearchPluginRegistry();
+  registry.register(createVectorPlugin({
+    id: 'note-vectors-unadmitted',
+    version: '1.0.0',
+    source: { entity: 'Note', vector: 'embedding', model: 'embedding_model', owns: () => true },
+    modelSpace: { model: 'embed-v1', dimensions: 2 },
+  }));
+  registry.bindSource(db);
+  db.prepare('INSERT INTO Note (id, embedding, embedding_model) VALUES (?, ?, ?)')
+    .run('n1', JSON.stringify([1, 0]), 'embed-v1');
+  const rebuilt = await registry.rebuild('note-vectors-unadmitted');
+  assert.equal(rebuilt.ok, true, rebuilt.lastError?.message);
+
+  const outcome = await registry.search('note-vectors-unadmitted', {
+    principal: PRINCIPAL,
+    query: { model: 'embed-v1', vector: [1, 0] },
+    limit: 10,
+  });
+  assert.equal(outcome.ok, false, 'an unadmitted vector index must not disclose hits');
+  assert.equal(outcome.result, null);
+  assert.match(outcome.lastError?.message ?? '', /admission adapter/);
 });
 
 test('validation errors retain a typed code', () => {

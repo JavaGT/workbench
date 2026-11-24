@@ -135,6 +135,7 @@ export const DEFAULT_LOW_DISK_HEADROOM_BYTES = 256 * 1024 * 1024;
 
 
 
+
 function installRuntimeShutdown(app            )       {
   if (app._runtimeShutdownInstalled) return;
   installGracefulShutdown(app         );
@@ -336,6 +337,19 @@ async function bootApplication(app            )                      {
       await app.writeQueue.run(() => reconcileOperationalConsumers());
     } catch (err) {
       log.warn('system', 'operational consumer recovery sweep failed', { err });
+    }
+  }
+  if (app._shutdownStarted) return app;
+  // Search staleness is cursor-backed: replay any _Log row committed before a
+  // crash in the commit→notify window so the source-change ledger is complete
+  // before the app serves searches. Same write-queue wrapping and degradation
+  // policy as the other cursor-backed reconcilers above.
+  const reconcileSearchStaleness = app.reconcileSearchStaleness;
+  if (app.db && reconcileSearchStaleness) {
+    try {
+      await app.writeQueue.run(() => reconcileSearchStaleness());
+    } catch (err) {
+      log.warn('system', 'search staleness recovery sweep failed', { err });
     }
   }
   if (app._shutdownStarted) return app;

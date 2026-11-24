@@ -123,6 +123,7 @@ interface RuntimeApp {
   reconcileBlobFinalize?(db: unknown): unknown;
   reconcileEmailDelivery?(db: unknown): unknown;
   reconcileOperationalConsumers?(): unknown;
+  reconcileSearchStaleness?(): unknown;
   durableEffectsRegistry?: unknown;
   httpServer?: { address(): { port?: number } | null };
   simulation?: unknown;
@@ -336,6 +337,19 @@ async function bootApplication(app: RuntimeApp): Promise<RuntimeApp> {
       await app.writeQueue.run(() => reconcileOperationalConsumers());
     } catch (err) {
       log.warn('system', 'operational consumer recovery sweep failed', { err });
+    }
+  }
+  if (app._shutdownStarted) return app;
+  // Search staleness is cursor-backed: replay any _Log row committed before a
+  // crash in the commit→notify window so the source-change ledger is complete
+  // before the app serves searches. Same write-queue wrapping and degradation
+  // policy as the other cursor-backed reconcilers above.
+  const reconcileSearchStaleness = app.reconcileSearchStaleness;
+  if (app.db && reconcileSearchStaleness) {
+    try {
+      await app.writeQueue.run(() => reconcileSearchStaleness());
+    } catch (err) {
+      log.warn('system', 'search staleness recovery sweep failed', { err });
     }
   }
   if (app._shutdownStarted) return app;

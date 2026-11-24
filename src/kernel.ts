@@ -15,7 +15,7 @@ import {
   isInvitationCreationAuthority,
 } from './auth/invitation.ts';
 import { createProjectedAsyncConsumer } from './projected-async.ts';
-import { createSearchStalenessConsumer } from './search-staleness.ts';
+import { createSearchStalenessConsumer, reconcileSearchStaleness } from './search-staleness.ts';
 import { buildDurableEffectsRegistry, createDurableEffectsConsumer } from './durable-effects.ts';
 import { createBlobLifecycle } from './blob-lifecycle.ts';
 import { createOperationalConsumers } from './operational-consumer.ts';
@@ -423,10 +423,11 @@ function buildDurableAdmission(app: any, annotatedKernel: any) {
 //   - 'durable-projection-consumer' — advances a per-scope _ConsumerCursor
 //     atomically with its work; a boot-time reconcile sweep (wired in
 //     application-runtime.mjs) replays any scope whose _Log outran its
-//     cursor. blob.finalize, projected.async, effect.durable, email all share
-//     this MECHANISM — but not the same idempotency property: blob.finalize's
-//     underlying work (a filesystem rename) is provably safe to replay
-//     (blob-store.mjs), so its replay is exactly-once in effect even though
+//     cursor. blob.finalize, projected.async, effect.durable, email, and
+//     search-staleness all share this MECHANISM — but not the same idempotency
+//     property: blob.finalize's underlying work (a filesystem rename) is
+//     provably safe to replay (blob-store.mjs), so its replay is exactly-once in
+//     effect even though
 //     the mechanism is at-least-once. email's underlying work (an external
 //     transport call) is NOT provably idempotent — a replay after a crash
 //     between a successful send and its cursor write can duplicate the send.
@@ -441,12 +442,10 @@ function buildDurableAdmission(app: any, annotatedKernel: any) {
 //   - 'best-effort-external-consumer' — no cursor, no reconcile sweep at all:
 //     a crash between COMMIT and this consumer running silently drops the
 //     work with no replay. Honestly at-least-once is a claim this kind
-//     CANNOT make; it is unknown-handoff. The search staleness notification
-//     (search-staleness.mjs) is the first shipped consumer of this kind: the
-//     durable ledger is best-effort for the commit→notify window only — a
-//     record that lands survives restart and re-processes via drain(), but a
-//     crash between COMMIT and the consumer cannot replay the missed event
-//     (A3's reconcile engine owns any future cursor-backed recovery).
+//     CANNOT make; it is unknown-handoff. No shipped consumer uses this kind
+//     since search-staleness became cursor-backed (Wave 1); the taxonomy keeps
+//     it named so a future unacknowledged handoff must declare itself as such
+//     rather than quietly reusing the durable contract.
 //
 // A fourth kind named by the Wave 5/6 design council but not represented in
 // this array — 'clock-driven maintenance starter' (the blob and log-retention
@@ -494,10 +493,11 @@ function engagedPostCommitConsumerDescriptors(app: any, entities: any, { blobFin
     { name: 'operational', kind: 'durable-projection-consumer', consumer: operationalConsumer },
     // The S4/A2 staleness ledger intake (review #109 finding 2): every
     // committed lifecycle event becomes a durable source-change record with its
-    // committedAt proof. Best-effort for the commit→notify window (no cursor) —
-    // see the kind taxonomy above. Absent when the app never constructed the
-    // bridge (raw buildKernel usage).
-    { name: 'search-staleness', kind: 'best-effort-external-consumer', consumer: app.searchStaleness ? createSearchStalenessConsumer(app.searchStaleness) : null },
+    // committedAt proof. Cursor-backed since Wave 1 — recording + cursor advance
+    // share one transaction, and application-runtime's boot sweep replays any
+    // _Log row missed in the commit→notify window (see the taxonomy above).
+    // Absent when the app never constructed the bridge (raw buildKernel usage).
+    { name: 'search-staleness', kind: 'durable-projection-consumer', consumer: app.searchStaleness ? createSearchStalenessConsumer(app.searchStaleness) : null },
   ].filter((d) => Boolean(d.consumer));
 }
 
@@ -548,6 +548,13 @@ export function buildKernel(app: any) {
   }
   app.durableEffectsRegistry = durableEffectsRegistry;
   app.reconcileBlobFinalize = reconcileBlobFinalize;
+  // The search staleness ledger shares the bridge the app constructed at
+  // workbench() time. Expose its cursor-backed boot sweep here (alongside the
+  // other reconcilers kernel owns) so application-runtime can replay any commit
+  // the post-commit consumer never saw. No-op when no bridge was constructed.
+  app.reconcileSearchStaleness = app.searchStaleness
+    ? () => reconcileSearchStaleness(app.db, app.searchStaleness)
+    : async () => ({ recorded: 0, blocked: 0 });
   // emailSeam(...).install(app) (called by the app author before .listen(),
   // per email-seam.mjs's contract) stashes its reconcile sweep on app._... —
   // pick it up here alongside the other reconcile sweeps kernel already owns.

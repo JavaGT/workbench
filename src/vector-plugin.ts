@@ -72,6 +72,12 @@ export interface VectorPluginOptions {
   readonly source: VectorPluginSource;
   readonly modelSpace: VectorModelSpace;
   readonly admission?: { readonly entity: EntityRecord; readonly adapter: AuthorizationAdapter };
+  // Escape hatch for LOW-LEVEL UNIT FIXTURES ONLY (never a production app):
+  // return raw candidate hits without re-authorizing each row through an
+  // admission adapter. The default fails closed — an index whose hits cannot be
+  // re-authorized returns no disclosure. A fixture that only exercises query /
+  // ranking mechanics opts in explicitly so the insecure path is visible.
+  readonly unsafeAllowUnauthorizedSearch?: boolean;
 }
 
 export interface VectorSearchQuery {
@@ -831,9 +837,20 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
         candidates,
       });
       for (const result of admitted.hits) hits.push(result.hit);
-    } else {
-      // The source reader is the framework's default grant-filtered reader.
+    } else if (options.unsafeAllowUnauthorizedSearch === true) {
+      // Explicit low-level unit-fixture opt-in ONLY. No adapter means no
+      // re-authorization of the current row: this path is unsafe by design and
+      // must never be used by an application serving protected content.
       for (const candidate of candidates) if (candidate.row !== null) hits.push(candidate.hit);
+    } else {
+      // Fail closed: without an admission adapter there is no proof that any
+      // candidate row is visible to this principal. Never fall back to the raw
+      // (grant-filtered-but-not-admitted) reader — index-time authorization is
+      // never current, so the disclosed hits would be unverified.
+      throw new VectorPluginValidationError(
+        'unauthorized-source-ownership',
+        'vector search requires a search admission adapter to re-authorize result rows',
+      );
     }
     return { hits };
   }

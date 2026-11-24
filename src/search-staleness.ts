@@ -41,7 +41,10 @@
 // bridge installs: `createSearchStalenessConsumer(bridge)` maps every committed
 // lifecycle event to a source change (committedAt proof included) and calls
 // `bridge.notifySourceChange(...)` — the kernel registers it as the
-// 'search-staleness' post-commit consumer. The S5/A5 revocation side is wired
+// 'search-staleness' post-commit consumer. Recording AND advancing the
+// consumer's per-scope _ConsumerCursor happen in ONE transaction; a boot sweep
+// (`reconcileSearchStaleness`) replays any _Log row committed before a crash in
+// the commit→notify window. The S5/A5 revocation side is wired
 // through the live-delivery core: app.ts registers `bridge.onRevocation` as a
 // core onRevocation listener when live delivery attaches, so a committed
 // deletion, a delivery-time reauthorization denial, or an app mutation's
@@ -50,7 +53,10 @@
 // module owns the durable ledger, the dispatch priority, and the drain loop it
 // exposes.
 
-import type { DbHandle } from './driver.ts';
+import { txn, type DbHandle } from './driver.ts';
+import { sweepBehindCursor, upsertConsumerCursor } from './consumer-cursor.ts';
+import { decodeConsumerLogRowData, type LogRowLike } from './committed-log.ts';
+import { getLog } from './log.ts';
 import { EventKind, parseEventType, type EventIdentityHandle } from './event-handle.ts';
 import { SEARCH_STALENESS_LEDGER_TABLE, type SearchChange, type SearchChangeKind, type SearchPluginRegistry, type SearchRevocationTarget } from './search-plugin.ts';
 import type { Principal } from './principal.ts';
@@ -164,6 +170,11 @@ const DEFAULT_TABLE_NAME = SEARCH_STALENESS_LEDGER_TABLE;
 // A pseudo source resource for principal-scope revocations. Real source
 // entities are bare SQL identifiers, so '$principal' can never collide.
 const PRINCIPAL_RESOURCE = '$principal';
+// The committed-log consumer identity for staleness intake. The live post-commit
+// consumer and the boot reconcile sweep share this ONE per-scope _ConsumerCursor,
+// so a commit that lands but whose notification is lost in a crash is replayed
+// exactly once (recording coalesces by source key; the cursor cannot rewind).
+export const SEARCH_STALENESS_CURSOR = 'search.staleness';
 
 function fail(message: string): never {
   throw new TypeError(`search staleness bridge: ${message}`);
@@ -687,24 +698,102 @@ function sourceChangeFromCommittedEvent(event: unknown): SearchSourceChangeInput
   };
 }
 
+// The ONE reconciliation primitive for staleness intake: record the (optional)
+// source change AND advance this consumer's per-scope cursor in a SINGLE
+// transaction. Both the live post-commit consumer and the boot reconcile sweep
+// call it, so a crash leaves either (a) a recorded change with an advanced
+// cursor, or (b) neither — never a half-applied intake. A replayed change is
+// harmless because notifySourceChange coalesces by (sourceResource, sourceKey).
+async function recordSourceChangeAndAdvance(
+  db: DbHandle,
+  notify: (input: SearchSourceChangeInput) => SearchStalenessNotice,
+  change: SearchSourceChangeInput | null,
+  cursor: { scope: string; seq: number },
+): Promise<void> {
+  await txn(db, () => {
+    if (change !== null) notify(change);
+    // Advance even for an event that maps to no source change: leaving such an
+    // event behind the cursor would replay it on every boot forever.
+    upsertConsumerCursor(db, { consumer: SEARCH_STALENESS_CURSOR, scope: cursor.scope, lastSeq: cursor.seq });
+  });
+}
+
 // The S3 post-commit consumer that FEEDS this bridge (review #109 finding 2).
 // The kernel installs it as the 'search-staleness' descriptor, so a committed
-// entity mutation records into the durable ledger with its committedAt proof.
-// A throwing notification is isolated (post-commit fan-out contract: it can
-// never undo a committed dispatch); the durable record itself is best-effort
-// for the commit→notify window (no cursor), which the 'best-effort-external-
-// consumer' classification states honestly.
+// entity mutation records into the durable ledger with its committedAt proof
+// AND advances the scope's cursor atomically. A throwing notification is
+// isolated (post-commit fan-out contract: it can never undo a committed
+// dispatch) and leaves that scope's cursor behind for the boot sweep to retry.
+// A later same-scope success never skips past an earlier failure (lastSeq only
+// moves up). Events with no _Log seq (live tier / direct fixtures) are recorded
+// best-effort, uncursored, exactly as before — they have no cursor to anchor to.
 export function createSearchStalenessConsumer(bridge: Pick<SearchStalenessBridge, 'notifySourceChange'>) {
-  return async (events: readonly unknown[]): Promise<void> => {
+  return async (events: readonly unknown[], context: { db?: DbHandle } = {}): Promise<void> => {
+    const db = context.db ?? null;
+    const blockedScopes = new Set<string>();
     for (const event of events) {
       const change = sourceChangeFromCommittedEvent(event);
-      if (change === null) continue;
+      const anchored = event as { scope?: unknown; seq?: unknown } | null;
+      const scope = anchored?.scope;
+      const seq = anchored?.seq;
+      if (!db || typeof seq !== 'number' || typeof scope !== 'string') {
+        if (change !== null) {
+          try {
+            bridge.notifySourceChange(change);
+          } catch {
+            // post-commit isolation: a notification failure never undoes a commit
+          }
+        }
+        continue;
+      }
+      if (blockedScopes.has(scope)) continue;
       try {
-        bridge.notifySourceChange(change);
-      } catch {
-        // post-commit isolation: a staleness-notification failure never undoes
-        // the committed dispatch
+        await recordSourceChangeAndAdvance(db, bridge.notifySourceChange, change, { scope, seq });
+      } catch (err) {
+        blockedScopes.add(scope);
+        getLog().warn('system', 'search staleness intake failed', { err, scope, seq });
       }
     }
   };
+}
+
+// Boot-time recovery for the commit→notify window: replay every _Log row this
+// consumer has not yet acknowledged into the durable staleness ledger. A crash
+// after COMMIT but before the post-commit consumer runs leaves a gap in
+// _ConsumerCursor; sweepBehindCursor walks exactly that gap (proportional to
+// the missed rows, not to retained history). Recording + cursor advance share
+// the same transaction as the live consumer, so a replay after a crash between
+// ledger write and cursor write is idempotent. A tampered log row BLOCKS its
+// scope (fail closed) rather than being skipped. `db` is the bridge's engaged
+// handle in every wiring (kernel passes app.db for both); callers must not split
+// them across connections or the ledger write and cursor checkpoint could land
+// on different databases.
+export async function reconcileSearchStaleness(
+  db: DbHandle,
+  bridge: Pick<SearchStalenessBridge, 'notifySourceChange'>,
+): Promise<{ recorded: number; blocked: number }> {
+  let recorded = 0;
+  const { blocked } = await sweepBehindCursor(db, SEARCH_STALENESS_CURSOR, async (row) => {
+    let data: Record<string, unknown>;
+    try {
+      data = decodeConsumerLogRowData(row as unknown as LogRowLike, {});
+    } catch (err) {
+      getLog().warn('system', 'search staleness recovery blocked on a tampered log row', { err, scope: row.scope, seq: row.seq });
+      return 'block';
+    }
+    const change = sourceChangeFromCommittedEvent({
+      type: row.eventType,
+      data,
+      committedAt: row.committedAt,
+    });
+    try {
+      await recordSourceChangeAndAdvance(db, bridge.notifySourceChange, change, { scope: row.scope, seq: row.seq });
+      if (change !== null) recorded += 1;
+      return 'done';
+    } catch (err) {
+      getLog().warn('system', 'search staleness recovery failed', { err, scope: row.scope, seq: row.seq });
+      return 'block';
+    }
+  });
+  return { recorded, blocked };
 }

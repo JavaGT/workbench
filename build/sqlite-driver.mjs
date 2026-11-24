@@ -378,12 +378,39 @@ export async function backupDatabaseViaVacuum(
     throw new TypeError(`invalid backup source schema name: ${sourceSchema}`);
   }
 
+  // A file-backed source gets its OWN read-only connection for the VACUUM INTO.
+  // Running VACUUM INTO on the live handle holds that handle's SQLite read
+  // transaction for the whole copy; a separate connection lets WAL-mode live
+  // writes proceed concurrently (it sees the same committed snapshot). The
+  // destination rename stays exactly as atomic as before.
+  //
+  // :memory: databases have no second addressable connection — they keep using
+  // the live handle. A fake/embedded handle with no location() does the same.
+  let sourcePath                = null;
+  try {
+    const located = typeof db.location === 'function' ? db.location() : null;
+    if (typeof located === 'string' && !isMemoryLocation(located)) sourcePath = located;
+  } catch {
+    sourcePath = null;
+  }
+  let snapshotDb                        = null;
+  if (sourcePath !== null) {
+    try {
+      snapshotDb = openSqliteDatabase(sourcePath, { readOnly: true });
+    } catch {
+      // A read-only WAL open can fail when no -shm exists yet. Fall back to the
+      // live handle rather than losing the backup entirely.
+      snapshotDb = null;
+    }
+  }
+  const snapshotSource = snapshotDb ?? db;
+
   // Same directory (same filesystem) keeps the final rename atomic. A UUID
   // suffix means VACUUM INTO never sees an existing target, even on a retry.
   const tmpPath = `${destination}.tmp-${randomUUID()}`;
   const schemaPrefix = sourceSchema ? `${sourceSchema} ` : '';
   try {
-    db.exec(`VACUUM ${schemaPrefix}INTO ${quotedSqlString(tmpPath)}`);
+    snapshotSource.exec(`VACUUM ${schemaPrefix}INTO ${quotedSqlString(tmpPath)}`);
     renameSync(tmpPath, destination);
   } catch (err) {
     // Clean only our own temp artifacts. The destination is never touched here.
@@ -395,6 +422,14 @@ export async function backupDatabaseViaVacuum(
       }
     }
     throw err;
+  } finally {
+    if (snapshotDb) {
+      try {
+        snapshotDb.close();
+      } catch {
+        /* best-effort close of the read-only snapshot connection */
+      }
+    }
   }
 
   const pageCountPragma = sourceSchema ? `PRAGMA ${sourceSchema}.page_count` : 'PRAGMA page_count';

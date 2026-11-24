@@ -418,7 +418,10 @@ export function createBackupManager(options: BackupManagerOptions): BackupManage
     // Only those two hold the mutex: once the snapshot file is sealed it is
     // immutable, so integrity/quick_check, schema identity and migration-ledger
     // reads run OUTSIDE the lock. A long verification can no longer stall every
-    // platform writer while the backup is being captured. ----
+    // platform writer while the backup is being captured. On Bun the snapshot
+    // hook (sqlite-driver.backupDatabase) opens a separate read-only connection
+    // on the source file for VACUUM INTO, so the full copy does not hold the
+    // live connection's SQLite write transaction either. ----
     let capture: CapturedState;
     try {
       const barrier = await writeCoordinator.run(() => captureCommittedBarrier(snapshotPath));

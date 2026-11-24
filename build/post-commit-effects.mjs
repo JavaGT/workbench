@@ -3,6 +3,7 @@
 // application-owned runner claims immutable descriptors after commit.
 
 
+import { writeQueueForDatabase } from './pipeline.mjs';
 import { recordFactDependencies } from './private-action-fact-dependency.mjs';
 import { isDeleteFact } from './annotated-text-delete-history.mjs';
 import { parseAnnotationTransition } from './annotation-transition.mjs';
@@ -389,6 +390,8 @@ function decodeCommittedEventJson(row                                           
 
 
 
+
+
 // Rebuild private projections solely from the private fact and its receipt-owned
 // event references. The caller supplies only explicitly opted-in projections.
 // One transaction covers the entire replay, and this seam performs no external I/O.
@@ -460,8 +463,12 @@ export function replayPrivateFactProjections(db          , projections          
         // same valid-JSON error boundary.
         data: decodeCommittedEventJson(stored                                              ),
       });
+      // Only explicitly private-fact projections may be replayed here. Ordinary
+      // entity projections already ran in the origin transaction; invoking them
+      // again would double-apply their reducers on every replay.
       const matched = projections.filter((projection) =>
-        projection.eventTypes.includes(committed.type)
+        projection.privateFact === true
+        && projection.eventTypes.includes(committed.type)
         && (projection.actionType === undefined || projection.actionType === owner.actionType));
       if (matched.length === 0) continue;
       if (!row || row.committedAt !== owner.committedAt) {
@@ -521,6 +528,20 @@ function identityParams(id         )                          {
   };
 }
 
+// The runner is a synchronous driver seam. When the db has an attached write
+// coordinator, a write that would interleave with a foreign in-flight
+// transaction is deferred through that mutex and the method returns a Promise;
+// a standalone or uncontended caller keeps the historical synchronous shape.
+// `await` flattens both, exactly like the job-queue entry points.
+
+
+
+
+
+
+
+
+
 
 
 
@@ -538,88 +559,114 @@ export function createPostCommitEffectRunner({ db, leaseMs = 30_000, now = () =>
   if (!Number.isSafeInteger(leaseMs) || leaseMs <= 0) throw new TypeError('leaseMs must be a positive safe integer');
   const handle = db;
 
-  function claim(workerId        )                                    {
-    assertText(workerId, 'workerId');
-    const at = now();
-    const row = handle.prepare(
-      `UPDATE _PostCommitEffect
-       SET status = ?, workerId = ?, leaseUntil = ?, fence = fence + 1
-       WHERE declarationOrder = (
-         SELECT candidate.declarationOrder FROM _PostCommitEffect candidate
-         WHERE (candidate.status = ? OR (candidate.status = ? AND candidate.leaseUntil <= ?))
-           AND (candidate.availableAt IS NULL OR candidate.availableAt <= ?)
-           AND NOT EXISTS (
-             SELECT 1 FROM _PostCommitEffect earlier
-             WHERE earlier.exclusionKey = candidate.exclusionKey
-               AND (earlier.originOrder < candidate.originOrder
-                 OR (earlier.originOrder = candidate.originOrder AND earlier.ordinal < candidate.ordinal))
-               AND earlier.status != ?
-           )
-         ORDER BY candidate.originOrder, candidate.ordinal LIMIT 1
-       )
-       RETURNING *`,
-    ).get(STATUS_CLAIMED, workerId, at + leaseMs, STATUS_PENDING, STATUS_CLAIMED, at, at, STATUS_COMPLETED);
-    return parse(row);
+  // Route a state-changing read/write through the one platform coordinator when
+  // it is actually contended. Inside an owned turn we are already serialized;
+  // with an idle mutex no other JS turn can interleave between these synchronous
+  // driver statements. A contended turn must be deferred, otherwise the runner
+  // write would land inside the kernel's still-open BEGIN IMMEDIATE.
+  function coordinated   (fn         )                      {
+    // Resolve at call time: the app builds this runner before boot attaches the
+    // kernel's coordinator to the db handle.
+    const writeCoordinator                                   =
+      (handle                                                          ).writeCoordinator ?? writeQueueForDatabase(handle);
+    if (!writeCoordinator) return fn();
+    if (writeCoordinator.owned
+      || (!writeCoordinator.running && !writeCoordinator.depth && !writeCoordinator.closed)) return fn();
+    return writeCoordinator.run(fn);
   }
 
-  function heartbeat(id                    , workerId        , fence        )          {
-    const at = now();
-    const params = { ...identityParams(id), workerId: assertText(workerId, 'workerId'), fence, at, leaseUntil: at + leaseMs };
-    return handle.prepare(
-      `UPDATE _PostCommitEffect SET leaseUntil = :leaseUntil
-       WHERE ${identityWhere()} AND status = 'claimed' AND workerId = :workerId AND fence = :fence AND leaseUntil > :at`,
-    ).run(params).changes > 0;
+  function claim(workerId        )                                                      {
+    return coordinated(() => {
+      assertText(workerId, 'workerId');
+      const at = now();
+      const row = handle.prepare(
+        `UPDATE _PostCommitEffect
+         SET status = ?, workerId = ?, leaseUntil = ?, fence = fence + 1
+         WHERE declarationOrder = (
+           SELECT candidate.declarationOrder FROM _PostCommitEffect candidate
+           WHERE (candidate.status = ? OR (candidate.status = ? AND candidate.leaseUntil <= ?))
+             AND (candidate.availableAt IS NULL OR candidate.availableAt <= ?)
+             AND NOT EXISTS (
+               SELECT 1 FROM _PostCommitEffect earlier
+               WHERE earlier.exclusionKey = candidate.exclusionKey
+                 AND (earlier.originOrder < candidate.originOrder
+                   OR (earlier.originOrder = candidate.originOrder AND earlier.ordinal < candidate.ordinal))
+                 AND earlier.status != ?
+             )
+           ORDER BY candidate.originOrder, candidate.ordinal LIMIT 1
+         )
+         RETURNING *`,
+      ).get(STATUS_CLAIMED, workerId, at + leaseMs, STATUS_PENDING, STATUS_CLAIMED, at, at, STATUS_COMPLETED);
+      return parse(row);
+    });
   }
 
-  function complete(id                    , workerId        , fence        , { verification }                            = {})                                                                {
-    const identity = identityParams(id);
-    const current = handle.prepare(`SELECT status, workerId, fence, verification FROM _PostCommitEffect WHERE ${identityWhere()}`).get(identity);
-    if (!current) return { accepted: false };
-    if (verification !== current.verification) return { accepted: false, verification: false };
-    if (current.status === STATUS_COMPLETED) {
-      return current.workerId === workerId && current.fence === fence
-        ? { accepted: true, noop: true }
-        : { accepted: false };
-    }
-    const at = now();
-    const params = { ...identity, workerId: assertText(workerId, 'workerId'), fence, at, completedAt: at, verification };
-    const changed = handle.prepare(
-      `UPDATE _PostCommitEffect SET status = 'completed', completedAt = :completedAt, leaseUntil = NULL
-       WHERE ${identityWhere()} AND status = 'claimed' AND workerId = :workerId AND fence = :fence
-         AND leaseUntil > :at AND verification = :verification`,
-    ).run(params).changes;
-    return changed > 0 ? { accepted: true, noop: false } : { accepted: false };
+  function heartbeat(id                    , workerId        , fence        )                            {
+    return coordinated(() => {
+      const at = now();
+      const params = { ...identityParams(id), workerId: assertText(workerId, 'workerId'), fence, at, leaseUntil: at + leaseMs };
+      return handle.prepare(
+        `UPDATE _PostCommitEffect SET leaseUntil = :leaseUntil
+         WHERE ${identityWhere()} AND status = 'claimed' AND workerId = :workerId AND fence = :fence AND leaseUntil > :at`,
+      ).run(params).changes > 0;
+    });
   }
 
-  function fail(id                    , workerId        , fence        , { retryAt = now() }                       = {})                        {
-    if (!Number.isFinite(retryAt)) throw new TypeError('retryAt must be a finite epoch time');
-    const at = now();
-    const params = { ...identityParams(id), workerId: assertText(workerId, 'workerId'), fence, at, retryAt };
-    const changed = handle.prepare(
-      `UPDATE _PostCommitEffect
-       SET status = 'pending', workerId = NULL, leaseUntil = NULL, availableAt = :retryAt
-       WHERE ${identityWhere()} AND status = 'claimed' AND workerId = :workerId AND fence = :fence AND leaseUntil > :at`,
-    ).run(params).changes;
-    return { accepted: changed > 0 };
+  function complete(id                    , workerId        , fence        , { verification }                            = {})                                                                                  {
+    return coordinated(() => {
+      const identity = identityParams(id);
+      const current = handle.prepare(`SELECT status, workerId, fence, verification FROM _PostCommitEffect WHERE ${identityWhere()}`).get(identity);
+      if (!current) return { accepted: false };
+      if (verification !== current.verification) return { accepted: false, verification: false };
+      if (current.status === STATUS_COMPLETED) {
+        return current.workerId === workerId && current.fence === fence
+          ? { accepted: true, noop: true }
+          : { accepted: false };
+      }
+      const at = now();
+      const params = { ...identity, workerId: assertText(workerId, 'workerId'), fence, at, completedAt: at, verification };
+      const changed = handle.prepare(
+        `UPDATE _PostCommitEffect SET status = 'completed', completedAt = :completedAt, leaseUntil = NULL
+         WHERE ${identityWhere()} AND status = 'claimed' AND workerId = :workerId AND fence = :fence
+           AND leaseUntil > :at AND verification = :verification`,
+      ).run(params).changes;
+      return changed > 0 ? { accepted: true, noop: false } : { accepted: false };
+    });
+  }
+
+  function fail(id                    , workerId        , fence        , { retryAt = now() }                       = {})                                          {
+    return coordinated(() => {
+      if (!Number.isFinite(retryAt)) throw new TypeError('retryAt must be a finite epoch time');
+      const at = now();
+      const params = { ...identityParams(id), workerId: assertText(workerId, 'workerId'), fence, at, retryAt };
+      const changed = handle.prepare(
+        `UPDATE _PostCommitEffect
+         SET status = 'pending', workerId = NULL, leaseUntil = NULL, availableAt = :retryAt
+         WHERE ${identityWhere()} AND status = 'claimed' AND workerId = :workerId AND fence = :fence AND leaseUntil > :at`,
+      ).run(params).changes;
+      return { accepted: changed > 0 };
+    });
   }
 
   // Rebuild missing declarations from private canonical facts. Existing rows,
   // including completion/fence state, are never overwritten. This performs no I/O.
-  function reconstruct()                       {
-    const facts = handle.prepare('SELECT * FROM _PrivateActionFact ORDER BY originOrder').all()                               ;
-    const insert = handle.prepare(
-      `INSERT OR IGNORE INTO _PostCommitEffect
-       (scope, actionId, file, operation, ordinal, originOrder, exclusionKey, verification, payload, declaredAt, status, fence)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0)`,
-    );
-    let inserted = 0;
-    for (const fact of facts) {
-      for (const effect of normalizeEffects(JSON.parse(fact.effects))) {
-        inserted += Number(insert.run(fact.scope, fact.actionId, effect.file, effect.operation, effect.ordinal, fact.originOrder,
-          effect.key, effect.verification, JSON.stringify(effect.payload), fact.committedAt).changes);
+  function reconstruct()                                         {
+    return coordinated(() => {
+      const facts = handle.prepare('SELECT * FROM _PrivateActionFact ORDER BY originOrder').all()                               ;
+      const insert = handle.prepare(
+        `INSERT OR IGNORE INTO _PostCommitEffect
+         (scope, actionId, file, operation, ordinal, originOrder, exclusionKey, verification, payload, declaredAt, status, fence)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0)`,
+      );
+      let inserted = 0;
+      for (const fact of facts) {
+        for (const effect of normalizeEffects(JSON.parse(fact.effects))) {
+          inserted += Number(insert.run(fact.scope, fact.actionId, effect.file, effect.operation, effect.ordinal, fact.originOrder,
+            effect.key, effect.verification, JSON.stringify(effect.payload), fact.committedAt).changes);
+        }
       }
-    }
-    return { inserted };
+      return { inserted };
+    });
   }
 
   return Object.freeze({ claim, heartbeat, complete, fail, reconstruct });

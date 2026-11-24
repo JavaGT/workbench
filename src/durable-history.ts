@@ -5,7 +5,13 @@ import { txn, upsert, type DbHandle } from './driver.ts';
 import { tryParseScopeKey } from './scope-handle.ts';
 import { applicationPrivateFactView, parseCompoundContributionFact, compoundKindOf } from './compound-contribution-fact.ts';
 import type { HistoryContributionPolicy, HistoryContributionPolicyRegistry } from './history-contribution-policy.ts';
+import { writeQueueForDatabase } from './pipeline.ts';
 import { forbidden } from './outcome.ts';
+
+// Structural shape of the one platform write coordinator. The no-op undo/redo
+// paths commit a receipt, so they must not open a BEGIN IMMEDIATE outside the
+// same mutex the kernel uses for every other durable write.
+type WriteCoordinatorLike = { run<T>(fn: () => T): Promise<T> };
 
 const HISTORY_DESCRIPTOR: unique symbol = Symbol('workbench.durable-history');
 
@@ -307,7 +313,7 @@ export function durableHistory({ authorize, actions = {} }: DurableHistoryOption
 }
 
 export function createDurableHistoryRuntime({
-  db, descriptor, generatedActions = {}, dispatch, dispatchBatch, authorize, cursorPolicy, contributionPolicies = null,
+  db, descriptor, generatedActions = {}, dispatch, dispatchBatch, authorize, cursorPolicy, contributionPolicies = null, writeQueue = null,
 }: {
   db: DbHandle;
   descriptor: DurableHistoryDescriptor | null | undefined;
@@ -317,8 +323,17 @@ export function createDurableHistoryRuntime({
   authorize: (context: AuthorizeContext) => boolean | Promise<boolean>;
   cursorPolicy?: ReadonlyMap<string, 'eligible' | 'excluded'>;
   contributionPolicies?: HistoryContributionPolicyRegistry | null;
+  writeQueue?: WriteCoordinatorLike | null;
 }): HistoryRuntime {
   if (!db) throw new Error('durable history requires a durable database');
+  // The host normally passes the server's coordinator; the WeakMap lookup is
+  // the fallback for direct runtime construction with an app-bound db handle.
+  const coordinator: WriteCoordinatorLike | undefined = writeQueue
+    ?? writeQueueForDatabase(db)
+    ?? (db as DbHandle & { writeCoordinator?: WriteCoordinatorLike }).writeCoordinator;
+  function coordinate<T>(fn: () => T): Promise<T> {
+    return coordinator ? coordinator.run(fn) : Promise.resolve().then(fn);
+  }
   if (!descriptor?.[HISTORY_DESCRIPTOR]) {
     throw new TypeError('history must be created with durableHistory(...)');
   }
@@ -595,7 +610,7 @@ export function createDurableHistoryRuntime({
       // 'Action receipt is unavailable' (#230).
       const confirmedThrough = readSeq(db, key.scope);
       const resultData = Object.freeze({ actionId: operationId, confirmedThrough });
-      await txn(db, async () => {
+      await coordinate(() => txn(db, async () => {
         await admitted(historyDescriptor, { operation, scope: key.scope, session: args.session, principal: args.principal });
         const current = currentCursor(db, key);
         if (!sameCursor(current, expected)) throw conflict('history cursor changed during dispatch');
@@ -603,7 +618,7 @@ export function createDurableHistoryRuntime({
           actionType: '$history.empty', actionData: { version: 1 }, principalKey: key.principalKey,
           sessionId: key.sessionId, operation, resultData,
         });
-      });
+      }));
       return Object.freeze({ ok: true, deduped: false, events: [], empty: true, resultData });
     }
     const originReceipt = receiptFor(db, key.scope, targetFrame.rootActionId);
@@ -780,14 +795,14 @@ export function createDurableHistoryRuntime({
       // Same clean no-op receipt contract as an ordinary empty move (#230).
       const confirmedThrough = readSeq(db, key.scope);
       const resultData = Object.freeze({ actionId: operationId, confirmedThrough });
-      await txn(db, async () => {
+      await coordinate(() => txn(db, async () => {
         await admitted(historyDescriptor, { operation: 'undo', scope: key.scope, session: args.session, principal: args.principal });
         if (!sameCursor(currentCursor(db, key), expected)) throw conflict('history cursor changed during dispatch');
         insertReceipt(db, key.scope, operationId, now, [], {
           actionType: '$history.empty', actionData: { version: 1, boundarySeq: seq, sourceActionIds }, principalKey: key.principalKey,
           sessionId: key.sessionId, operation: 'undoToPoint', resultData,
         });
-      });
+      }));
       return Object.freeze({ ok: true, deduped: false, events: [], empty: true, resultData });
     }
     const translated: TranslatedAction[] = [];

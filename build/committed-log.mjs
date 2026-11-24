@@ -590,6 +590,71 @@ export function logRetentionReport(db          , retentionDays        , nowMs   
   };
 }
 
+// A v16 capability claim is one-shot: it is needed only while the _Log row it
+// admitted is still retained. Once that row has been pruned, replay/dedupe is
+// governed by the surviving receipt and the claim is obsolete — keeping it
+// forever would let the claim table grow without bound (its DDL contract).
+// Nonce identity is derived from the retained row itself, so the only honest
+// way to recognize obsolete claims is to re-derive the retained nonce set.
+function pruneObsoleteV16Claims(db          )         {
+  const exists = db.prepare(
+    "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = '_V16CapabilityClaim'",
+  ).get();
+  if (exists === undefined) return 0;
+  const rows = db.prepare('SELECT scope, seq, eventType, eventData, actionId FROM _Log').all()
+
+    ;
+  const retained = new Set        ();
+  let uncertain = false;
+  for (const row of rows) {
+    let text        ;
+    let parsed         ;
+    try {
+      text = unwrapStoredPayloadText(row.eventData);
+      parsed = JSON.parse(text);
+    } catch {
+      uncertain = true;
+      continue;
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
+      || (parsed                         ).version !== 16) continue;
+    let entity        ;
+    let field        ;
+    try {
+      const handle = parseEventType(row.eventType);
+      if (handle.kind !== 'native' || handle.nativeName !== 'operated') throw new Error('not an operated event');
+      entity = handle.entity;
+      field = handle.field;
+    } catch {
+      uncertain = true;
+      continue;
+    }
+    try {
+      const canonical = serializeV16OperatedEvent(parsed                        );
+      const id = (parsed                    ).id;
+      retained.add(v16AdmissionNonce({
+        owningScope: row.scope,
+        entity,
+        field,
+        documentId: typeof id === 'string' ? id : '',
+        actionId: row.actionId,
+      }, canonical));
+    } catch {
+      uncertain = true;
+    }
+  }
+  // Fail closed: an unreadable retained row must never cause a live capability
+  // to be deleted (that would admit a replay of a consumed event).
+  if (uncertain) return 0;
+  const claims = db.prepare('SELECT nonce FROM _V16CapabilityClaim').all()                            ;
+  const remove = prepareCached(db, 'DELETE FROM _V16CapabilityClaim WHERE nonce = ?');
+  let pruned = 0;
+  for (const claim of claims) {
+    if (!retained.has(claim.nonce)) pruned += Number(remove.run(claim.nonce).changes);
+  }
+  return pruned;
+}
+
 // retentionPrune — delete log entries older than a cutoff date. Used by the
 // log retention reaper (serve.mjs). Runs under the writeQueue mutex.
 export function retentionPrune(db          , cutoffIso        ) {
@@ -611,10 +676,26 @@ export function retentionPrune(db          , cutoffIso        ) {
     // Keep the erasure prerequisite index exactly aligned with the surviving
     // facts — this sweep runs outside any cascade guarantee (design §5).
     sweepFactDependencies(db);
-    db.prepare('DELETE FROM _Log WHERE committedAt < :cutoff').run({ cutoff: cutoffIso });
+    // A consumer's per-scope cursor is its acknowledged prefix. Never delete a
+    // row any active consumer still owes: seq > MIN(lastSeq) on that scope.
+    // Scopes with no cursor have no lagging consumer and may prune by age alone.
+    const hasCursors = db.prepare(
+      "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = '_ConsumerCursor'",
+    ).get() !== undefined;
+    const logDelete = hasCursors
+      ? `DELETE FROM _Log
+         WHERE committedAt < :cutoff
+           AND NOT EXISTS (
+             SELECT 1 FROM _ConsumerCursor AS cursor
+             WHERE cursor.scope = _Log.scope AND _Log.seq > cursor.lastSeq
+           )`
+      : 'DELETE FROM _Log WHERE committedAt < :cutoff';
+    db.prepare(logDelete).run({ cutoff: cutoffIso });
     // The composite journal falls back to snapshot recovery together with the
     // _Log it indexes (#122 design §14, Retention).
     pruneCompositeChanges(db, cutoffIso);
+    // Bounds the one-shot v16 nonce table in step with the log rows it guards.
+    pruneObsoleteV16Claims(db);
   });
 }
 

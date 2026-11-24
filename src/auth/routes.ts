@@ -46,6 +46,7 @@ import { verifyTotpStep, verifyBackupCode } from './totp.ts';
 import { loginChallengeStore as defaultLoginChallengeStore, createLoginChallengeStore } from './login-challenge.ts';
 import { evaluateLockout, nextFailedAttemptCount, loginLockoutDecision, totpLockoutDecision } from './lockout.ts';
 import { txn, begin, commit, rollback, type DbHandle } from '../driver.ts';
+import { writeQueueForDatabase } from '../pipeline.ts';
 import { hashPasswordAsync, verifyHashAsync } from '../field-strategy.ts';
 import {
   generateChallenge,
@@ -194,6 +195,13 @@ async function authorizeScopedApiKey({
   return { ok: true };
 }
 
+// The one platform write coordinator, structurally typed so an auth router
+// mounted against a raw test db (no coordinator attached) keeps its existing
+// synchronous behavior. In a running app `createServer` attaches this exact
+// coordinator to the db handle, so `writeQueueForDatabase(db)` is the same
+// mutex the kernel's BEGIN IMMEDIATE transactions use.
+type WriteCoordinatorLike = { run<T>(fn: () => T): Promise<T> };
+
 interface AuthRequest {
   body: Record<string, unknown> | null | undefined;
   params: Record<string, string>;
@@ -271,6 +279,16 @@ export function authRoutes({
   // below — which TypeScript does not narrow across their declaration
   // boundary — see a non-null, fully-typed handle.
   const db: DbHandle = maybeDb;
+  // Every auth write transaction enters through the one coordinator when the
+  // db has one: an auth route must never slip a BEGIN IMMEDIATE between the
+  // kernel's own transaction steps. Resolve at call time — `.auth()` mounts
+  // before the kernel attaches its coordinator to the db handle on boot.
+  // A nested call joins the current turn.
+  function coordinate<T>(fn: () => T): T | Promise<T> {
+    const coordinator: WriteCoordinatorLike | undefined =
+      (db as DbHandle & { writeCoordinator?: WriteCoordinatorLike }).writeCoordinator ?? writeQueueForDatabase(db);
+    return coordinator ? coordinator.run(fn) : fn();
+  }
   const { User, Session, Credential, Invitation, ApiKey, TwoFactor } = entities;
   const { createInvitation, acceptInvitation, rejectInvitation, listInvitationsForUser } = createInvitationApi({ Invitation });
   const passkeyStore: ChallengeStore = suppliedPasskeyStore
@@ -840,7 +858,7 @@ export function authRoutes({
     let outcome: ResetOutcome | undefined;
 
     try {
-      await txn(db, () => {
+      await coordinate(() => txn(db, () => {
         const row = db.prepare(
           'SELECT id, userId, expiresAt, usedAt FROM _PasswordResetToken WHERE tokenHash = ? LIMIT 1',
         ).get(tokenHash) as { id: string; userId: string; expiresAt: number; usedAt: number | null } | undefined;
@@ -860,7 +878,7 @@ export function authRoutes({
         db.prepare("DELETE FROM Session WHERE principalType = 'user' AND principalId = ?")
           .run(row.userId);
         outcome = 'ok';
-      });
+      }));
     } catch (err) {
       const e = err as { status?: unknown; message?: string };
       return next({ status: e.status ?? 500, message: e.message });
@@ -1391,7 +1409,7 @@ export function authRoutes({
       | { kind: 'gone' };
     let outcome: DisableOutcome | undefined;
     try {
-      await txn(db, () => {
+      await coordinate(() => txn(db, () => {
         // Re-read the enrollment inside the write lock — the authoritative row.
         const row = TwoFactor.findById(twoFactor.id);
         if (!row) {
@@ -1406,7 +1424,7 @@ export function authRoutes({
         TwoFactor.delete(row.id);
         revokeOtherSessions(userId, req);
         outcome = { kind: 'ok', totpCounter: settled.totpCounter, secret: settled.secret };
-      });
+      }));
     } catch (err) {
       const e = err as { status?: unknown; message?: string };
       return next({ status: e.status ?? 500, message: e.message });
@@ -1458,32 +1476,34 @@ export function authRoutes({
     let commitStatus: 'committed' | 'rolled-back' | 'ambiguous' = 'ambiguous';
     let error: unknown;
     try {
-      begin(db);
-      // 3. Re-read the enrollment under the write lock — the authoritative row.
-      const row = TwoFactor.findOne(TwoFactor.userId.is(userId));
-      if (!row || row.enabled !== 1) {
-        outcome = { kind: 'gone' };
-      } else {
-        // 4. Verify against the authoritative hashes + replay guard.
-        const settled = settleSecondFactor(userId, row, tokenValue);
-        if (settled.kind !== 'ok') {
-          outcome = settled;
+      await coordinate(() => {
+        begin(db);
+        // 3. Re-read the enrollment under the write lock — the authoritative row.
+        const row = TwoFactor.findOne(TwoFactor.userId.is(userId));
+        if (!row || row.enabled !== 1) {
+          outcome = { kind: 'gone' };
         } else {
-          // 5. Valid factor: fence reset + one-time code removal / replay step
-          // already wrote inside this transaction; mint the Session in it too.
-          const session = Session.create({ userId });
-          const user = User.getOrFail(userId);
-          outcome = {
-            kind: 'ok',
-            session,
-            username: user.username,
-            totpCounter: settled.totpCounter,
-            secret: settled.secret,
-          };
+          // 4. Verify against the authoritative hashes + replay guard.
+          const settled = settleSecondFactor(userId, row, tokenValue);
+          if (settled.kind !== 'ok') {
+            outcome = settled;
+          } else {
+            // 5. Valid factor: fence reset + one-time code removal / replay step
+            // already wrote inside this transaction; mint the Session in it too.
+            const session = Session.create({ userId });
+            const user = User.getOrFail(userId);
+            outcome = {
+              kind: 'ok',
+              session,
+              username: user.username,
+              totpCounter: settled.totpCounter,
+              secret: settled.secret,
+            };
+          }
         }
-      }
-      commit(db);
-      commitStatus = 'committed';
+        commit(db);
+        commitStatus = 'committed';
+      });
     } catch (err) {
       error = err;
       try {

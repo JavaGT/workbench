@@ -77,6 +77,7 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import { getLog } from './log.mjs';
+import { canonicalStringify } from './canonical-json.mjs';
 import { createWriteQueue } from './write-queue.mjs';
 import { MIGRATION_LEDGER_TABLE } from './migration-ledger.mjs';
 
@@ -130,11 +131,16 @@ const MIGRATION_LEDGER = MIGRATION_LEDGER_TABLE;
 export const MAX_RECOVERY_DIAGNOSTIC_ERROR_LENGTH = 500;
 const { sanitizeError } = createMessageSanitizer(MAX_RECOVERY_DIAGNOSTIC_ERROR_LENGTH);
 
-// Deep-equality for the manifest comparison surfaces (arrays of strings and the
-// migration ledger object). Order matters for both, so JSON comparison is the
-// honest check.
+// Canonical-equality for the manifest comparison surfaces. Arrays keep their
+// order (schema identity is ordered), while object KEY order is insignificant:
+// a ledger read back from SQLite can insert keys in a different order than the
+// manifest writer did, and JSON.stringify would report a false mismatch.
 function deepEqual(a         , b         )          {
-  return JSON.stringify(a) === JSON.stringify(b);
+  try {
+    return canonicalStringify(a) === canonicalStringify(b);
+  } catch {
+    return false;
+  }
 }
 
 // ---- public types ---------------------------------------------------------
@@ -491,6 +497,25 @@ export function createRecoveryManager(options                        )          
           reason:
             'an earlier restore was interrupted before the database was installed — the recovered copy is in quarantine and the database file is missing. Run reconcile() to quarantine the leftover, then restore from a backup explicitly.',
           findings: staleStage,
+          interruptedRecovery,
+          backups: list(),
+        };
+      }
+      // A missing main file is healthy ONLY when no WAL/shm sidecars were left
+      // behind. An orphan sidecar means a crash between file deletion and
+      // sidecar cleanup (or a partial quarantine): opening the adapter would
+      // replay a WAL with no database and fail closed at boot, so report the
+      // damaged state here instead of a false healthy probe.
+      const orphanSidecars = ['-wal', '-shm']
+        .map((suffix) => `${dataFile}${suffix}`)
+        .filter((file) => existsSync(file));
+      if (orphanSidecars.length > 0) {
+        return {
+          ok: false,
+          state: 'recovery-required',
+          reason:
+            'the database file is missing but its SQLite WAL/shm sidecars remain — the database was left damaged by an interrupted shutdown or cleanup. Reconcile or restore from a backup explicitly.',
+          findings: orphanSidecars,
           interruptedRecovery,
           backups: list(),
         };

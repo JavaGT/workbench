@@ -128,13 +128,21 @@ export interface SideTableStrategy {
 // Strategy collection
 // ---------------------------------------------------------------------------
 
-const SIDE_TABLE_STRATEGIES: readonly SideTableStrategy[] = Object.freeze([
-  FTS_STRATEGY,
-  MAP_SIDE_TABLE_STRATEGY,
-  ORDERED_SIDE_TABLE_STRATEGY,
-  LOG_SIDE_TABLE_STRATEGY,
-  EPHEMERAL_SIDE_TABLE_STRATEGY,
-]);
+// Resolved on demand, NOT at module evaluation. `scope-sql` loads
+// `annotated-text-field`, which registers a field-kind contribution through this
+// barrel while a direct `strategy/map` import is still evaluating its own
+// strategy constant. A module-level `const` here would read that strategy in its
+// temporal dead zone (ReferenceError); the function body only runs once callers
+// actually collect strategies, by which time every strategy has initialized.
+function sideTableStrategies(): readonly SideTableStrategy[] {
+  return [
+    FTS_STRATEGY,
+    MAP_SIDE_TABLE_STRATEGY,
+    ORDERED_SIDE_TABLE_STRATEGY,
+    LOG_SIDE_TABLE_STRATEGY,
+    EPHEMERAL_SIDE_TABLE_STRATEGY,
+  ];
+}
 
 export interface SideTableStrategyEntry {
   strategy: SideTableStrategy;
@@ -142,7 +150,7 @@ export interface SideTableStrategyEntry {
 }
 
 export function collectSideTableStrategies(fields: Record<string, FieldDescriptor>): SideTableStrategyEntry[] {
-  return SIDE_TABLE_STRATEGIES
+  return sideTableStrategies()
     .map((strategy) => ({
       strategy,
       fields: Object.entries(fields).filter(([, descriptor]) => strategy.matches(descriptor)),
@@ -151,7 +159,7 @@ export function collectSideTableStrategies(fields: Record<string, FieldDescripto
 }
 
 export function sideTableDDL(entity: { name: string }, fieldName: string, descriptor: FieldDescriptor): string | null {
-  const strategy = SIDE_TABLE_STRATEGIES.find((candidate) => candidate.matches(descriptor));
+  const strategy = sideTableStrategies().find((candidate) => candidate.matches(descriptor));
   return strategy ? strategy.ddl(entity.name, fieldName, descriptor) : null;
 }
 

@@ -3,7 +3,10 @@
 	"version": "0.1.3",
 	"description": "Workbench for collaborative, persisted, realtime data.",
 	"type": "module",
-	"sideEffects": false,
+	"sideEffects": [
+		"./build/annotated-text-field.mjs",
+		"./src/annotated-text-field.ts"
+	],
 	"files": [
 		"build/",
 		"public/",

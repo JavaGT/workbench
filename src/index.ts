@@ -38,7 +38,7 @@ export { matchRoute } from './http-route-match.ts';
 export { serveStatic } from './views.ts';
 // Web Fetch / Bun.serve adapter — the one HTTP/auth spine exposed as a
 // standard Request -> Promise<Response> handler.
-export { createFetchHandler } from './serve.ts';
+export { createFetchHandler, createBunServerHandlers, createBunWebSocketAdapter } from './serve.ts';
 // Session cookie helpers — promoted to the public surface so an app hand-rolling
 // its auth boundary (like projects/session.mjs) can set/clear the fail-closed
 // `sid` cookie without reaching into `workbench/internal`. sessionPrincipalOf is

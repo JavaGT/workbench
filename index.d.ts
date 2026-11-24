@@ -1829,10 +1829,16 @@ export interface FetchAdapterRequest {
   readonly method: string;
   readonly url: string;
   readonly headers: Record<string, string | string[] | undefined>;
+  /** Verbatim Web headers as [name, value] pairs, including repeated fields. */
+  readonly rawHeaders: readonly string[];
   readonly socket: { readonly remoteAddress?: string };
   readonly aborted: boolean;
   readonly destroyed: boolean;
   readonly raw: FetchAdapterRequest;
+  on(event: string, listener: (...args: any[]) => void): FetchAdapterRequest;
+  off(event: string, listener: (...args: any[]) => void): FetchAdapterRequest;
+  once(event: string, listener: (...args: any[]) => void): FetchAdapterRequest;
+  emit(event: string, ...args: any[]): boolean;
 }
 
 export interface FetchHandlerOptions {
@@ -1847,17 +1853,78 @@ export interface FetchHandlerOptions {
   /** The one authorization adapter, shared with listen() and every other transport. */
   authorization?: AuthorizationAdapter;
   trustedProxies?: boolean | readonly string[] | ((ip: string) => boolean);
+  /** Fallback client IP for rate limiting when the host has no requestIP(). */
+  remoteAddress?: string;
+  /** Bun/Node host; `requestIP(request)?.address` supplies the rate-limit key. */
+  server?: { requestIP?(request: Request): { address?: string } | null | undefined } | null;
 }
 
-export type FetchHandler = (request: Request) => Promise<Response>;
+export type FetchHandler = (request: Request, server?: any) => Promise<Response>;
 
 /**
- * Adapt an app to `(request: Request) => Promise<Response>` for Bun.serve,
- * Deno.serve, or any Web Fetch host. Shares the entire HTTP/auth spine with
- * `listen()` — CORS/CSRF, route gate, CRUD dispatch, framework routes, and
- * principal hydration are not reimplemented here.
+ * Adapt an app to `(request: Request[, server]) => Promise<Response>` for
+ * Bun.serve, Deno.serve, or any Web Fetch host. Shares the entire HTTP/auth
+ * spine with `listen()` — CORS/CSRF, route gate, CRUD dispatch, framework
+ * routes, and principal hydration are not reimplemented here. Requests and
+ * responses stream under backpressure; when `db`/`principalOf` are omitted they
+ * are derived from the app exactly as `listen()` derives them.
  */
 export function createFetchHandler(app: WorkbenchApp, options?: FetchHandlerOptions): FetchHandler;
+
+/** Minimal Bun.serve server surface consumed by the WebSocket upgrade seam. */
+export interface BunServerLike {
+  upgrade(request: unknown, options?: { data?: unknown }): boolean;
+  requestIP?(request: unknown): { address?: string } | null | undefined;
+}
+
+/** Minimal Bun ServerWebSocket surface bridged onto the shared LiveConnection. */
+export interface BunWebSocketLike {
+  send(data: string): number;
+  close(code?: number, reason?: string): void;
+  terminate(): void;
+  ping?(): void;
+  pong?(): void;
+  readyState?: number;
+  bufferedAmount?: number;
+  data?: unknown;
+  remoteAddress?: string;
+}
+
+export interface BunServerHandlersOptions {
+  path?: string;
+  /** Reuse an existing application LiveDeliveryCore instead of creating one. */
+  core?: unknown;
+  principalOf?: (request: FetchAdapterRequest) => Principal | Promise<Principal>;
+  resolveEntity?: ((name: string) => any) | null;
+  mayVerb?: ((entity: any, verb: string, row: any, principal: Principal) => boolean | Promise<boolean>) | null;
+  authorization?: AuthorizationAdapter | null;
+  log?: unknown;
+  ready?: () => Promise<unknown>;
+  trustedProxies?: boolean | readonly string[] | ((ip: string) => boolean);
+  heartbeatIntervalMs?: number | false;
+  maxPayload?: number;
+  fetchOptions?: FetchHandlerOptions;
+}
+
+export interface BunServerHandlers {
+  fetch(request: Request, server?: BunServerLike): Promise<Response | undefined>;
+  websocket: {
+    open(ws: BunWebSocketLike): void;
+    message(ws: BunWebSocketLike, message: unknown): void;
+    close(ws: BunWebSocketLike, code?: number, reason?: string): void;
+    drain(ws: BunWebSocketLike): void;
+  };
+  close(): Promise<void>;
+  readonly core: unknown;
+}
+
+/**
+ * Bun.serve handlers over the same HTTP/auth spine and the SAME LiveDeliveryCore
+ * the node:http skin presents. Call before `app.start()` so the Kernel registers
+ * the delivery's committed consumer.
+ */
+export function createBunServerHandlers(app: WorkbenchApp, options?: BunServerHandlersOptions): BunServerHandlers;
+export const createBunWebSocketAdapter: typeof createBunServerHandlers;
 
 /**
  * A field handle as the snapshot grammar reads it. `Key` carries the field NAME

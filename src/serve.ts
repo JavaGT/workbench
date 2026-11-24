@@ -24,12 +24,13 @@
 
 import { createServer as createHttpServer } from 'node:http';
 
+import { defaultPrincipalOfForApp } from './http-fetch.ts';
 import { anonymous, collapseForAdmission, type Principal } from './principal.ts';
 import { mayVerb } from './row-grant.ts';
 import { createAuthorizationAdapter, type AuthorizationAdapter } from './authorization-adapter.ts';
 import { config } from './config.ts';
 import { applySecurityHeaders, renderError, isSameOriginRequest, resolveClientIp, type TrustedProxies } from './middleware.ts';
-import { sessionPrincipalOf, sessionTokenOf, apiKeyPrincipalOf } from './auth/session.ts';
+import { sessionTokenOf } from './auth/session.ts';
 import { createWebSocketLiveDelivery } from './live-delivery.ts';
 import { getLog, withLog } from './log.ts';
 import { createRateLimiter } from './rate-limit.ts';
@@ -581,18 +582,10 @@ export function listen(app: any, port: any, optionsOrCallback: any = {}) {
   // This is the SAME authorization engine as session principals — no second auth
   // path. The session takes priority: a request with BOTH a valid cookie and a
   // Bearer header resolves to the user principal.
-  const sessionResolver = app.db
-    ? sessionPrincipalOf(app.db, { durationMs: app.config.sessionDurationMs })
-    : null;
-  const apiKeyResolver = app.db ? apiKeyPrincipalOf(app.db) : null;
-  const defaultPrincipalOf = sessionResolver
-    ? (req: any) => {
-        const p = sessionResolver(req);
-        if (p.type !== 'anonymous') return p;
-        return apiKeyResolver ? apiKeyResolver(req) : p;
-      }
-    : undefined;
-  const principalOf = options.principalOf ?? defaultPrincipalOf;
+  // One resolver for every transport (fetch adapter, Bun WebSocket seam, this
+  // node:http skin) — the helper lives in http-fetch.ts so a new transport cannot
+  // drift into a second session/API-key hydration path.
+  const principalOf = options.principalOf ?? defaultPrincipalOfForApp(app);
 
   // Two-phase boot. The routing table resolves asynchronously (an entity's
   // `routes` thunk may be async — e.g. a parent lazily dynamic-imports a child at
@@ -738,3 +731,6 @@ export function listen(app: any, port: any, optionsOrCallback: any = {}) {
 // above, so CORS/CSRF, the route gate, CRUD dispatch, framework routes, and
 // principal hydration are the SAME spine as a node:http server.
 export { createFetchHandler } from './http-fetch.ts';
+// Bun.serve handlers: the same HTTP spine plus a WebSocket upgrade skin over
+// the app's one LiveDeliveryCore (no second delivery or auth engine).
+export { createBunServerHandlers, createBunWebSocketAdapter } from './live-delivery-bun-ws.ts';

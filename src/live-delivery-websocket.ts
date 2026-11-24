@@ -25,6 +25,7 @@ import {
   DEFAULT_WS_HEARTBEAT_INTERVAL_MS,
   DEFAULT_WS_MAX_PAYLOAD,
   type PerMessageDeflateOptions,
+  type ServerWebSocket,
 } from './websocket.ts';
 import { isSameOriginRequest, type TrustedProxies } from './middleware.ts';
 import { createLiveFanout } from './live-fanout.ts';
@@ -61,6 +62,74 @@ export interface LiveDeliveryWebSocket {
   close(): Promise<void>;
 }
 
+// The shared live-transport resources. Both the node:http upgrade skin and the
+// Bun.serve skin call this factory: one fan-out, one caret presence, one cursor
+// reader, one connection registry, and one connection constructor over the SAME
+// injected LiveDeliveryCore. Neither skin owns a second authority.
+export interface LiveTransportResourcesOptions {
+  core?: LiveDeliveryCore | null;
+  resolveEntity?: ((name: string) => LiveEntityRecord | undefined | null) | null;
+  mayVerb?: MayVerb | null;
+  authorization?: AuthorizationAdapter | null;
+  db?: LiveDatabase | null;
+  log?: FrameworkLog | null;
+  maxPayload?: number;
+}
+
+export interface LiveTransportResources {
+  fanout: LiveFanoutHandle;
+  connections: Set<LiveConnection>;
+  currentSeq(scope: string): number;
+  createConnection(ws: ServerWebSocket, id: string, principal: Principal): LiveConnection;
+  closeConnections(): Promise<void>;
+}
+
+export function createLiveTransportResources({
+  core = null,
+  resolveEntity = null,
+  mayVerb = null,
+  authorization = null,
+  db = null,
+  log = null,
+  maxPayload = DEFAULT_WS_MAX_PAYLOAD,
+}: LiveTransportResourcesOptions = {}): LiveTransportResources {
+  const fanout: LiveFanoutHandle = createLiveFanout({ mayVerb, authorization });
+  const carets = createAnnotatedTextCaretLive({ db: db as never, resolveEntity: resolveEntity as never, mayVerb: mayVerb as never, fanout });
+  const connections = new Set<LiveConnection>();
+
+  const currentSeq = (scope: string) => {
+    const liveScope = resolveEntity && classifyLiveScope(scope, resolveEntity);
+    return liveScope ? readRevision(db as never, scope) : readSeq(db, scope);
+  };
+
+  function createConnection(ws: ServerWebSocket, id: string, principal: Principal): LiveConnection {
+    const conn = new LiveConnection(ws, id, {
+      fanout,
+      core,
+      resolveEntity,
+      mayVerb,
+      authorization,
+      db,
+      currentSeq,
+      log,
+      carets,
+      maxPayload,
+      onClose: () => connections.delete(conn),
+    });
+    conn.setPrincipal(principal);
+    connections.add(conn);
+    return conn;
+  }
+
+  async function closeConnections(): Promise<void> {
+    await Promise.all([...connections].map((conn) => conn.close?.().catch(() => {})));
+    connections.clear();
+    fanout.close();
+  }
+
+  return { fanout, connections, currentSeq, createConnection, closeConnections };
+}
+
 export function createLiveDeliveryWebSocket(httpServer: Server, {
   path = '/events',
   core = null,
@@ -77,18 +146,13 @@ export function createLiveDeliveryWebSocket(httpServer: Server, {
   trustedProxies = false,
 }: LiveDeliveryWebSocketOptions = {}): LiveDeliveryWebSocket {
   const wss = createWebSocketServer({ maxPayload, perMessageDeflate });
-  const fanout: LiveFanoutHandle = createLiveFanout({ mayVerb, authorization });
-  const carets = createAnnotatedTextCaretLive({ db: db as never, resolveEntity: resolveEntity as never, mayVerb: mayVerb as never, fanout });
-  const connections = new Set<LiveConnection>();
+  const { connections, createConnection, closeConnections } = createLiveTransportResources({
+    core, resolveEntity, mayVerb, authorization, db, log, maxPayload,
+  });
   const pendingUpgrades = new Set<Duplex>();
   let closed = false;
   let closePromise: Promise<void> | null = null;
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
-
-  const currentSeq = (scope: string) => {
-    const liveScope = resolveEntity && classifyLiveScope(scope, resolveEntity);
-    return liveScope ? readRevision(db as never, scope) : readSeq(db, scope);
-  };
 
   function stopHeartbeat(): void {
     if (heartbeatTimer !== null) {
@@ -135,10 +199,8 @@ export function createLiveDeliveryWebSocket(httpServer: Server, {
     httpServer.off('close', onServerClose);
     for (const socket of pendingUpgrades) socket.destroy();
     pendingUpgrades.clear();
-    await Promise.all([...connections].map((conn) => conn.close?.().catch(() => {})));
-    connections.clear();
+    await closeConnections();
     await new Promise<void>((resolve) => wss.close(() => resolve()));
-    fanout.close();
   }
 
   const onUpgrade = (req: IncomingMessage, socket: Duplex, head: Buffer) => {
@@ -200,21 +262,7 @@ export function createLiveDeliveryWebSocket(httpServer: Server, {
           }
 
           const id = `ws:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`;
-          const conn = new LiveConnection(ws, id, {
-            fanout,
-            core,
-            resolveEntity,
-            mayVerb,
-            authorization,
-            db,
-            currentSeq,
-            log,
-            carets,
-            maxPayload,
-            onClose: () => connections.delete(conn),
-          });
-          conn.setPrincipal(principal);
-          connections.add(conn);
+          createConnection(ws, id, principal);
         });
       })
       .catch(() => {

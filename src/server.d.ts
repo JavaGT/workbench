@@ -1605,4 +1605,17 @@ export function createFetchHandler(
   app: import('../index.d.ts').WorkbenchApp,
   options?: import('../index.d.ts').FetchHandlerOptions,
 ): import('../index.d.ts').FetchHandler;
-export type { FetchAdapterRequest, FetchHandler, FetchHandlerOptions } from '../index.d.ts';
+export type {
+  FetchAdapterRequest,
+  FetchHandler,
+  FetchHandlerOptions,
+  BunServerHandlers,
+  BunServerHandlersOptions,
+  BunServerLike,
+  BunWebSocketLike,
+} from '../index.d.ts';
+export function createBunServerHandlers(
+  app: import('../index.d.ts').WorkbenchApp,
+  options?: import('../index.d.ts').BunServerHandlersOptions,
+): import('../index.d.ts').BunServerHandlers;
+export const createBunWebSocketAdapter: typeof createBunServerHandlers;

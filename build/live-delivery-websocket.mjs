@@ -25,6 +25,7 @@ import {
   DEFAULT_WS_HEARTBEAT_INTERVAL_MS,
   DEFAULT_WS_MAX_PAYLOAD,
 
+
 } from './websocket.mjs';
 import { isSameOriginRequest,                     } from './middleware.mjs';
 import { createLiveFanout } from './live-fanout.mjs';
@@ -61,6 +62,74 @@ import { anonymous,                } from './principal.mjs';
 
 
 
+// The shared live-transport resources. Both the node:http upgrade skin and the
+// Bun.serve skin call this factory: one fan-out, one caret presence, one cursor
+// reader, one connection registry, and one connection constructor over the SAME
+// injected LiveDeliveryCore. Neither skin owns a second authority.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+export function createLiveTransportResources({
+  core = null,
+  resolveEntity = null,
+  mayVerb = null,
+  authorization = null,
+  db = null,
+  log = null,
+  maxPayload = DEFAULT_WS_MAX_PAYLOAD,
+}                                = {})                         {
+  const fanout                   = createLiveFanout({ mayVerb, authorization });
+  const carets = createAnnotatedTextCaretLive({ db: db         , resolveEntity: resolveEntity         , mayVerb: mayVerb         , fanout });
+  const connections = new Set                ();
+
+  const currentSeq = (scope        ) => {
+    const liveScope = resolveEntity && classifyLiveScope(scope, resolveEntity);
+    return liveScope ? readRevision(db         , scope) : readSeq(db, scope);
+  };
+
+  function createConnection(ws                 , id        , principal           )                 {
+    const conn = new LiveConnection(ws, id, {
+      fanout,
+      core,
+      resolveEntity,
+      mayVerb,
+      authorization,
+      db,
+      currentSeq,
+      log,
+      carets,
+      maxPayload,
+      onClose: () => connections.delete(conn),
+    });
+    conn.setPrincipal(principal);
+    connections.add(conn);
+    return conn;
+  }
+
+  async function closeConnections()                {
+    await Promise.all([...connections].map((conn) => conn.close?.().catch(() => {})));
+    connections.clear();
+    fanout.close();
+  }
+
+  return { fanout, connections, currentSeq, createConnection, closeConnections };
+}
+
 export function createLiveDeliveryWebSocket(httpServer        , {
   path = '/events',
   core = null,
@@ -77,18 +146,13 @@ export function createLiveDeliveryWebSocket(httpServer        , {
   trustedProxies = false,
 }                               = {})                        {
   const wss = createWebSocketServer({ maxPayload, perMessageDeflate });
-  const fanout                   = createLiveFanout({ mayVerb, authorization });
-  const carets = createAnnotatedTextCaretLive({ db: db         , resolveEntity: resolveEntity         , mayVerb: mayVerb         , fanout });
-  const connections = new Set                ();
+  const { connections, createConnection, closeConnections } = createLiveTransportResources({
+    core, resolveEntity, mayVerb, authorization, db, log, maxPayload,
+  });
   const pendingUpgrades = new Set        ();
   let closed = false;
   let closePromise                       = null;
   let heartbeatTimer                                        = null;
-
-  const currentSeq = (scope        ) => {
-    const liveScope = resolveEntity && classifyLiveScope(scope, resolveEntity);
-    return liveScope ? readRevision(db         , scope) : readSeq(db, scope);
-  };
 
   function stopHeartbeat()       {
     if (heartbeatTimer !== null) {
@@ -135,10 +199,8 @@ export function createLiveDeliveryWebSocket(httpServer        , {
     httpServer.off('close', onServerClose);
     for (const socket of pendingUpgrades) socket.destroy();
     pendingUpgrades.clear();
-    await Promise.all([...connections].map((conn) => conn.close?.().catch(() => {})));
-    connections.clear();
+    await closeConnections();
     await new Promise      ((resolve) => wss.close(() => resolve()));
-    fanout.close();
   }
 
   const onUpgrade = (req                 , socket        , head        ) => {
@@ -200,21 +262,7 @@ export function createLiveDeliveryWebSocket(httpServer        , {
           }
 
           const id = `ws:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`;
-          const conn = new LiveConnection(ws, id, {
-            fanout,
-            core,
-            resolveEntity,
-            mayVerb,
-            authorization,
-            db,
-            currentSeq,
-            log,
-            carets,
-            maxPayload,
-            onClose: () => connections.delete(conn),
-          });
-          conn.setPrincipal(principal);
-          connections.add(conn);
+          createConnection(ws, id, principal);
         });
       })
       .catch(() => {

@@ -71,6 +71,8 @@ import {
 } from './authorization-adapter.ts';
 import { resolveAnnotatedTextOwningScope } from './annotated-text-field.ts';
 import { anonymous, collapseForAdmission, type Principal } from './principal.ts';
+import { machinePrincipal, machineAllows, type MachinePrincipal } from './machine-principal.ts';
+import { execute } from './operation.ts';
 import { failure } from './outcome.ts';
 import { requireUser, type Gate } from './route-gate.ts';
 import {
@@ -1064,6 +1066,26 @@ export async function handleBlobReadRoute(
   return true;
 }
 
+// An authenticated worker runs as a typed machine principal — the same
+// attributable identity shape the schedule clock and the in-process job seam
+// use — instead of an untyped bespoke bearer check. The WIRE protocol is
+// UNCHANGED: job functions still receive the workerId string; the machine
+// principal is the typed in-process authorization context derived from it.
+const WORKER_OPERATIONS: readonly string[] = Object.freeze([execute.operation]);
+
+export function workerMachinePrincipal(
+  bearer: string | null,
+  jobs: { authenticate(bearer: string): string | null },
+): MachinePrincipal | null {
+  if (!bearer) return null;
+  const workerId = jobs.authenticate(bearer);
+  if (typeof workerId !== 'string' || workerId.length === 0) return null;
+  const worker = machinePrincipal({ id: workerId, operations: WORKER_OPERATIONS });
+  // The typed principal authorizes the worker dispatch through the same closed
+  // operation vocabulary; a non-machine identity never reaches the job seam.
+  return machineAllows(worker, execute) ? worker : null;
+}
+
 // Framework-owned job-queue endpoints (spec #5, Walk 2). NOT mounted routes: the
 // worker / job API is a framework default, intercepted before route matching (like
 // /blobs, /health, /snapshot). Auth is its OWN path — a per-worker bearer token,
@@ -1097,8 +1119,9 @@ export async function handleJobRoute(
   }
 
   if (url.pathname === '/jobs/claim') {
-    const workerId = jobs.authenticate(bearer);
-    if (!workerId) { reject(res, 401, 'unauthorized'); return true; }
+    const worker = workerMachinePrincipal(bearer, jobs);
+    if (!worker) { reject(res, 401, 'unauthorized'); return true; }
+    const workerId = worker.id;
     let body: unknown;
     try { body = await readRequestBody(req, { jsonOnly: true }); } catch (err) {
       if (err instanceof BodyError) { reject(res, err.status, err.message); return true; }
@@ -1132,8 +1155,9 @@ export async function handleJobRoute(
 
   const hb = url.pathname.match(/^\/jobs\/([^/]+)\/heartbeat$/);
   if (hb) {
-    const workerId = jobs.authenticate(bearer);
-    if (!workerId) { reject(res, 401, 'unauthorized'); return true; }
+    const worker = workerMachinePrincipal(bearer, jobs);
+    if (!worker) { reject(res, 401, 'unauthorized'); return true; }
+    const workerId = worker.id;
     const ok = await jobs.heartbeat(hb[1], workerId);
     if (!ok) { reject(res, 403, 'not the owning worker or job not running'); return true; }
     sendJson(res, 200, { ok: true });
@@ -1142,8 +1166,9 @@ export async function handleJobRoute(
 
   const pg = url.pathname.match(/^\/jobs\/([^/]+)\/progress$/);
   if (pg) {
-    const workerId = jobs.authenticate(bearer);
-    if (!workerId) { reject(res, 401, 'unauthorized'); return true; }
+    const worker = workerMachinePrincipal(bearer, jobs);
+    if (!worker) { reject(res, 401, 'unauthorized'); return true; }
+    const workerId = worker.id;
     let body: unknown;
     try { body = await readRequestBody(req, { jsonOnly: true }); } catch (err) {
       if (err instanceof BodyError) { reject(res, err.status, err.message); return true; }
@@ -1159,8 +1184,9 @@ export async function handleJobRoute(
 
   const rs = url.pathname.match(/^\/jobs\/([^/]+)\/result$/);
   if (rs) {
-    const workerId = jobs.authenticate(bearer);
-    if (!workerId) { reject(res, 401, 'unauthorized'); return true; }
+    const worker = workerMachinePrincipal(bearer, jobs);
+    if (!worker) { reject(res, 401, 'unauthorized'); return true; }
+    const workerId = worker.id;
     let body: unknown;
     try { body = await readRequestBody(req, { jsonOnly: true }); } catch (err) {
       if (err instanceof BodyError) { reject(res, err.status, err.message); return true; }
@@ -1176,8 +1202,9 @@ export async function handleJobRoute(
 
   const cn = url.pathname.match(/^\/jobs\/([^/]+)\/cancel$/);
   if (cn) {
-    const workerId = jobs.authenticate(bearer);
-    if (!workerId) { reject(res, 401, 'unauthorized'); return true; }
+    const worker = workerMachinePrincipal(bearer, jobs);
+    if (!worker) { reject(res, 401, 'unauthorized'); return true; }
+    const workerId = worker.id;
     const cancelled = await jobs.cancelJob({ jobId: cn[1], workerId }) as { forbidden?: unknown; terminal?: unknown; id?: unknown; status?: unknown } | null | undefined;
     if (!cancelled) { reject(res, 404, 'job not found'); return true; }
     if (cancelled.forbidden) { reject(res, 403, 'not the owning worker'); return true; }

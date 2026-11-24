@@ -141,6 +141,11 @@ const ATTRIBUTION_INVALID = '<attribution-invalid>';
 
 
 
+      
+
+
+
+
 
 // Structural write-queue surface (the app's single-writer coordinator). Type-only
 // shape, deliberately not imported: the queue only needs `run`.
@@ -199,6 +204,17 @@ function normalizeDeclaredOperations(operations                   , context     
   );
 }
 
+// Normalize the optional handler timeout. A zero/negative/NaN value would be a
+// misconfiguration (instant timeout or no bound at all), so it fails closed at
+// construction. No value means "no timeout" — the pre-existing behavior.
+function normalizeHandlerTimeout(value                    , context        )                {
+  if (value === undefined) return null;
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+    throw new Error(`${context}: handlerTimeoutMs must be a positive finite number when provided`);
+  }
+  return value;
+}
+
 // Normalize the opt-in per-kind active cap. Fail closed on a malformed map: a
 // negative, zero, fractional, or non-numeric value would silently under- or
 // over-enforce at claim time, so the whole map is rejected at construction.
@@ -235,6 +251,7 @@ export function createJobQueue({
   backoffMs = 5_000,
   pollIntervalMs = 1_000,
   maxActiveByKind,
+  handlerTimeoutMs,
   now = () => Date.now(),
   clock,
 }                 ) {
@@ -243,6 +260,7 @@ export function createJobQueue({
     throw new Error('createJobQueue: sharedSecret is required (fail-closed — worker registration needs a secret)');
   }
   const activeCaps = normalizeMaxActiveByKind(maxActiveByKind);
+  const defaultHandlerTimeoutMs = normalizeHandlerTimeout(handlerTimeoutMs, 'createJobQueue');
   // Store only the hash — the plaintext never persists past construction.
   const secretHash = sha256hex(sharedSecret);
   let timer                                        = null;
@@ -829,13 +847,15 @@ export function createJobQueue({
   // once() on `pollIntervalMs`. `stop()` halts the loop. The fn's thrown error →
   // failed result → substrate retry/dead-letter policy; its return value →
   // completed result.
-  function work(kind        , fn                                             , { principal, operations, pollIntervalMs: intervalMs = pollIntervalMs }                                                                                         )                                                                                                                     {
+  function work(kind        , fn                                             , { principal, operations, pollIntervalMs: intervalMs = pollIntervalMs, handlerTimeoutMs: workTimeoutMs }                                                                                                                    )                                                                                                                     {
     if (!kind) throw new Error('work: kind is required');
     if (typeof fn !== 'function') throw new Error('work: fn must be a function');
     if (!isMachinePrincipal(principal)) {
       throw new Error('work: an attributable machine principal is required (machinePrincipal({ id, operations })) — operational work never runs unattributed');
     }
     const declared = normalizeDeclaredOperations(operations, 'work');
+    // Per-worker override, else the queue-wide bound; absent = no timeout.
+    const timeoutMs = normalizeHandlerTimeout(workTimeoutMs, 'work') ?? defaultHandlerTimeoutMs;
     const workerId = `in-process:${kind}:${randomUUID()}`;
     let pollTimer                                        = null;
     let pollWatcher                            = null;
@@ -887,6 +907,7 @@ export function createJobQueue({
       }
       let result              ;
       let heartbeatTimer                                        = null;
+      let timeoutTimer                                       = null;
       let active = true;
       const clearHeartbeat = () => {
         active = false;
@@ -915,7 +936,21 @@ export function createJobQueue({
         if (typeof heartbeatTimer.unref === 'function') heartbeatTimer.unref();
       }
       try {
-        const output = await fn(job);
+        const output = timeoutMs == null
+          ? await fn(job)
+          : await Promise.race([
+              // Defer the call so a synchronous throw is caught by this try too.
+              Promise.resolve().then(() => fn(job)),
+              new Promise       ((_resolve, reject) => {
+                timeoutTimer = setTimeout(() => {
+                  reject(Object.assign(
+                    new Error(`job handler exceeded ${timeoutMs}ms (failure goes through the standard attempt-bound retry/dead-letter policy)`),
+                    { code: 'HANDLER_TIMEOUT' },
+                  ));
+                }, timeoutMs);
+                if (typeof timeoutTimer.unref === 'function') timeoutTimer.unref();
+              }),
+            ]);
         clearHeartbeat();
         result = await submitResult(job.id, workerId, { status: STATES.COMPLETED, output: output ?? null });
       } catch (err) {
@@ -924,6 +959,10 @@ export function createJobQueue({
         getLog().warn('system', 'job worker fn failed', { err, kind, jobId: job.id });
       } finally {
         clearHeartbeat();
+        if (timeoutTimer) {
+          clearTimeout(timeoutTimer);
+          timeoutTimer = null;
+        }
       }
       return { job, result };
     }

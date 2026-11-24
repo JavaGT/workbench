@@ -35,23 +35,68 @@ import { createHash } from 'node:crypto';
 
 
 
-// The Session row projected by the hydration lookup. `type` is validated by
-// principal() against the closed union; `createdAt` is validated by
-// sessionCreatedAtMs; `status` (when the table exposes it) is validated by
-// principal() against the closed status union. A corrupt stored row therefore
-// resolves to anonymous.
+// The Session row projected by the ONE resolver. `principalType` is validated
+// by principal() against the closed union; `createdAt` by sessionCreatedAtMs;
+// `status` (when the table exposes it) by the closed status guard. A corrupt
+// stored row therefore resolves to anonymous, never to an admitted identity.
 
 
 
 
 
 
+
+
+
+
+// Build the single session-row resolver for a db. It probes for a `status`
+// column once, then resolves a plain token by SHA-256 hash with a legacy raw
+// token fallback. auth/routes.ts and sessionPrincipalOf BOTH use this resolver,
+// so session lookup has one authority — one hash/legacy rule and one fail-closed
+// behavior — instead of two copies that can drift apart.
+export function sessionRowResolver(db       )                     {
+  let hasStatusColumn = false;
+  try {
+    db.prepare('SELECT status FROM Session LIMIT 0');
+    hasStatusColumn = true;
+  } catch {
+    hasStatusColumn = false;
+  }
+  const select = hasStatusColumn
+    ? 'SELECT id, principalType, principalId, createdAt, status FROM Session WHERE token = ?'
+    : 'SELECT id, principalType, principalId, createdAt FROM Session WHERE token = ?';
+  return (plainToken) => {
+    if (typeof plainToken !== 'string' || plainToken.length === 0) return null;
+    try {
+      // Prepare per request so a broken db fails CLOSED each time rather than at
+      // construction. Look up the SHA-256 hash first (the canonical at-rest form
+      // written by Session.create); fall back to a raw lookup ONLY when the token
+      // is not itself a 64-hex digest — a stolen stored hash can never be
+      // replayed as a cookie.
+      const stmt = db.prepare(select);
+      const tokenHash = hashSessionToken(plainToken);
+      let row = stmt.get(tokenHash)                                       ;
+      if (!row && !SHA256_HEX_RE.test(plainToken)) {
+        row = stmt.get(plainToken)                                       ;
+      }
+      return row ?? null;
+    } catch {
+      return null;
+    }
+  };
+}
 
 function sha256hex(s        )         {
   return createHash('sha256').update(s).digest('hex');
 }
 
 const SHA256_HEX_RE = /^[0-9a-f]{64}$/i;
+
+// The ONE session-duration default (sourced from config.ts, the same value
+// resolveConfig()/app.config use). Both session seams read it: auth/routes.ts
+// for the cookie Max-Age and /sessions listing, and sessionPrincipalOf for the
+// expiry admission check. A framework default change cannot desynchronize them.
+export const DEFAULT_SESSION_DURATION_MS = config.sessionDurationMs;
 
 // Hash an opaque session token before storing in `Session.token` or querying
 // against it. Storing only SHA-256 digests prevents a read-only DB compromise
@@ -179,47 +224,15 @@ function sessionCreatedAtMs(value         )                {
 // forged/unknown-token path still returns the canonical `anonymous` (always
 // `'active'`), so an unauthenticated caller never learns a real status — the
 // two-valued admission collapse happens at the A2 seam, not here.
-export function sessionPrincipalOf(db       , { durationMs = config.sessionDurationMs, now = Date.now }                                              = {})                                  {
-  // A Session table may or may not have a `status` column yet (downstream
-  // tickets add it for revoked/disabled sessions). Probe ONCE at construction:
-  // a table WITHOUT the column keeps resolving exactly as before (existing
-  // deployments), while a table WITH it threads status into the principal.
-  // Fail closed — a probe failure just means no status column, and a corrupt
-  // stored status is still rejected by principal()'s closed-union check
-  // (→ anonymous).
-  let hasStatusColumn = false;
-  try {
-    db.prepare('SELECT status FROM Session LIMIT 0');
-    hasStatusColumn = true;
-  } catch {
-    hasStatusColumn = false;
-  }
-  const select = hasStatusColumn
-    ? 'SELECT principalType AS type, principalId AS id, createdAt, status FROM Session WHERE token = ?'
-    : 'SELECT principalType AS type, principalId AS id, createdAt FROM Session WHERE token = ?';
-
+export function sessionPrincipalOf(db       , { durationMs = DEFAULT_SESSION_DURATION_MS, now = Date.now }                                              = {})                                  {
+  // Use the SAME row resolver auth/routes.ts uses. The identity comes entirely
+  // from the server-side Session row; the client supplied only the opaque token.
+  const resolveSession = sessionRowResolver(db);
   return (req) => {
     const token = sessionTokenOf(req);
     if (!token) return anonymous;
     try {
-      // The lookup is prepared per request rather than at construction so a
-      // broken db fails CLOSED (anonymous) on each request instead of throwing at
-      // listen time. The identity comes entirely from the server-side Session
-      // row; the client supplied only the token. principal() re-validates the
-      // closed type union, so a corrupt stored type is anonymous too.
-      //
-      // Look up by SHA-256 hash first (the canonical at-rest representation
-      // written by Session.create). Fall back to a raw lookup ONLY when the
-      // incoming token is not itself a 64-hex SHA-256 digest — this preserves
-      // legacy/test fixtures that insert short plaintext tokens directly while
-      // ensuring a stolen Session.token hash from a DB dump can never be
-      // replayed as a cookie.
-      const stmt = db.prepare(select);
-      const tokenHash = hashSessionToken(token);
-      let row = stmt.get(tokenHash)                                 ;
-      if (!row && !SHA256_HEX_RE.test(token)) {
-        row = stmt.get(token)                                 ;
-      }
+      const row = resolveSession(token);
       if (!row) return anonymous;
       // Session cleanup reclaims expired rows eventually; authorization must not
       // wait for that scheduler. Validate timestamps in JavaScript because SQLite
@@ -241,7 +254,7 @@ export function sessionPrincipalOf(db       , { durationMs = config.sessionDurat
       // must carry it here — otherwise scope binds the token param to NULL and
       // the link principal reads nothing (fail-closed by accident, not by the
       // token match the session was minted to grant).
-      const attributes = row.type === 'link' ? { token: row.id } : {};
+      const attributes = row.principalType === 'link' ? { token: row.principalId } : {};
       // Thread the stored status when present; principal() defaults to 'active'.
       // The DB cell is an `unknown` — narrow it through the closed-union guard
       // (never a bare assertion). SQL NULL / absent cell → no status → the
@@ -252,7 +265,14 @@ export function sessionPrincipalOf(db       , { durationMs = config.sessionDurat
         if (!isPrincipalStatus(row.status)) return anonymous;
         storedStatus = row.status;
       }
-      return principal({ type: row.type, id: row.id, attributes, status: storedStatus });
+      // principal() re-validates the closed type union, so a corrupt stored type
+      // throws here and is caught below → anonymous (fail closed).
+      return principal({
+        type: row.principalType                 ,
+        id: row.principalId,
+        attributes,
+        status: storedStatus,
+      });
     } catch {
       return anonymous;
     }

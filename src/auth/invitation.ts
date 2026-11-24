@@ -12,7 +12,7 @@ import { failure } from '../outcome.ts';
 import type { StatementLike } from '../http-crud-dispatch.ts';
 import type { FieldDescriptor } from '../field-strategy.ts';
 import type { WorkbenchFailure } from '../outcome.ts';
-import type { Principal } from '../principal.ts';
+import { collapseForAdmission, principal, type Principal } from '../principal.ts';
 import {
   authorizeInvitationAcceptance,
   invitationAcceptancePrincipal,
@@ -133,12 +133,18 @@ function requireSuccess(result: InvitationBatchResult | null | undefined, operat
 
 const invitationCreationAuthorities = new WeakSet<object>();
 
-function invitationCreationPrincipal(user: Principal): object {
-  const authority = Object.freeze({
+function invitationCreationPrincipal(user: Principal | null | undefined): Principal | null {
+  if (!user || user.type !== 'user' || typeof user.id !== 'string' || user.id.length === 0) return null;
+  // Build through the one principal constructor, then collapse at the admission
+  // seam: a revoked/disabled identity is anonymous and gets no creation authority.
+  const admitted = collapseForAdmission(principal({
     type: 'user',
     id: user.id,
-    attributes: Object.freeze({ ...(user.attributes ?? {}) }),
-  });
+    attributes: { ...user.attributes },
+    status: user.status,
+  }));
+  if (admitted.type !== 'user' || admitted.id == null) return null;
+  const authority: Principal = Object.freeze({ ...admitted });
   invitationCreationAuthorities.add(authority);
   return authority;
 }
@@ -150,8 +156,19 @@ export function isInvitationCreationAuthority(principal: object | null | undefin
 // The authority module's declared details type is stricter than the values
 // acceptance really passes (mapOperation/invitationOperation may be null). The
 // runtime shape is authoritative; widen at the boundary, never in the authority.
-function authorizeAcceptance(authority: object, details: InvitationAcceptanceDetails): void {
-  authorizeInvitationAcceptance(authority, details as unknown as Parameters<typeof authorizeInvitationAcceptance>[1]);
+function authorizeAcceptance(
+  authority: object,
+  details: InvitationAcceptanceDetails,
+  declaredRoles: readonly string[],
+): void {
+  const admitted = authorizeInvitationAcceptance(
+    authority,
+    details as unknown as Parameters<typeof authorizeInvitationAcceptance>[1],
+    declaredRoles,
+  );
+  if (!admitted) {
+    throw httpError(400, `role '${details.role}' is not a declared membership role on ${details.targetEntity}`);
+  }
 }
 
 function invitationTargetFor(runtime: InvitationRuntime, name: string, role: string): {
@@ -159,6 +176,7 @@ function invitationTargetFor(runtime: InvitationRuntime, name: string, role: str
   fieldName: string;
   table: string;
   ownerColumn: string;
+  roles: readonly string[];
 } {
   let target: InvitationTargetEntity;
   try {
@@ -190,12 +208,16 @@ function invitationTargetFor(runtime: InvitationRuntime, name: string, role: str
         : `role '${role}' is ambiguous on ${target.name}`,
     );
   }
-  const [fieldName] = candidates[0];
+  const [fieldName, descriptor] = candidates[0];
   return {
     entity: target,
     fieldName,
     table: membershipTable(target.name, fieldName),
     ownerColumn: membershipOwnerCol(target.name),
+    // The declared membership roles come from the load-time-validated field
+    // descriptor. They are the allowlist the acceptance authority checks — the
+    // invitation row's self-declared role is never trusted on its own.
+    roles: Object.freeze([...(descriptor.roles ?? [])]),
   };
 }
 
@@ -265,6 +287,7 @@ export function createInvitationApi({ Invitation, db: suppliedDb }: CreateInvita
     }
 
     const authority = invitationCreationPrincipal(principal);
+    if (!authority) throw httpError(403, 'the user principal is not active');
     const result = await appRuntime.batch(() => [{
       type: `${boundInvitation.name}.create`,
       payload: {
@@ -300,6 +323,7 @@ export function createInvitationApi({ Invitation, db: suppliedDb }: CreateInvita
 
     let accepted: { targetEntity: string; targetId: string; role: string } | null = null;
     const authority = invitationAcceptancePrincipal(user);
+    if (!authority) throw httpError(403, 'the user principal is not active');
     const result = await appRuntime.batch(() => {
       const invitation = boundInvitation.findOne(boundInvitation.token.is(token));
       if (!invitation) throw httpError(404, 'invitation not found');
@@ -369,7 +393,7 @@ export function createInvitationApi({ Invitation, db: suppliedDb }: CreateInvita
           invitationId: String(invitation.id),
           invitationOperation: invitation.targetUser !== null ? 'remove' : membershipChanged ? 'update' : null,
           useCount: invitation.useCount + 1,
-        });
+        }, target.roles);
       } catch (error) {
         const e = error as { status?: unknown; message?: string };
         if (e.status) throw error;
@@ -395,6 +419,7 @@ export function createInvitationApi({ Invitation, db: suppliedDb }: CreateInvita
       throw httpError(403, 'a user principal is required to reject an invitation');
     }
     const authority = invitationAcceptancePrincipal(user);
+    if (!authority) throw httpError(403, 'the user principal is not active');
     const result = await appRuntime.batch(() => {
       const invitation = boundInvitation.findOne(boundInvitation.token.is(token));
       if (!invitation) throw httpError(404, 'invitation not found');
@@ -415,7 +440,7 @@ export function createInvitationApi({ Invitation, db: suppliedDb }: CreateInvita
         invitationId: String(invitation.id),
         invitationOperation: 'remove',
         useCount: invitation.useCount,
-      });
+      }, target.roles);
       return [{ type: 'Invitation.remove', payload: { id: invitation.id } }];
     }, { principal: authority });
     requireSuccess(result, 'rejection');

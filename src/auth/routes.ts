@@ -34,6 +34,8 @@ import {
   sessionCookie,
   sessionTokenOf,
   hashSessionToken,
+  sessionRowResolver,
+  DEFAULT_SESSION_DURATION_MS,
   SESSION_COOKIE,
   isValidApiKeyEntityName,
   isReservedApiKeyEntityName,
@@ -215,7 +217,6 @@ const DEFAULT_MIN_PASSWORD_LENGTH = 8;
 const DEFAULT_PASSWORD_RESET_TTL_MS = 60 * 60 * 1000; // 1 hour
 const TOTP_REPLAY_TTL_MS = 120_000; // > 90s (±1 step) window
 const TOTP_REPLAY_MAX_ENTRIES = 10_000;
-const SHA256_HEX_RE = /^[0-9a-f]{64}$/i;
 const SAFE_SQL_IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 function parseSessionCreatedAtMs(value: unknown): number | null {
@@ -249,7 +250,7 @@ export function authRoutes({
   secure = config.env === 'production',
   identifyBy = ['username'],
   minimumPasswordLength,
-  sessionDurationMs = config.sessionDurationMs,
+  sessionDurationMs = DEFAULT_SESSION_DURATION_MS,
   totpIssuer = 'workbench',
   requireUserVerification = true,
   persistChallenges = false,
@@ -545,16 +546,12 @@ export function authRoutes({
     return { user: null, rawPassword: null, failed: false };
   }
 
-  function findSessionRowByToken(plainToken: string): { id: string; principalType: string; principalId: string; createdAt: unknown } | null {
-    const stmt = db.prepare('SELECT id, principalType, principalId, createdAt FROM Session WHERE token = ? LIMIT 1');
-    const tokenHash = hashSessionToken(plainToken);
-    const hashed = stmt.get(tokenHash) as { id: string; principalType: string; principalId: string; createdAt: unknown } | undefined;
-    if (hashed) return hashed;
-    if (!SHA256_HEX_RE.test(plainToken)) {
-      const legacy = stmt.get(plainToken) as { id: string; principalType: string; principalId: string; createdAt: unknown } | undefined;
-      if (legacy) return legacy;
-    }
-    return null;
+  // Session rows resolve through the ONE session-resolution authority in
+  // auth/session.ts — the same hashed-token lookup and legacy fallback the
+  // request principal resolver uses. No second lookup path lives here.
+  const resolveSessionRow = sessionRowResolver(db);
+  function findSessionRowByToken(plainToken: string): ReturnType<typeof resolveSessionRow> {
+    return resolveSessionRow(plainToken);
   }
 
   function revokeOtherSessions(userId: unknown, req: AuthRequest): void {

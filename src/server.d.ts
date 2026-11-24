@@ -1077,6 +1077,46 @@ export function defineSqliteSchema(spec: {
   migrations?: readonly NamespacedMigration[];
 }): SqliteSchemaResult;
 
+// ---------------------------------------------------------------------------
+// External table adoption
+// ---------------------------------------------------------------------------
+
+/** The read-only slice of a database handle adoption needs (PRAGMAs + `sqlite_schema`). */
+export interface AdoptableDb {
+  prepare(sql: string): { all(...params: unknown[]): Array<Record<string, unknown>> };
+}
+
+/** Declaration-only knowledge produced by adoption. Nothing here is created. */
+export interface AdoptedExternalTables {
+  readonly externalTables: readonly { name: string; columns: readonly string[] }[];
+  readonly externalIndexes: readonly { name: string; table?: string }[];
+}
+
+export interface AdoptExternalTablesOptions {
+  /**
+   * Compile a full schema description instead of returning raw declarations.
+   * With `name` supplied, `tables` may add Workbench-owned tables to that schema.
+   */
+  name?: string;
+  tables?: readonly TableDeclaration[];
+}
+
+/**
+ * Adopt existing app-owned tables as declaration-only knowledge for the
+ * Workbench startup census. The tables and their non-SQLite indexes are read
+ * from the live schema; this function never mutates it. With `options.name`,
+ * returns a complete compiled schema (optionally with `options.tables`); by
+ * default returns `{ externalTables, externalIndexes }` for `defineSqliteSchema`.
+ */
+export function adoptExternalTables(
+  db: AdoptableDb,
+  tableNames: readonly string[],
+  options?: AdoptExternalTablesOptions,
+): AdoptedExternalTables | SqliteSchemaResult;
+
+/** The full compiled schema returned by `adoptExternalTables` with `options.name`. */
+export type SqliteSchemaDescription = SqliteSchemaResult;
+
 // DDL helpers (also on the root `workbench` grammar surface through
 // build/internal.mjs) are public on `workbench/server` so app authors never
 // reach a private entrypoint just to set up schema.

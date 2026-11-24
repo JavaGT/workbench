@@ -32,7 +32,17 @@ export { runMigrations } from './migrations.mjs';
 // DDL helpers so app authors can set up schema through workbench/server alone —
 // they never need the private build/internal.mjs entrypoint.
 export { executeDDL, executeFrameworkDDL } from './ddl.mjs';
-export { defineSqliteSchema } from './sqlite-schema.mjs';
+export {
+  defineSqliteSchema,
+  // Adopt pre-existing app-owned tables/indexes as declaration-only census
+  // knowledge. Bun/Node apps (e.g. scope2) set up their schema entirely through
+  // workbench/server — no private build/internal.mjs reach-through required.
+  adoptExternalTables,
+
+
+
+
+} from './sqlite-schema.mjs';
 export { createSchemaReport,                                                                       } from './schema-report.mjs';
 export { describeEntityStorage, describeSqliteStorage } from './sqlite-storage-description.mjs';
 export { readSeq as readCommittedCursor } from './committed-log.mjs';

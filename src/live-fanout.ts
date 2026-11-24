@@ -30,6 +30,7 @@ import type { AuthorizationAdapter } from './authorization-adapter.ts';
 import { readableFieldNames } from './field-admission.ts';
 import { projectRowForRecipient } from './entity/projection.ts';
 import {
+  fieldKindSnapshotControlReason,
   hasFieldKindFeature,
   isFieldKindOperationEvent,
   suppressesFieldKindDelta,
@@ -615,6 +616,10 @@ export function createLiveFanout({ mayVerb = null, authorization = null }: { may
       entityHasContributedKind = entityHasDeltaSuppressingKind(entityRecord);
       contributedKindByEntity.set(entityRecord, entityHasContributedKind);
     }
+    // A contributed kind declares its own opaque-snapshot delivery reason. No
+    // generic layer hardcodes a kind-specific string; kinds with no declared
+    // reason fall back to the ordinary recipient snapshot requirement.
+    const snapshotControlReason = fieldKindSnapshotControlReason(entityRecord.fields) ?? 'recipient-snapshot-required';
 
     // Delta projection is per-entity state diffing; a scope-anchored foreign
     // event carries its own data and must not be fed to the anchor's projector.
@@ -639,13 +644,13 @@ export function createLiveFanout({ mayVerb = null, authorization = null }: { may
         continue;
       }
 
-      // Annotated-text resync must be sent to ALL subscribers regardless of
+      // A contributed-kind resync must be sent to ALL subscribers regardless of
       // field interest — the subscriber needs to know about the event to
       // maintain its cursor, even if it didn't ask for the ephemeral field.
       if (suppressContributedDelta) {
         const seq = committed.seq as number;
         if (!Number.isSafeInteger(seq) || seq < 0) continue;
-        queueSnapshotControl(conn, name, id, seq, 'annotated-text-snapshot-required');
+        queueSnapshotControl(conn, name, id, seq, snapshotControlReason);
         continue;
       }
 
@@ -674,13 +679,7 @@ export function createLiveFanout({ mayVerb = null, authorization = null }: { may
           && readableFields !== undefined && !readableFields.has(handle.field)) {
         const seq = committed.seq as number;
         if (!Number.isSafeInteger(seq) || seq < 0) continue;
-        queueSnapshotControl(
-          conn,
-          name,
-          id,
-          seq,
-          entityHasContributedKind ? 'annotated-text-snapshot-required' : 'recipient-snapshot-required',
-        );
+        queueSnapshotControl(conn, name, id, seq, snapshotControlReason);
         continue;
       }
 

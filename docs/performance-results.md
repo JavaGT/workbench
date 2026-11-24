@@ -58,6 +58,69 @@ Values are operations per second. The median is the primary reference number; sa
 
 ## Annotated-text composite resync
 
+### Latest fresh HEAD record (2026-11-24, uncommitted lane worktree)
+
+Benchmark: `benchmark/annotated-text-composite-resync.mjs`, SHA-256
+`80e3ea7bdfb79655976b30e4e8cef9e245b17295591aa2bde6fa633ecfd56ae0`.
+Source SHAs (bytes on the measured path):
+`src/annotated-text-snapshot.ts` `aa29176b…`,
+`src/annotated-text-recipient-projection.ts` `89b9af16…`,
+`public/workbench-client.mjs` `bcd6edb6…`,
+`public/workbench-annotated-text-snapshot.mjs` `ff758a34…`.
+Node `v26.13.1`, `darwin/arm64`, Apple M4 (10 logical CPUs), 16,384 MiB RAM.
+Fixture: 36,000 words, 72,000 annotations (2 per word), 36,001 unique ranges,
+one protecting annotation, 25 mixed recipients (13 visible / 12 redacted), 50 controls.
+Acceptance boundary per sample: projection → `JSON.stringify` → `JSON.parse` → public
+snapshot validation. `profiling: false`, write coordinator held: **false** in both scenarios.
+
+**Commit note:** both runs recorded `provenance.commit: null` — they were measured on the
+dirty Wave 3 lane worktree before the cutover commit landed. Per the repository contract
+this is a **directional measurement from an unverified worktree**, not a versioned, CI-grade
+expectation. Compare against the committed `37853db` record below only after accounting
+for the different latency gates (1,000 ms / 1,750 ms here versus 500 ms there).
+
+#### Initial scenario — `ANNOTATED_TEXT_BENCH_SCENARIO=initial`
+
+- Recorded at: `2026-11-24T06:57:53.938Z`
+- End-to-end p95: **196.905 ms** (gate `initial bootstrap snapshot` < 1,000 ms) — **MET**
+- Projection p95: 50.439 ms; serialization p95: 35.816 ms; parse+validation p95: 155.859 ms
+- Visible p95: 567.262 ms; redacted p95: 99.874 ms
+- Serialized envelope: 15,536,642 B visible, 11,859,192 B redacted
+- Raw process RSS Δ: 723.05 MiB; peak raw RSS Δ: 1,063.81 MiB; per-recipient RSS window peak: 244.16 MiB; fixture setup RSS: 86.82 MiB
+- Event-loop p99: 1.531 ms (limit < 100 ms) — **met**; 25 coalesced messages
+- Connection budgets: C0 25 starts / 0 burst (≤ 100, min 1), C1 25 starts / 0 burst (≤ 200, min 2) — **met**
+- `fallbackRecovery: null`; `thresholdNotes: []`
+
+#### Forced-fallback scenario — `ANNOTATED_TEXT_BENCH_SCENARIO=fallback`
+
+- Recorded at: `2026-11-24T06:57:58.613Z`
+- End-to-end p95: **199.023 ms** (gate `forced fallback cycle` < 1,750 ms) — **MET**
+- Projection p95: 55.021 ms; serialization p95: 36.102 ms; parse+validation p95: 144.896 ms
+- Visible p95: 581.141 ms; redacted p95: 141.957 ms
+- Serialized envelope: 15,536,642 B visible, 11,859,352 B redacted
+- Raw process RSS Δ: 1,201.40 MiB; peak raw RSS Δ: 1,461.79 MiB; per-recipient RSS window peak: 246.79 MiB; fixture setup RSS: 85.19 MiB
+- Event-loop p99: 1.475 ms (limit < 100 ms) — **met**; 25 coalesced messages
+- Recovery seam `createLiveDeliverySession` (evidence `budget.C1`): topology changed,
+  visibility changed, persisted owner change (`u1` → `u2`, protected target edges 100 → 99),
+  0 snapshot calls before controls / 25 after, `attemptsPerRecipient: [1 × 25]`
+- Connection budgets C0 / C1 unchanged and **met**
+- `thresholdNotes`: "forced fallback did not use exactly two recovery attempts per recipient"
+
+#### Gate verdict (fresh HEAD worktree)
+
+| Gate | Initial | Forced fallback | Limit | Verdict |
+|---|--:|--:|--:|:--|
+| End-to-end p95 / recipient | 196.905 ms | 199.023 ms | < 1,000 ms / < 1,750 ms | MET |
+| Snapshot projection p95 / recipient | 50.439 ms | 55.021 ms | < 500 ms | MET |
+| Per-recipient RSS window peak | 244.16 MiB | 246.79 MiB | < 256 MiB | met |
+| Event-loop delay p99 | 1.531 ms | 1.475 ms | < 100 ms | met |
+| Write coordinator held | false | false | never | met |
+| Recovery budget C0 / C1 | met | met | ≤ 100 / ≤ 200 | met |
+
+---
+
+### Earlier committed record — W1a #152 at HEAD `37853db` (superseded as latest)
+
 **W1a #152 — authoritative fresh record at committed HEAD `37853db`.**
 
 Benchmark: `benchmark/annotated-text-composite-resync.mjs`, SHA-256

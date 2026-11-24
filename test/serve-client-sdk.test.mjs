@@ -79,6 +79,44 @@ test('db-backed app serves every relative module imported by the browser SDK', a
   }
 });
 
+test('db-backed app serves /workbench.mjs and every transitive ./workbench-client-*.mjs import as JS', async (t) => {
+  const origin = await bootDb(t);
+  const entry = `${origin}/workbench.mjs`;
+  const entryRes = await fetch(entry);
+  assert.equal(entryRes.status, 200);
+  assert.equal(entryRes.headers.get('content-type'), 'text/javascript; charset=utf-8');
+
+  // Walk the relative-import graph from the barrel. Side-effect imports
+  // (`import './x.mjs'`) and re-exports (`export … from './x.mjs'`) both count.
+  const seen = new Set();
+  const queue = [entry];
+  while (queue.length > 0) {
+    const url = queue.shift();
+    if (seen.has(url)) continue;
+    seen.add(url);
+    const res = await fetch(url);
+    assert.equal(res.status, 200, url);
+    assert.equal(res.headers.get('content-type'), 'text/javascript; charset=utf-8', url);
+    const body = await res.text();
+    for (const match of body.matchAll(/['"](\.\/workbench-client-[A-Za-z0-9-]+\.mjs)['"]/g)) {
+      queue.push(new URL(match[1], url).href);
+    }
+  }
+  // The barrel plus at least one real split module must have been exercised.
+  assert.ok(seen.size > 1, 'expected split modules to be referenced by /workbench.mjs');
+});
+
+test('the split SDK route never serves an unlisted or traversal path', async (t) => {
+  const origin = await bootDb(t);
+  for (const path of [
+    '/workbench-client-nope.mjs',
+    '/workbench-client-%2e%2e%2fworkbench-client-core.mjs',
+    '/workbench-client-core.mjs.map',
+  ]) {
+    assert.equal((await fetch(`${origin}${path}`)).status, 404, path);
+  }
+});
+
 test('db-backed app: an app route is not shadowed by the SDK endpoint', async (t) => {
   // a mounted route at /notes still works alongside the framework SDK endpoint.
   const origin = await bootDb(t);

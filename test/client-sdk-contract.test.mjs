@@ -16,7 +16,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 
@@ -186,8 +186,17 @@ test('ScopeDispatchResult.settlement optionality matches its runtime producers',
 });
 
 // --- snapshot-patch cursor verdict is built on the shared Replay decision ---
+// The zero-import client is now split across workbench-client-*.mjs modules;
+// structural guards search the whole browser SDK surface, not just the barrel.
+function readClientSources() {
+  return readdirSync(join(root, 'public'))
+    .filter((file) => /^workbench-client(-.*)?\.mjs$/.test(file))
+    .map((file) => readFileSync(join(root, 'public', file), 'utf8'))
+    .join('\n');
+}
+
 function extractSnapshotPatchVerdict() {
-  const source = readFileSync(join(root, 'public/workbench-client.mjs'), 'utf8');
+  const source = readClientSources();
   const start = source.indexOf('function snapshotPatchVerdict(cursor, head, tail) {');
   assert.ok(start !== -1, 'client missing snapshotPatchVerdict helper');
   let depth = 0;
@@ -235,14 +244,16 @@ const BEGIN_MARKER = '// --- BEGIN GENERATED from src/replay-decision.ts';
 const END_MARKER = '// --- END GENERATED from src/replay-decision.ts';
 
 function extractEmbeddedReplayDecision() {
-  const clientSource = readFileSync(join(root, 'public/workbench-client.mjs'), 'utf8');
+  const clientSource = readClientSources();
   const begin = clientSource.indexOf(BEGIN_MARKER);
   const end = clientSource.indexOf(END_MARKER);
   assert.ok(begin !== -1, 'client missing BEGIN GENERATED marker');
   assert.ok(end !== -1 && end > begin, 'client missing END GENERATED marker');
   const blockStart = clientSource.indexOf('\n', begin) + 1;
   const blockEnd = clientSource.lastIndexOf('\n', end);
-  const blockText = clientSource.slice(blockStart, blockEnd);
+  // Split modules export these helpers for cross-slice imports; strip the
+  // keyword before evaluating the embedded copy in isolation.
+  const blockText = clientSource.slice(blockStart, blockEnd).replace(/^export\s+/gm, '');
   const factory = new Function(`${blockText}\nreturn { normalizeSeqSpan, decideReplay };`);
   return factory();
 }

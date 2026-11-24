@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -11,17 +11,28 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const BEGIN_MARKER = '// --- BEGIN GENERATED from src/replay-decision.ts';
 const END_MARKER = '// --- END GENERATED from src/replay-decision.ts';
 
+// The browser SDK is split across workbench-client-*.mjs modules; structural
+// checks read the whole surface so the embed can live in any slice.
+function readClientSources() {
+  return readdirSync(join(root, 'public'))
+    .filter((file) => /^workbench-client(-.*)?\.mjs$/.test(file))
+    .map((file) => readFileSync(join(root, 'public', file), 'utf8'))
+    .join('\n');
+}
+
 // Slice the embedded zero-import body out of the client and evaluate it in a
 // controlled scope so we can drive the client's own functions, not a copy.
 function extractEmbeddedReplayDecision() {
-  const client = readFileSync(join(root, 'public/workbench-client.mjs'), 'utf8');
+  const client = readClientSources();
   const begin = client.indexOf(BEGIN_MARKER);
   const end = client.indexOf(END_MARKER);
   assert.ok(begin !== -1, 'client missing BEGIN GENERATED marker');
   assert.ok(end !== -1 && end > begin, 'client missing END GENERATED marker');
   const blockStart = client.indexOf('\n', begin) + 1;
   const blockEnd = client.lastIndexOf('\n', end);
-  const blockText = client.slice(blockStart, blockEnd);
+  // Split modules export these helpers for cross-slice imports; strip the
+  // keyword before evaluating the embedded copy in isolation.
+  const blockText = client.slice(blockStart, blockEnd).replace(/^export\s+/gm, '');
   const factory = new Function(`${blockText}\nreturn { normalizeSeqSpan, decideReplay };`);
   return factory();
 }
@@ -37,7 +48,7 @@ function captureError(fn) {
 
 test('workbench-client embeds a replay-decision that behaves identically to src', () => {
   const src = readFileSync(join(root, 'src/replay-decision.ts'), 'utf8');
-  const client = readFileSync(join(root, 'public/workbench-client.mjs'), 'utf8');
+  const client = readClientSources();
 
   // Lightweight marker check: the zero-import embed is flagged and both function
   // names survive, so accidental deletion/rename is caught without pinning the

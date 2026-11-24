@@ -318,3 +318,62 @@ test('client decideReplay/normalizeSeqSpan behave identically to build/replay-de
     assert.equal(embeddedError.name, buildError.name);
   }
 });
+
+// --- Reactive surface contract (Wave 3) -------------------------------------
+//
+// The fine-grained LiveList/LiveStore surface and the framework-agnostic
+// bindings are new public API. Both directions are pinned: every runtime member
+// named here must exist in client.d.ts, and every declaration must have a
+// runtime counterpart.
+
+test('reactive runtime members match their client.d.ts declarations', () => {
+  const dts = readFileSync(dtsPath, 'utf8');
+  const between = (start, end) => {
+    const from = dts.indexOf(start);
+    const to = dts.indexOf(end);
+    assert.ok(from !== -1 && to !== -1 && to > from, `cannot slice ${start} .. ${end}`);
+    return dts.slice(from, to);
+  };
+
+  const listDecl = between('export class LiveList', 'export interface LiveListConfig');
+  for (const member of ['status', 'onChange', 'onStatusChange']) {
+    assert.match(listDecl, new RegExp(`\\b${member}\\b`), `LiveList.${member} missing from client.d.ts`);
+  }
+  for (const member of ['onChange', 'onStatusChange']) {
+    assert.equal(typeof client.LiveList.prototype[member], 'function', `LiveList.prototype.${member} missing at runtime`);
+  }
+  assert.equal(Object.getOwnPropertyDescriptor(client.LiveList.prototype, 'status')?.get?.constructor, Function,
+    'LiveList.status must be a getter');
+
+  const storeDecl = between('export interface LiveStore<', 'export function createLiveStore');
+  for (const member of ['onChange', 'onStatusChange']) {
+    assert.match(storeDecl, new RegExp(`\\b${member}\\b`), `LiveStore.${member} missing from client.d.ts`);
+  }
+
+  const channel = {
+    subscribe: async () => ({ currentSeq: 0 }),
+    unsubscribe: async () => {},
+    close() {},
+    onConnectionChange: () => () => {},
+  };
+  const replicaState = {
+    reserve: async () => ({ operation: {}, actionId: 'op', counter: 1 }),
+    head: async () => null,
+    commit: async () => {},
+    block: async () => {},
+    reconcile: async () => [],
+  };
+  const store = client.createLiveStore({
+    baseUrl: 'https://example.test', name: 'Doc', path: '/docs', channel, replicaState,
+  });
+  for (const member of ['onChange', 'onStatusChange']) {
+    assert.equal(typeof store[member], 'function', `store.${member} missing at runtime`);
+    assert.equal(typeof store[member](() => {}), 'function', `${member} must return an unsubscribe function`);
+  }
+  store.close();
+
+  for (const name of ['bindAction', 'bindField', 'bindList', 'bindConnection']) {
+    assert.match(dts, new RegExp(`export function ${name}\\b`), `${name} missing from client.d.ts`);
+    assert.equal(typeof client[name], 'function', `${name} missing at runtime`);
+  }
+});

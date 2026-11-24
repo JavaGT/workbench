@@ -229,6 +229,36 @@ export interface WsEventEnvelope {
 // LiveList — single-document live state
 // ---------------------------------------------------------------------------
 
+/**
+ * Delivery lifecycle exposed by LiveList and forwarded by LiveStore.
+ * - `idle`: ready and no active recovery
+ * - `bootstrapping`: initial snapshot fetch / subscribe
+ * - `resyncing`: events-since or snapshot gap fill in flight
+ * - `stale`: the server asked for a fresh snapshot
+ * - `removed`: terminal entity removal
+ * - `buffer-overflow`: the bounded live queue dropped events; a resnapshot is in flight
+ */
+export type LiveListStatus =
+  | 'idle'
+  | 'bootstrapping'
+  | 'resyncing'
+  | 'stale'
+  | 'removed'
+  | 'buffer-overflow';
+
+/** A fine-grained path-level fold record emitted by `LiveList.onChange`. */
+export interface LiveChangeRecord<Row extends Record<string, unknown> = Record<string, unknown>> {
+  readonly kind: 'snapshot' | 'patch' | 'remove' | 'resync';
+  /** Entity id the change belongs to (LiveList emits its own subscription id). */
+  readonly id?: string | number;
+  /** Top-level fields the fold touched; absent for whole-state kinds. */
+  readonly fields?: readonly string[];
+  /** Sequence the change was applied at. */
+  readonly seq: number;
+  /** State as published by the fold (null for a terminal removal). */
+  readonly state: Row | null;
+}
+
 export class LiveList<Row extends Record<string, unknown> = Record<string, unknown>> {
   constructor(config: LiveListConfig);
 
@@ -243,6 +273,10 @@ export class LiveList<Row extends Record<string, unknown> = Record<string, unkno
 
   subscribe(): Promise<void>;
   onRender(cb: (state: Row | null) => void): () => void;
+  /** Subscribe to fine-grained fold records. Returns an unsubscribe function. */
+  onChange(cb: (change: LiveChangeRecord<Row>) => void): () => void;
+  /** Subscribe to delivery-status transitions. Returns an unsubscribe function. */
+  onStatusChange(cb: (status: LiveListStatus) => void): () => void;
   close(): Promise<void>;
 }
 
@@ -446,6 +480,8 @@ export interface PendingCreateEntry {
 
 export interface LiveStore<Row extends Record<string, unknown> = Record<string, unknown>> {
   subscribe: (id: string | number, options?: SubscribeOptions) => LiveList<Row>;
+  /** Ids of every currently cached LiveList (read-only collection input). */
+  listIds: () => Array<string | number>;
   dispatch: (type: string, payload: Record<string, unknown>) => Promise<DispatchResult>;
   create: (payload: Record<string, unknown>) => Promise<DispatchResult>;
   update: (id: string | number, payload: Record<string, unknown>) => Promise<DispatchResult>;
@@ -462,12 +498,82 @@ export interface LiveStore<Row extends Record<string, unknown> = Record<string, 
   overlayStatusFor: (id: string | number) => OverlayStatus | null;
   pendingCreates: () => PendingCreateEntry[];
   onRender: (cb: () => void) => () => void;
+  /** Fine-grained fold records forwarded from every cached LiveList. */
+  onChange: (cb: (change: LiveChangeRecord<Row>) => void) => () => void;
+  /** Delivery-status transitions with the originating list id. */
+  onStatusChange: (cb: (status: LiveListStatus, id: string | number) => void) => () => void;
   [key: string]: unknown;
 }
 
 export function createLiveStore<Row extends Record<string, unknown> = Record<string, unknown>>(
   config: LiveStoreConfig,
 ): LiveStore<Row>;
+
+// ---------------------------------------------------------------------------
+// Reactive UI bindings — framework-agnostic projections (public/workbench-ui-bindings.mjs)
+// ---------------------------------------------------------------------------
+
+/** Where a projected value came from. */
+export type ReactiveProvenance = 'confirmed' | 'projected' | 'unknown';
+
+/** All lifecycle values a reactive handle may expose as `status`. */
+export type ReactiveStatus = LiveListStatus | ConnectionStatus | OverlayStatus['status'] | 'failed' | 'idle';
+
+/** The single immutable value a reactive handle projects to a UI framework. */
+export interface ReactiveProjection<Value = unknown> {
+  readonly value: Value;
+  readonly provenance: ReactiveProvenance;
+  readonly status: ReactiveStatus;
+}
+
+/** Framework-agnostic handle: read, subscribe, and release in three methods. */
+export interface ReactiveHandle<Value = unknown> {
+  get(): ReactiveProjection<Value>;
+  subscribe(fn: (projection: ReactiveProjection<Value>) => void): () => void;
+  destroy(): void;
+}
+
+/** An action binding also dispatches through the store's one mutation path. */
+export interface ReactiveActionHandle<Value = unknown> extends ReactiveHandle<Value> {
+  dispatch(overridePayload?: Record<string, unknown>): Promise<DispatchResult>;
+}
+
+export interface BindActionOptions {
+  /** Row id whose optimistic overlay should be projected; omit for global actions. */
+  id?: string | number;
+  /** Fully-qualified action type, e.g. `Doc.update`. */
+  action: string;
+  payload?: Record<string, unknown>;
+}
+
+export interface BindFieldOptions {
+  id: string | number;
+  field: string;
+}
+
+export interface BindListOptions {
+  /** Bind one row when present; otherwise bind all rows observed for the store. */
+  id?: string | number;
+  /** Project one sub-collection field instead of the whole row. */
+  field?: string;
+}
+
+export function bindAction<Row extends Record<string, unknown> = Record<string, unknown>>(
+  store: LiveStore<Row>,
+  options: BindActionOptions,
+): ReactiveActionHandle<DispatchResult | null>;
+
+export function bindField<Row extends Record<string, unknown> = Record<string, unknown>>(
+  store: LiveStore<Row>,
+  options: BindFieldOptions,
+): ReactiveHandle<unknown>;
+
+export function bindList<Row extends Record<string, unknown> = Record<string, unknown>>(
+  store: LiveStore<Row>,
+  options?: BindListOptions,
+): ReactiveHandle<Row | readonly unknown[] | unknown>;
+
+export function bindConnection(channel: LiveChannel): ReactiveHandle<ConnectionStatus>;
 
 // ---------------------------------------------------------------------------
 // createLiveDeliverySession — recipient-envelope delivery and recovery
@@ -932,6 +1038,12 @@ export interface QueryClientOptions {
   fetchImpl?: typeof globalThis.fetch;
   /** Maximum number of recently executed pages retained by the bounded LRU. */
   cacheSize?: number;
+  /**
+   * Maximum number of query-identity revision fences held for stale-page
+   * rejection. Defaults to `cacheSize` when given, otherwise 256. Eviction is
+   * least-recently-used so a long-lived session cannot leak identities.
+   */
+  maxHeldRevisions?: number;
 }
 
 export interface QueryRequestOptions {

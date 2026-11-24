@@ -19,6 +19,9 @@ import { isOffsetRange, materializeAnnotatedTextSnapshot, projectPendingAnnotate
 import { applyOffsetTextEdit, applyTextOperation, materializeText as materializeFamilyText, resolveOffsetToEndpoint, restoreTextFamily } from './workbench-annotated-text-continuous.mjs';
 import { annotatedTextAction } from './workbench-annotated-text-action.mjs';
 export { bindAnnotatedTextEditor } from './workbench-annotated-text-editor.mjs';
+// Framework-agnostic reactive bindings (Wave 3). Zero framework deps; the
+// store stays the single reconciliation authority.
+export { bindAction, bindField, bindList, bindConnection } from './workbench-ui-bindings.mjs';
 export { materializeAnnotatedTextSnapshot };
 export { projectEndpointToOffset } from './workbench-annotated-text-continuous.mjs';
 
@@ -864,6 +867,16 @@ export class LiveList {
     this._snapshotRecovery = false;
     this._forceSnapshotRequested = false;
     this._renderCallbacks = new Set();
+    // Fine-grained reactive surface (Wave 3). `onChange` publishes path-level
+    // fold records so a Solid 2 createStore/reconcile can touch only the fields
+    // that actually moved; `onStatusChange` exposes the delivery lifecycle that
+    // `_resyncing` and `_bufferOverflow` previously kept private.
+    this._changeCallbacks = new Set();
+    this._statusCallbacks = new Set();
+    this._status = 'idle';
+    // Sequence being applied by the current fold. Change records should name
+    // the sequence they produce, not the cursor we are about to advance from.
+    this._applyingSeq = null;
     this._ordered = {};             // { [field]: [{id, key, item}] } — internal ordered tracking
     this._textStates = {};          // durable annotated-text reducer state by field
     // Fields folded since the last render tick whose materialized text is
@@ -893,6 +906,14 @@ export class LiveList {
   /** Current sequence cursor. */
   get cursor() { return this._cursor; }
 
+  /**
+   * Delivery lifecycle: 'idle' (ready, no active recovery), 'bootstrapping',
+   * 'resyncing', 'stale' (server asked for a fresh snapshot), 'removed'
+   * (terminal entity removal), or 'buffer-overflow' (the bounded live queue
+   * dropped events and a resnapshot is in flight).
+   */
+  get status() { return this._status; }
+
   /** Promise that resolves when bootstrap completes (same as subscribe()). */
   get ready() { return this._readyPromise; }
 
@@ -907,6 +928,7 @@ export class LiveList {
   async subscribe() {
     if (this._subscribeCalled) throw new Error('subscribe already called');
     this._subscribeCalled = true;
+    this._setStatus('bootstrapping');
     const epoch = this._epoch;
 
     try {
@@ -917,7 +939,7 @@ export class LiveList {
       );
       const { snapshot, seq, reducers } = await this._decode(snapRes);
       this._assertActive(epoch);
-      this._installSnapshot(snapshot);
+      this._installSnapshot(snapshot, 'snapshot', seq);
       await this._installTextReducers(reducers);
       this._cursor = seq;
       this._removed = false;
@@ -958,8 +980,10 @@ export class LiveList {
       // 5. Render initial state, then resolve.
       this._flushDirtyTextFields();
       this._render();
+      this._setStatus(this._removed ? 'removed' : 'idle');
       this._readyResolve();
     } catch (err) {
+      this._setStatus('stale');
       this._readyReject(err);
       throw err;
     }
@@ -974,6 +998,43 @@ export class LiveList {
     return () => this._renderCallbacks.delete(cb);
   }
 
+  /**
+   * Fine-grained fold notifications. Each record is
+   * `{ kind, id?, fields?, seq, state }` where `kind` is 'snapshot', 'patch',
+   * 'remove' or 'resync' and `fields` names the top-level fields the fold
+   * touched. A UI can reconcile only those fields instead of replacing the
+   * whole row. Returns an unsubscribe function.
+   */
+  onChange(cb) {
+    this._changeCallbacks.add(cb);
+    return () => this._changeCallbacks.delete(cb);
+  }
+
+  /** Delivery-status transitions. Returns an unsubscribe function. */
+  onStatusChange(cb) {
+    this._statusCallbacks.add(cb);
+    return () => this._statusCallbacks.delete(cb);
+  }
+
+  _setStatus(status) {
+    if (this._closed || this._status === status) return;
+    this._status = status;
+    for (const cb of this._statusCallbacks) {
+      try { cb(status); } catch { /* isolate consumers */ }
+    }
+  }
+
+  /** Publish one path-level change record; `state` is always the live object. */
+  _emitChange(kind, { id, fields, seq = this._applyingSeq ?? this._cursor, state = this._state } = {}) {
+    if (this._changeCallbacks.size === 0) return;
+    const change = { kind, seq, state };
+    if (id !== undefined) change.id = id;
+    if (fields !== undefined) change.fields = fields;
+    for (const cb of this._changeCallbacks) {
+      try { cb(change); } catch { /* isolate consumers */ }
+    }
+  }
+
   /** Tear down: unsubscribe from channel, clear callbacks, stop folding. Idempotent. */
   async close() {
     if (this._closed) return;
@@ -985,6 +1046,8 @@ export class LiveList {
       this._resyncRetryTimer = null;
     }
     this._renderCallbacks.clear();
+    this._changeCallbacks.clear();
+    this._statusCallbacks.clear();
     this._queue = [];
     if (!this._ready) this._readyReject(new ClientClosedError('Live list closed before it became ready'));
     try { await this._channel.unsubscribe(this._entity, this._id); } catch { /* ignore */ }
@@ -1057,6 +1120,8 @@ export class LiveList {
     if (this._queue.length >= this._maxBufferedEvents) {
       this._queue = [];
       this._bufferOverflow = true;
+      // Never silently drop: the overflow is observable and forces a resnapshot.
+      this._setStatus('buffer-overflow');
       return;
     }
     if (!this._bufferOverflow) this._queue.push(envelope);
@@ -1105,6 +1170,8 @@ export class LiveList {
     this._bufferOverflow = false;
     this._snapshotRequiredSeq = 0;
     this._queue = [];
+    this._emitChange('remove', { id: this._id });
+    this._setStatus('removed');
     return true;
   }
 
@@ -1136,7 +1203,12 @@ export class LiveList {
     }
     // next — apply and advance cursor to span hi (shared Replay decision)
     this._installTextReducers(reducers);
-    this._applyEvent(event, delta);
+    this._applyingSeq = decision.cursor;
+    try {
+      this._applyEvent(event, delta);
+    } finally {
+      this._applyingSeq = null;
+    }
     this._cursor = decision.cursor;
     this._flushDirtyTextFields();
     this._render();
@@ -1155,6 +1227,7 @@ export class LiveList {
   async _resync(forceSnapshot = false) {
     if (this._resyncing) return; // prevent re-entrancy
     this._resyncing = true;
+    this._setStatus('resyncing');
     const snapshotRequested = forceSnapshot || this._forceSnapshotRequested;
     this._forceSnapshotRequested = false;
     this._snapshotRecovery = snapshotRequested;
@@ -1177,6 +1250,8 @@ export class LiveList {
         this._state = null;
         this._cursor = body.seq;
         this._removed = true;
+        this._emitChange('remove', { id: this._id });
+        this._setStatus('removed');
         this._ordered = {};
         this._textStates = {};
         this._dirtyTextFields.clear();
@@ -1185,13 +1260,14 @@ export class LiveList {
         this._queue = [];
       } else if (snapshotRequested || this._bufferOverflow || body?.resync === 'stale') {
         // Forced re-bootstrap: fresh snapshot replaces state entirely.
+        if (body?.resync === 'stale') this._setStatus('stale');
         const snapRes = await this._fetchImpl(
           this._snapshotUrl(this._entity, this._id),
           { signal: this._abortController.signal },
         );
         const { snapshot, seq, reducers } = await this._decode(snapRes);
         this._assertActive(epoch);
-        this._installSnapshot(snapshot);
+        this._installSnapshot(snapshot, 'resync', seq);
         await this._installTextReducers(reducers);
         this._cursor = seq;
         this._removed = false;
@@ -1229,7 +1305,12 @@ export class LiveList {
               reducers: row.reducers,
             };
             await this._installTextReducers(normalized.reducers);
-            this._applyEvent(normalized.event, normalized.delta);
+            this._applyingSeq = row.seq;
+            try {
+              this._applyEvent(normalized.event, normalized.delta);
+            } finally {
+              this._applyingSeq = null;
+            }
             // Advance through the shared Replay decision, not a hand-assigned
             // seq. The whole-batch pre-check guarantees this is `next`; a
             // different verdict is a contract violation and fails the batch.
@@ -1277,6 +1358,7 @@ export class LiveList {
 
     this._flushDirtyTextFields();
     this._render();
+    this._setStatus(this._removed ? 'removed' : 'idle');
   }
 
   _scheduleResync() {
@@ -1337,10 +1419,11 @@ export class LiveList {
    * shared by reference; every mutation path below is copy-on-write, so the
    * fetched object is never aliased as the live state.
    */
-  _installSnapshot(snapshot) {
+  _installSnapshot(snapshot, kind = 'snapshot', seq = this._cursor) {
     this._state = snapshot && typeof snapshot === 'object' && !Array.isArray(snapshot)
       ? { ...snapshot }
       : snapshot;
+    this._emitChange(kind, { seq });
   }
 
   /** CRUD operations (2-part types: ticket.created / .updated / .removed). */
@@ -1349,6 +1432,8 @@ export class LiveList {
       case 'created':
         this._state = { ...event.data };
         this._removed = false;
+        if (this._status === 'removed' || this._status === 'buffer-overflow') this._setStatus('idle');
+        this._emitChange('patch', { id: event.data?.id ?? this._id, fields: Object.keys(event.data ?? {}) });
         this._ordered = {};
         // Whole-state replacement: pending rematerializations refer to the
         // discarded state object and must not overwrite the new one.
@@ -1376,17 +1461,27 @@ export class LiveList {
             next[key] = event.data[key];
           }
         }
-        // Apply per-kind delta for the fields the delta owns.
+        // Apply per-kind delta for the fields the delta owns (it publishes its
+        // own field-level change record), then report the whole-value fields.
         if (delta) {
           this._applyDelta(delta, next);
         }
         this._state = next;
+        if (this._status === 'removed') this._setStatus('idle');
+        const changedFields = Object.keys(event.data ?? {}).filter(
+          (key) => key !== 'id' && !(delta && Object.prototype.hasOwnProperty.call(delta, key)),
+        );
+        if (changedFields.length > 0) {
+          this._emitChange('patch', { id: event.data?.id ?? this._id, fields: changedFields });
+        }
         break;
       }
 
       case 'removed':
         this._state = null;
         this._removed = true;
+        this._emitChange('remove', { id: event.data?.id ?? this._id });
+        this._setStatus('removed');
         // Nothing may resurrect a field onto a removed row's null state.
         this._dirtyTextFields.clear();
         break;
@@ -1436,6 +1531,8 @@ export class LiveList {
         // Malformed delta for this field — skip.
       }
     }
+    const fields = Object.keys(delta);
+    if (fields.length > 0) this._emitChange('patch', { fields, state: next });
   }
 
   /**
@@ -1487,6 +1584,7 @@ export class LiveList {
         // Log append — push the full data as an entry.
         this._writableState();
         this._state[field] = [...(this._state[field] ?? []), data];
+        this._emitChange('patch', { fields: [field] });
         break;
 
       case 'added':
@@ -1496,6 +1594,7 @@ export class LiveList {
         m[data.member] = data.role;
         this._writableState();
         this._state[field] = m;
+        this._emitChange('patch', { fields: [field] });
         break;
       }
 
@@ -1507,6 +1606,7 @@ export class LiveList {
           delete m[data.member];
           this._writableState();
           this._state[field] = m;
+          this._emitChange('patch', { fields: [field] });
         } else if ('id' in data) {
           this._applyOrderedOp(field, 'removed', data);
         }
@@ -1572,6 +1672,7 @@ export class LiveList {
     // Expose as the sorted array of item values (new state identity each op).
     this._writableState();
     this._state[field] = this._ordered[field].map(e => e.item);
+    this._emitChange('patch', { fields: [field], id: data.id ?? this._id });
   }
 
   /**
@@ -1582,10 +1683,12 @@ export class LiveList {
    */
   _flushDirtyTextFields() {
     if (this._state == null || this._dirtyTextFields.size === 0) return;
-    for (const field of this._dirtyTextFields) {
+    const fields = [...this._dirtyTextFields];
+    for (const field of fields) {
       this._rematerializeTextField(field);
     }
     this._dirtyTextFields.clear();
+    this._emitChange('patch', { fields });
   }
 
   /** Materialize one field's folded text state into public view. */
@@ -1848,7 +1951,11 @@ export function createLiveStore({ baseUrl, name, path, channel, fetchImpl, repli
   const _listOptions = new Map();   // id → serialized subscribe options
   const _overlay = new Map();       // opId → overlay entry
   const _renderCallbacks = new Set();
+  const _changeCallbacks = new Set();
+  const _statusCallbacks = new Set();
   const _listUnsubs = new Map();    // id → LiveList.onRender unsub
+  const _listChangeUnsubs = new Map(); // id → LiveList.onChange unsub
+  const _listStatusUnsubs = new Map(); // id → LiveList.onStatusChange unsub
   const _actionRoutes = new Map();  // actionType → { method, path }
   const _textSendChains = new Map(); // document → serialized head delivery
   const _textAllocationChains = new Map(); // document → serialized durable reservation and draft update
@@ -2036,6 +2143,19 @@ export function createLiveStore({ baseUrl, name, path, channel, fetchImpl, repli
       _storeRender();
     });
     _listUnsubs.set(id, unsub);
+
+    // Forward the fine-grained fold and lifecycle surfaces so store-level
+    // consumers never need to reach into the cached LiveList themselves.
+    _listChangeUnsubs.set(id, list.onChange((change) => {
+      for (const cb of _changeCallbacks) {
+        try { cb(change); } catch { /* isolate consumers */ }
+      }
+    }));
+    _listStatusUnsubs.set(id, list.onStatusChange((status) => {
+      for (const cb of _statusCallbacks) {
+        try { cb(status, id); } catch { /* isolate consumers */ }
+      }
+    }));
 
     // Boot strap (do not await — caller may await list.ready)
     list.subscribe().catch(() => {});
@@ -2420,6 +2540,12 @@ export function createLiveStore({ baseUrl, name, path, channel, fetchImpl, repli
     for (const unsub of _listUnsubs.values()) {
       unsub();
     }
+    for (const unsub of _listChangeUnsubs.values()) {
+      unsub();
+    }
+    for (const unsub of _listStatusUnsubs.values()) {
+      unsub();
+    }
     for (const list of _listCache.values()) {
       list.close().catch(() => {});
     }
@@ -2428,14 +2554,20 @@ export function createLiveStore({ baseUrl, name, path, channel, fetchImpl, repli
     _listCache.clear();
     _listOptions.clear();
     _listUnsubs.clear();
+    _listChangeUnsubs.clear();
+    _listStatusUnsubs.clear();
     _overlay.clear();
     _renderCallbacks.clear();
+    _changeCallbacks.clear();
+    _statusCallbacks.clear();
   }
 
   // --- Store object ---
 
   const store = {
     subscribe: _subscribeLiveList,
+    /** Ids of every cached LiveList — read-only input for collection bindings. */
+    listIds() { return [..._listCache.keys()]; },
     dispatch,
     create(payload) { return dispatch(`${name}.create`, payload); },
     update(id, payload) { return dispatch(`${name}.update`, { id, ...payload }); },
@@ -2451,6 +2583,16 @@ export function createLiveStore({ baseUrl, name, path, channel, fetchImpl, repli
     onRender(cb) {
       _renderCallbacks.add(cb);
       return () => _renderCallbacks.delete(cb);
+    },
+    /** Fine-grained fold records forwarded from every cached LiveList. */
+    onChange(cb) {
+      _changeCallbacks.add(cb);
+      return () => _changeCallbacks.delete(cb);
+    },
+    /** Delivery-status transitions: `(status, id)` for the originating list. */
+    onStatusChange(cb) {
+      _statusCallbacks.add(cb);
+      return () => _statusCallbacks.delete(cb);
     },
   };
 
@@ -2828,8 +2970,16 @@ export function createLiveDeliverySession({
         const liveCycle = snapshotRecoveryCycle?.id === cycleId ? snapshotRecoveryCycle : null;
         const latestCoverage = liveCycle?.floor ?? null;
         const latestReceipt = liveCycle?.receiptFloor ?? receiptFloor;
+        // A coalesced recovery only needs a SECOND snapshot when the first one
+        // actually left a fence uncovered. Cursor can advance through live
+        // folds or catch-up without installing a snapshot, so a generation
+        // check alone would schedule a redundant full fetch even though the
+        // pending receipt fence and control anchor are already covered.
+        const fenceCovered = (latestCoverage == null || cursorAnchor(cursor) >= latestCoverage)
+          && (latestReceipt == null || cursorAnchor(cursor) >= latestReceipt);
         if (latestReceipt != null && !closed && status !== 'revoked' && status !== 'unavailable'
           && snapshotGeneration === snapshotGenerationAtStart
+          && !fenceCovered
           && liveCycle) {
           // A reconnect may supersede this request without installing its
           // result. Give the coalesced recovery one fresh attempt before
@@ -5698,9 +5848,15 @@ export function createAuthClient({ baseUrl, fetchImpl } = {}) {
 // success value is the server body: a query page for the family/entity calls,
 // a hits + staleness response for search. `credentials: 'include'` sends the
 // fail-closed session cookie, exactly like the CRUD store.
-export function createQueryClient({ baseUrl, fetchImpl, cacheSize } = {}) {
+export function createQueryClient({ baseUrl, fetchImpl, cacheSize, maxHeldRevisions } = {}) {
   const fetchFn = fetchImpl ?? globalThis.fetch;
   const maxCachedPages = Number.isSafeInteger(cacheSize) && cacheSize > 0 ? cacheSize : 32;
+  // Revision fences are kept per queryIdentity. Without a bound a long-lived
+  // session accumulates one entry per distinct request forever; the LRU below
+  // gives each entry a recent-use signal and caps the map.
+  const maxHeldRevisionCount = Number.isSafeInteger(maxHeldRevisions) && maxHeldRevisions > 0
+    ? maxHeldRevisions
+    : (Number.isSafeInteger(cacheSize) && cacheSize > 0 ? cacheSize : 256);
   // Bounded LRU of executed pages. Query calls still FETCH (the existing
   // contract); the cache is an explicit read surface for consumers that want a
   // last-known page, plus the target of an invalidation-triggered refetch.
@@ -5730,11 +5886,30 @@ export function createQueryClient({ baseUrl, fetchImpl, cacheSize } = {}) {
     return JSON.stringify([kind, name, request ?? {}]);
   }
 
+  /** Read a held revision and mark it recently used without changing its value. */
+  function touchHeldRevision(identity) {
+    const held = heldRevisions.get(identity);
+    if (held !== undefined) {
+      heldRevisions.delete(identity);
+      heldRevisions.set(identity, held);
+    }
+    return held;
+  }
+
+  /** Write the high-water revision, evicting the least-recently-used identity. */
+  function rememberHeldRevision(identity, revision) {
+    heldRevisions.delete(identity);
+    heldRevisions.set(identity, revision);
+    while (heldRevisions.size > maxHeldRevisionCount) {
+      heldRevisions.delete(heldRevisions.keys().next().value);
+    }
+  }
+
   function acceptQueryPage(page) {
     if (!page || !Number.isSafeInteger(page.revision) || typeof page.queryIdentity !== 'string') {
       throw new WorkbenchFailureError(clientFailure('invalid-input', 'query page is missing a revision token or identity'));
     }
-    const held = heldRevisions.get(page.queryIdentity);
+    const held = touchHeldRevision(page.queryIdentity);
     return held !== undefined && page.revision < held ? 'reject-stale' : 'accept';
   }
 
@@ -5766,8 +5941,8 @@ export function createQueryClient({ baseUrl, fetchImpl, cacheSize } = {}) {
       if (acceptQueryPage(page) === 'reject-stale') {
         throw new WorkbenchFailureError(clientFailure('conflict', 'stale query page'));
       }
-      const held = heldRevisions.get(page.queryIdentity);
-      if (held === undefined || page.revision > held) heldRevisions.set(page.queryIdentity, page.revision);
+      const held = touchHeldRevision(page.queryIdentity);
+      if (held === undefined || page.revision > held) rememberHeldRevision(page.queryIdentity, page.revision);
       rememberPage(key, kind, name, request, page, opts?.invalidationId);
       return page;
     })();

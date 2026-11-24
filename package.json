@@ -3,6 +3,7 @@
 	"version": "0.1.3",
 	"description": "Workbench for collaborative, persisted, realtime data.",
 	"type": "module",
+	"sideEffects": false,
 	"files": [
 		"build/",
 		"public/",

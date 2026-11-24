@@ -23,6 +23,8 @@ export {
 } from './schema-table-census.mjs';
 export { matchRoute } from './http-route-match.mjs';
 export { serveStatic } from './views.mjs';
+// Web Fetch / Bun.serve adapter over the same HTTP/auth spine as listen().
+export { createFetchHandler } from './serve.mjs';
 export { createJobQueue } from './job-queue.mjs';
 export { createBlobStore } from './blob-store.mjs';
 export { compileBlobCensus, EMPTY_BLOB_CENSUS } from './blob-census.mjs';

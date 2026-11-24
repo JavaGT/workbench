@@ -733,3 +733,8 @@ export function listen(app: any, port: any, optionsOrCallback: any = {}) {
 
   return app;
 }
+
+// Web Fetch / Bun.serve surface. The adapter delegates to makeRequestHandler
+// above, so CORS/CSRF, the route gate, CRUD dispatch, framework routes, and
+// principal hydration are the SAME spine as a node:http server.
+export { createFetchHandler } from './http-fetch.ts';

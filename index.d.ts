@@ -1822,6 +1822,44 @@ export interface ListenOptions {
 }
 
 /**
+ * The Node-shaped request the Web Fetch adapter passes to `principalOf`, so a
+ * Bearer/session resolver reads the same headers it reads under node:http.
+ */
+export interface FetchAdapterRequest {
+  readonly method: string;
+  readonly url: string;
+  readonly headers: Record<string, string | string[] | undefined>;
+  readonly socket: { readonly remoteAddress?: string };
+  readonly aborted: boolean;
+  readonly destroyed: boolean;
+  readonly raw: FetchAdapterRequest;
+}
+
+export interface FetchHandlerOptions {
+  principalOf?: (request: FetchAdapterRequest) => Principal;
+  db?: WorkbenchDatabase;
+  env?: string;
+  rateLimiter?: KeyedRateLimiter;
+  csp?: string;
+  hsts?: boolean;
+  cors?: { origins: readonly string[] };
+  requestLog?: boolean;
+  /** The one authorization adapter, shared with listen() and every other transport. */
+  authorization?: AuthorizationAdapter;
+  trustedProxies?: boolean | readonly string[] | ((ip: string) => boolean);
+}
+
+export type FetchHandler = (request: Request) => Promise<Response>;
+
+/**
+ * Adapt an app to `(request: Request) => Promise<Response>` for Bun.serve,
+ * Deno.serve, or any Web Fetch host. Shares the entire HTTP/auth spine with
+ * `listen()` — CORS/CSRF, route gate, CRUD dispatch, framework routes, and
+ * principal hydration are not reimplemented here.
+ */
+export function createFetchHandler(app: WorkbenchApp, options?: FetchHandlerOptions): FetchHandler;
+
+/**
  * A field handle as the snapshot grammar reads it. `Key` carries the field NAME
  * as a literal type (real entity handles satisfy this structurally), and the
  * phantoms carry value/mode knowledge for projection-shape inference.

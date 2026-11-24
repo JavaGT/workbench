@@ -1558,3 +1558,11 @@ export function createHistoryReader(options: {
   projectRecipient?: ProjectRecipient;
   scopeVisible?: ScopeVisibleCheck;
 }): HistoryReader;
+
+// Web Fetch / Bun.serve adapter. Declared once in the root entrypoint and
+// mirrored here so `workbench/server` consumers get the same contract.
+export function createFetchHandler(
+  app: import('../index.d.ts').WorkbenchApp,
+  options?: import('../index.d.ts').FetchHandlerOptions,
+): import('../index.d.ts').FetchHandler;
+export type { FetchAdapterRequest, FetchHandler, FetchHandlerOptions } from '../index.d.ts';

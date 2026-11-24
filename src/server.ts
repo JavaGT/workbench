@@ -23,6 +23,8 @@ export {
 } from './schema-table-census.ts';
 export { matchRoute } from './http-route-match.ts';
 export { serveStatic } from './views.ts';
+// Web Fetch / Bun.serve adapter over the same HTTP/auth spine as listen().
+export { createFetchHandler } from './serve.ts';
 export { createJobQueue } from './job-queue.ts';
 export { createBlobStore } from './blob-store.ts';
 export { compileBlobCensus, EMPTY_BLOB_CENSUS } from './blob-census.ts';

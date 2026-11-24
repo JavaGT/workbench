@@ -22,6 +22,8 @@ import { scopeOf } from '../scope-handle.ts';
 import * as eventHandles from '../event-handle.ts';
 import { canonicalTextOp } from '../annotated-text.ts';
 import { fieldKindContribution, resolveFieldKindEventScope } from '../strategy/index.ts';
+// Arms the field-kind registry for standalone CRUD/dispatch entry points.
+import '../annotated-text-field.ts';
 import { CASCADE_DESCENDANT, CASCADE_PREAUTHORIZED } from './removal-cascade.ts';
 import { admitRow } from '../row-grant.ts';
 import { admitRowTransition } from '../field-admission.ts';

@@ -5,6 +5,7 @@ const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 import { assertGuarded } from './guard/static.mjs';
 import { write } from './grant.mjs';
 
+import { registerFieldKindContribution } from './strategy/index.mjs';
 import * as eventHandles from './event-handle.mjs';
 import { annotatedTextDeniedPlaceholder } from './field-admission.mjs';
 import { markAnnotatedEntityProjection } from './annotated-text-history.mjs';
@@ -896,6 +897,7 @@ function hasAnnotatedField(fields                                               
 const annotatedTextContribution = {
   kind: 'annotatedText',
   blocksConditionalCreateHistory: true,
+  snapshotControlReason: 'annotated-text-snapshot-required',
 
   validateEntityFields(entity, fields) {
     for (const [fieldName, descriptor] of Object.entries(fields)) {
@@ -956,6 +958,10 @@ const annotatedTextContribution = {
 }                                ;
 
 export const ANNOTATED_TEXT_FIELD_KIND_CONTRIBUTION                        = Object.freeze(annotatedTextContribution);
+
+// The kind owns its registration: strategy/index stays independent of every
+// field kind, and any entry point that loads this module arms the core loops.
+registerFieldKindContribution(ANNOTATED_TEXT_FIELD_KIND_CONTRIBUTION);
 
 export function annotatedTextAuthoringStreamDDL(entity        , field        )           {
   const prefix = `${entity}_${field}`;

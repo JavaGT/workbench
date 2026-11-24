@@ -5,7 +5,9 @@
 // admission are then projected through the annotated-text recipient grammar.
 import { projectRowForRecipient } from './entity/projection.ts';
 import { readableFieldNames } from './field-admission.ts';
-import { fieldKindContribution, hasFieldKindFeature } from './strategy/index.ts';
+import { fieldKindContribution, fieldKindSnapshotControlReason, hasFieldKindFeature } from './strategy/index.ts';
+// Arms the field-kind registry when this projection module is loaded on its own.
+import './annotated-text-field.ts';
 import type { AuthorizationAdapter } from './authorization-adapter.ts';
 
 export interface EntityFieldDescriptor {
@@ -19,8 +21,17 @@ export interface EntitySnapshotRecord {
   deserializeRow(row: Record<string, unknown>): Record<string, unknown>;
 }
 
-export function hasAnnotatedTextFields(entity: EntitySnapshotRecord): boolean {
+/** True when any declared field kind owns a recipient-snapshot projection. */
+export function hasSnapshotProjectedFields(entity: EntitySnapshotRecord): boolean {
   return hasFieldKindFeature(entity.fields as never, 'snapshotField');
+}
+
+/** Legacy name retained for callers that still ask about annotated text specifically. */
+export const hasAnnotatedTextFields = hasSnapshotProjectedFields;
+
+/** The delivery reason declared by the kind that needs a fresh snapshot. */
+export function snapshotControlReasonFor(entity: EntitySnapshotRecord): string | null {
+  return fieldKindSnapshotControlReason(entity.fields as never);
 }
 
 export interface ProjectSnapshotOptions {

@@ -17,6 +17,8 @@ import type { DbHandle } from '../driver.ts';
 import type { SideTableStrategyEntry, ProjectionEvent } from '../side-table-strategy.ts';
 import { readableFieldNames } from '../field-admission.ts';
 import { fieldKindContribution, markFieldKindProjections } from '../strategy/index.ts';
+// Arms the field-kind registry for standalone projection/live-fanout entry points.
+import '../annotated-text-field.ts';
 import type { AuthorizationAdapter } from '../authorization-adapter.ts';
 import { rawRow } from './query.ts';
 

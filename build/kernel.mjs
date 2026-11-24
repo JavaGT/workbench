@@ -5,7 +5,7 @@ import {
   clearRemovedScheduleReceipts,
   rearmChangedScheduleReceipts,
 } from './schedule-runtime.mjs';
-import { createServer, durableMutationVariant, liveMutationVariant } from './pipeline.mjs';
+import { createServer, durableMutationVariant, liveMutationVariant, HANDLER_POLICY,                    } from './pipeline.mjs';
 
 import { buildEffectsRegistry, validateEffects, executeEffectsForEvent } from './effect-compiler.mjs';
 import { User, Session, Inbox, Credential, Invitation, ApiKey, TwoFactor } from './auth/entities.mjs';
@@ -40,6 +40,22 @@ import { validateProtectedArtefactsDeclaration } from './protected-artefact-stor
 // routes). They must be present in the validation set so the admission handshake
 // can resolve them + their `admitsEffects`.
 const FRAMEWORK_ENTITIES = [User, Session, Inbox, Credential, Invitation, ApiKey, TwoFactor];
+
+/**
+ * Attach the handler's capability record as one typed policy under HANDLER_POLICY.
+ * The pipeline reads that symbol through readHandlerPolicy; the own-property
+ * mirror keeps legacy readers (the annotated-text kernel seam, app shims, tests)
+ * working unchanged.
+ */
+export function attachHandlerPolicy(handler     , policy               )      {
+  const attached = Object.freeze({ ...policy });
+  Object.defineProperty(handler, HANDLER_POLICY, { value: attached });
+  for (const [key, value] of Object.entries(attached)) {
+    if (value === undefined) continue;
+    Object.defineProperty(handler, key, { value });
+  }
+  return handler;
+}
 
 function collectAppEntities(app     ) {
   const handlers                      = {};
@@ -96,47 +112,31 @@ function collectAppEntities(app     ) {
     const handler = async (context     ) => runDeclaredActionWithBlobClaims({
       declaration, context, lifecycle: app.pendingBlobLifecycle,
     });
-    Object.defineProperty(handler, 'inTransaction', { value: true });
-    if (declaration.ownedResources === true) {
-      Object.defineProperty(handler, 'ownedResources', { value: true });
-      Object.defineProperty(handler, 'ownedResourcePlans', { value: app.searchPlugins.purgePlans() });
-    }
-    Object.defineProperty(handler, 'batchForbidden', {
-      value: compoundContributionPolicy != null
-        || (app._blobLifecycleOptions?.fields ?? []).some((field     ) => field.actionName === declaration.type)
-        || protectedArtefactTables.length > 0,
-    });
-    Object.defineProperty(handler, 'erasureCapable', { value: Boolean(declaration.erasure) });
-    Object.defineProperty(handler, 'erasurePrepare', {
-      value: declaration.erasure === true ? undefined : declaration.erasure?.prepare,
-    });
-    Object.defineProperty(handler, 'erasurePreparationTables', {
-      value: declaration.erasure && declaration.erasure !== true
-        ? Object.freeze([...declaration.erasure.tables]) : Object.freeze([]),
-    });
-    Object.defineProperty(handler, 'erasurePreparationReadTables', {
-      value: declaration.erasure && declaration.erasure !== true
-        ? Object.freeze([...(declaration.erasure.readTables ?? [])]) : Object.freeze([]),
-    });
-    Object.defineProperty(handler, 'protectedArtefactTables', {
-      value: protectedArtefactTables,
-    });
-    Object.defineProperty(handler, 'privateFactProjection', {
-      value: declaration.projections?.some((projection     ) => projection?.privateFact === true) ?? false,
-    });
-    if (composedAnnotated != null) {
-      Object.defineProperty(handler, 'compoundContributionPolicy', { value: composedAnnotated.compoundContributionPolicy });
-      compoundPolicies.push(composedAnnotated.contributionPolicy);
-      Object.defineProperty(handler, 'dedupeReceiptMatches', { value: composedAnnotated.dedupeReceiptMatches });
-    }
+    if (composedAnnotated != null) compoundPolicies.push(composedAnnotated.contributionPolicy);
     // An action wrapped by `atomicOperation(...)` (S3/A6) carries its
     // in-transaction read + resolution registration on the raw handler. The
     // wrapper must forward it — commitEvents resolves and field-admits atomic
     // operations off the REGISTERED handler it runs, so an app-level atomic
     // action behaves exactly like the package-internal path.
-    if (declaration.handler?.atomicOperation) {
-      Object.defineProperty(handler, 'atomicOperation', { value: declaration.handler.atomicOperation });
-    }
+    attachHandlerPolicy(handler, {
+      inTransaction: true,
+      ownedResources: declaration.ownedResources === true,
+      ownedResourcePlans: declaration.ownedResources === true ? app.searchPlugins.purgePlans() : undefined,
+      batchForbidden: compoundContributionPolicy != null
+        || (app._blobLifecycleOptions?.fields ?? []).some((field     ) => field.actionName === declaration.type)
+        || protectedArtefactTables.length > 0,
+      erasureCapable: Boolean(declaration.erasure),
+      erasurePrepare: declaration.erasure === true ? undefined : declaration.erasure?.prepare,
+      erasurePreparationTables: declaration.erasure && declaration.erasure !== true
+        ? Object.freeze([...declaration.erasure.tables]) : Object.freeze([]),
+      erasurePreparationReadTables: declaration.erasure && declaration.erasure !== true
+        ? Object.freeze([...(declaration.erasure.readTables ?? [])]) : Object.freeze([]),
+      protectedArtefactTables,
+      privateFactProjection: declaration.projections?.some((projection     ) => projection?.privateFact === true) ?? false,
+      compoundContributionPolicy: composedAnnotated?.compoundContributionPolicy,
+      dedupeReceiptMatches: composedAnnotated?.dedupeReceiptMatches,
+      atomicOperation: declaration.handler?.atomicOperation,
+    });
     handlers[declaration.type] = handler;
     for (const projection of declaration.projections ?? []) {
       if (!Array.isArray(projection?.eventTypes) || typeof projection.apply !== 'function') {

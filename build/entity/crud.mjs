@@ -22,6 +22,8 @@ import { scopeOf } from '../scope-handle.mjs';
 import * as eventHandles from '../event-handle.mjs';
 import { canonicalTextOp } from '../annotated-text.mjs';
 import { fieldKindContribution, resolveFieldKindEventScope } from '../strategy/index.mjs';
+// Arms the field-kind registry for standalone CRUD/dispatch entry points.
+import '../annotated-text-field.mjs';
 import { CASCADE_DESCENDANT, CASCADE_PREAUTHORIZED } from './removal-cascade.mjs';
 import { admitRow } from '../row-grant.mjs';
 import { admitRowTransition } from '../field-admission.mjs';

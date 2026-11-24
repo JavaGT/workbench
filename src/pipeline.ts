@@ -36,6 +36,59 @@ import { writeInvalidationInTxn } from './invalidation-ledger.ts';
 import { ownedResourcesCapability } from './owned-resource-purge.ts';
 import { createWriteQueue, type WriteQueue } from './write-queue.ts';
 
+// ---- Typed handler policy -------------------------------------------------
+//
+// The kernel attaches these capabilities to a registered handler as ONE typed
+// record under a symbol; the pipeline reads them back through one accessor.
+// This replaces scattered untyped own-property writes/reads. Legacy own
+// properties remain readable so handlers assembled outside the kernel (tests,
+// app-level shims) keep behaving exactly as before.
+
+export const HANDLER_POLICY = Symbol('workbench.handlerPolicy');
+
+export interface HandlerPolicy {
+  readonly inTransaction?: boolean;
+  readonly ownedResources?: boolean;
+  readonly ownedResourcePlans?: readonly any[];
+  readonly batchForbidden?: boolean;
+  readonly erasureCapable?: boolean;
+  readonly erasurePrepare?: any;
+  readonly erasurePreparationTables?: readonly string[];
+  readonly erasurePreparationReadTables?: readonly string[];
+  readonly protectedArtefactTables?: readonly string[];
+  readonly privateFactProjection?: boolean;
+  readonly compoundContributionPolicy?: any;
+  readonly dedupeReceiptMatches?: ((receipt: any, request: any) => boolean) | undefined;
+  readonly atomicOperation?: any;
+}
+
+const LEGACY_HANDLER_POLICY_KEYS = [
+  'inTransaction',
+  'ownedResources',
+  'ownedResourcePlans',
+  'batchForbidden',
+  'erasureCapable',
+  'erasurePrepare',
+  'erasurePreparationTables',
+  'erasurePreparationReadTables',
+  'protectedArtefactTables',
+  'privateFactProjection',
+  'compoundContributionPolicy',
+  'dedupeReceiptMatches',
+  'atomicOperation',
+] as const satisfies readonly (keyof HandlerPolicy)[];
+
+export function readHandlerPolicy(handler: any): HandlerPolicy {
+  if (!handler) return {};
+  const attached = handler[HANDLER_POLICY];
+  if (attached) return attached as HandlerPolicy;
+  const legacy: Record<string, unknown> = {};
+  for (const key of LEGACY_HANDLER_POLICY_KEYS) {
+    if (handler[key] !== undefined) legacy[key] = handler[key];
+  }
+  return legacy as HandlerPolicy;
+}
+
 /**
  * Optional domain-kind commit hook wired by the kernel seam (e.g., composed
  * annotated-text registered actions) so `pipeline.ts` stays free of field-kind
@@ -869,7 +922,7 @@ function atomicOperationsFor(payload: unknown): readonly import('./atomic-operat
 }
 
 async function resolveAtomicOperation(handler: any, context: AtomicOperationContext & { authorization?: AuthorizationAdapter | null }): Promise<AtomicExecution | undefined> {
-  const registration = handler.atomicOperation;
+  const registration = readHandlerPolicy(handler).atomicOperation;
   if (!registration) return undefined;
   const operations = atomicOperationsFor(context.payload);
   if (!operations) throw new ValidationError('atomic operation requires atomicOperations');
@@ -1129,17 +1182,18 @@ async function commitEvents(db: any, events: any, {
       }
 
       if (handler) {
+        const policy = readHandlerPolicy(handler);
         // A declared protected-artefact store hands the handler a transaction-
         // bound write/erase authority over exactly its declared application
         // tables, live only for this handler call. The capability joins this
         // origin transaction: any later failure rolls back its writes with the
         // log, cursor, projection, and receipt. It closes after the handler so
         // no later pipeline stage can reach the store.
-        const protectedArtefact = handler.protectedArtefactTables?.length
-          ? protectedArtefactCapability(db, handler.protectedArtefactTables)
+        const protectedArtefact = policy.protectedArtefactTables?.length
+          ? protectedArtefactCapability(db, policy.protectedArtefactTables)
           : null;
-        const ownedResources = handler.ownedResources
-          ? ownedResourcesCapability(db, handler.ownedResourcePlans ?? []) : null;
+        const ownedResources = policy.ownedResources
+          ? ownedResourcesCapability(db, policy.ownedResourcePlans ?? []) : null;
         try {
           atomicOperationsFor(payload);
           const atomic = await resolveAtomicOperation(handler, {
@@ -1163,14 +1217,14 @@ async function commitEvents(db: any, events: any, {
         throw new TypeError(`action '${type}' handler must return an event array`);
       }
       const directive = commit.directive;
-      if (directive !== undefined && (!handler?.erasureCapable || Array.isArray(payload) || historyCommit?.apply)) {
+      if (directive !== undefined && (!readHandlerPolicy(handler).erasureCapable || Array.isArray(payload) || historyCommit?.apply)) {
         throw new TypeError(`action '${type}' cannot return an erasure directive`);
       }
       // A protected-artefact action's request payload must never become the
       // receipt's canonical actionData (undo history reads it): the handler
       // must return a canonicalPayload containing only the non-sensitive IDs
       // and provenance needed to reference the protected artefacts.
-      if (handler?.protectedArtefactTables?.length && directive === undefined && commit.canonicalPayload === undefined) {
+      if (readHandlerPolicy(handler).protectedArtefactTables?.length && directive === undefined && commit.canonicalPayload === undefined) {
         throw new TypeError(`action '${type}' declares protected artefacts and must return a canonicalPayload without protected payloads`);
       }
 
@@ -1190,7 +1244,7 @@ async function commitEvents(db: any, events: any, {
           historyCommit,
           contributionPolicies,
         });
-      } else if (handler?.compoundContributionPolicy) {
+      } else if (readHandlerPolicy(handler).compoundContributionPolicy) {
         throw new TypeError(`composed action '${type}' requires a configured commit hook`);
       }
 
@@ -1268,9 +1322,12 @@ async function commitEvents(db: any, events: any, {
       if (directive !== undefined) {
         const prepared = isErasureDirectivePreparation(directive) ? prepareErasureDirective(db, directive, { excludeActionId: actionId } as any) : directive;
         if (!isErasureDirective(prepared)) throw new TypeError(`action '${type}' returned an invalid erasure directive`);
+        const erasurePolicy = readHandlerPolicy(handler);
         await applyErasureDirective(db, prepared, {
-          scope, actionId, actionContext: { ...(erasureActionContext as object | null ?? {}), committedAt: now }, prepare: handler.erasurePrepare,
-          tables: handler.erasurePreparationTables, readTables: handler.erasurePreparationReadTables,
+          scope, actionId, actionContext: { ...(erasureActionContext as object | null ?? {}), committedAt: now },
+          prepare: erasurePolicy.erasurePrepare,
+          tables: erasurePolicy.erasurePreparationTables && [...erasurePolicy.erasurePreparationTables],
+          readTables: erasurePolicy.erasurePreparationReadTables && [...erasurePolicy.erasurePreparationReadTables],
         });
       }
       await historyCommit?.apply?.(db);
@@ -1477,10 +1534,11 @@ export function createServer({ handlers = {}, authorize, db, pipeline = durableM
     // name falls back to the durable lane (treated as not live), matching
     // handleOfEvent's unparseable-type fallback.
     const liveAtomicRefusal = (handler: any, context: Record<string, unknown>, details?: unknown) => {
-      if (tierOfEvent === undefined || handler?.atomicOperation?.entity?.name === undefined) return null;
+      const atomicOperation = readHandlerPolicy(handler).atomicOperation;
+      if (tierOfEvent === undefined || atomicOperation?.entity?.name === undefined) return null;
       let live = false;
       try {
-        live = tierOfEvent(parseEventType(`${handler.atomicOperation.entity.name}.updated`)) === 'live';
+        live = tierOfEvent(parseEventType(`${atomicOperation.entity.name}.updated`)) === 'live';
       } catch {
         live = false;
       }
@@ -1501,7 +1559,7 @@ export function createServer({ handlers = {}, authorize, db, pipeline = durableM
       // A protected-artefact store needs the durable transaction the in-memory
       // kernel cannot provide — fail closed instead of silently dropping the
       // capability (the handler would otherwise write nothing and commit anyway).
-      if (handler.protectedArtefactTables?.length) {
+      if (readHandlerPolicy(handler).protectedArtefactTables?.length) {
         return executionFailure(
           new ValidationError(`action '${type}' declares protected artefacts and requires a durable database`),
           { actionId, type },
@@ -1570,7 +1628,7 @@ export function createServer({ handlers = {}, authorize, db, pipeline = durableM
       if (missingIdx !== -1) {
         return unknownActionOutcome(actions[missingIdx].type, { actionIndex: missingIdx });
       }
-      const batchForbiddenIdx = actions.findIndex((action) => handlers[action.type].batchForbidden);
+      const batchForbiddenIdx = actions.findIndex((action) => readHandlerPolicy(handlers[action.type]).batchForbidden);
       if (batchForbiddenIdx !== -1) {
         return executionFailure(
           new ValidationError(`action '${actions[batchForbiddenIdx].type}' requires single dispatch`),
@@ -1578,7 +1636,7 @@ export function createServer({ handlers = {}, authorize, db, pipeline = durableM
           { actionIndex: batchForbiddenIdx },
         );
       }
-      const privateProjectionIdx = actions.findIndex((action) => handlers[action.type].privateFactProjection);
+      const privateProjectionIdx = actions.findIndex((action) => readHandlerPolicy(handlers[action.type]).privateFactProjection);
       if (privateProjectionIdx !== -1) {
         return executionFailure(
           new ValidationError(`action '${actions[privateProjectionIdx].type}' with a private-fact projection requires single dispatch`),
@@ -1667,7 +1725,7 @@ export function createServer({ handlers = {}, authorize, db, pipeline = durableM
     // or handlers can mutate application-owned request objects.
     let erasureActionContext;
     try {
-      erasureActionContext = handler.erasurePrepare === undefined ? undefined : {
+      erasureActionContext = readHandlerPolicy(handler).erasurePrepare === undefined ? undefined : {
         id: actionId, type, scope, operation: 'erasure',
         payload: structuredClone(payload),
         principal: { type: principal.type, id: principal.id },
@@ -1709,14 +1767,14 @@ export function createServer({ handlers = {}, authorize, db, pipeline = durableM
     // under a different owning scope is independent action identity, and a
     // zero-event action is durably deduped via its receipt even though it left
     // no _Log row to key on.
-    const dedupeArgs = { scope, actionId, request, receiptMatches: handler.dedupeReceiptMatches, livePipeline };
+    const dedupeArgs = { scope, actionId, request, receiptMatches: readHandlerPolicy(handler).dedupeReceiptMatches, livePipeline };
     const dedupe = singleDispatchDedupe(db, dedupeArgs);
     if (dedupe) return dedupe;
 
     // Run the handler — events only, no DB writes (Fork A: entity-as-projection).
     // The handler may be sync or async.
     let emitted = null;
-    if (!handler.inTransaction && !historyCommit?.handlerInputs) {
+    if (!readHandlerPolicy(handler).inTransaction && !historyCommit?.handlerInputs) {
       try {
         emitted = await handler({
           payload, principal, scope,
@@ -1734,7 +1792,7 @@ export function createServer({ handlers = {}, authorize, db, pipeline = durableM
     const now = new Date().toISOString();
     const committed = await commitEvents(db, emitted, {
       now, actionId, principal, payload, pipeline, livePipeline, tierOfEvent, scope, type, authorize, historyCommit,
-      handler: handler.inTransaction || historyCommit?.handlerInputs ? handler : null, erasureActionContext,
+      handler: readHandlerPolicy(handler).inTransaction || historyCommit?.handlerInputs ? handler : null, erasureActionContext,
       authorization, contributionPolicies, writeQueue: serverWriteQueue, commitHook, onConsumerError,
       recheckDedupe: (txnDb) => singleDispatchDedupe(txnDb, dedupeArgs),
     });
@@ -1771,7 +1829,7 @@ export function createServer({ handlers = {}, authorize, db, pipeline = durableM
     if (missingIdx !== -1) {
       return unknownActionOutcome(actions[missingIdx].type, { actionIndex: missingIdx });
     }
-    const batchForbiddenIdx = actions.findIndex((action) => handlers[action.type].batchForbidden);
+    const batchForbiddenIdx = actions.findIndex((action) => readHandlerPolicy(handlers[action.type]).batchForbidden);
     if (batchForbiddenIdx !== -1) {
       return executionFailure(
         new ValidationError(`action '${actions[batchForbiddenIdx].type}' requires single dispatch`),
@@ -1779,7 +1837,7 @@ export function createServer({ handlers = {}, authorize, db, pipeline = durableM
         { actionIndex: batchForbiddenIdx },
       );
     }
-    const privateProjectionIdx = actions.findIndex((action) => handlers[action.type].privateFactProjection);
+    const privateProjectionIdx = actions.findIndex((action) => readHandlerPolicy(handlers[action.type]).privateFactProjection);
     if (privateProjectionIdx !== -1) {
       return executionFailure(
         new ValidationError(`action '${actions[privateProjectionIdx].type}' with a private-fact projection requires single dispatch`),
@@ -1871,7 +1929,10 @@ export function createServer({ handlers = {}, authorize, db, pipeline = durableM
       return { events: allEmitted, canonicalPayload: actions };
     };
     const runInTxn = Boolean(historyCommit?.handlerInputs)
-      || actions.some((action) => handlers[action.type].inTransaction || handlers[action.type].atomicOperation);
+      || actions.some((action) => {
+        const policy = readHandlerPolicy(handlers[action.type]);
+        return policy.inTransaction || policy.atomicOperation;
+      });
     let batchCommit = null;
     if (!runInTxn) {
       try { batchCommit = await runHandlers(); }

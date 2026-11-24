@@ -5,7 +5,6 @@ import { ORDERED_SIDE_TABLE_STRATEGY } from './ordered.mjs';
 import { LOG_SIDE_TABLE_STRATEGY } from './log.mjs';
 import { EPHEMERAL_SIDE_TABLE_STRATEGY } from './ephemeral.mjs';
 import { FTS_STRATEGY } from '../fts-strategy.mjs';
-import { ANNOTATED_TEXT_FIELD_KIND_CONTRIBUTION } from '../annotated-text-field.mjs';
 
 // Shared strategy helpers. Re-exported here so consumers that import from the
 // strategy barrel (annotated-text-admit, auth/invitation via side-table-strategy)
@@ -235,14 +234,59 @@ export function sideTableDDL(entity                  , fieldName        , descri
 
 
 
-// The registry is frozen: kinds are registered by the owning modules at module
-// load, never grown at runtime by a request. Adding a kind is one entry here.
-export const FIELD_KIND_CONTRIBUTIONS                                   = Object.freeze([
-  ANNOTATED_TEXT_FIELD_KIND_CONTRIBUTION,
-]);
+
+
+// The registry is owned by this module; kind modules contribute themselves when
+// they load (strategy/index must not import a kind). Registration is a module-load
+// concern, never a per-request one.
+//
+// `scope-sql` (a transitive strategy dependency) loads `annotated-text-field`, so
+// a kind can register while this module's dependencies are still evaluating. The
+// hoisted function/`var` bindings keep that cycle safe — a `const` Map would still
+// be in its temporal dead zone at registration time. FIELD_KIND_CONTRIBUTIONS is
+// a frozen snapshot refreshed on registration, so readers always see a frozen
+// array while the registry itself stays extensible.
+var fieldKindRegistryState                                                ;
+
+function fieldKindRegistry()                                     {
+  if (fieldKindRegistryState === undefined) fieldKindRegistryState = new Map();
+  return fieldKindRegistryState;
+}
+
+function fieldKindSnapshot()                                   {
+  return Object.freeze([...fieldKindRegistry().values()]);
+}
+
+export var FIELD_KIND_CONTRIBUTIONS                                   = fieldKindSnapshot();
+
+export function registerFieldKindContribution(contribution                       )       {
+  if (!contribution || typeof contribution !== 'object'
+    || typeof contribution.kind !== 'string' || contribution.kind.length === 0) {
+    throw new TypeError('field-kind contribution requires a non-empty kind');
+  }
+  const registry = fieldKindRegistry();
+  const existing = registry.get(contribution.kind);
+  if (existing === contribution) return;
+  if (existing !== undefined) {
+    throw new Error(`field-kind contribution '${contribution.kind}' is already registered`);
+  }
+  registry.set(contribution.kind, contribution);
+  FIELD_KIND_CONTRIBUTIONS = fieldKindSnapshot();
+}
 
 export function fieldKindContribution(kind         )                                    {
-  return typeof kind === 'string' ? FIELD_KIND_CONTRIBUTIONS.find((contribution) => contribution.kind === kind) : undefined;
+  return typeof kind === 'string' ? fieldKindRegistry().get(kind) : undefined;
+}
+
+/** The delivery reason declared by the kind owning any field of `fields`, if any. */
+export function fieldKindSnapshotControlReason(
+  fields                                                  ,
+)                {
+  for (const descriptor of Object.values(fields ?? {})) {
+    const reason = fieldKindContribution(descriptor?.kind)?.snapshotControlReason;
+    if (typeof reason === 'string' && reason.length > 0) return reason;
+  }
+  return null;
 }
 
 /** True when any declared field of `fields` is owned by a kind contributing `feature`. */
@@ -254,11 +298,11 @@ export function hasFieldKindFeature(
 }
 
 export function validateFieldKindEntities(entity        , fields                                           )       {
-  for (const contribution of FIELD_KIND_CONTRIBUTIONS) contribution.validateEntityFields?.(entity, fields);
+  for (const contribution of fieldKindRegistry().values()) contribution.validateEntityFields?.(entity, fields);
 }
 
 export function resolveFieldKindEventScope(entity                 , payload              )                {
-  for (const contribution of FIELD_KIND_CONTRIBUTIONS) {
+  for (const contribution of fieldKindRegistry().values()) {
     if (typeof contribution.resolveEntityEventScope !== 'function') continue;
     const field = Object.values(entity.fields ?? {}).find((descriptor) => descriptor?.kind === contribution.kind);
     if (!field) continue;
@@ -269,7 +313,7 @@ export function resolveFieldKindEventScope(entity                 , payload     
 }
 
 export function markFieldKindProjections(projection        , fields                                           )       {
-  for (const contribution of FIELD_KIND_CONTRIBUTIONS) contribution.markEntityProjection?.(projection, fields);
+  for (const contribution of fieldKindRegistry().values()) contribution.markEntityProjection?.(projection, fields);
 }
 
 export function isFieldKindOperationEvent(
@@ -282,7 +326,7 @@ export function isFieldKindOperationEvent(
 }
 
 export function suppressesFieldKindDelta(context                       )          {
-  return FIELD_KIND_CONTRIBUTIONS.some((contribution) => contribution.suppressesDelta?.(context) === true);
+  return [...fieldKindRegistry().values()].some((contribution) => contribution.suppressesDelta?.(context) === true);
 }
 
 // ---------------------------------------------------------------------------

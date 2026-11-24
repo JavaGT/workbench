@@ -17,6 +17,8 @@ import {
 
 import { readableFieldNames } from '../field-admission.mjs';
 import { fieldKindContribution, markFieldKindProjections } from '../strategy/index.mjs';
+// Arms the field-kind registry for standalone projection/live-fanout entry points.
+import '../annotated-text-field.mjs';
 
 import { rawRow } from './query.mjs';
 

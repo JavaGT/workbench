@@ -5,7 +5,9 @@
 // admission are then projected through the annotated-text recipient grammar.
 import { projectRowForRecipient } from './entity/projection.mjs';
 import { readableFieldNames } from './field-admission.mjs';
-import { fieldKindContribution, hasFieldKindFeature } from './strategy/index.mjs';
+import { fieldKindContribution, fieldKindSnapshotControlReason, hasFieldKindFeature } from './strategy/index.mjs';
+// Arms the field-kind registry when this projection module is loaded on its own.
+import './annotated-text-field.mjs';
 
 
 
@@ -19,8 +21,17 @@ import { fieldKindContribution, hasFieldKindFeature } from './strategy/index.mjs
 
 
 
-export function hasAnnotatedTextFields(entity                      )          {
+/** True when any declared field kind owns a recipient-snapshot projection. */
+export function hasSnapshotProjectedFields(entity                      )          {
   return hasFieldKindFeature(entity.fields         , 'snapshotField');
+}
+
+/** Legacy name retained for callers that still ask about annotated text specifically. */
+export const hasAnnotatedTextFields = hasSnapshotProjectedFields;
+
+/** The delivery reason declared by the kind that needs a fresh snapshot. */
+export function snapshotControlReasonFor(entity                      )                {
+  return fieldKindSnapshotControlReason(entity.fields         );
 }
 
 

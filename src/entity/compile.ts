@@ -47,6 +47,9 @@ import {
   resolveFieldKindEventScope,
   validateFieldKindEntities,
 } from '../strategy/index.ts';
+// Kind modules register their contributions at load; arming the registry here
+// keeps entity compilation correct even when ddl.ts is not on the import path.
+import '../annotated-text-field.ts';
 import { scopeOf } from '../scope-handle.ts';
 import { normalizeTierDeclaration } from '../live-tier.ts';
 

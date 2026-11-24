@@ -14,7 +14,7 @@ import { createWriteQueue } from '../build/write-queue.mjs';
 
 const alice = principal({ type: 'user', id: 'alice' });
 
-function admission() {
+function admission(db) {
   const Note = entity('Note', {
     title: text(),
     body: text(),
@@ -24,10 +24,14 @@ function admission() {
       (await is.owner()) ? grant(read, write, subscribe) : deny('no'),
     )],
   });
-  const adapter = createAuthorizationAdapter();
+  // Bind the search resource to the real Note table: per-result admission must
+  // verify the registered scope through the compiled SQL engine (the fail-closed
+  // authority), not a DB-less JS fallback.
+  const adapter = createAuthorizationAdapter({ db });
   adapter.registerResource({
     category: 'search', name: 'note-fts', scope: ({ is }) => is.owner(),
     fields: { owner: ref('User', { role: 'owner' }) },
+    table: 'Note', db,
   });
   return { adapter, entity: Note };
 }
@@ -39,7 +43,7 @@ async function setup({ snippetLength, fields = ['title', 'body'] } = {}) {
   const plugin = createFts5Plugin({
     id: 'note-fts', version: '1.0.0', tokenizer: 'porter',
     source: { entity: 'Note', fields },
-    admission: admission(),
+    admission: admission(db),
     ...(snippetLength === undefined ? {} : { snippetLength }),
   });
   registry.register(plugin);

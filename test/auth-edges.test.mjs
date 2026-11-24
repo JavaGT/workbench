@@ -71,8 +71,10 @@ test('row grant denies a different user (403)', async () => {
   assert.equal(r1.status, 201);
   const doc = await r1.json();
 
-  // Now create a new app with bob as principal
-  app.httpServer.close();
+  // Now create a new app with bob as principal. Shut the first app down (not
+  // just its listener): shutdown drains and closes its handle-attached write
+  // coordinator, which is the one authority that may be reattached to this db.
+  await app.shutdown();
 
   const app2 = workbench({ db }).mount('/notes', Note);
   app2.listen(0, { principalOf: () => ({ type: 'user', id: '2' }) });
@@ -87,7 +89,7 @@ test('row grant denies a different user (403)', async () => {
   const r3 = await fetch(`http://127.0.0.1:${port2}/notes/${doc.id}`);
   assert.equal(r3.status, 404, 'bob cannot see alices note (scope filter)');
 
-  app2.httpServer.close();
+  await app2.shutdown();
 });
 
 test('client sending computed/touch/readonly field in payload → 400', async () => {

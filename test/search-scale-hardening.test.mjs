@@ -36,7 +36,7 @@ import {
 
 const alice = principal({ type: 'user', id: 'alice' });
 
-function makeAdmission(pluginIds = ['note-fts', 'note-vec']) {
+function makeAdmission(db, pluginIds = ['note-fts', 'note-vec']) {
   const Note = entity('Note', {
     projectId: text(),
     title: text(),
@@ -48,13 +48,18 @@ function makeAdmission(pluginIds = ['note-fts', 'note-vec']) {
       ),
     ],
   });
-  const adapter = createAuthorizationAdapter();
+  // Every per-result admission verifies the registered owner scope against the
+  // actual Note table via the compiled SQL engine. A DB-less adapter now fails
+  // closed, so bind the source handle and table at registration time.
+  const adapter = createAuthorizationAdapter({ db });
   for (const name of pluginIds) {
     adapter.registerResource({
       category: 'search',
       name,
       scope: ({ is }) => is.owner(),
       fields: { owner: ref('User', { role: 'owner' }) },
+      table: 'Note',
+      db,
     });
   }
   return { entity: Note, adapter };
@@ -95,7 +100,7 @@ async function setupSearchSuite({
   `);
 
   const registry = createSearchPluginRegistry();
-  const admission = makeAdmission(['note-fts', 'note-vec']);
+  const admission = makeAdmission(db, ['note-fts', 'note-vec']);
 
   const ftsPlugin = withFts
     ? createFts5Plugin({

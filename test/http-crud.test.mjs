@@ -327,7 +327,9 @@ test('non-owner cannot see or mutate an inherit-child row (scope hides it)', asy
     body: JSON.stringify({ doc: docId, body: 'note' }),
   });
   const { id: commentId } = await cm.json();
-  aApp.httpServer.close();
+  // Shut the whole app down before booting another one on the same handle:
+  // the handle's single write coordinator must be drained/closed first.
+  await aApp.shutdown();
 
   // Bob (non-owner) tries to update/remove — should get 403
   const bApp = workbench({ db });
@@ -335,7 +337,7 @@ test('non-owner cannot see or mutate an inherit-child row (scope hides it)', asy
   bApp.mount('/comments', Comment);
   bApp.listen(0, { principalOf: () => bob });
   await bApp.ready;
-  t.after(() => { bApp.httpServer.close(); db.close(); });
+  t.after(async () => { await bApp.shutdown(); db.close(); });
   const bOrigin = `http://127.0.0.1:${bApp.httpServer.address().port}`;
 
   const upd = await fetch(`${bOrigin}/comments/${commentId}`, {

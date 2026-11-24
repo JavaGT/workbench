@@ -36,7 +36,12 @@ import { read, type Capability } from './grant.ts';
 import type { Principal } from './principal.ts';
 import type { EntityRecord } from './row-grant.ts';
 import { requireUser, type Gate } from './route-gate.ts';
-import type { AuthorizationAdapter, AdmissionReasonCode } from './authorization-adapter.ts';
+import type {
+  AuthorizationAdapter,
+  AdmissionReasonCode,
+  AuthorizationDb,
+  ResourceEntityLike,
+} from './authorization-adapter.ts';
 import type { SearchRank, SearchResultHit, SearchStaleness } from './search-response.ts';
 
 // A closed admission outcome: admitted plus the adapter's closed reason code
@@ -56,6 +61,18 @@ export interface SearchResourceRegistration {
   readonly scope: (ctx: { is: unknown; fields: unknown }) => unknown;
   readonly fields?: Readonly<Record<string, unknown>>;
   readonly checks?: Readonly<Record<string, (ctx: unknown) => boolean>>;
+  // Per-result admission verifies each candidate against the REGISTERED scope.
+  // The adapter can only do that truthfully when it can reach a SQL table (or
+  // an entity carrying a compiled scope) — pass those through so a DB-backed
+  // caller admits through the one compiled SQL engine. With no SQL target the
+  // adapter fails closed; a purely in-memory policy caller may say so with the
+  // explicit `allowRowScopeFallback` opt-in. This seam never sets it by default.
+  readonly db?: AuthorizationDb;
+  readonly table?: string;
+  readonly entity?: ResourceEntityLike;
+  readonly entityName?: string;
+  readonly registry?: Readonly<Record<string, unknown>>;
+  readonly allowRowScopeFallback?: boolean;
 }
 
 // The seam's own ledger of registered search resources. The adapter does not
@@ -101,6 +118,12 @@ export function createSearchSourceRegistry(adapter: AuthorizationAdapter): Searc
       scope: input.scope,
       fields: input.fields,
       checks: input.checks,
+      db: input.db,
+      table: input.table,
+      entity: input.entity,
+      entityName: input.entityName,
+      registry: input.registry,
+      allowRowScopeFallback: input.allowRowScopeFallback,
     });
     registered.add(input.pluginId);
   }

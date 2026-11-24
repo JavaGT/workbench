@@ -119,9 +119,12 @@ async function startApp(db, E, principalId) {
   return { app, origin: `http://127.0.0.1:${port}` };
 }
 
-function stopApp(app) {
-  app.httpServer.closeAllConnections();
-  app.httpServer.close();
+async function stopApp(app) {
+  // Each principal gets its own app over the SAME db handle. Shutting the app
+  // down drains and closes its handle-attached write coordinator; closing only
+  // the HTTP listener would leave that coordinator attached and the next app
+  // would correctly refuse to mint a second, uncoordinated mutex.
+  await app.shutdown();
 }
 
 async function createThing(origin) {
@@ -145,7 +148,7 @@ async function assertMatrix(label, E) {
     try {
       id = await createThing(ownerApp.origin);
     } finally {
-      stopApp(ownerApp.app);
+      await stopApp(ownerApp.app);
     }
 
     // Owner: read 200, update 200, delete 204.
@@ -161,7 +164,7 @@ async function assertMatrix(label, E) {
       const removed = await fetch(`${ownerAgain.origin}/things/${id}`, { method: 'DELETE' });
       assert.equal(removed.status, 204, `${label}: owner DELETE must be 204`);
     } finally {
-      stopApp(ownerAgain.app);
+      await stopApp(ownerAgain.app);
     }
 
     // Recreate: the owner just deleted the row.
@@ -169,7 +172,7 @@ async function assertMatrix(label, E) {
     try {
       id = await createThing(ownerRecreate.origin);
     } finally {
-      stopApp(ownerRecreate.app);
+      await stopApp(ownerRecreate.app);
     }
 
     // Non-owner (bob, id 2): denied at the read-scope → 404 on every verb (fail
@@ -186,7 +189,7 @@ async function assertMatrix(label, E) {
       const removed = await fetch(`${bobApp.origin}/things/${id}`, { method: 'DELETE' });
       assert.equal(removed.status, 404, `${label}: non-owner DELETE must be 404`);
     } finally {
-      stopApp(bobApp.app);
+      await stopApp(bobApp.app);
     }
 
     // Anonymous: denied at the route gate (default requireUser()) → 401.
@@ -200,7 +203,7 @@ async function assertMatrix(label, E) {
       });
       assert.equal(posted.status, 401, `${label}: anonymous POST must be 401`);
     } finally {
-      stopApp(anonApp.app);
+      await stopApp(anonApp.app);
     }
   } finally {
     db.close();

@@ -685,15 +685,19 @@ export function flattenStruct(fieldName: string, descriptor: FieldDescriptor, va
 export function resolveStrategy(kind: string): FieldStrategy {
   if (NON_STRATEGY_FIELD_KINDS.has(kind)) {
     throw new Error(
-      `${kind} fields do not use a persistence strategy — ` +
+      `${kind} fields do not persist — ` +
         `${kind === 'ephemeral' ? 'they engage the pace seam, not the persist seam' : 'they own their DDL in annotated-text-field.ts'}`,
     );
   }
   const strategy = STRATEGIES[kind];
   if (!strategy) {
+    // List the PERSISTENCE strategies only. The non-strategy kinds (ephemeral,
+    // annotatedText) are storage seams, not strategy choices: naming them here
+    // would invite a caller to "fix" an unknown kind by picking one that cannot
+    // answer resolveStrategy at all.
     throw new Error(
       `unknown field kind '${kind}'. The field kinds are: ` +
-        `${Object.keys(SUPPORTED_FIELD_TYPES).sort().join(', ')}.`,
+        `${Object.keys(STRATEGIES).sort().join(', ')}.`,
     );
   }
   return strategy;

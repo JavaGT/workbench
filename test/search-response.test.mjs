@@ -62,6 +62,9 @@ function ownerAdapter(trace = false) {
     pluginId: 'notes-fts',
     scope: ({ is }) => is.owner(),
     fields: { owner: ref('User', { role: 'owner' }) },
+    // Purely in-memory policy fixture: no SQL table backs these rows, so opt in
+    // to single-row evaluation explicitly (production registrations do not).
+    allowRowScopeFallback: true,
   });
   return { adapter, registry };
 }
@@ -366,6 +369,8 @@ describe('search authorization — pre-scope admission', () => {
       pluginId: 'public-notes',
       scope: ({ fields }) => fields.visibility.is('public'),
       fields: { visibility: text() },
+      // In-memory policy fixture: evaluate the supplied row against the scope.
+      allowRowScopeFallback: true,
     });
     const pre = await admitSearchSourceScope(adapter, registry, {
       pluginId: 'public-notes',
@@ -468,6 +473,8 @@ describe('search authorization — per-result admission', () => {
       pluginId: 'articles',
       scope: ({ fields }) => fields.status.is('published'),
       fields: { status: text() },
+      // In-memory policy fixture: evaluate the supplied row against the scope.
+      allowRowScopeFallback: true,
     });
     const published = await admitSearchResult(adapter, { pluginId: 'articles', principal: anonymous, row: { id: 'a1', status: 'published' } });
     assert.equal(published.admitted, true);

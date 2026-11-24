@@ -39,6 +39,11 @@ import { requireUser,           } from './route-gate.mjs';
 
 
 
+
+
+
+
+
 // A closed admission outcome: admitted plus the adapter's closed reason code
 // (null on admit). A denied admission carries a generic code, never row content
 // and never which non-active status applied — the S5/A2 surface unchanged.
@@ -51,6 +56,18 @@ import { requireUser,           } from './route-gate.mjs';
 // names the resource; `scope` is the principal-aware scope predicate over the
 // source entity; `fields`/`checks` supply the compile registry the scope may
 // use (the source entity's field descriptors).
+
+
+
+
+
+
+
+                                           
+
+
+
+
 
 
 
@@ -101,6 +118,12 @@ export function createSearchSourceRegistry(adapter                      )       
       scope: input.scope,
       fields: input.fields,
       checks: input.checks,
+      db: input.db,
+      table: input.table,
+      entity: input.entity,
+      entityName: input.entityName,
+      registry: input.registry,
+      allowRowScopeFallback: input.allowRowScopeFallback,
     });
     registered.add(input.pluginId);
   }

@@ -6,7 +6,10 @@ import {
   assertNoFrameworkTableSql,
   claimedBlobLifecycle,
   createLiveDelivery,
+  createSchemaReport,
   declaredTableNames,
+  EMPTY_BLOB_CENSUS,
+  executeDDL,
   frameworkTableNames,
   readCommittedCursor,
 } from '../build/server.mjs';
@@ -18,6 +21,15 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 test('server exports the claimed blob lifecycle facade', () => {
   assert.equal(typeof claimedBlobLifecycle, 'function');
+});
+
+test('server exports the promoted DDL, blob-census, and schema-report contract', () => {
+  // Wave 1 promoted these from internal paths onto the public server surface.
+  assert.equal(typeof executeDDL, 'function');
+  assert.equal(typeof executeFrameworkDDL, 'function');
+  assert.equal(typeof createSchemaReport, 'function');
+  assert.equal(typeof EMPTY_BLOB_CENSUS, 'object');
+  assert.deepEqual(EMPTY_BLOB_CENSUS.references, []);
 });
 
 function appendEvent(db, scope, seq, type, data = {}) {
@@ -33,7 +45,11 @@ function noteEntity() {
   return {
     name: 'Note',
     fields: { title: { kind: 'value' } },
-    grant: [],
+    // Declare a real read/subscribe capability. An empty grant array is no
+    // longer a permissive fixture: fail-closed mayRow (and live admission)
+    // consult the declared grant before an injected mayVerb, so a grant-less
+    // entity would revoke every subscription/catch-up regardless of injection.
+    grant: () => [scope(() => true).can(() => grant(read, subscribe))],
     scopeFilter: () => ({ sql: '1=1', params: {} }),
     hydrate: (row) => ({ ...row }),
   };

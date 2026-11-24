@@ -51,7 +51,6 @@ const BASELINE_CYCLES = new Set([
     'src/strategy/map.ts',
     'src/strategy/ordered.ts',
   ]),
-  cycleKey(['src/durable-history.ts', 'src/pipeline.ts', 'src/post-commit-effects.ts']),
   cycleKey(['src/app.ts', 'src/auth/routes.ts']),
   cycleKey(['src/http-fetch.ts', 'src/live-delivery-bun-ws.ts', 'src/serve.ts']),
   cycleKey(['src/schedule-runtime.ts', 'src/schedule.ts']),

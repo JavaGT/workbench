@@ -1,6 +1,7 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import type { Readable } from 'node:stream';
 import { txn, type DbHandle } from './driver.ts';
+import { readSeq } from './committed-log.ts';
 import { principalKeyOf, type Principal } from './principal.ts';
 import type { BlobErasureCategory, BlobLifecycleKind, BlobOwnership } from './blob-census.ts';
 import type { BlobStore } from './blob-store.ts';
@@ -586,6 +587,116 @@ export function createPendingBlobLifecycle(app: PendingBlobApp, options: Pending
     fields,
     options: Object.freeze({ ...options }),
   });
+}
+
+/**
+ * Wraps a registered action's handler with the pending-blob claim lifecycle.
+ * Extracted from kernel.ts so the claim grammar and attestation scan live in
+ * the module that owns the blob seam; kernel only assembles the seam.
+ */
+export async function runDeclaredActionWithBlobClaims(args: {
+  declaration: { type: string; handler: (context: any) => unknown | Promise<unknown> };
+  context: {
+    db: DbHandle;
+    scope: string;
+    actionId: string;
+    principal: Principal;
+    payload: Record<string, any>;
+    [key: string]: any;
+  };
+  lifecycle: PendingBlobLifecycle | null | undefined;
+}): Promise<any> {
+  const { declaration, context, lifecycle } = args;
+  const deletion = lifecycle?.fields.find((field) => field.purgeActionName === declaration.type);
+  if (deletion && context.payload?.[deletion.field] !== undefined) {
+    const blobRef = context.payload[deletion.field];
+    const blobId = typeof blobRef === 'string' ? blobRef : blobRef?.blobId;
+    await lifecycle!.requestDeletion({
+      blobId, actionName: declaration.type, actionId: context.actionId,
+      scopeId: context.scope, resourceId: context.payload?.[deletion.resourceField],
+    });
+  }
+  let handlerContext: any = context;
+  const claimedFields: Array<{ field: DeclaredBlobField; blobId: string }> = [];
+  if (lifecycle) {
+    for (const field of lifecycle.fields) {
+      if (field.actionName !== declaration.type) continue;
+      const committedEventId = `${context.scope}:${readSeq(context.db, context.scope) + 1}`;
+      const claimedBlob = await lifecycle.validateClaim({
+        claim: context.payload[field.field], field: field.field, actionName: declaration.type,
+        actionId: context.actionId, authenticatedPrincipal: context.principal,
+        scopeId: context.scope, resourceId: context.payload[field.resourceField], committedEventId,
+      });
+      const { blobId } = claimedBlob;
+      claimedFields.push({ field, blobId });
+      handlerContext = {
+        ...handlerContext,
+        payload: { ...handlerContext.payload, [field.field]: blobId },
+        claimedBlobs: Object.freeze({ ...(handlerContext.claimedBlobs ?? {}), [field.field]: claimedBlob }),
+      };
+    }
+  }
+  const result = await declaration.handler(handlerContext);
+  const commit: any = Array.isArray(result) ? { events: result } : result;
+  if (!commit || !Array.isArray(commit.events)) throw new Error(`registered action '${declaration.type}' must return an event array`);
+  if (handlerContext.claimedBlobs) {
+    const claimedBlobValues = Object.values(handlerContext.claimedBlobs) as any[];
+    const forbiddenEventMetadata = claimedBlobValues.flatMap((blob) => [blob.sha256, blob.md5, blob.byteLength, blob.mediaType]).filter((value) => value !== null);
+    const forbiddenPrivateMetadata = claimedBlobValues.flatMap((blob) => [blob.resourceId, blob.sha256, blob.md5, blob.byteLength, blob.mediaType]).filter((value) => value !== null);
+    const attestationKeys = new Set(['resourceId', 'sha256', 'md5', 'byteLength', 'mediaType']);
+    const containsAttestationMetadata = (value: any, forbidden: any[], seen = new Set<unknown>()): boolean => {
+      if (typeof value !== 'object' || value === null) return forbidden.some((candidate) => Object.is(candidate, value));
+      if (seen.has(value)) return false;
+      seen.add(value);
+      if (Array.isArray(value)) return value.some((item) => containsAttestationMetadata(item, forbidden, seen));
+      const keys = Object.keys(value);
+      if (keys.includes('claimedBlobs') || keys.includes('resourceId') || keys.filter((key) => attestationKeys.has(key)).length > 1) return true;
+      return Object.values(value).some((item) => containsAttestationMetadata(item, forbidden, seen));
+    };
+    if (containsAttestationMetadata(commit.events, forbiddenEventMetadata)
+      || containsAttestationMetadata({ directive: commit.directive, privateFact: commit.privateFact, effects: commit.effects }, forbiddenPrivateMetadata)) {
+      throw new Error(`declared blob action '${declaration.type}' cannot serialize claimed blob metadata`);
+    }
+  }
+  if (!lifecycle) return Array.isArray(result) ? result : {
+    events: commit.events,
+    ...(commit.canonicalPayload === undefined ? {} : { canonicalPayload: commit.canonicalPayload }),
+    ...(commit.directive === undefined ? {} : { directive: commit.directive }),
+    ...(commit.privateFact === undefined ? {} : { privateFact: commit.privateFact }),
+    ...(commit.effects === undefined ? {} : { effects: commit.effects }),
+    ...(commit.annotatedText === undefined ? {} : { annotatedText: commit.annotatedText }),
+    ...(commit.applicationTransition === undefined ? {} : { applicationTransition: commit.applicationTransition }),
+  };
+  for (const { field, blobId } of claimedFields) {
+    const owningEvents = commit.events.filter((event: any) => event?.scope === context.scope && event.data && Object.prototype.hasOwnProperty.call(event.data, field.field));
+    if (owningEvents.length !== 1) throw new Error(`declared blob action '${declaration.type}' must emit exactly one owning event field '${field.field}' in its dispatch scope`);
+    if (owningEvents[0].data[field.field] !== blobId) throw new Error(`declared blob action '${declaration.type}' must emit its canonical blob id in field '${field.field}'`);
+    for (const [metadataName, path] of Object.entries(field.canonicalEventMetadata ?? {}) as Array<[string, any]>) {
+      let target = owningEvents[0].data;
+      for (const part of path.slice(0, -1)) {
+        if (!Object.prototype.hasOwnProperty.call(target, part) || typeof target[part] !== 'object' || target[part] === null || Array.isArray(target[part])) {
+          throw new Error(`declared blob action '${declaration.type}' canonical metadata path '${path.join('.')}' must already have an object parent`);
+        }
+        target = target[part];
+      }
+      const leaf = path.at(-1);
+      if (Object.prototype.hasOwnProperty.call(target, leaf)) {
+        throw new Error(`declared blob action '${declaration.type}' handler cannot set canonical metadata path '${path.join('.')}'`);
+      }
+      target[leaf] = handlerContext.claimedBlobs[field.field][metadataName];
+    }
+  }
+  return {
+    events: commit.events,
+    ...(claimedFields.length === 0
+      ? (commit.canonicalPayload === undefined ? {} : { canonicalPayload: commit.canonicalPayload })
+      : { canonicalPayload: handlerContext.payload, claimedBlobs: handlerContext.claimedBlobs }),
+    ...(commit.directive === undefined ? {} : { directive: commit.directive }),
+    ...(commit.privateFact === undefined ? {} : { privateFact: commit.privateFact }),
+    ...(commit.effects === undefined ? {} : { effects: commit.effects }),
+    ...(commit.annotatedText === undefined ? {} : { annotatedText: commit.annotatedText }),
+    ...(commit.applicationTransition === undefined ? {} : { applicationTransition: commit.applicationTransition }),
+  };
 }
 
 interface PendingBlobWorkbench {

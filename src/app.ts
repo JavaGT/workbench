@@ -82,6 +82,11 @@ import { User, Session, Inbox, Credential, Invitation, ApiKey, TwoFactor } from 
 import { config, resolveConfig } from './config.ts';
 import { buildOwnershipCensus } from './schema-census.ts';
 import { validateExactSchema } from './schema-exact-validation.ts';
+import {
+  SEARCH_STALENESS_TABLE_NAME,
+  DERIVED_RESOURCE_TABLE_NAME,
+  SCHEMA_MAINTENANCE_TABLE_NAME,
+} from './operational-ledger-ddl.ts';
 import { createSchemaReport } from './schema-report.ts';
 import path from 'node:path';
 import { mkdirSync } from 'node:fs';
@@ -1152,7 +1157,24 @@ export default function workbench({
           }
           latestSchemaReport = createSchemaReport(app.db, settledCensus);
           if (settledOwnership.errors.length > 0) throw new Error(settledOwnership.errors[0].message);
-          const exactErrors = validateExactSchema(app.db, settledCensus, schema ? [schema] : [])
+          // Census validation fails closed on a declared object absent from the
+          // live schema — EXCEPT the three framework operational ledgers, which
+          // are declared by OPERATIONAL_LEDGER_DDL but materialized lazily on
+          // first use. A bridge that never fired legitimately leaves its table
+          // uncreated, so those entries are checked only when actually present.
+          // Every other census entry (schema, entity, plugin, framework DDL)
+          // must exist. Names come from the one DDL source, never literals here.
+          const presentSchemaObjects = new Set(observedSchemaObjects(app.db).map(schemaObjectKey));
+          const lazyLedgerTables = new Set(
+            [SEARCH_STALENESS_TABLE_NAME, DERIVED_RESOURCE_TABLE_NAME, SCHEMA_MAINTENANCE_TABLE_NAME]
+              .map((name) => name.toLowerCase()),
+          );
+          const validationCensus = new Map(
+            [...settledCensus].filter(([key, entry]) =>
+              presentSchemaObjects.has(key)
+              || !(entry.kind === 'framework' && entry.objectKind === 'table' && lazyLedgerTables.has(entry.name.toLowerCase()))),
+          );
+          const exactErrors = validateExactSchema(app.db, validationCensus, schema ? [schema] : [], { validateCensus: true })
             // A schema-owned entity root may legitimately carry a trigger that
             // belongs to a registered derived-resource plugin (A2 ownership).
             .filter((error) => settledCensus.get(`trigger:${error.name.toLowerCase()}`)?.kind !== 'plugin');

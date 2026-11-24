@@ -19,8 +19,8 @@ import { createSearchStalenessConsumer, reconcileSearchStaleness } from './searc
 import { buildDurableEffectsRegistry, createDurableEffectsConsumer } from './durable-effects.mjs';
 import { createBlobLifecycle } from './blob-lifecycle.mjs';
 import { createOperationalConsumers } from './operational-consumer.mjs';
-import { createPendingBlobLifecycle } from './pending-blob.mjs';
-import { readSeq } from './committed-log.mjs';
+import { createPendingBlobLifecycle, runDeclaredActionWithBlobClaims } from './pending-blob.mjs';
+import { createQueryInvalidationConsumer } from './query-scoped-read.mjs';
 import { CRUD_CURSOR_POLICY } from './entity/crud.mjs';
 import { EventKind } from './event-handle.mjs';
 import { bindAuthorizedRows, isAuthorizedRows } from './action-authorization.mjs';
@@ -90,99 +90,12 @@ function collectAppEntities(app     ) {
     // annotated-text kernel seam so kernel.ts stays a thin assembler.
     const composedAnnotated = compileComposedAnnotatedTextAction(declaration, entities, app.db);
     const compoundContributionPolicy = composedAnnotated?.compoundContributionPolicy ?? null;
-    const handler = async (context     ) => {
-      const lifecycle = app.pendingBlobLifecycle;
-      const deletion = lifecycle?.fields.find((field     ) => field.purgeActionName === declaration.type);
-      if (deletion && context.payload?.[deletion.field] !== undefined) {
-        const blobRef = context.payload[deletion.field];
-        const blobId = typeof blobRef === 'string' ? blobRef : blobRef?.blobId;
-        await lifecycle.requestDeletion({
-          blobId, actionName: declaration.type, actionId: context.actionId,
-          scopeId: context.scope, resourceId: context.payload?.[deletion.resourceField],
-        });
-      }
-      let handlerContext      = context;
-      const claimedFields = [];
-      if (lifecycle) {
-        for (const field of lifecycle.fields) {
-          if (field.actionName !== declaration.type) continue;
-          const committedEventId = `${context.scope}:${readSeq(context.db, context.scope) + 1}`;
-          const claimedBlob = await lifecycle.validateClaim({
-            claim: context.payload[field.field], field: field.field, actionName: declaration.type,
-            actionId: context.actionId, authenticatedPrincipal: context.principal,
-            scopeId: context.scope, resourceId: context.payload[field.resourceField], committedEventId,
-          });
-          const { blobId } = claimedBlob;
-          claimedFields.push({ field, blobId });
-          handlerContext = {
-            ...handlerContext,
-            payload: { ...handlerContext.payload, [field.field]: blobId },
-            claimedBlobs: Object.freeze({ ...(handlerContext.claimedBlobs ?? {}), [field.field]: claimedBlob }),
-          };
-        }
-      }
-      const result = await declaration.handler(handlerContext);
-      const commit = Array.isArray(result) ? { events: result } : result;
-      if (!commit || !Array.isArray(commit.events)) throw new Error(`registered action '${declaration.type}' must return an event array`);
-      if (handlerContext.claimedBlobs) {
-        const claimedBlobValues = Object.values(handlerContext.claimedBlobs);
-        const forbiddenEventMetadata = claimedBlobValues.flatMap((blob     ) => [blob.sha256, blob.md5, blob.byteLength, blob.mediaType]).filter((value) => value !== null);
-        const forbiddenPrivateMetadata = claimedBlobValues.flatMap((blob     ) => [blob.resourceId, blob.sha256, blob.md5, blob.byteLength, blob.mediaType]).filter((value) => value !== null);
-        const attestationKeys = new Set(['resourceId', 'sha256', 'md5', 'byteLength', 'mediaType']);
-        const containsAttestationMetadata = (value     , forbidden       , seen = new Set         ())          => {
-          if (typeof value !== 'object' || value === null) return forbidden.some((candidate) => Object.is(candidate, value));
-          if (seen.has(value)) return false;
-          seen.add(value);
-          if (Array.isArray(value)) return value.some((item) => containsAttestationMetadata(item, forbidden, seen));
-          const keys = Object.keys(value);
-          if (keys.includes('claimedBlobs') || keys.includes('resourceId') || keys.filter((key) => attestationKeys.has(key)).length > 1) return true;
-          return Object.values(value).some((item) => containsAttestationMetadata(item, forbidden, seen));
-        };
-        if (containsAttestationMetadata(commit.events, forbiddenEventMetadata)
-          || containsAttestationMetadata({ directive: commit.directive, privateFact: commit.privateFact, effects: commit.effects }, forbiddenPrivateMetadata)) {
-          throw new Error(`declared blob action '${declaration.type}' cannot serialize claimed blob metadata`);
-        }
-      }
-      if (!lifecycle) return Array.isArray(result) ? result : {
-        events: commit.events,
-        ...(commit.canonicalPayload === undefined ? {} : { canonicalPayload: commit.canonicalPayload }),
-        ...(commit.directive === undefined ? {} : { directive: commit.directive }),
-        ...(commit.privateFact === undefined ? {} : { privateFact: commit.privateFact }),
-        ...(commit.effects === undefined ? {} : { effects: commit.effects }),
-        ...(commit.annotatedText === undefined ? {} : { annotatedText: commit.annotatedText }),
-        ...(commit.applicationTransition === undefined ? {} : { applicationTransition: commit.applicationTransition }),
-      };
-      for (const { field, blobId } of claimedFields) {
-        const owningEvents = commit.events.filter((event     ) => event?.scope === context.scope && event.data && Object.prototype.hasOwnProperty.call(event.data, field.field));
-        if (owningEvents.length !== 1) throw new Error(`declared blob action '${declaration.type}' must emit exactly one owning event field '${field.field}' in its dispatch scope`);
-        if (owningEvents[0].data[field.field] !== blobId) throw new Error(`declared blob action '${declaration.type}' must emit its canonical blob id in field '${field.field}'`);
-        for (const [metadataName, path] of Object.entries(field.canonicalEventMetadata ?? {})                        ) {
-          let target = owningEvents[0].data;
-          for (const part of path.slice(0, -1)) {
-            if (!Object.prototype.hasOwnProperty.call(target, part) || typeof target[part] !== 'object' || target[part] === null || Array.isArray(target[part])) {
-              throw new Error(`declared blob action '${declaration.type}' canonical metadata path '${path.join('.')}' must already have an object parent`);
-            }
-            target = target[part];
-          }
-          const leaf = path.at(-1);
-          if (Object.prototype.hasOwnProperty.call(target, leaf)) {
-            throw new Error(`declared blob action '${declaration.type}' handler cannot set canonical metadata path '${path.join('.')}'`);
-          }
-          target[leaf] = handlerContext.claimedBlobs[field.field][metadataName];
-        }
-      }
-      return {
-        events: commit.events,
-        ...(claimedFields.length === 0
-          ? (commit.canonicalPayload === undefined ? {} : { canonicalPayload: commit.canonicalPayload })
-          : { canonicalPayload: handlerContext.payload, claimedBlobs: handlerContext.claimedBlobs }),
-        ...(commit.directive === undefined ? {} : { directive: commit.directive }),
-        ...(commit.privateFact === undefined ? {} : { privateFact: commit.privateFact }),
-        ...(commit.effects === undefined ? {} : { effects: commit.effects }),
-        ...(commit.annotatedText === undefined ? {} : { annotatedText: commit.annotatedText }),
-        ...(commit.applicationTransition === undefined ? {} : { applicationTransition: commit.applicationTransition }),
-      };
-    };
+    // Pending-blob claim validation, attestation scanning, and canonical
+    // metadata rewriting belong to the module that owns the blob seam
+    // (pending-blob.ts) — kernel stays a thin assembler.
+    const handler = async (context     ) => runDeclaredActionWithBlobClaims({
+      declaration, context, lifecycle: app.pendingBlobLifecycle,
+    });
     Object.defineProperty(handler, 'inTransaction', { value: true });
     if (declaration.ownedResources === true) {
       Object.defineProperty(handler, 'ownedResources', { value: true });
@@ -498,6 +411,13 @@ function engagedPostCommitConsumerDescriptors(app     , entities     , { blobFin
     // _Log row missed in the commit→notify window (see the taxonomy above).
     // Absent when the app never constructed the bridge (raw buildKernel usage).
     { name: 'search-staleness', kind: 'durable-projection-consumer', consumer: app.searchStaleness ? createSearchStalenessConsumer(app.searchStaleness) : null },
+    // Query invalidation is a READ-side post-commit signal. When an app has
+    // installed the hub (ensureQueryInvalidationHub), register it as a normal
+    // kernel consumer so it flows through the SAME post-commit pipeline as
+    // every other fan-out — not a transport-side observer bolted onto dispatch.
+    // Unknown handoff by design: a dropped notice only causes a client refetch,
+    // so its honest kind is best-effort-external, never cursor-backed.
+    { name: 'query-invalidation', kind: 'best-effort-external-consumer', consumer: app.queryInvalidationHub ? createQueryInvalidationConsumer(app.queryInvalidationHub, app.db) : null },
   ].filter((d) => Boolean(d.consumer));
 }
 
@@ -667,6 +587,7 @@ export function buildKernel(app     ) {
     },
     db: app.db,
     writeQueue: app.writeQueue,
+    onConsumerError: app.onConsumerError,
     commitHook: annotatedKernel.commitHook,
     history: app._history,
     historyActions: generatedHistoryActions,
@@ -685,6 +606,7 @@ export function buildKernel(app     ) {
       effectsRegistry: effectsRegistry.size > 0 ? effectsRegistry : null,
       executeEffectsForEvent,
       postCommitConsumers: postCommitConsumerDescriptors.map((d) => d.consumer),
+      onConsumerError: app.onConsumerError,
       // Composite journal routing (#122): compiled patch plans from the
       // attached live delivery. Undefined when no snapshots are declared —
       // journaling is skipped entirely and legacy behavior is unchanged.
@@ -711,6 +633,7 @@ export function buildKernel(app     ) {
       effectsRegistry: effectsRegistry.size > 0 ? effectsRegistry : null,
       executeEffectsForEvent,
       postCommitConsumers: livePostCommitConsumers,
+      onConsumerError: app.onConsumerError,
     }) : undefined,
     tierOfEvent,
   });

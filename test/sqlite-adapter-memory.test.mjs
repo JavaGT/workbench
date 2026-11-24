@@ -46,7 +46,8 @@ test('the memory adapter applies the same centralized PRAGMA layer', () => {
   try {
     assert.deepEqual({ ...memory.handle.prepare('PRAGMA journal_mode').get() }, { journal_mode: 'memory' });
     assert.deepEqual({ ...memory.handle.prepare('PRAGMA foreign_keys').get() }, { foreign_keys: 1 });
-    assert.deepEqual({ ...memory.handle.prepare('PRAGMA synchronous').get() }, { synchronous: 1 });
+    // W2 durability: FULL is the default WAL sync level (1 = NORMAL opt-out).
+    assert.deepEqual({ ...memory.handle.prepare('PRAGMA synchronous').get() }, { synchronous: 2 });
     assert.deepEqual({ ...memory.handle.prepare('PRAGMA busy_timeout').get() }, { timeout: 5000 });
   } finally {
     memory.close();

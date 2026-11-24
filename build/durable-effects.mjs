@@ -88,8 +88,25 @@ export function buildDurableEffectsRegistry(entities                            
   return registry;
 }
 
-function durableJobId(ev                  , kind        ) {
-  return `durable-effect:${ev.scope.replace(':', ':')}:${ev.seq}:${kind}`;
+// A scope handle is `Entity:id`; the id itself may contain ':' (or '%' or any
+// other text). The historical `scope.replace(':', ':')` was a no-op, leaving the
+// segments ambiguous: a (scope, seq, kind) tuple could collide with another.
+// Keep the canonical format byte-identical for ordinary ids (so existing job
+// ids and recovery cursors stay stable) and percent-encode ONLY segments that
+// could blur a boundary. Entity names cannot contain ':' by grammar; a kind
+// with ':' is encoded too, because it is the right-most segment.
+const SAFE_SEGMENT = /^[A-Za-z0-9._-]+$/;
+
+function encodeIdSegment(value        )         {
+  return SAFE_SEGMENT.test(value) ? value : encodeURIComponent(value);
+}
+
+export function durableJobId(ev                  , kind        )         {
+  const colon = ev.scope.indexOf(':');
+  const scope = colon <= 0
+    ? ev.scope
+    : `${ev.scope.slice(0, colon)}:${encodeIdSegment(ev.scope.slice(colon + 1))}`;
+  return `durable-effect:${scope}:${ev.seq}:${encodeIdSegment(kind)}`;
 }
 
 function durablePayload(ev                  , effect                          )                                                                                                            {

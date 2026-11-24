@@ -88,6 +88,14 @@ interface RuntimeClock {
   _schedule(): void;
 }
 
+/** The structural shape of a read-only recovery health probe result. */
+interface RuntimeRecoveryProbeResult {
+  readonly ok: boolean;
+  readonly reason?: string;
+  readonly findings?: readonly string[];
+  readonly checkedAt?: string;
+}
+
 interface RuntimeApp {
   _runtimeShutdownInstalled?: boolean;
   _transportReady: Promise<unknown>;
@@ -134,6 +142,13 @@ interface RuntimeApp {
   ready?: Promise<unknown>;
   onShutdown(name: string, hook: () => void | Promise<void>, options?: { timeoutMs?: number }): void;
   _shutdownFromStartFailure?(): Promise<unknown>;
+  /**
+   * Optional read-only recovery/backup health probe (the sqlite adapter's
+   * `probeRecovery` or a backup/recovery manager's `probe`). When configured,
+   * bootApplication runs it before any writer is admitted so a corrupt
+   * database fails closed instead of serving a broken committed log.
+   */
+  probeRecovery?(): RuntimeRecoveryProbeResult | Promise<RuntimeRecoveryProbeResult>;
 }
 
 function installRuntimeShutdown(app: RuntimeApp): void {
@@ -269,6 +284,28 @@ async function bootApplication(app: RuntimeApp): Promise<RuntimeApp> {
   await app.resolveRoutes();
   if (app._shutdownStarted) return app;
   if (app.db && typeof app.db.exec === 'function') await app.prepareSchema();
+  if (app._shutdownStarted) return app;
+
+  // Optional recovery/backup probe. When an app wires one (e.g. the sqlite
+  // adapter's read-only file probe, or a backup/recovery manager), boot runs it
+  // BEFORE the kernel and any writer, so a database that needs recovery fails
+  // closed instead of serving a commit log SQLite cannot be trusted to keep.
+  // A probe failure is a boot failure, never a degradation.
+  if (typeof app.probeRecovery === 'function') {
+    let probeResult: RuntimeRecoveryProbeResult;
+    try {
+      probeResult = await app.probeRecovery();
+    } catch (err) {
+      log.error('system', 'recovery probe threw during boot', { err });
+      throw err;
+    }
+    if (probeResult && probeResult.ok === false) {
+      const reason = probeResult.reason ?? 'recovery probe reported an unhealthy database';
+      const findings = probeResult.findings ?? [];
+      log.error('system', 'recovery probe failed — refusing to boot', { reason, findings });
+      throw new Error(`recovery probe failed: ${reason}${findings.length > 0 ? ` (${findings.join('; ')})` : ''}`);
+    }
+  }
   if (app._shutdownStarted) return app;
 
   app.kernel = buildKernel(app) as unknown as RuntimeKernel;

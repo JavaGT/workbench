@@ -97,7 +97,8 @@ test('the centralized PRAGMA layer is applied at open (single source of truth)',
       const pragmas = (sql) => opened.handle.prepare(sql).get();
       assert.deepEqual({ ...pragmas('PRAGMA journal_mode') }, { journal_mode: 'wal' });
       assert.deepEqual({ ...pragmas('PRAGMA foreign_keys') }, { foreign_keys: 1 });
-      assert.deepEqual({ ...pragmas('PRAGMA synchronous') }, { synchronous: 1 });
+      // W2 durability: FULL is the default WAL sync level (1 = NORMAL opt-out).
+      assert.deepEqual({ ...pragmas('PRAGMA synchronous') }, { synchronous: 2 });
       assert.deepEqual({ ...pragmas('PRAGMA busy_timeout') }, { timeout: 5000 });
     } finally {
       opened.close();

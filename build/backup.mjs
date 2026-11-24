@@ -414,10 +414,24 @@ export function createBackupManager(options                      )              
 
     // ---- THE single consistency boundary: committed DB state + referenced
     // blob set, inside ONE coordinated turn. The snapshot and the census
-    // observe the same committed prefix; nothing can write between them. ----
+    // observe the same committed prefix; nothing can write between them.
+    // Only those two hold the mutex: once the snapshot file is sealed it is
+    // immutable, so integrity/quick_check, schema identity and migration-ledger
+    // reads run OUTSIDE the lock. A long verification can no longer stall every
+    // platform writer while the backup is being captured. ----
     let capture               ;
     try {
-      capture = await writeCoordinator.run(() => captureCommittedState(snapshotPath));
+      const barrier = await writeCoordinator.run(() => captureCommittedBarrier(snapshotPath));
+      const snapshotState = readSnapshotState(snapshotPath);
+      // Blob census fail-closed: a blob-capable schema means adopted blob
+      // generations MAY exist, and a no-seam capture can only record an empty
+      // blob set — which would falsely report complete. Refuse instead.
+      if (blobs === null && snapshotState.blobCapableSchema) {
+        throw new Error(
+          `backup refuses a blob-capable database without a blob census seam: the schema declares ${BLOB_METADATA_LEDGER}, so adopted blob generations may exist — supply a census seam (backupManager blobs) or this backup would silently record an empty blob set`,
+        );
+      }
+      capture = { ...barrier, ...snapshotState };
     } catch (err) {
       return quarantineFailed('snapshot', backupId, dir, err, { backupId });
     }
@@ -527,7 +541,11 @@ export function createBackupManager(options                      )              
     return { ok: true, status: 'complete', backupId, directory: dir, manifest };
   }
 
-  async function captureCommittedState(snapshotPath        )                         {
+  // Only the work that MUST share the commit barrier runs inside the mutex:
+  // the WAL probe, the SQLite snapshot copy, and the referenced blob census.
+  // The snapshot file is sealed when backupTo resolves; every other read is
+  // over that immutable file and runs outside the coordinator after this turn.
+  async function captureCommittedBarrier(snapshotPath        )                                                            {
     // WAL fail-closed probe: the ticket's snapshot is WAL-safe by contract, and
     // a plain copy of the main database file would silently drop WAL content —
     // so a non-WAL source is refused outright instead of being approximated.
@@ -538,18 +556,8 @@ export function createBackupManager(options                      )              
       );
     }
     const pages = await source.backupTo(snapshotPath);
-    const state = readSnapshotState(snapshotPath);
-    // Blob census fail-closed (review #82 finding 1): a blob-capable schema
-    // (the framework blob-metadata ledger present) means adopted blob
-    // generations MAY exist, and a no-seam capture can only record an empty
-    // blob set — which would falsely report complete. Refuse instead.
-    if (blobs === null && state.blobCapableSchema) {
-      throw new Error(
-        `backup refuses a blob-capable database without a blob census seam: the schema declares ${BLOB_METADATA_LEDGER}, so adopted blob generations may exist — supply a census seam (backupManager blobs) or this backup would silently record an empty blob set`,
-      );
-    }
     const blobGenerations = blobs === null ? [] : Array.from(await blobs.census());
-    return { pages, blobGenerations, ...state };
+    return { pages, blobGenerations };
   }
 
   function list()                           {

@@ -246,17 +246,35 @@ export function upsert(db          , opts               ) {
 // wrapDriver applies the same list under a thin try/catch for raw-handle test
 // callers. Exactly one module declares the PRAGMA SQL — change them here only.
 
-export const CONNECTION_PRAGMA_SQL                    = Object.freeze([
-  'PRAGMA journal_mode = WAL',
-  'PRAGMA foreign_keys = ON',
-  'PRAGMA synchronous = NORMAL',
-  'PRAGMA busy_timeout = 5000',
-]);
+
+
+
+
+
+
+
+
+
+
+export function connectionPragmaSql({ synchronous = 'FULL' }                          = {})                    {
+  return Object.freeze([
+    'PRAGMA journal_mode = WAL',
+    'PRAGMA foreign_keys = ON',
+    `PRAGMA synchronous = ${synchronous}`,
+    'PRAGMA busy_timeout = 5000',
+  ]);
+}
+
+// The default connection PRAGMA list: FULL WAL durability. Kept as a named
+// constant so the single-source-of-truth tests (and the adapter source guard)
+// keep one obvious place to inspect; callers needing relaxed mode use
+// `connectionPragmaSql({ synchronous: 'NORMAL' })` / `applyConnectionPragmas(db, ...)`.
+export const CONNECTION_PRAGMA_SQL                    = connectionPragmaSql();
 
 // Fail-closed application: any PRAGMA error propagates. Used by the sqlite
 // adapter at open, where a silent catch would leave a connection misconfigured.
-export function applyConnectionPragmas(db                                )       {
-  for (const sql of CONNECTION_PRAGMA_SQL) db.exec(sql);
+export function applyConnectionPragmas(db                                , options                          = {})       {
+  for (const sql of connectionPragmaSql(options)) db.exec(sql);
 }
 
 // The WAL starvation-guard checkpoint (scope#2727): wal_checkpoint(RESTART) run

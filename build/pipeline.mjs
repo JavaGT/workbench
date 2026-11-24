@@ -164,6 +164,37 @@ function effectEventsFor(registry         , executeEffectsForEvent         ) {
 
 
 
+/**
+ * Observability seam for a post-commit consumer failure. The committed origin
+ * is NEVER changed by a consumer throw: the hook is a side-channel so an app
+ * can page/metric a broken delivery without a second write path. A hook that
+ * itself throws is contained — it must not turn a committed dispatch into a
+ * reported failure.
+ */
+
+
+
+
+
+
+function reportConsumerError(
+  hook                                    ,
+  error         ,
+  phase                                                   ,
+  actionId         ,
+  consumerIndex         ,
+)       {
+  if (!hook) return;
+  try {
+    hook(error, { phase, actionId, consumerIndex });
+  } catch (hookErr) {
+    // The hook is observability, never a second commit path. Its failure is
+    // logged and contained so the committed origin stays a success.
+    getLog().warn('dispatch', 'post-commit consumer error hook failed', { err: hookErr, actionId, phase });
+  }
+}
+
+
 
 
 
@@ -507,6 +538,7 @@ function createMutationVariant        ({
     effectsRegistry = null,
     executeEffectsForEvent = null,
     postCommitConsumers = [],
+    onConsumerError = null,
     maxEffectDepth = 8,
   } = options;
   if (!Number.isInteger(maxEffectDepth) || maxEffectDepth < 0) {
@@ -582,11 +614,23 @@ function createMutationVariant        ({
         && events.some((event) => consumer.eventTypes.includes(event.type)));
     },
     async afterCommit(events         , context         ) {
-      for (const consumer of postCommitConsumers) {
+      const actionId = (context                                )?.actionId;
+      // A hook passed to createServer (and threaded through commitEvents'
+      // context) applies even when this variant was built without one.
+      const consumerErrorHook = onConsumerError
+        ?? (context                                                                   )?.onConsumerError
+        ?? null;
+      for (const [consumerIndex, consumer] of postCommitConsumers.entries()) {
         try {
           await consumer(events, context);
-        } catch {
-          // a post-commit fan-out failure never undoes the committed dispatch
+        } catch (err) {
+          // A post-commit fan-out failure never undoes the committed dispatch.
+          // It is no longer silent: structured log + an optional app hook give
+          // ops a truthful signal while the origin stays committed.
+          getLog().warn('dispatch', 'post-commit consumer failed', {
+            err, actionId, consumerIndex, variant: name,
+          });
+          reportConsumerError(consumerErrorHook, err, 'consumer', actionId, consumerIndex);
         }
       }
     },
@@ -1001,8 +1045,9 @@ function handleOfEvent(event     )      {
 // Post-commit delivery can no longer turn a committed mutation into a failure.
 async function commitEvents(db     , events     , {
   now, actionId, principal, payload, pipeline, livePipeline, tierOfEvent, scope, type, authorize, historyCommit, handler,
-  erasureActionContext, authorization, contributionPolicies = null, writeQueue = null, commitHook = null, recheckDedupe = null,
+  erasureActionContext, authorization, contributionPolicies = null, writeQueue = null, commitHook = null, recheckDedupe = null, onConsumerError = null,
 }
+
 
 
 
@@ -1279,14 +1324,16 @@ async function commitEvents(db     , events     , {
   // — e.g. the search-staleness seam — is wired into both pipelines). A
   // fan-out failure never turns a committed mutation into a reported failure.
   try {
-    await pipeline.afterCommit(committed.durableEvents, { db, actionId });
+    await pipeline.afterCommit(committed.durableEvents, { db, actionId, onConsumerError });
   } catch (err) {
-    getLog().error('dispatch', 'post-commit delivery failed', { err, actionId });
+    getLog().error('dispatch', 'post-commit delivery failed', { err, actionId, phase: 'durable-delivery' });
+    reportConsumerError(onConsumerError, err, 'durable-delivery', actionId);
   }
   try {
-    await livePipeline?.afterCommit?.(committed.liveEvents, { db, actionId });
+    await livePipeline?.afterCommit?.(committed.liveEvents, { db, actionId, onConsumerError });
   } catch (err) {
-    getLog().error('dispatch', 'post-commit delivery failed', { err, actionId });
+    getLog().error('dispatch', 'post-commit delivery failed', { err, actionId, phase: 'live-delivery' });
+    reportConsumerError(onConsumerError, err, 'live-delivery', actionId);
   }
   return Object.freeze({ ...successOutcome(committed.events), resultData: committed.resultData });
 }
@@ -1312,11 +1359,44 @@ function receiptMetadata(request     , historyCommit     ) {
   };
 }
 
+// ---- one write coordinator per SQLite handle -------------------------------
+// A db handle has exactly ONE platform mutex. Two `createServer` calls over the
+// same handle must never each mint a private mutex: SQLite is single-writer, so
+// a second mutex only creates the illusion of coordination while the two queues
+// interleave transactions. Key by the handle itself (a WeakMap keeps a closed db
+// and its queue collectible together) — the handle identity is more truthful
+// than a file location, which two different connections may share.
+const attachedWriteQueues = new WeakMap                    ();
+
+/** The write coordinator already attached to a db handle, if any. Testable seam. */
+export function writeQueueForDatabase(db                           )                         {
+  return db && typeof db === 'object' ? attachedWriteQueues.get(db) : undefined;
+}
+
+function resolveServerWriteQueue(db         , supplied                   )             {
+  const key = db && typeof db === 'object' ? db           : null;
+  const attached = key ? attachedWriteQueues.get(key) : undefined;
+  if (supplied) {
+    if (attached && attached !== supplied && !attached.closed) {
+      throw new Error(
+        'createServer refuses a second write queue on a database handle that already has an attached write coordinator; '
+        + 'reuse the attached coordinator (writeQueueForDatabase(db)) instead of creating an uncoordinated mutex',
+      );
+    }
+    if (key) attachedWriteQueues.set(key, supplied);
+    return supplied;
+  }
+  if (attached && !attached.closed) return attached;
+  const created = createWriteQueue();
+  if (key) attachedWriteQueues.set(key, created);
+  return created;
+}
+
 // gate's default-on requireUser(). Authorization is always an explicit function
 // (AGENTS.md: never a magic default); omitting it is a load-time error. When
 // Phase 2 wires this kernel to a request path, `authorize` is where the route
 // gate + grant engine compose — it is not a second, looser auth path.
-export function createServer({ handlers = {}, authorize, db, pipeline = durableMutationVariant(), livePipeline, tierOfEvent, history, historyActions = {}, cursorPolicy, contributionPolicies = null, authorization, writeQueue = null, commitHook = null }
+export function createServer({ handlers = {}, authorize, db, pipeline = durableMutationVariant(), livePipeline, tierOfEvent, history, historyActions = {}, cursorPolicy, contributionPolicies = null, authorization, writeQueue = null, commitHook = null, onConsumerError = null }
 
 
 
@@ -1325,6 +1405,8 @@ export function createServer({ handlers = {}, authorize, db, pipeline = durableM
 
 
                                                                     
+
+
 
 
 
@@ -1568,7 +1650,9 @@ export function createServer({ handlers = {}, authorize, db, pipeline = durableM
   // ---- durable path (db engaged) — async, SQLite-backed ----
   // A caller-supplied WriteQueue is THE platform mutex; never substitute a
   // private one for it (that would let other coordinated writers interleave).
-  const serverWriteQueue = writeQueue ?? createWriteQueue();
+  // Without one, reuse the handle's attached coordinator (or create + attach
+  // exactly one) so two servers over the same db never mint rival mutexes.
+  const serverWriteQueue = resolveServerWriteQueue(db, writeQueue);
 
   // The durable dispatch: authorize (Fork C, outside txn — revoked-principal
   // detection before dedupe) → dedupe by actionId → run handler → commit
@@ -1651,7 +1735,7 @@ export function createServer({ handlers = {}, authorize, db, pipeline = durableM
     const committed = await commitEvents(db, emitted, {
       now, actionId, principal, payload, pipeline, livePipeline, tierOfEvent, scope, type, authorize, historyCommit,
       handler: handler.inTransaction || historyCommit?.handlerInputs ? handler : null, erasureActionContext,
-      authorization, contributionPolicies, writeQueue: serverWriteQueue, commitHook,
+      authorization, contributionPolicies, writeQueue: serverWriteQueue, commitHook, onConsumerError,
       recheckDedupe: (txnDb) => singleDispatchDedupe(txnDb, dedupeArgs),
     });
     return committed;
@@ -1807,7 +1891,7 @@ export function createServer({ handlers = {}, authorize, db, pipeline = durableM
     const committed = await commitEvents(db, batchCommit, {
       now, actionId, principal, payload: actions, pipeline, livePipeline, tierOfEvent, scope, type: '$batch', authorize, historyCommit,
       handler: runInTxn ? runHandlers : null,
-      authorization, contributionPolicies, writeQueue: serverWriteQueue, commitHook,
+      authorization, contributionPolicies, writeQueue: serverWriteQueue, commitHook, onConsumerError,
       recheckDedupe: (txnDb) => batchDispatchDedupe(txnDb, dedupeArgs),
     });
     return committed;
@@ -1818,7 +1902,8 @@ export function createServer({ handlers = {}, authorize, db, pipeline = durableM
        db, descriptor: history, generatedActions: historyActions, dispatch, dispatchBatch, authorize, cursorPolicy, contributionPolicies,
     })
     : undefined;
-  return { dispatch, dispatchBatch, history: historyRuntime, db, log: [] };  // log is the durable _Log table; empty array for compat
+  // Expose the coordinating mutex for observability and tests (one per db).
+  return { dispatch, dispatchBatch, history: historyRuntime, db, writeQueue: serverWriteQueue, log: [] };  // log is the durable _Log table; empty array for compat
 }
 
 // createClient({ events }) — the client-side reconciliation path (SPEC §7 stage

@@ -458,6 +458,13 @@ export function createJobQueue({
       }
       return runInTxn(() => {
         const jobId = id ?? randomUUID();
+        // Caller-owned ids are a dedupe key, not a fresh-write instruction. A
+        // durable-effect retry (or any re-enqueue of the same event) must be a
+        // no-op returning the existing row — never a UNIQUE crash and never a
+        // second `enqueued` event. The check and the insert share one BEGIN
+        // IMMEDIATE turn through the one coordinator, so no writer can interleave.
+        const existing = rawRow(db, '_Job', jobId);
+        if (existing) return parseJob(existing);
         const t = now();
         db.prepare(
           'INSERT INTO _Job (id, kind, payload, status, enqueuedAt, scope, workerId, claimedAt, leaseUntil, principalKey, operations) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)',

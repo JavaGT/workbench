@@ -9,7 +9,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 
-import { entity, everyone, grant, read, ref, scope, subscribe, text, write } from '../build/index.mjs';
+import { entity, everyone, grant, inherit, map, membership, never, read, ref, scope, subscribe, text, write } from '../build/index.mjs';
 import workbench from '../build/internal.mjs';
 
 const alice = { type: 'user', id: 'alice' };
@@ -125,4 +125,137 @@ test('compiled read scope is enforced even for a scope-only grant', async () => 
   assert.deepEqual((await TenantNote.findAllFor(alice)).map((r) => r.id), ['n1']);
   assert.deepEqual((await TenantNote.findAllFor(bob)).map((r) => r.id), ['n2']);
   assert.deepEqual(await TenantNote.findAllFor(outsider), []);
+});
+
+// A child's grant is its parent's: the compiled scope is a correlated EXISTS
+// over the parent table. rowMatchesScope cannot prove that from one child row,
+// so the principal-scoped helpers must evaluate that scope in SQL instead.
+function bootInheritedDocs() {
+  const Project = entity('ScopedReadProject', {
+    title: text(),
+    owner: ref('User', { role: 'owner' }),
+    grant: () => [scope(({ is }) => is.owner()).can(async ({ is }) => (
+      await is.owner() ? grant(read, write) : grant()
+    ))],
+  });
+  const Doc = entity('ScopedReadDoc', {
+    title: text(),
+    projectId: ref(Project),
+    grant: inherit(Project, { via: 'projectId' }),
+  });
+
+  const db = new DatabaseSync(':memory:');
+  db.exec('CREATE TABLE ScopedReadProject (id TEXT, title TEXT, owner TEXT)');
+  db.exec('CREATE TABLE ScopedReadDoc (id TEXT, title TEXT, projectId TEXT)');
+  db.prepare('INSERT INTO ScopedReadProject VALUES (?, ?, ?)').run('p1', 'Alice project', 'alice');
+  db.prepare('INSERT INTO ScopedReadProject VALUES (?, ?, ?)').run('p2', 'Bob project', 'bob');
+  db.prepare('INSERT INTO ScopedReadDoc VALUES (?, ?, ?)').run('d1', 'Alice doc', 'p1');
+  db.prepare('INSERT INTO ScopedReadDoc VALUES (?, ?, ?)').run('d2', 'Bob doc', 'p2');
+  const app = workbench({ db, entities: [Project, Doc] });
+  return { db, Doc: app.entity(Doc) };
+}
+
+test('inherit(Project, { via }) admits the parent owner through findByIdFor/findAllFor', async () => {
+  const { Doc } = bootInheritedDocs();
+
+  assert.equal((await Doc.findByIdFor('d1', alice))?.title, 'Alice doc');
+  assert.equal(await Doc.findByIdFor('d1', bob), null);
+  assert.equal(await Doc.findByIdFor('d1', outsider), null);
+  assert.equal((await Doc.findByIdFor('d2', bob))?.title, 'Bob doc');
+
+  assert.deepEqual((await Doc.findAllFor(alice)).map((r) => r.id), ['d1']);
+  assert.deepEqual((await Doc.findAllFor(bob)).map((r) => r.id), ['d2']);
+  assert.deepEqual(await Doc.findAllFor(outsider), []);
+  // A predicate runs as a separate query; it must intersect the SQL-admitted
+  // id set rather than widen or collide with the scope's bound params.
+  assert.deepEqual(await Doc.findAllFor(alice, Doc.title.is('Bob doc')), []);
+  assert.deepEqual((await Doc.findAllFor(bob, Doc.title.is('Bob doc'))).map((r) => r.id), ['d2']);
+  // An anonymous principal owns no parent project, so it sees no child rows.
+  const anonymous = { type: 'anonymous', id: null };
+  assert.equal(await Doc.findByIdFor('d1', anonymous), null);
+  assert.deepEqual(await Doc.findAllFor(anonymous), []);
+});
+
+// membership() compiles the owner-or-map-member scope to anyOf(is.owner(),
+// is.member()), whose De Morgan lowering contains an existsMembership node.
+// Again, one row alone cannot prove membership — the scope must run in SQL.
+function bootMembershipProjects() {
+  const Project = entity('ScopedReadMemberProject', {
+    title: text(),
+    owner: ref('User', { role: 'owner' }),
+    secret: text().can(async ({ is }) => (await is.owner() ? grant(read, write) : grant())),
+    members: map(ref('User'), { role: ['viewer', 'editor'], default: {} }),
+  });
+  membership(Project, { member: { can: [read] } });
+
+  const db = new DatabaseSync(':memory:');
+  db.exec('CREATE TABLE ScopedReadMemberProject (id TEXT, title TEXT, owner TEXT, secret TEXT)');
+  db.exec('CREATE TABLE ScopedReadMemberProject_members (ScopedReadMemberProject_id TEXT, member_id TEXT, role TEXT)');
+  db.prepare('INSERT INTO ScopedReadMemberProject VALUES (?, ?, ?, ?)').run('p1', 'Shared project', 'alice', 'owner-only-value');
+  db.prepare('INSERT INTO ScopedReadMemberProject_members VALUES (?, ?, ?)').run('p1', 'bob', 'editor');
+  const app = workbench({ db, entities: [Project] });
+  return { db, Project: app.entity(Project) };
+}
+
+test('membership() admits owner and invited member through findByIdFor/findAllFor', async () => {
+  const { Project } = bootMembershipProjects();
+
+  assert.equal((await Project.findByIdFor('p1', alice))?.secret, 'owner-only-value');
+  // Skipping rowMatchesScope must not skip field-level projection.
+  const forBob = await Project.findByIdFor('p1', bob);
+  assert.equal(forBob?.title, 'Shared project');
+  assert.equal('secret' in forBob, false);
+  assert.equal(JSON.stringify(forBob).includes('owner-only-value'), false);
+  assert.equal(await Project.findByIdFor('p1', outsider), null);
+
+  assert.deepEqual((await Project.findAllFor(alice)).map((r) => r.id), ['p1']);
+  const bobRows = await Project.findAllFor(bob);
+  assert.deepEqual(bobRows.map((r) => r.id), ['p1']);
+  assert.equal('secret' in bobRows[0], false);
+  assert.deepEqual(await Project.findAllFor(outsider), []);
+});
+
+// membership() may also overlay an application-bound entity. In that case the
+// scopeFilter closure is installed on the same target the query helpers use,
+// and must agree with the record's live readScope/grant.
+test('membership() applied to an app-bound entity is honored by findByIdFor/findAllFor', async () => {
+  const declaration = entity('ScopedReadOverlayProject', {
+    title: text(),
+    owner: ref('User', { role: 'owner' }),
+    members: map(ref('User'), { role: ['viewer', 'editor'], default: {} }),
+  });
+  const db = new DatabaseSync(':memory:');
+  db.exec('CREATE TABLE ScopedReadOverlayProject (id TEXT, title TEXT, owner TEXT)');
+  db.exec('CREATE TABLE ScopedReadOverlayProject_members (ScopedReadOverlayProject_id TEXT, member_id TEXT, role TEXT)');
+  db.prepare('INSERT INTO ScopedReadOverlayProject VALUES (?, ?, ?)').run('p1', 'Overlay project', 'alice');
+  db.prepare('INSERT INTO ScopedReadOverlayProject_members VALUES (?, ?, ?)').run('p1', 'bob', 'viewer');
+  const app = workbench({ db, entities: [declaration] });
+  const Project = app.entity(declaration);
+  membership(Project, { member: { can: [read] } });
+
+  assert.equal((await Project.findByIdFor('p1', alice))?.title, 'Overlay project');
+  assert.equal((await Project.findByIdFor('p1', bob))?.title, 'Overlay project');
+  assert.equal(await Project.findByIdFor('p1', outsider), null);
+  assert.deepEqual((await Project.findAllFor(alice)).map((r) => r.id), ['p1']);
+  assert.deepEqual((await Project.findAllFor(bob)).map((r) => r.id), ['p1']);
+  assert.deepEqual(await Project.findAllFor(outsider), []);
+});
+
+// `never()` lowers to `1=0`; the helpers must refuse without even running a
+// scoped query (mayRow's scope-only capabilities would otherwise admit it).
+test('an impossible (never) scope fails closed for every principal', async () => {
+  const declaration = entity('ScopedReadNever', {
+    title: text(),
+    grant: () => [scope(() => never())],
+  });
+  const db = new DatabaseSync(':memory:');
+  db.exec('CREATE TABLE ScopedReadNever (id TEXT, title TEXT)');
+  db.prepare('INSERT INTO ScopedReadNever VALUES (?, ?)').run('n1', 'Hidden');
+  const app = workbench({ db, entities: [declaration] });
+  const Never = app.entity(declaration);
+
+  for (const who of [alice, bob, outsider]) {
+    assert.equal(await Never.findByIdFor('n1', who), null);
+    assert.deepEqual(await Never.findAllFor(who), []);
+  }
 });

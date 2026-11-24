@@ -1,4 +1,4 @@
-import { lowerToSql, rowMatchesScope, type ReadScopeTemplate } from '../scope-sql.ts';
+import { bindReadScope, lowerToSql, rowMatchesScope, type ReadScopeTemplate } from '../scope-sql.ts';
 import { applyNearest, type NearestSpec } from '../vector.ts';
 import type { Principal } from '../principal.ts';
 import { mayRow, type EntityRecord } from '../row-grant.ts';
@@ -151,19 +151,52 @@ export function installEntityQueries(
 ) {
   const entityRecord = record as unknown as EntityRecord;
 
+  // The compiled read scope decides row VISIBILITY; the row grant's `.can`
+  // decides the read capability. The scope is bound per principal through the
+  // SAME binder the HTTP/live paths use — `scopeFilter` reads the live
+  // readScope (so a membership() overlay is honored), `bindReadScope` is the
+  // direct fallback for a record installed without it. The extremes are
+  // resolved before any SQL runs: `1=0` denies, `1=1` needs no row filter.
+  // A join (inherit) or existsMembership (map role) node cannot be decided
+  // from one row, so the SQL branch evaluates the scope against the database
+  // instead of consulting rowMatchesScope.
+  type ScopeDecision =
+    | { kind: 'deny' }
+    | { kind: 'all' }
+    | { kind: 'js' }
+    | { kind: 'sql'; db: Db; sql: string; params: Record<string, unknown> };
+
+  function decideScope(principal: Principal): ScopeDecision {
+    if (record.grant == null) return { kind: 'deny' };
+    const readScope = record.readScope as ReadScopeTemplate | undefined;
+    if (!readScope) return { kind: 'all' };
+    const scopeFilter = record.scopeFilter as
+      | ((principal: Principal) => { sql: string; params: Record<string, unknown> })
+      | undefined;
+    const bound = typeof scopeFilter === 'function'
+      ? scopeFilter.call(record, principal)
+      : bindReadScope(readScope, principal);
+    if (!bound || typeof bound.sql !== 'string') return { kind: 'deny' };
+    const compact = bound.sql.replace(/\s+/g, '');
+    if (compact === '1=0' || compact === '(1=0)') return { kind: 'deny' };
+    if (compact === '1=1' || compact === '(1=1)') return { kind: 'all' };
+    // Without a database the SQL decision cannot be made. Fall back to the
+    // JS evaluator, which fails closed for side-table predicates.
+    if (!db) return { kind: 'js' };
+    return { kind: 'sql', db, sql: bound.sql, params: { ...bound.params } };
+  }
+
   // One fail-closed read decision for a materialized row. Both halves are
-  // required: the compiled read scope decides row VISIBILITY (a scope-only
-  // grant confers read to every row it is handed, so mayRow alone would fail
-  // open across tenants), while the row grant's runtime `.can` decides the
-  // read capability (mayVerb). Finally the field-read projection strips every
-  // field this principal cannot read. Null means "not found" — never a partial
-  // or unauthorized row.
-  async function readForPrincipal(row: Row, principal: Principal): Promise<Row | null> {
+  // required: visibility was already decided (in SQL for the scoped helpers),
+  // and the row grant's runtime `.can` decides the read capability (mayVerb).
+  // Finally the field-read projection strips every field this principal cannot
+  // read. Null means "not found" — never a partial or unauthorized row.
+  async function readForPrincipal(row: Row, principal: Principal, scopeChecked = false): Promise<Row | null> {
     if (record.grant == null) return null;
-    const readScope = record.readScope as { sql: string; params: Record<string, unknown> } | undefined;
-    const scopeAst = record.scopeAst;
-    if (readScope) {
-      if (!scopeAst || !rowMatchesScope({ ...readScope, ast: scopeAst } as ReadScopeTemplate, row, principal)) return null;
+    if (!scopeChecked) {
+      const readScope = record.readScope as ReadScopeTemplate | undefined;
+      const scopeAst = record.scopeAst;
+      if (!readScope || !scopeAst || !rowMatchesScope({ ...readScope, ast: scopeAst } as ReadScopeTemplate, row, principal)) return null;
     }
     if (!(await mayRow(entityRecord, 'read', row, principal))) return null;
     return await projectRead(entityRecord, row, principal);
@@ -201,16 +234,39 @@ export function installEntityQueries(
   // it is returned.
   record.findByIdFor = async (id: string, principal: Principal): Promise<Row | null> => {
     requirePrincipal('findByIdFor', principal);
+    const scope = decideScope(principal);
+    if (scope.kind === 'deny') return null;
+    if (scope.kind === 'sql') {
+      // Scope visibility is decided by SQLite, not by rowMatchesScope: the
+      // compiled scope may reference parent or membership side tables that a
+      // single materialized row cannot prove. Fetch only an admitted row.
+      const found = preparedEntityStatement(scope.db, `SELECT * FROM ${name} AS t0 WHERE (${scope.sql}) AND t0.id = :scopeId`)
+        .get({ ...scope.params, scopeId: id }) as Row | undefined;
+      if (!found) return null;
+      return await readForPrincipal(hydrate(found, principal), principal, true);
+    }
     const row = (record.findById as (id: string, principal: Principal) => Row | null)(id, principal);
-    return row ? await readForPrincipal(row, principal) : null;
+    return row ? await readForPrincipal(row, principal, scope.kind === 'all') : null;
   };
 
   record.findAllFor = async (principal: Principal, predicate?: unknown): Promise<Row[]> => {
     requirePrincipal('findAllFor', principal);
+    const scope = decideScope(principal);
+    if (scope.kind === 'deny') return [];
+    // One scope query for the whole table — not one per row. The caller's
+    // predicate stays a separate query with its own param space, so the two
+    // cannot collide; rows are filtered to the admitted id set in memory.
+    let admittedIds: Set<string> | null = null;
+    if (scope.kind === 'sql') {
+      const admitted = preparedEntityStatement(scope.db, `SELECT t0.id FROM ${name} AS t0 WHERE (${scope.sql})`)
+        .all(scope.params) as Row[];
+      admittedIds = new Set(admitted.map((row) => String(row.id)));
+    }
     const source = await (record.findAll as (predicate?: unknown) => Row[] | PromiseLike<Row[]>)(predicate);
     const rows: Row[] = [];
     for (const row of source) {
-      const admitted = await readForPrincipal(row, principal);
+      if (admittedIds && !admittedIds.has(String(row.id))) continue;
+      const admitted = await readForPrincipal(row, principal, scope.kind !== 'js');
       if (admitted) rows.push(admitted);
     }
     return rows;

@@ -42,8 +42,11 @@ import { createEntityProjection, createConditionalHistoryProjection, createCondi
 import { createCrudHandlers, materializeCreateDefaults } from './crud.ts';
 import { installEntityQueries, rawRow } from './query.ts';
 import { validateScheduleTrigger, autoStateScheduleTrigger, stateEffectEntries, assertSqlIdentifier, mintToken } from './schedule-compile.ts';
-import { validateAnnotatedTextDeclaration } from '../annotated-text-field.ts';
-import { getAnnotatedTextCompiledMetadata, resolveAnnotatedTextOwningScope } from '../annotated-text-field.ts';
+import {
+  hasFieldKindFeature,
+  resolveFieldKindEventScope,
+  validateFieldKindEntities,
+} from '../strategy/index.ts';
 import { scopeOf } from '../scope-handle.ts';
 import { normalizeTierDeclaration } from '../live-tier.ts';
 
@@ -253,9 +256,6 @@ export function entity<const Name extends string, const Declaration extends Reco
         }
       }
     }
-    if (descriptor.kind === 'annotatedText') {
-      validateAnnotatedTextDeclaration(name, fieldName, descriptor, fields);
-    }
   }
 
   // Index constraints may only name stored main-table columns. One validation
@@ -331,24 +331,9 @@ export function entity<const Name extends string, const Declaration extends Reco
     if (descriptor?.unique === true) addUnique([fieldName], `field '${fieldName}' unique`);
   }
 
-  const annotatedOwningRefs = new Set(Object.values(fields)
-    .filter((descriptor) => descriptor?.kind === 'annotatedText')
-    .map((descriptor) => descriptor.project));
-  if (annotatedOwningRefs.size > 1) {
-    throw new Error(`entity('${name}') annotatedText fields must share one owning project ref`);
-  }
-
-  const caretCells = new Set();
-  for (const [, descriptor] of Object.entries(fields)) {
-    if (descriptor.kind !== 'annotatedText') continue;
-    const caret = getAnnotatedTextCompiledMetadata(descriptor)?.caret;
-    if (!caret) continue;
-    const key = `${caret.field}\u0000${caret.cell}`;
-    if (caretCells.has(key)) {
-      throw new Error(`entity('${name}') caret cell '${caret.field}.${caret.cell}' is linked to more than one annotatedText field`);
-    }
-    caretCells.add(key);
-  }
+  // Field kinds that need compile-time validation contribute it through the
+  // registry; the compiler owns no per-kind validation branches.
+  validateFieldKindEntities(name, fields);
 
   const { registry, readScope, scopeAst, clauses } = compileEntityAuthz(name, {
     fields,
@@ -549,7 +534,7 @@ export function entity<const Name extends string, const Declaration extends Reco
   };
 
   const sideTableStrategyEntries = collectSideTableStrategies(fields);
-  if (conditionalCreateHistory && (sideTableStrategyEntries.length > 0 || storedComputedFields.length > 0 || Object.values(fields).some((descriptor) => descriptor.kind === 'annotatedText' || descriptor.kind === 'crdt' || descriptor.kind === 'struct' || descriptor.kind === 'hash'))) {
+  if (conditionalCreateHistory && (sideTableStrategyEntries.length > 0 || storedComputedFields.length > 0 || hasFieldKindFeature(fields, 'blocksConditionalCreateHistory') || Object.values(fields).some((descriptor) => descriptor.kind === 'crdt' || descriptor.kind === 'struct' || descriptor.kind === 'hash'))) {
     throw new Error(`entity('${name}') conditional create history supports only replayable stored value fields`);
   }
 
@@ -612,9 +597,7 @@ export function entity<const Name extends string, const Declaration extends Reco
   record.removedEvent = (id: any, db: any) => ({
     handle: record.verbs.removed.handle,
     type: record.verbs.removed.type,
-    scope: Object.values(fields).some((descriptor) => descriptor.kind === 'annotatedText')
-      ? resolveAnnotatedTextOwningScope(Object.values(fields).find((descriptor) => descriptor.kind === 'annotatedText'), fields, rawRow(db, name, id) ?? {}).key
-      : scopeOf(name, id).key,
+    scope: resolveFieldKindEventScope({ name, fields }, rawRow(db, name, id) ?? {}) ?? scopeOf(name, id).key,
     data: { id },
   });
 

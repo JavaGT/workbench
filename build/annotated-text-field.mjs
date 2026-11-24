@@ -4,6 +4,11 @@
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 import { assertGuarded } from './guard/static.mjs';
 import { write } from './grant.mjs';
+
+import * as eventHandles from './event-handle.mjs';
+import { annotatedTextDeniedPlaceholder } from './field-admission.mjs';
+import { markAnnotatedEntityProjection } from './annotated-text-history.mjs';
+import { projectAnnotatedTextSnapshot } from './annotated-text-snapshot.mjs';
 const CAPABILITY_IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$/;
 const SCALAR_TYPES = new Set(['text', 'boolean', 'date', 'number', 'json', 'vector', 'ref']);
 const RESERVED_ANNOTATION_COLUMNS = new Set(['annotation_id', 'id', 'document_id', 'project_id', 'owner_id', 'family']);
@@ -875,6 +880,82 @@ export function annotatedTextDDL(entity        , field        , descriptor     ,
   );
   return statements;
 }
+
+// -- Field-kind contribution -------------------------------------------------
+//
+// The annotatedText kind's behavior inside the three generic loops is
+// concentrated here. Core modules (entity compiler, CRUD, projections, live
+// fan-out) query the registry in strategy/index.ts; they never branch on the
+// kind string. This is the single authority for "what annotatedText changes in
+// the machine", mirroring annotated-text-kernel.ts for the Kernel/Pipeline seam.
+
+function hasAnnotatedField(fields                                                              )          {
+  return Object.values(fields ?? {}).some((descriptor) => descriptor?.kind === 'annotatedText');
+}
+
+const annotatedTextContribution = {
+  kind: 'annotatedText',
+  blocksConditionalCreateHistory: true,
+
+  validateEntityFields(entity, fields) {
+    for (const [fieldName, descriptor] of Object.entries(fields)) {
+      if (descriptor?.kind !== 'annotatedText') continue;
+      validateAnnotatedTextDeclaration(entity, fieldName, descriptor, fields);
+    }
+    const owningRefs = new Set(Object.values(fields)
+      .filter((descriptor) => descriptor?.kind === 'annotatedText')
+      .map((descriptor) => descriptor.project));
+    if (owningRefs.size > 1) {
+      throw new Error(`entity('${entity}') annotatedText fields must share one owning project ref`);
+    }
+    const caretCells = new Set        ();
+    for (const descriptor of Object.values(fields)) {
+      if (descriptor?.kind !== 'annotatedText') continue;
+      const caret = getAnnotatedTextCompiledMetadata(descriptor)?.caret;
+      if (!caret) continue;
+      const key = `${caret.field}\u0000${caret.cell}`;
+      if (caretCells.has(key)) {
+        throw new Error(`entity('${entity}') caret cell '${caret.field}.${caret.cell}' is linked to more than one annotatedText field`);
+      }
+      caretCells.add(key);
+    }
+  },
+
+  resolveEntityEventScope(entity, _field, payload) {
+    if (!hasAnnotatedField(entity.fields)) return null;
+    const field = Object.values(entity.fields).find((descriptor) => descriptor?.kind === 'annotatedText') ;
+    return resolveAnnotatedTextOwningScope(field, entity.fields, payload).key;
+  },
+
+  rejectsPlainUpdate(_field) {
+    return 'is an annotated-text field and cannot be set through update payloads';
+  },
+
+  projectRowField() {
+    return annotatedTextDeniedPlaceholder();
+  },
+
+  markEntityProjection(projection, fields) {
+    if (hasAnnotatedField(fields)) markAnnotatedEntityProjection(projection);
+  },
+
+  async snapshotField(context) {
+    return projectAnnotatedTextSnapshot(context         );
+  },
+
+  isOperationEvent(context) {
+    return context.eventScope === context.directScope
+      && context.handle.kind === eventHandles.EventKind.native
+      && context.handle.nativeName === 'operated';
+  },
+
+  suppressesDelta(context) {
+    return !context.scopeAnchored
+      && (context.isOperationEvent || (context.ephemeralField !== null && context.entityHasContributedKind));
+  },
+}                                ;
+
+export const ANNOTATED_TEXT_FIELD_KIND_CONTRIBUTION                        = Object.freeze(annotatedTextContribution);
 
 export function annotatedTextAuthoringStreamDDL(entity        , field        )           {
   const prefix = `${entity}_${field}`;

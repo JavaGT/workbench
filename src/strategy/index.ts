@@ -5,6 +5,7 @@ import { ORDERED_SIDE_TABLE_STRATEGY } from './ordered.ts';
 import { LOG_SIDE_TABLE_STRATEGY } from './log.ts';
 import { EPHEMERAL_SIDE_TABLE_STRATEGY } from './ephemeral.ts';
 import { FTS_STRATEGY } from '../fts-strategy.ts';
+import { ANNOTATED_TEXT_FIELD_KIND_CONTRIBUTION } from '../annotated-text-field.ts';
 
 // Shared strategy helpers. Re-exported here so consumers that import from the
 // strategy barrel (annotated-text-admit, auth/invitation via side-table-strategy)
@@ -153,6 +154,135 @@ export function collectSideTableStrategies(fields: Record<string, FieldDescripto
 export function sideTableDDL(entity: { name: string }, fieldName: string, descriptor: FieldDescriptor): string | null {
   const strategy = SIDE_TABLE_STRATEGIES.find((candidate) => candidate.matches(descriptor));
   return strategy ? strategy.ddl(entity.name, fieldName, descriptor) : null;
+}
+
+// ---------------------------------------------------------------------------
+// Field-kind contributions
+// ---------------------------------------------------------------------------
+//
+// A side-table strategy derives runtime *storage* from a declared field shape.
+// A field-kind contribution is the sibling seam for the *core loops*: it lets a
+// kind that needs behavior inside the generic entity compiler, CRUD generator,
+// projections, and live fan-out contribute named hooks instead of those modules
+// hard-coding `descriptor.kind === '<kind>'` branches. This is a registry of
+// real functions (authorization is always functions; identity lives with the
+// kind that owns it) — NOT a config DSL that relocates behavior into data.
+//
+// Every hook is optional: a module queries the kind's contribution and falls
+// through to its generic path when the kind contributes nothing for that seam.
+
+export type FieldKindRow = Record<string, unknown>;
+
+export interface FieldKindEntity {
+  readonly name: string;
+  readonly fields: Readonly<Record<string, FieldDescriptor>>;
+}
+
+export interface FieldKindEventHandle {
+  entity?: string;
+  field?: string;
+  kind?: string;
+  nativeName?: string;
+}
+
+export interface FieldKindOperationContext {
+  readonly handle: FieldKindEventHandle;
+  readonly eventScope?: string;
+  readonly directScope?: string;
+}
+
+export interface FieldKindDeltaContext {
+  readonly scopeAnchored: boolean;
+  readonly isOperationEvent: boolean;
+  readonly ephemeralField: string | null;
+  readonly entityHasContributedKind: boolean;
+}
+
+export interface FieldKindSnapshotEntity extends FieldKindEntity {
+  deserializeRow(row: FieldKindRow): FieldKindRow;
+}
+
+export interface FieldKindSnapshotContext {
+  readonly db: unknown;
+  readonly entity: FieldKindSnapshotEntity;
+  readonly row: FieldKindRow;
+  readonly principal: unknown;
+  readonly fieldName: string;
+  readonly descriptor: FieldDescriptor;
+  readonly authoring?: unknown;
+}
+
+export interface FieldKindContribution {
+  /** The declared field kind this contribution owns. */
+  readonly kind: string;
+  /** Compile-time validation of every field of this kind in one entity. */
+  validateEntityFields?(entity: string, fields: Readonly<Record<string, FieldDescriptor>>): void;
+  /** This kind is not replayable through conditional create history. */
+  readonly blocksConditionalCreateHistory?: boolean;
+  /** Owning scope for an entity's lifecycle event, or null to use the default. */
+  resolveEntityEventScope?(entity: FieldKindEntity, field: FieldDescriptor, payload: FieldKindRow): string | null;
+  /** Why a plain update payload may not set a field of this kind, or null when allowed. */
+  rejectsPlainUpdate?(field: FieldDescriptor): string | null;
+  /** Redacted value for an unreadable recipient row field of this kind. */
+  projectRowField?(field: FieldDescriptor, fieldName: string, row: FieldKindRow, principal: unknown): unknown;
+  /** Mark a compiled entity projection as participating in this kind. */
+  markEntityProjection?(projection: object, fields: Readonly<Record<string, FieldDescriptor>>): void;
+  /** Project a readable field into a recipient snapshot. Returns its value. */
+  snapshotField?(context: FieldKindSnapshotContext): Promise<unknown> | unknown;
+  /** Whether an event is this kind's native operation event. */
+  isOperationEvent?(context: FieldKindOperationContext): boolean;
+  /** Whether this kind requires the delta projection to be skipped. */
+  suppressesDelta?(context: FieldKindDeltaContext): boolean;
+}
+
+// The registry is frozen: kinds are registered by the owning modules at module
+// load, never grown at runtime by a request. Adding a kind is one entry here.
+export const FIELD_KIND_CONTRIBUTIONS: readonly FieldKindContribution[] = Object.freeze([
+  ANNOTATED_TEXT_FIELD_KIND_CONTRIBUTION,
+]);
+
+export function fieldKindContribution(kind: unknown): FieldKindContribution | undefined {
+  return typeof kind === 'string' ? FIELD_KIND_CONTRIBUTIONS.find((contribution) => contribution.kind === kind) : undefined;
+}
+
+/** True when any declared field of `fields` is owned by a kind contributing `feature`. */
+export function hasFieldKindFeature(
+  fields: Readonly<Record<string, any>> | null | undefined,
+  feature: keyof FieldKindContribution,
+): boolean {
+  return Object.values(fields ?? {}).some((descriptor) => Boolean(fieldKindContribution(descriptor?.kind)?.[feature]));
+}
+
+export function validateFieldKindEntities(entity: string, fields: Readonly<Record<string, FieldDescriptor>>): void {
+  for (const contribution of FIELD_KIND_CONTRIBUTIONS) contribution.validateEntityFields?.(entity, fields);
+}
+
+export function resolveFieldKindEventScope(entity: FieldKindEntity, payload: FieldKindRow): string | null {
+  for (const contribution of FIELD_KIND_CONTRIBUTIONS) {
+    if (typeof contribution.resolveEntityEventScope !== 'function') continue;
+    const field = Object.values(entity.fields ?? {}).find((descriptor) => descriptor?.kind === contribution.kind);
+    if (!field) continue;
+    const scope = contribution.resolveEntityEventScope(entity, field, payload);
+    if (typeof scope === 'string' && scope.length > 0) return scope;
+  }
+  return null;
+}
+
+export function markFieldKindProjections(projection: object, fields: Readonly<Record<string, FieldDescriptor>>): void {
+  for (const contribution of FIELD_KIND_CONTRIBUTIONS) contribution.markEntityProjection?.(projection, fields);
+}
+
+export function isFieldKindOperationEvent(
+  fields: Readonly<Record<string, any>> | null | undefined,
+  context: FieldKindOperationContext,
+): boolean {
+  const field = fields?.[context.handle.field ?? ''];
+  const contribution = fieldKindContribution(field?.kind);
+  return contribution?.isOperationEvent?.(context) === true;
+}
+
+export function suppressesFieldKindDelta(context: FieldKindDeltaContext): boolean {
+  return FIELD_KIND_CONTRIBUTIONS.some((contribution) => contribution.suppressesDelta?.(context) === true);
 }
 
 // ---------------------------------------------------------------------------

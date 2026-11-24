@@ -4,7 +4,6 @@ import * as eventHandle from '../event-handle.mjs';
 import { captureDeletedRowAnchor } from '../deleted-row-anchor.mjs';
 import { CASCADE_DESCENDANT } from './removal-cascade.mjs';
 import { applyTextOp, createTextState, restoreTextCheckpoint, textCheckpoint } from '../annotated-text.mjs';
-import { markAnnotatedEntityProjection } from '../annotated-text-history.mjs';
 import {
   annotatedTextProjectionEventTypes,
   applyAnnotatedTextNativeEvent,
@@ -16,7 +15,8 @@ import {
 } from '../annotated-text-projection.mjs';
 
 
-import { annotatedTextDeniedPlaceholder, readableFieldNames } from '../field-admission.mjs';
+import { readableFieldNames } from '../field-admission.mjs';
+import { fieldKindContribution, markFieldKindProjections } from '../strategy/index.mjs';
 
 import { rawRow } from './query.mjs';
 
@@ -92,8 +92,11 @@ export async function projectRowForRecipient(
   for (const [fieldName, descriptor] of Object.entries(fields)) {
     if (readable.has(fieldName)) {
       if (Object.prototype.hasOwnProperty.call(row, fieldName)) projected[fieldName] = row[fieldName];
-    } else if (descriptor?.kind === 'annotatedText') {
-      projected[fieldName] = annotatedTextDeniedPlaceholder();
+    } else {
+      const contribution = fieldKindContribution(descriptor?.kind);
+      if (contribution?.projectRowField) {
+        projected[fieldName] = contribution.projectRowField(descriptor, fieldName, row, principal);
+      }
     }
   }
   return projected;
@@ -256,7 +259,7 @@ export function createEntityProjection({ name, fields, verbs, storedComputedFiel
     apply: (event           , db    )       => { applyProjection(event, db, false); },
     applyAsync: async (event           , db    )                => { await applyProjection(event, db, true); },
   };
-  if (Object.values(fields).some((field) => field.kind === 'annotatedText')) markAnnotatedEntityProjection(projection);
+  markFieldKindProjections(projection, fields);
   return Object.freeze(projection);
 }
 

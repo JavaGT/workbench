@@ -4,7 +4,6 @@ import * as eventHandle from '../event-handle.ts';
 import { captureDeletedRowAnchor } from '../deleted-row-anchor.ts';
 import { CASCADE_DESCENDANT } from './removal-cascade.ts';
 import { applyTextOp, createTextState, restoreTextCheckpoint, textCheckpoint } from '../annotated-text.ts';
-import { markAnnotatedEntityProjection } from '../annotated-text-history.ts';
 import {
   annotatedTextProjectionEventTypes,
   applyAnnotatedTextNativeEvent,
@@ -16,7 +15,8 @@ import {
 } from '../annotated-text-projection.ts';
 import type { DbHandle } from '../driver.ts';
 import type { SideTableStrategyEntry, ProjectionEvent } from '../side-table-strategy.ts';
-import { annotatedTextDeniedPlaceholder, readableFieldNames } from '../field-admission.ts';
+import { readableFieldNames } from '../field-admission.ts';
+import { fieldKindContribution, markFieldKindProjections } from '../strategy/index.ts';
 import type { AuthorizationAdapter } from '../authorization-adapter.ts';
 import { rawRow } from './query.ts';
 
@@ -92,8 +92,11 @@ export async function projectRowForRecipient(
   for (const [fieldName, descriptor] of Object.entries(fields)) {
     if (readable.has(fieldName)) {
       if (Object.prototype.hasOwnProperty.call(row, fieldName)) projected[fieldName] = row[fieldName];
-    } else if (descriptor?.kind === 'annotatedText') {
-      projected[fieldName] = annotatedTextDeniedPlaceholder();
+    } else {
+      const contribution = fieldKindContribution(descriptor?.kind);
+      if (contribution?.projectRowField) {
+        projected[fieldName] = contribution.projectRowField(descriptor, fieldName, row, principal);
+      }
     }
   }
   return projected;
@@ -256,7 +259,7 @@ export function createEntityProjection({ name, fields, verbs, storedComputedFiel
     apply: (event: EventLike, db: Db): void => { applyProjection(event, db, false); },
     applyAsync: async (event: EventLike, db: Db): Promise<void> => { await applyProjection(event, db, true); },
   };
-  if (Object.values(fields).some((field) => field.kind === 'annotatedText')) markAnnotatedEntityProjection(projection);
+  markFieldKindProjections(projection, fields);
   return Object.freeze(projection);
 }
 

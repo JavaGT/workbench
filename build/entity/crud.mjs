@@ -21,7 +21,7 @@ import {
 import { scopeOf } from '../scope-handle.mjs';
 import * as eventHandles from '../event-handle.mjs';
 import { canonicalTextOp } from '../annotated-text.mjs';
-import { resolveAnnotatedTextOwningScope } from '../annotated-text-field.mjs';
+import { fieldKindContribution, resolveFieldKindEventScope } from '../strategy/index.mjs';
 import { CASCADE_DESCENDANT, CASCADE_PREAUTHORIZED } from './removal-cascade.mjs';
 import { admitRow } from '../row-grant.mjs';
 import { admitRowTransition } from '../field-admission.mjs';
@@ -52,10 +52,8 @@ export function resolveGeneratedEventScope(record     , { id, row, payload, scop
       return scope;
     }
   }
-  if (Object.values(record.fields).some((descriptor     ) => descriptor.kind === 'annotatedText')) {
-    const annotated = Object.entries(record.fields).find(([, descriptor]               ) => descriptor.kind === 'annotatedText');
-    return resolveAnnotatedTextOwningScope(annotated [1], record.fields, row ?? payload ?? {}).key;
-  }
+  const contributedScope = resolveFieldKindEventScope(record, row ?? payload ?? {});
+  if (contributedScope !== null) return contributedScope;
   return scopeOf(record.name, id).key;
 }
 
@@ -203,8 +201,10 @@ export function createCrudHandlers({ record, sideTableStrategyEntries, condition
         return { events: [{ handle: verbs.updated.handle, type: verbs.updated.type, scope: resolveGeneratedEventScope(record, { id, row: currentStored, payload: replacement, scope }), data: { ...data, id } }], privateFact: { before: expected, after: replacement } };
       }
       for (const fieldName of Object.keys(rest)) {
-        if (fields[fieldName]?.kind === 'annotatedText') {
-          throw new ValidationError(`${name}.${fieldName} is an annotated-text field and cannot be set through update payloads`);
+        const descriptor = fields[fieldName];
+        const plainUpdateRejection = descriptor && fieldKindContribution(descriptor.kind)?.rejectsPlainUpdate?.(descriptor);
+        if (plainUpdateRejection) {
+          throw new ValidationError(`${name}.${fieldName} ${plainUpdateRejection}`);
         }
         if (fields[fieldName]?.immutable === true) {
           throw new ValidationError(`${name}.${fieldName} is immutable: a client may set it on create but may not change it.`);

@@ -3,9 +3,9 @@
 // the field-read admission projection (S5/A3) FIRST, so a principal receives
 // exactly the readable field subset; annotated-text fields that survive field
 // admission are then projected through the annotated-text recipient grammar.
-import { projectAnnotatedTextSnapshot } from './annotated-text-snapshot.ts';
 import { projectRowForRecipient } from './entity/projection.ts';
 import { readableFieldNames } from './field-admission.ts';
+import { fieldKindContribution, hasFieldKindFeature } from './strategy/index.ts';
 import type { AuthorizationAdapter } from './authorization-adapter.ts';
 
 export interface EntityFieldDescriptor {
@@ -20,7 +20,7 @@ export interface EntitySnapshotRecord {
 }
 
 export function hasAnnotatedTextFields(entity: EntitySnapshotRecord): boolean {
-  return Object.values(entity.fields).some((descriptor) => descriptor.kind === 'annotatedText');
+  return hasFieldKindFeature(entity.fields as never, 'snapshotField');
 }
 
 export interface ProjectSnapshotOptions {
@@ -37,8 +37,9 @@ export async function projectEntitySnapshot({ db, entity, row, principal, author
   const readable = await readableFieldNames(entity as never, materialized, principal, authorization);
   const snapshot = await projectRowForRecipient(entity as never, materialized, principal, { readable, authorization });
   for (const [fieldName, descriptor] of Object.entries(entity.fields)) {
-    if (descriptor.kind === 'annotatedText' && readable.has(fieldName)) {
-      snapshot[fieldName] = await projectAnnotatedTextSnapshot({ db, entity, row, principal, fieldName, descriptor, authoring });
+    const contribution = fieldKindContribution(descriptor.kind);
+    if (contribution?.snapshotField && readable.has(fieldName)) {
+      snapshot[fieldName] = await contribution.snapshotField({ db, entity: entity as never, row, principal, fieldName, descriptor: descriptor as never, authoring });
     }
   }
   return snapshot;

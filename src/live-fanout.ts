@@ -29,6 +29,11 @@ import { publicEvent } from './event-delivery.ts';
 import type { AuthorizationAdapter } from './authorization-adapter.ts';
 import { readableFieldNames } from './field-admission.ts';
 import { projectRowForRecipient } from './entity/projection.ts';
+import {
+  hasFieldKindFeature,
+  isFieldKindOperationEvent,
+  suppressesFieldKindDelta,
+} from './strategy/index.ts';
 
 // ---- Shared live-delivery type vocabulary ---------------------------------
 
@@ -202,8 +207,8 @@ export interface LiveFanoutHandle {
 
 // ---- Live fan-out -----------------------------------------------------------
 
-function hasAnnotatedText(entityRecord: LiveEntityRecord): boolean {
-  return Object.values(entityRecord.fields ?? {}).some((field) => field?.kind === 'annotatedText');
+function entityHasDeltaSuppressingKind(entityRecord: LiveEntityRecord): boolean {
+  return hasFieldKindFeature(entityRecord.fields, 'suppressesDelta');
 }
 
 // S5/A3 field-read admission on the fan-out path. The committed lifecycle
@@ -269,7 +274,7 @@ export function createLiveFanout({ mayVerb = null, authorization = null }: { may
   const byScope = new Map<string, Map<LiveConn, LiveSubscriptionSpec>>(); // Map<scopeKey, Map<conn, SubSpec>>
   const connSubs = new Map<LiveConn, Set<string>>();  // Map<conn, Set<scopeKey>>
   const paceBuffers = new Map<string, PaceBufferEntry>();
-  const annotatedTextByEntity = new WeakMap<object, boolean>();
+  const contributedKindByEntity = new WeakMap<object, boolean>();
   // One pending snapshot-control per (connection, document) per event-loop turn.
   // Later controls only raise the high-water sequence; the flush emits one message.
   const pendingSnapshotControls = new Map<string, {
@@ -550,14 +555,11 @@ export function createLiveFanout({ mayVerb = null, authorization = null }: { may
 
     const removed = row === undefined;
 
-    // Annotated-text operations have no recipient event grammar. Classify them
-    // before delta/reducer construction so canonical family facts cannot enter
+    // Field kinds that own an operation event with no recipient event grammar
+    // (annotatedText today) are classified through the contribution registry
+    // before delta/reducer construction, so canonical family facts cannot enter
     // any live envelope; recipients recover through the projected snapshot.
-    const isAnnotatedTextOperation = !scopeAnchored
-      && eventScope === directScope
-      && handle.kind === EventKind.native
-      && handle.nativeName === 'operated'
-      && entityRecord.fields?.[handle.field]?.kind === 'annotatedText';
+    const isContributedOperation = !scopeAnchored && isFieldKindOperationEvent(entityRecord.fields, { handle, eventScope, directScope });
 
     let authzRow: Record<string, unknown> | undefined = row;
     if (!removed && entityRecord.findById) {
@@ -574,16 +576,22 @@ export function createLiveFanout({ mayVerb = null, authorization = null }: { may
         ephemeralField = handle.field;
       }
     }
-    let annotatedText = annotatedTextByEntity.get(entityRecord);
-    if (annotatedText === undefined) {
-      annotatedText = hasAnnotatedText(entityRecord);
-      annotatedTextByEntity.set(entityRecord, annotatedText);
+    let entityHasContributedKind = contributedKindByEntity.get(entityRecord);
+    if (entityHasContributedKind === undefined) {
+      entityHasContributedKind = entityHasDeltaSuppressingKind(entityRecord);
+      contributedKindByEntity.set(entityRecord, entityHasContributedKind);
     }
-    const isAnnotatedTextEphemeral = ephemeralField !== null && annotatedText;
 
     // Delta projection is per-entity state diffing; a scope-anchored foreign
     // event carries its own data and must not be fed to the anchor's projector.
-    const delta = scopeAnchored || isAnnotatedTextOperation || isAnnotatedTextEphemeral
+    // Whether a contributed kind suppresses the delta is the kind's own policy.
+    const suppressContributedDelta = suppressesFieldKindDelta({
+      scopeAnchored,
+      isOperationEvent: isContributedOperation,
+      ephemeralField,
+      entityHasContributedKind,
+    });
+    const delta = scopeAnchored || suppressContributedDelta
       ? undefined
       : deltaProjector.project(entityRecord as never, id, authzRow, committed as never);
 
@@ -600,7 +608,7 @@ export function createLiveFanout({ mayVerb = null, authorization = null }: { may
       // Annotated-text resync must be sent to ALL subscribers regardless of
       // field interest — the subscriber needs to know about the event to
       // maintain its cursor, even if it didn't ask for the ephemeral field.
-      if (isAnnotatedTextOperation || isAnnotatedTextEphemeral) {
+      if (suppressContributedDelta) {
         const seq = committed.seq as number;
         if (!Number.isSafeInteger(seq) || seq < 0) continue;
         queueSnapshotControl(conn, name, id, seq, 'annotated-text-snapshot-required');
@@ -637,7 +645,7 @@ export function createLiveFanout({ mayVerb = null, authorization = null }: { may
           name,
           id,
           seq,
-          annotatedText ? 'annotated-text-snapshot-required' : 'recipient-snapshot-required',
+          entityHasContributedKind ? 'annotated-text-snapshot-required' : 'recipient-snapshot-required',
         );
         continue;
       }

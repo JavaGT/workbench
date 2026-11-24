@@ -552,6 +552,7 @@ export function validateExactSchema(
     for (const virtualTable of schema.virtualTables) validateVirtualTable(db, census, schema.name, virtualTable, push);
   }
   if (options.validateCensus) {
+    const externalTableNames = new Set(schemas.flatMap((schema) => (schema.externalTables ?? []).map((t) => folded(t.name))));
     for (const entry of census.values()) {
       const type = entry.objectKind === 'virtual-table' || entry.objectKind === 'shadow-table' ? 'table' : entry.objectKind;
       const live = db.prepare('SELECT sql FROM sqlite_schema WHERE type = ? AND lower(name) = lower(?)').get(type, entry.name);
@@ -562,7 +563,7 @@ export function validateExactSchema(
         push('missing-object', ownerKind, owner, objectKind, entry.name, 'is declared by the lifecycle census but absent from the live schema');
       } else if (entry.objectKind === 'virtual-table' && !/^CREATE\s+VIRTUAL\s+TABLE/i.test(String(live.sql ?? ''))) {
         push('object-kind', ownerKind, owner, 'virtual-table', entry.name, 'is declared as a virtual table but exists as an ordinary table');
-      } else if (entry.objectKind === 'table' && /^CREATE\s+VIRTUAL\s+TABLE/i.test(String(live.sql ?? ''))) {
+      } else if (entry.objectKind === 'table' && !externalTableNames.has(folded(entry.name)) && /^CREATE\s+VIRTUAL\s+TABLE/i.test(String(live.sql ?? ''))) {
         push('object-kind', ownerKind, owner, 'table', entry.name, 'is declared as an ordinary table but exists as a virtual table');
       }
     }

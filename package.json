@@ -53,7 +53,7 @@
 		"emit:ts": "node --disable-warning=ExperimentalWarning scripts/emit-ts.mjs",
 		"build": "pnpm emit:ts",
 		"setup:hooks": "sh scripts/setup-hooks.sh",
-		"lint": "eslint .",
+		"lint": "eslint --max-warnings 0 .",
 		"test": "pnpm emit:ts && node scripts/run-tests.mjs",
 		"test:bun": "bun test test/w8-bun-ws-streaming.test.mjs test/w7-bun-cutover-parity.test.mjs",
 		"bench": "node bench/hot-path.mjs",

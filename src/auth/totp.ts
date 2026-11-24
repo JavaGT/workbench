@@ -16,6 +16,7 @@
 //     one-time use (consumed on success)
 
 import crypto from 'node:crypto';
+import { sha256hex } from './session.ts';
 
 // ---- base32 (RFC 4648, no padding) --------------------------------------------
 
@@ -58,10 +59,6 @@ export function base32Decode(str: string): Buffer {
 }
 
 // ---- HOTP (RFC 4226) / TOTP (RFC 6238) ---------------------------------------
-
-function sha256hex(s: string): string {
-  return crypto.createHash('sha256').update(s).digest('hex');
-}
 
 // hotp(secret, counter) — compute a 6-digit HOTP token per RFC 4226 §5.3.
 //   - HMAC-SHA1(key=base32Decode(secret), message=8-byte big-endian counter)

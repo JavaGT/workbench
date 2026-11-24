@@ -18,7 +18,7 @@
 // so their read-scope grants nothing — `never()`/`deny`. The auth layer reaches
 // them only through the UNSCOPED, trusted query API, never a request path.
 
-import { randomBytes, createHash } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import { entity } from '../entity/compile.ts';
 import { text, hash, ref, date, number } from '../field.ts';
 import { scope, type RuntimeGrantClause } from '../scope.ts';
@@ -27,7 +27,7 @@ import { grant, deny, read, write, subscribe } from '../grant.ts';
 import { schedule, schedulerSource } from '../schedule.ts';
 import { config } from '../config.ts';
 import { generateSecret, generateBackupCodes } from './totp.ts';
-import { hashSessionToken } from './session.ts';
+import { hashSessionToken, sha256hex } from './session.ts';
 import type { Principal } from '../principal.ts';
 
 // The check-execution context the grant `.can` bodies and `checks` functions
@@ -35,10 +35,6 @@ import type { Principal } from '../principal.ts';
 // predicate half (compiled to SQL) is never awaited; the `.can` half is.
 interface IsContext {
   is: Record<string, () => Promise<unknown>>;
-}
-
-function sha256hex(s: string): string {
-  return createHash('sha256').update(s).digest('hex');
 }
 
 // A framework auth entity is never request-readable: its rows are reached only

@@ -86,7 +86,10 @@ export function sessionRowResolver(db       )                     {
   };
 }
 
-function sha256hex(s        )         {
+// The ONE string→SHA-256-hex helper for the auth coat. entities.ts (API key
+// token hashing) and totp.ts (backup-code hashing) import this instead of
+// carrying their own copies, so a digest means the same thing everywhere.
+export function sha256hex(s        )         {
   return createHash('sha256').update(s).digest('hex');
 }
 
@@ -196,7 +199,9 @@ export function sessionTokenOf(req             )                     {
   return value;
 }
 
-function sessionCreatedAtMs(value         )                {
+// The ONE timestamp parser for auth creation times. auth/routes.ts imports this
+// for its /sessions listing instead of keeping an identical second copy.
+export function sessionCreatedAtMs(value         )                {
   if (typeof value === 'number') return Number.isFinite(value) ? value : null;
   if (value instanceof Date) {
     const timestamp = value.getTime();

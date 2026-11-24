@@ -35,6 +35,7 @@
 // login challenge that reused it would inherit the wrong guarantees.
 
 import crypto from 'node:crypto';
+import { generateChallenge } from './passkey.mjs';
 
 const DEFAULT_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const DEFAULT_MAX_ATTEMPTS = 5;
@@ -81,9 +82,11 @@ const DEFAULT_MAX_SIZE = 10_000;
 
 
 // generateLoginChallenge(length) → base64url-encoded random bytes. 32 bytes
-// (256 bits) makes the challenge cryptographically unguessable.
+// (256 bits) makes the challenge cryptographically unguessable. Both ceremonies
+// draw from the ONE challenge generator (passkey.ts); the name stays exported
+// for callers that import the login-specific seam directly.
 export function generateLoginChallenge(length = 32)         {
-  return crypto.randomBytes(length).toString('base64url');
+  return generateChallenge(length);
 }
 
 function ensureLoginChallengeTable(db           )       {
@@ -386,6 +389,10 @@ export function createLoginChallengeStore(
     },
   };
 }
+
+// The public type of a login challenge store. Named so consumers (authRoutes'
+// `loginChallengeStore` option) can type the seam without importing the factory.
+
 
 // The default singleton login challenge store — used by the built-in auth
 // routes. Module-level so a login challenge survives in the single process that

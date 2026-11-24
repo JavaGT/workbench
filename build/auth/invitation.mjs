@@ -12,10 +12,11 @@ import { failure } from '../outcome.mjs';
 
 
 
-import { collapseForAdmission, principal,                } from '../principal.mjs';
+
 import {
   authorizeInvitationAcceptance,
   invitationAcceptancePrincipal,
+  mintInvitationUserAuthority,
 } from './invitation-acceptance-authority.mjs';
 
 export { admitInvitationAcceptance } from './invitation-acceptance-authority.mjs';
@@ -134,17 +135,10 @@ function requireSuccess(result                                          , operat
 const invitationCreationAuthorities = new WeakSet        ();
 
 function invitationCreationPrincipal(user                              )                   {
-  if (!user || user.type !== 'user' || typeof user.id !== 'string' || user.id.length === 0) return null;
-  // Build through the one principal constructor, then collapse at the admission
-  // seam: a revoked/disabled identity is anonymous and gets no creation authority.
-  const admitted = collapseForAdmission(principal({
-    type: 'user',
-    id: user.id,
-    attributes: { ...user.attributes },
-    status: user.status,
-  }));
-  if (admitted.type !== 'user' || admitted.id == null) return null;
-  const authority            = Object.freeze({ ...admitted });
+  // The principal() + collapseForAdmission() half is shared with the acceptance
+  // authority; here we only brand it for invitation creation.
+  const authority = mintInvitationUserAuthority(user);
+  if (!authority) return null;
   invitationCreationAuthorities.add(authority);
   return authority;
 }
@@ -221,6 +215,25 @@ function invitationTargetFor(runtime                   , name        , role     
   };
 }
 
+// The ONE row-level admin-authority evaluation for the auth coat. Both scoped
+// API-key creation (routes.ts) and invitation creation ask the same question of
+// one materialized target row: does this principal hold the row's admin
+// capability? Sharing the evaluation keeps their fail-closed verdicts identical;
+// each caller keeps its own row-visibility and error-status handling.
+export async function rowAdminAuthority(
+  entity                                       ,
+  row                         ,
+  principal           ,
+)                                                         {
+  const decision = await rowCapabilities(entity, row, principal);
+  const adminHeld = decision.granted && decision.capabilities.includes(admin);
+  const capabilities = new Set        ();
+  if (adminHeld) {
+    for (const capability of decision.capabilities) capabilities.add(capability.capability);
+  }
+  return { admin: adminHeld, capabilities };
+}
+
 export async function admitInvitationCreation({ Invitation, event, principal }
 
 
@@ -237,8 +250,7 @@ export async function admitInvitationCreation({ Invitation, event, principal }
   const storedRow = readScopedRow({ db: runtime.db }, target.entity, String(invitation.targetId), principal);
   if (!storedRow) throw httpError(404, `${target.entity.name} ${String(invitation.targetId)} not found`);
   const row = target.entity.deserializeRow({ ...storedRow });
-  const decision = await rowCapabilities(target.entity, row, principal);
-  return decision.granted && decision.capabilities.includes(admin);
+  return (await rowAdminAuthority(target.entity, row, principal)).admin;
 }
 
 export function createInvitationApi({ Invitation, db: suppliedDb }                             = {})                {

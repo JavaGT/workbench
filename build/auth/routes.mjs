@@ -26,10 +26,8 @@
 
 import { randomBytes, randomUUID } from 'node:crypto';
 import { router } from '../app.mjs';
-import { admin } from '../grant.mjs';
 import { allowAnonymous, requireUser } from '../route-gate.mjs';
-import { rowCapabilities } from '../row-grant.mjs';
-import { createInvitationApi } from './invitation.mjs';
+import { createInvitationApi, rowAdminAuthority } from './invitation.mjs';
 import {
   sessionCookie,
   sessionTokenOf,
@@ -37,13 +35,14 @@ import {
   sessionRowResolver,
   DEFAULT_SESSION_DURATION_MS,
   SESSION_COOKIE,
+  sessionCreatedAtMs as parseSessionCreatedAtMs,
   isValidApiKeyEntityName,
   isReservedApiKeyEntityName,
   isValidApiKeyRole,
 } from './session.mjs';
 import { config,                      } from '../config.mjs';
 import { verifyTotpStep, verifyBackupCode } from './totp.mjs';
-import { loginChallengeStore as defaultLoginChallengeStore, createLoginChallengeStore } from './login-challenge.mjs';
+import { loginChallengeStore as defaultLoginChallengeStore,                          } from './login-challenge.mjs';
 import { evaluateLockout, nextFailedAttemptCount, loginLockoutDecision, totpLockoutDecision } from './lockout.mjs';
 import { txn, begin, commit, rollback,               } from '../driver.mjs';
 import { writeQueueForDatabase } from '../pipeline.mjs';
@@ -51,7 +50,6 @@ import { hashPasswordAsync, verifyHashAsync } from '../field-strategy.mjs';
 import {
   generateChallenge,
   challengeStore as defaultPasskeyChallengeStore,
-  createChallengeStore,
   verifyRegistration,
   verifyAuthentication,
   rpConfig,
@@ -68,10 +66,6 @@ import {
 // res is the response facade, and next forwards an error to the error renderer.
 // The entity facades (User, Session, ...) are compiled bindings from the untyped
 // entity layer, so they stay `any`; the request surface is pinned here.
-
-
-
-
 
 
 
@@ -172,11 +166,11 @@ async function authorizeScopedApiKey({
   for (const storedRow of storedRows) {
     try {
       const row = target.deserializeRow({ ...storedRow });
-      const decision = await rowCapabilities(target                                         , row, principal);
-      if (decision.granted && decision.capabilities.includes(admin)) {
+      const verdict = await rowAdminAuthority(target                                           , row, principal);
+      if (verdict.admin) {
         hasAdmin = true;
-        for (const cap of decision.capabilities) {
-          adminCapabilities.add(cap.capability);
+        for (const capability of verdict.capabilities) {
+          adminCapabilities.add(capability);
         }
       }
     } catch {
@@ -227,21 +221,6 @@ const TOTP_REPLAY_TTL_MS = 120_000; // > 90s (±1 step) window
 const TOTP_REPLAY_MAX_ENTRIES = 10_000;
 const SAFE_SQL_IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
-function parseSessionCreatedAtMs(value         )                {
-  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
-  if (value instanceof Date) {
-    const ts = value.getTime();
-    return Number.isFinite(ts) ? ts : null;
-  }
-  if (typeof value !== 'string') return null;
-  if (/^-?\d+(?:\.\d+)?$/.test(value)) {
-    const ts = Number(value);
-    return Number.isFinite(ts) ? ts : null;
-  }
-  const parsed = Date.parse(value);
-  return Number.isFinite(parsed) && new Date(parsed).toISOString() === value ? parsed : null;
-}
-
 // Build the `/auth` router. `secure` follows the app env (true only in
 // production) so the same fail-closed cookie attributes apply on login and
 // logout, and plain-http dev works. The router is mounted at `/auth` by
@@ -261,8 +240,6 @@ export function authRoutes({
   sessionDurationMs = DEFAULT_SESSION_DURATION_MS,
   totpIssuer = 'workbench',
   requireUserVerification = true,
-  persistChallenges = false,
-  passkeyChallengeStore: suppliedPasskeyStore,
   loginChallengeStore: suppliedLoginStore,
   emailSeam,
   app: emailApp,
@@ -291,10 +268,8 @@ export function authRoutes({
   }
   const { User, Session, Credential, Invitation, ApiKey, TwoFactor } = entities;
   const { createInvitation, acceptInvitation, rejectInvitation, listInvitationsForUser } = createInvitationApi({ Invitation });
-  const passkeyStore                 = suppliedPasskeyStore
-    ?? (persistChallenges ? createChallengeStore({ db }) : defaultPasskeyChallengeStore);
-  const activeLoginChallengeStore = suppliedLoginStore
-    ?? (persistChallenges ? createLoginChallengeStore(undefined, undefined, undefined, { db }) : defaultLoginChallengeStore);
+  const passkeyStore                 = defaultPasskeyChallengeStore;
+  const activeLoginChallengeStore = suppliedLoginStore ?? defaultLoginChallengeStore;
   const s = router();
   const identityFields = Array.isArray(identifyBy) && identifyBy.length > 0 ? identifyBy : ['username'];
   // Password length floor defaults to 8 characters; apps may raise it or pass 0

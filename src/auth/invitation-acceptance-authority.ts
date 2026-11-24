@@ -39,12 +39,13 @@ export function isDeclaredInvitationRole(
     && declaredRoles.includes(role);
 }
 
-// Mint the acceptance authority through the ONE principal constructor. A
-// hand-rolled `{ type: 'user', id }` literal bypasses the closed type/status
-// union and would let a revoked or malformed identity grant membership. Here
-// the identity is rebuilt by principal() and collapsed at the admission seam:
-// a non-active identity becomes anonymous and receives NO authority.
-export function invitationAcceptancePrincipal(user: Principal | null | undefined): Principal | null {
+// Mint a user authority through the ONE principal constructor and the ONE
+// admission collapse. A hand-rolled `{ type: 'user', id }` literal bypasses the
+// closed type/status union and would let a revoked or malformed identity grant
+// membership. Invitation creation (invitation.ts) and acceptance share this
+// exact half; only the brand attached afterwards differs. The frozen object is
+// a distinct identity so a WeakMap/WeakSet brand cannot leak between them.
+export function mintInvitationUserAuthority(user: Principal | null | undefined): Principal | null {
   if (!user || user.type !== 'user' || typeof user.id !== 'string' || user.id.length === 0) return null;
   const admitted = collapseForAdmission(principal({
     type: 'user',
@@ -53,10 +54,14 @@ export function invitationAcceptancePrincipal(user: Principal | null | undefined
     status: user.status,
   }));
   if (admitted.type !== 'user' || admitted.id == null) return null;
-  // A distinct frozen object keeps the WeakMap brand per authority, while
-  // remaining a principal built by principal()/collapseForAdmission — never a
-  // fabricated principal-shaped literal.
-  const authority: Principal = Object.freeze({ ...admitted });
+  return Object.freeze({ ...admitted });
+}
+
+// Brand the shared authority as an acceptance authority. Details are attached
+// only when the role is declared (see authorizeInvitationAcceptance below).
+export function invitationAcceptancePrincipal(user: Principal | null | undefined): Principal | null {
+  const authority = mintInvitationUserAuthority(user);
+  if (!authority) return null;
   invitationAcceptanceAuthorities.set(authority, null);
   return authority;
 }

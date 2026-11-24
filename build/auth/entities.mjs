@@ -18,7 +18,7 @@
 // so their read-scope grants nothing — `never()`/`deny`. The auth layer reaches
 // them only through the UNSCOPED, trusted query API, never a request path.
 
-import { randomBytes, createHash } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import { entity } from '../entity/compile.mjs';
 import { text, hash, ref, date, number } from '../field.mjs';
 import { scope,                         } from '../scope.mjs';
@@ -27,7 +27,7 @@ import { grant, deny, read, write, subscribe } from '../grant.mjs';
 import { schedule, schedulerSource } from '../schedule.mjs';
 import { config } from '../config.mjs';
 import { generateSecret, generateBackupCodes } from './totp.mjs';
-import { hashSessionToken } from './session.mjs';
+import { hashSessionToken, sha256hex } from './session.mjs';
 
 
 // The check-execution context the grant `.can` bodies and `checks` functions
@@ -36,10 +36,6 @@ import { hashSessionToken } from './session.mjs';
 
 
 
-
-function sha256hex(s        )         {
-  return createHash('sha256').update(s).digest('hex');
-}
 
 // A framework auth entity is never request-readable: its rows are reached only
 // by trusted server code (login lookup, principal hydration), never dispatched

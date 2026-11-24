@@ -27,6 +27,42 @@ const ANNOTATED_TEXT_EDITOR_SDK_PATH = join(root, 'public', 'workbench-annotated
 const ANNOTATED_TEXT_CONTINUOUS_SDK_PATH = join(root, 'public', 'workbench-annotated-text-continuous.mjs');
 const UI_BINDINGS_SDK_PATH = join(root, 'public', 'workbench-ui-bindings.mjs');
 
+// The split browser SDK modules. The barrel at /workbench.mjs imports these by
+// exact relative path; each is served from public/ under the same strict
+// allowlist. The names are closed (never derived from req.url), so a path like
+// /workbench-client-../../etc/passwd cannot resolve to an arbitrary file.
+const CLIENT_SDK_SPLIT_FILES = Object.freeze([
+  'workbench-client-annotated-http-ops-1.mjs',
+  'workbench-client-annotated-http-ops-2.mjs',
+  'workbench-client-annotated-http-ops-3.mjs',
+  'workbench-client-annotated-http.mjs',
+  'workbench-client-auth.mjs',
+  'workbench-client-core.mjs',
+  'workbench-client-delivery-http.mjs',
+  'workbench-client-delivery-ops-1.mjs',
+  'workbench-client-delivery-ops-2.mjs',
+  'workbench-client-delivery-ops-3.mjs',
+  'workbench-client-delivery-ops-4.mjs',
+  'workbench-client-delivery-ops-5.mjs',
+  'workbench-client-delivery.mjs',
+  'workbench-client-errors.mjs',
+  'workbench-client-live-channel.mjs',
+  'workbench-client-live-list-methods-1.mjs',
+  'workbench-client-live-list-methods-2.mjs',
+  'workbench-client-live-list.mjs',
+  'workbench-client-live-store-ops-1.mjs',
+  'workbench-client-live-store-ops-2.mjs',
+  'workbench-client-live-store-ops-3.mjs',
+  'workbench-client-live-store.mjs',
+  'workbench-client-live-sync-methods.mjs',
+  'workbench-client-live-sync.mjs',
+  'workbench-client-replica.mjs',
+  'workbench-client-scope-store.mjs',
+]);
+const CLIENT_SDK_SPLIT_PATHS = new Map(
+  CLIENT_SDK_SPLIT_FILES.map((file) => [`/${file}`, join(root, 'public', file)]),
+);
+
 export function handleClientSdkRoute(
   app: FrameworkApp | null | undefined,
   req: FrameworkRequest,
@@ -96,6 +132,14 @@ export function handleClientSdkRoute(
   if (url.pathname === '/workbench-ui-bindings.mjs') {
     if (!app || !app.db) return false;
     const body = readFileSync(UI_BINDINGS_SDK_PATH);
+    res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'content-length': Buffer.byteLength(body) });
+    res.end(body);
+    return true;
+  }
+  const splitPath = CLIENT_SDK_SPLIT_PATHS.get(url.pathname);
+  if (splitPath !== undefined) {
+    if (!app || !app.db) return false;
+    const body = readFileSync(splitPath);
     res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'content-length': Buffer.byteLength(body) });
     res.end(body);
     return true;

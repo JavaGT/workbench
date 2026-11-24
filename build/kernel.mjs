@@ -41,6 +41,32 @@ import { validateProtectedArtefactsDeclaration } from './protected-artefact-stor
 // can resolve them + their `admitsEffects`.
 const FRAMEWORK_ENTITIES = [User, Session, Inbox, Credential, Invitation, ApiKey, TwoFactor];
 
+// A registered action's emitted events carry the DECLARING action type on an
+// enumerable symbol. Object spread (pipeline's eventWithHandle / finalizeEvents)
+// preserves enumerable own symbols, so the marker survives intact to both
+// durable admission gates. Generated CRUD events never carry it. The bypass is
+// therefore keyed on registered-action provenance AND the declared event.type:
+// a generated CRUD event can no longer borrow the bypass merely because some
+// registered action happens to declare a projection on the same event.type.
+const REGISTERED_ACTION_EVENT                = Symbol('workbench.registered-action-event');
+
+function tagRegisteredActionEvents(commit     , actionType        )      {
+  if (!commit || typeof commit !== 'object') return commit;
+  const tag = (event     ) => {
+    if (!event || typeof event !== 'object') return event;
+    // Events may be frozen (compiled helpers); a shallow copy with an
+    // enumerable symbol keeps every existing field and handle untouched.
+    const tagged = { ...event };
+    Object.defineProperty(tagged, REGISTERED_ACTION_EVENT, {
+      value: actionType, enumerable: true, configurable: true, writable: false,
+    });
+    return tagged;
+  };
+  if (Array.isArray(commit)) return commit.map(tag);
+  if (Array.isArray(commit.events)) return { ...commit, events: commit.events.map(tag) };
+  return commit;
+}
+
 /**
  * Attach the handler's capability record as one typed policy under HANDLER_POLICY.
  * The pipeline reads that symbol through readHandlerPolicy; the own-property
@@ -109,9 +135,12 @@ function collectAppEntities(app     ) {
     // Pending-blob claim validation, attestation scanning, and canonical
     // metadata rewriting belong to the module that owns the blob seam
     // (pending-blob.ts) — kernel stays a thin assembler.
-    const handler = async (context     ) => runDeclaredActionWithBlobClaims({
-      declaration, context, lifecycle: app.pendingBlobLifecycle,
-    });
+    const handler = async (context     ) => {
+      const commit = await runDeclaredActionWithBlobClaims({
+        declaration, context, lifecycle: app.pendingBlobLifecycle,
+      });
+      return tagRegisteredActionEvents(commit, declaration.type);
+    };
     if (composedAnnotated != null) compoundPolicies.push(composedAnnotated.contributionPolicy);
     // An action wrapped by `atomicOperation(...)` (S3/A6) carries its
     // in-transaction read + resolution registration on the raw handler. The
@@ -199,10 +228,20 @@ function buildDurableAdmission(app     , annotatedKernel     ) {
     entities: app.entities ?? new Map(),
     registration: app._annotatedTextAdmission,
   });
-  const registeredEventTypes = new Set(
+  // The bypass is keyed on the event type AND on provenance: the event must
+  // have come from a registered action (its handler stamped the action type on
+  // the event), not from generated CRUD that happens to emit the same event
+  // type. Any registered action may emit a shared event type that another
+  // registered action declares a projection on; generated CRUD may never borrow
+  // that bypass, so Doc.create / Doc.remove keep their full admission gates.
+  const registeredEventTypes = new Set        (
     (app.actions ?? []).flatMap((action     ) =>
       (action.projections ?? []).flatMap((projection     ) => projection.eventTypes ?? [])),
   );
+  function isRegisteredActionProjectionEvent(event     )          {
+    return typeof event?.[REGISTERED_ACTION_EVENT] === 'string'
+      && registeredEventTypes.has(event?.type);
+  }
   function admissionRowId(event     ) {
     // Native field events are scoped to their parent row as `owner`; lifecycle
     // events use their entity row `id` (and may independently declare an owner
@@ -238,7 +277,7 @@ function buildDurableAdmission(app     , annotatedKernel     ) {
   return {
     ...(annotatedMutation === null ? {} : { annotatedMutation }),
     async beforeProjection({ entityName, verb, principal, event, payload, db: hookDb, now }     ) {
-      if (registeredEventTypes.has(event?.type)) return true;
+      if (isRegisteredActionProjectionEvent(event)) return true;
       if (event?.[CASCADE_PREAUTHORIZED]) return true;
       if (admitInvitationAcceptance({ event, principal })) return true;
       if (
@@ -280,12 +319,13 @@ function buildDurableAdmission(app     , annotatedKernel     ) {
       if (verb === 'update' || verb === 'remove') {
         // The generated CRUD handler's own proposed-transition admission
         // (admitRowTransition) is the ONE governing gate for these events: it
-        // evaluates BOTH the current row and the proposed after-row through the
-        // injected adapter (app._authorization) exactly once. This durable gate
-        // must not re-admit the current row through the adapter on top of that —
-        // a duplicate consultation that could contradict the handler's decision.
-        // With no adapter injected the framework row-grant default still runs
-        // here, unchanged (defense in depth over the same framework engine).
+        // evaluates the target row through the injected adapter
+        // (app._authorization) on update AND remove, on /action, /batch, and
+        // REST CRUD alike. This durable gate must not re-admit the current row
+        // through the adapter on top of that — a duplicate consultation that
+        // could contradict the handler's decision. With no adapter injected
+        // the framework row-grant default still runs here, unchanged
+        // (defense in depth over the same framework engine).
         const durableAdmission = app._authorization
           ? true
           : await admitsExistingRow({ entityName, verb, principal, event });
@@ -304,7 +344,7 @@ function buildDurableAdmission(app     , annotatedKernel     ) {
       return annotatedKernel.admitProject({ entityName, verb, principal, event }, app);
     },
     async afterProjection({ entityName, verb, principal, event, db: hookDb }     ) {
-      if (registeredEventTypes.has(event?.type)) return true;
+      if (isRegisteredActionProjectionEvent(event)) return true;
       if (
         entityName === Invitation.name
         && verb === 'create'
@@ -547,8 +587,11 @@ export function buildKernel(app     ) {
       const declaration = registeredActions.get(context.type);
       if (!declaration) {
         const [entityName, verb] = String(context.type).split('.');
-        const entity = (verb === 'update' || verb === 'create') ? app.entities?.get(entityName) : null;
-        if (!entity || (verb === 'update' && !entity.conditionalHistory) || (verb === 'create' && !entity.conditionalCreateHistory)) return true;
+        const entity = (verb === 'update' || verb === 'create' || verb === 'remove') ? app.entities?.get(entityName) : null;
+        if (!entity
+          || (verb === 'update' && !entity.conditionalHistory)
+          || (verb === 'create' && !entity.conditionalCreateHistory)
+          || (verb === 'remove' && !entity.conditionalCreateHistory)) return true;
         const id = context.payload?.id;
         if (typeof id !== 'string' || id.length === 0) return false;
         const stored = rawRow(app.db, entity.name, id)
@@ -568,6 +611,13 @@ export function buildKernel(app     ) {
         // transition admission, so its deletion-anchor admission is rerouted
         // through the same adapter-aware seam instead.
         if (verb === 'update') return true;
+        if (verb === 'remove' && !app._authorization) {
+          // The generated remove handler is the one gate for framework-default
+          // admission. A HISTORY undo of a create has no handler-side transition
+          // admission, so consult the injected adapter here when one exists;
+          // without one, defer to the handler as before.
+          return true;
+        }
         return admitRowTransition({
           entity,
           verb: 'remove',
@@ -605,7 +655,13 @@ export function buildKernel(app     ) {
       blobAdapter: blobAdapter       ,
       effectsRegistry: effectsRegistry.size > 0 ? effectsRegistry : null,
       executeEffectsForEvent,
-      postCommitConsumers: postCommitConsumerDescriptors.map((d) => d.consumer),
+      postCommitConsumers: [
+        // A job enqueued inside the dispatch transaction buffers its live wake
+        // until the outer commit. Release it here, on the post-commit lane,
+        // before the normal consumers run (the kernel owns the commit boundary).
+        () => { (app.jobs                                                     )?.flushEvents?.(); },
+        ...postCommitConsumerDescriptors.map((d) => d.consumer),
+      ],
       onConsumerError: app.onConsumerError,
       // Composite journal routing (#122): compiled patch plans from the
       // attached live delivery. Undefined when no snapshots are declared —

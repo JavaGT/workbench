@@ -25,7 +25,6 @@ import { fieldKindContribution, resolveFieldKindEventScope } from '../strategy/i
 // Arms the field-kind registry for standalone CRUD/dispatch entry points.
 import '../annotated-text-field.mjs';
 import { CASCADE_DESCENDANT, CASCADE_PREAUTHORIZED } from './removal-cascade.mjs';
-import { admitRow } from '../row-grant.mjs';
 import { admitRowTransition } from '../field-admission.mjs';
 import { admitsInvitationRemoval, admitInvitationAcceptance } from '../auth/invitation-acceptance-authority.mjs';
 import { rawRow } from './query.mjs';
@@ -82,6 +81,19 @@ export function materializeCreateDefaults(record     , payload     ) {
     }
   }
   return data;
+}
+
+// The ONE admission gate for a generated remove. `admitRowTransition` evaluates
+// the target row through the injected authorization adapter when one was wired
+// into the dispatch context (`authorization`), and through the framework row
+// grant otherwise — the same seam the generated update handler uses. Previously
+// this path called `admitRow` directly, which could only see the framework grant:
+// an injected adapter that denied 'remove' was never consulted on /action,
+// /batch, or REST CRUD. Invitation removal keeps its narrow acceptance authority.
+async function admitGeneratedRemoval(record     , row     , id         , principal     , authorization     )                   {
+  if (!row) return false;
+  if (record.name === 'Invitation' && admitsInvitationRemoval(principal, id)) return true;
+  return admitRowTransition({ entity: record, verb: 'remove', before: row, principal, authorization });
 }
 
 export function createCrudHandlers({ record, sideTableStrategyEntries, conditionalHistory = false, conditionalCreateHistory = false }
@@ -321,7 +333,7 @@ export function createCrudHandlers({ record, sideTableStrategyEntries, condition
       }
       return result;
     },
-    [`${name}.remove`]: async ({ payload, principal, db, history, scope }     ) => {
+    [`${name}.remove`]: async ({ payload, principal, db, history, scope, authorization }     ) => {
       if (!payload.id) throw Object.assign(new Error('remove requires an id'), { status: 400 });
       if (history) {
         if (!conditionalCreateHistory || history.operation !== 'undo' || !history.input || Object.keys(history.input).length !== 2) throw new ValidationError(`${name}.remove history input is invalid`);
@@ -337,6 +349,14 @@ export function createCrudHandlers({ record, sideTableStrategyEntries, condition
         return { events: [{ handle: verbs.removed.handle, type: verbs.removed.type, scope: resolveGeneratedEventScope(record, { id: payload.id, row: current, payload: history.input.expected, scope }), data: { id: payload.id } }], privateFact: { before: history.input.expected, after: null } };
       }
       if (record.removalCascade) {
+        // The cascade's own descendants are pre-authorized for the row-grant
+        // engine. The ROOT is still a generated remove: consult the injected
+        // adapter here so an adapter that denies 'remove' denies a cascading
+        // removal too, on every dispatch path.
+        const rootRow = rawRow(db, name, payload.id);
+        if (!(await admitGeneratedRemoval(record, rootRow, payload.id, principal, authorization))) {
+          throw Object.assign(new Error('forbidden'), { status: 403 });
+        }
         return record.removalCascade(payload.id, principal, db)
           .then((rows     ) => {
             const events = rows.map(({ entity, id }     , index        ) => ({
@@ -352,9 +372,10 @@ export function createCrudHandlers({ record, sideTableStrategyEntries, condition
       }
       // A conditional remove reads its private preimage below, so authorize the
       // target row first rather than allowing that read to precede admission.
+      // The proposed-transition seam (with the app's injected adapter) is the
+      // one governing gate for every generated remove.
       const admissionRow = rawRow(db, name, payload.id);
-      if (!admissionRow || (!(await admitRow({ kind: 'verb', entity: record, row: admissionRow, principal, verb: 'remove' }))
-        && !(record.name === 'Invitation' && admitsInvitationRemoval(principal, payload.id)))) {
+      if (!(await admitGeneratedRemoval(record, admissionRow, payload.id, principal, authorization))) {
         throw Object.assign(new Error('forbidden'), { status: 403 });
       }
       const events = [{

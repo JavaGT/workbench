@@ -1,11 +1,11 @@
 // Framework-owned job-queue endpoints (worker bearer is its own wire
 // credential; worker identity is still a typed machine principal).
 
-import { BodyError, readRequestBody } from './http-body.mjs';
+import { readRequestBody } from './http-body.mjs';
 import { sendJson,                       } from './http-response.mjs';
 import { machinePrincipal, machineAllows,                       } from './machine-principal.mjs';
 import { execute } from './operation.mjs';
-import {                                           reject } from './http-routes-shared.mjs';
+import {                                           readJsonObjectBody, reject } from './http-routes-shared.mjs';
 
 // An authenticated worker runs as a typed machine principal — the same
 // attributable identity shape the schedule clock and the in-process job seam
@@ -21,6 +21,11 @@ export function workerMachinePrincipal(
   if (!bearer) return null;
   const workerId = jobs.authenticate(bearer);
   if (typeof workerId !== 'string' || workerId.length === 0) return null;
+  // Every authenticated worker request is also a liveness signal. Touch the
+  // worker BEFORE minting its principal: an idle poller that only ever gets 204
+  // from /jobs/claim must never be revoked by the reaper. The optional seam
+  // keeps fake/short jobs stubs in direct unit tests working unchanged.
+  (jobs                                               ).touchWorker?.(workerId);
   const worker = machinePrincipal({ id: workerId, operations: WORKER_OPERATIONS });
   // The typed principal authorizes the worker dispatch through the same closed
   // operation vocabulary; a non-machine identity never reaches the job seam.
@@ -48,14 +53,22 @@ export async function handleJobRoute(
   const bearer = (req.headers.authorization ?? '').replace(/^Bearer\s+/i, '').trim() || null;
 
   if (url.pathname === '/workers/register') {
-    let body         ;
-    try { body = await readRequestBody(req, { jsonOnly: true }); } catch (err) {
-      if (err instanceof BodyError) { reject(res, err.status, err.message); return true; }
-      throw err;
-    }
-    const w = jobs.registerWorker((body                        ).secret);
+    const body = await readJsonObjectBody(req, res);
+    if (body === null) return true;
+    const w = jobs.registerWorker(body.secret);
     if (!w) { reject(res, 401, 'invalid shared secret'); return true; }
     sendJson(res, 200, w);
+    return true;
+  }
+
+  // Explicit liveness ping for an idle worker. Authentication itself already
+  // refreshes _Worker.lastHeartbeat, so every authenticated route keeps an idle
+  // poller alive; this route gives workers a cheap, intent-revealing way to do
+  // it without polling for a job they do not want yet.
+  if (url.pathname === '/workers/heartbeat') {
+    const worker = workerMachinePrincipal(bearer, jobs);
+    if (!worker) { reject(res, 401, 'unauthorized'); return true; }
+    sendJson(res, 200, { ok: true });
     return true;
   }
 
@@ -63,16 +76,8 @@ export async function handleJobRoute(
     const worker = workerMachinePrincipal(bearer, jobs);
     if (!worker) { reject(res, 401, 'unauthorized'); return true; }
     const workerId = worker.id;
-    let body         ;
-    try { body = await readRequestBody(req, { jsonOnly: true }); } catch (err) {
-      if (err instanceof BodyError) { reject(res, err.status, err.message); return true; }
-      throw err;
-    }
-    if (body != null && (typeof body !== 'object' || Array.isArray(body))) {
-      reject(res, 400, 'request body must be a JSON object');
-      return true;
-    }
-    const bodyRecord = (body ?? {})                                       ;
+    const bodyRecord = await readJsonObjectBody(req, res);
+    if (bodyRecord === null) return true;
     if (bodyRecord.kind != null && typeof bodyRecord.kind !== 'string') {
       reject(res, 400, 'kind must be a string');
       return true;
@@ -88,7 +93,15 @@ export async function handleJobRoute(
     const claimOpts = kind !== undefined || scope !== undefined
       ? { ...(kind !== undefined ? { kind } : {}), ...(scope !== undefined ? { scope } : {}) }
       : undefined;
-    const job = await jobs.claim(workerId, claimOpts);
+    // Present the worker's typed machine principal so claim() enforces the
+    // job's durable attribution: a worker can never claim work attributed to
+    // a different machine principal.
+    // The shared FrameworkJobs surface predates attribution-aware claim; the
+    // runtime queue accepts this option. Widen at the one call site that owns
+    // the worker principal instead of editing a seam outside this lane.
+    const job = await (jobs
+
+     ).claim(workerId, { ...(claimOpts ?? {}), principal: worker });
     if (!job) { res.writeHead(204); res.end(); return true; } // no queued work
     sendJson(res, 200, job);
     return true;
@@ -110,13 +123,9 @@ export async function handleJobRoute(
     const worker = workerMachinePrincipal(bearer, jobs);
     if (!worker) { reject(res, 401, 'unauthorized'); return true; }
     const workerId = worker.id;
-    let body         ;
-    try { body = await readRequestBody(req, { jsonOnly: true }); } catch (err) {
-      if (err instanceof BodyError) { reject(res, err.status, err.message); return true; }
-      throw err;
-    }
-    const bodyRecord = body                                           ;
-    const updated = await jobs.updateProgress({ jobId: pg[1], workerId, progress: bodyRecord.progress, stage: bodyRecord.stage });
+    const bodyRecord = await readJsonObjectBody(req, res);
+    if (bodyRecord === null) return true;
+    const updated = await jobs.updateProgress({ jobId: pg[1], workerId, progress: bodyRecord.progress, stage: bodyRecord.stage                       });
     if (!updated) { reject(res, 403, 'not the owning worker or job not in progress'); return true; }
     const progress = updated                                                                           ;
     sendJson(res, 200, { id: progress.id, progress: progress.progress, stage: progress.stage, status: progress.status });
@@ -128,11 +137,8 @@ export async function handleJobRoute(
     const worker = workerMachinePrincipal(bearer, jobs);
     if (!worker) { reject(res, 401, 'unauthorized'); return true; }
     const workerId = worker.id;
-    let body         ;
-    try { body = await readRequestBody(req, { jsonOnly: true }); } catch (err) {
-      if (err instanceof BodyError) { reject(res, err.status, err.message); return true; }
-      throw err;
-    }
+    const body = await readJsonObjectBody(req, res);
+    if (body === null) return true;
     let result                                          ;
     try { result = await jobs.submitResult(rs[1], workerId, body)                                            ; }
     catch (err) { reject(res, 400, (err         ).message); return true; }
@@ -146,6 +152,17 @@ export async function handleJobRoute(
     const worker = workerMachinePrincipal(bearer, jobs);
     if (!worker) { reject(res, 401, 'unauthorized'); return true; }
     const workerId = worker.id;
+    // cancel has no body fields. Older workers (and fetch's default for a
+    // string body) send `{}` as text/plain; drain that as an empty body. An
+    // explicit JSON body still goes through readJsonObjectBody's strict guard,
+    // so a JSON null/primitive is a 400 rather than a 500 TypeError.
+    const contentType = String(req.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase();
+    if (contentType !== '' && contentType !== 'application/json') {
+      try { await readRequestBody(req, { jsonOnly: false }); } catch { /* no fields needed */ }
+    } else {
+      const body = await readJsonObjectBody(req, res);
+      if (body === null) return true;
+    }
     const cancelled = await jobs.cancelJob({ jobId: cn[1], workerId })                                                                                                  ;
     if (!cancelled) { reject(res, 404, 'job not found'); return true; }
     if (cancelled.forbidden) { reject(res, 403, 'not the owning worker'); return true; }

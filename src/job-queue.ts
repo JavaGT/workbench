@@ -277,6 +277,9 @@ export function createJobQueue({
   // standalone queue runs synchronously. The result is the body's value, or a
   // Promise of it when coordinated — `await` flattens both uniformly.
   function coordinated<T>(fn: () => T): T | Promise<T> {
+    // If an earlier caller-owned transaction has since committed, release its
+    // buffered job events before starting this turn. No DB writes happen here.
+    flushEvents();
     return writeQueue ? writeQueue.run(fn) : fn();
   }
 
@@ -284,6 +287,14 @@ export function createJobQueue({
 
   const listeners: Listener[] = [];
   let pendingEvents: JobEvent[] | null = null;
+  // Events emitted while the CALLER owns the outer transaction. runInTxn joins
+  // that transaction, so we cannot know when it commits from inside emit();
+  // notifying there would deliver a phantom job event for a write that may yet
+  // roll back. They are buffered here and released only once the handle is no
+  // longer in a transaction AND their _Log row is still present (a rollback
+  // removed it). `flushEvents()` does that release and is called opportunistically
+  // by each entry point and by the kernel's post-commit lane.
+  let deferredOuterEvents: JobEvent[] = [];
 
   function onEvent(fn: Listener): () => void {
     listeners.push(fn);
@@ -299,6 +310,24 @@ export function createJobQueue({
         try { fn(event); } catch { /* per-listener isolation */ }
       }
     }
+  }
+
+  // Release caller-owned-transaction events once the outer transaction has
+  // ended. Only events whose durable _Log row still exists are delivered: a
+  // rolled-back outer transaction removed that row, so notifying for it would
+  // be a phantom live-visibility signal. Returns the number delivered.
+  function flushEvents(): number {
+    if (isInTransaction(db) || pendingEvents !== null || deferredOuterEvents.length === 0) return 0;
+    const buffered = deferredOuterEvents;
+    deferredOuterEvents = [];
+    const committed = buffered.filter((event) => {
+      if (event.scope == null) return false;
+      return Boolean(db.prepare(
+        'SELECT 1 FROM _Log WHERE scope = ? AND seq = ? AND eventType = ?',
+      ).get(event.scope, event.seq, event.type));
+    });
+    if (committed.length > 0) notifyListeners(committed);
+    return committed.length;
   }
 
   // Wrap multi-statement _Job + _Cursor + _Log mutations in a synchronous
@@ -351,6 +380,12 @@ export function createJobQueue({
     appendEvents(db, [event as unknown as AppendedEvent]);
     if (pendingEvents !== null) {
       pendingEvents.push(event);
+      return;
+    }
+    if (isInTransaction(db)) {
+      // Caller-owned outer transaction: buffer until it commits. Never notify
+      // from here — the _Log row is not durable yet and may be rolled back.
+      deferredOuterEvents.push(event);
       return;
     }
     notifyListeners([event]);
@@ -447,6 +482,7 @@ export function createJobQueue({
   // Bearer authentication: `<workerId>.<token>`. Look up the worker by PK (not a
   // timing oracle), reject if unknown or revoked, then constant-time compare
   // sha256(token) to the stored hash. Returns the workerId or null.
+  //
   function authenticate(bearer: string): string | null {
     if (typeof bearer !== 'string') return null;
     const dot = bearer.indexOf('.');
@@ -457,6 +493,19 @@ export function createJobQueue({
     if (!row || row.revoked) return null;
     if (!ctEqualHex(sha256hex(token), String(row.tokenHash))) return null;
     return workerId;
+  }
+
+  // Liveness (idle-worker fix): EVERY authenticated worker REQUEST refreshes
+  // `_Worker.lastHeartbeat` — not just a job heartbeat. An idle transcription
+  // worker polling /jobs/claim (which returns 204 with no work) is still alive,
+  // and the reaper must never revoke it heartbeatGraceMs after registration.
+  // The transport calls this on the workerId it just authenticated, so a forged
+  // bearer can never refresh anything. A single-statement UPDATE like
+  // registerWorker's INSERT, with no lifecycle semantics (and inside the
+  // claim() turn, no extra statement is needed because claim() touches too).
+  function touchWorker(workerId: string): boolean {
+    if (typeof workerId !== 'string' || workerId.length === 0) return false;
+    return db.prepare('UPDATE _Worker SET lastHeartbeat = ? WHERE id = ? AND revoked = 0').run(now(), workerId).changes > 0;
   }
 
   // Enqueue a job. A post-commit consumer (or an imperative handler) calls this;
@@ -510,13 +559,32 @@ export function createJobQueue({
   // claimed/running (counted across scopes and handles), while uncapped or
   // under-cap kinds remain claimable. Ties on `enqueuedAt` break deterministically
   // by `rowid ASC`. Returns the claimed job (status 'claimed', leaseUntil set) or null.
-  function claim(workerId: string, { kind, scope }: { kind?: string; scope?: string } = {}): JobRow | null | Promise<JobRow | null> {
+  function claim(workerId: string, { kind, scope, principal }: { kind?: string; scope?: string; principal?: MachinePrincipal } = {}): JobRow | null | Promise<JobRow | null> {
+    if (principal != null && !isMachinePrincipal(principal)) {
+      throw new Error('claim: principal must be an attributable machine principal — a raw system or human principal is never a job attribution');
+    }
     return coordinated(() => runInTxn(() => {
       const t = now();
+      // An authenticated worker polling for work is alive. Touch its liveness
+      // inside the claim turn (direct queue API use has no authenticate() call);
+      // in-process workers have no _Worker row so the UPDATE affects zero rows.
+      db.prepare('UPDATE _Worker SET lastHeartbeat = ? WHERE id = ?').run(t, workerId);
       const clauses = ['candidate.status = ?', '(candidate.availableAt IS NULL OR candidate.availableAt <= ?)'];
       const params: (string | number)[] = [STATES.QUEUED, t];
       if (kind != null) { clauses.push('candidate.kind = ?'); params.push(kind); }
       if (scope != null) { clauses.push('candidate.scope = ?'); params.push(scope); }
+      // Job attribution enforcement (when a worker principal is presented):
+      // a queued job attributed to a DIFFERENT machine principal is never
+      // claimable. Unattributed jobs (both durable columns NULL) stay claimable
+      // by anyone, preserving the pre-attribution default. Matching on BOTH the
+      // canonical principalKey and its normalized allowlist means a rotated or
+      // widened identity cannot inherit another principal's attributed work.
+      if (principal) {
+        clauses.push('(candidate.principalKey IS NULL OR (candidate.principalKey = ? AND candidate.operations = ?))');
+        // A machine principal always has a closed type + non-empty id, so the
+        // canonical key is non-null here (isMachinePrincipal already proved it).
+        params.push(principalKeyOf(principal)!, JSON.stringify(principal.attributes.operations));
+      }
       const where = clauses.join(' AND ');
 
       // Enforce per-kind concurrency cap inside the same UPDATE…RETURNING
@@ -987,5 +1055,5 @@ export function createJobQueue({
     return { once, stop, workerId };
   }
 
-  return { registerWorker, authenticate, enqueue, claim, heartbeat, submitResult, updateProgress, cancelJob, reap, startReaper, stop, work, onEvent, list };
+  return { registerWorker, authenticate, touchWorker, enqueue, claim, heartbeat, submitResult, updateProgress, cancelJob, reap, startReaper, stop, work, onEvent, flushEvents, list };
 }

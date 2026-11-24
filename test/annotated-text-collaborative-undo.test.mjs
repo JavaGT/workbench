@@ -255,7 +255,7 @@ test('Alice undoes her own insertion after Bob edits elsewhere; Bob remains and 
 
   // No eligible annotated-text action ever stores a whole document-table image:
   // the contribution fact is the narrow v2 schema, and the operated event is the
-  // exact v13 key set (no `tables`, no snapshot) that the fold seam requires.
+  // exact v14 key set (no `tables`, no snapshot) that the fold seam requires.
   const original = JSON.parse(c.db.prepare("SELECT fact FROM _PrivateActionFact WHERE actionId = 'alice-insert'").get().fact);
   assert.equal(original.kind, 'annotated-text.contribution');
   assert.deepEqual(Object.keys(original).sort(), ['contribution', 'documentId', 'kind', 'version']);

@@ -50,8 +50,7 @@ import { createResponseFacade } from './http-response-factory.mjs';
 import { dispatchCrud } from './http-crud-dispatch.mjs';
 import { failure } from './outcome.mjs';
 import { sendFailure,               } from './http-failure.mjs';
-import { handleResyncRoute, handleBlobUploadRoute, handleBlobReadRoute, handleJobRoute, handleClientSdkRoute, handleQueryRoute, handleQueryFamilyRoute, handleSearchRoute, handleQueryInvalidationRoute, ensureQueryInvalidationHub } from './http-framework-routes.mjs';
-import { createQueryInvalidationConsumer } from './query-scoped-read.mjs';
+import { handleResyncRoute, handleBlobUploadRoute, handleBlobReadRoute, handleJobRoute, handleClientSdkRoute, handleQueryRoute, handleQueryFamilyRoute, handleSearchRoute, handleQueryInvalidationRoute } from './http-framework-routes.mjs';
 import { handleApplicationActionHttp } from './application-action-http.mjs';
 
 // sendJson's strict Http response param is wider than the transport's loose
@@ -716,33 +715,6 @@ export function listen(app     , port     , optionsOrCallback      = {}) {
   // accepted at the first possible instant observes the boot barrier.
   app.start();
 
-  // Query invalidation is a read-side post-commit signal: create the one hub
-  // per app here (so /queries/* works without app-side wiring) and attach its
-  // consumer once the kernel exists. The kernel currently hard-codes its
-  // consumer descriptors, so a transport-side observer is the cleanest wiring
-  // available inside this lane; Wave 2 should add a one-line 'query-invalidation'
-  // descriptor in kernel.ts and retire this adapter. Observing committed events
-  // never changes the write path: a consumer failure is isolated by the hub.
-  if (app.db) {
-    const hub = ensureQueryInvalidationHub(app);
-    const notice = createQueryInvalidationConsumer(hub, app.db);
-    Promise.resolve(app.ready).then(() => {
-      const kernel = app.kernel;
-      if (!kernel || (kernel       )._queryInvalidationAttached) return;
-      (kernel       )._queryInvalidationAttached = true;
-      for (const method of ['dispatch', 'dispatchBatch']         ) {
-        const original = kernel[method];
-        if (typeof original !== 'function') continue;
-        (kernel       )[method] = async function queryInvalidationDispatch(request     ) {
-          const result = await original.call(kernel, request);
-          if (result?.ok && Array.isArray(result.events) && result.events.length > 0) {
-            await notice(result.events);
-          }
-          return result;
-        };
-      }
-    }).catch(() => {});
-  }
   try {
     // Bun may report an invalid numeric port asynchronously. Keep the
     // synchronous argument-error contract on both supported runtimes.

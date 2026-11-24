@@ -61,6 +61,7 @@ import { retentionMs } from './blob-retention.mjs';
 import { createRecycleManager, recycleManagerBinSeam } from './backup/recycle.mjs';
 import { createJobQueue } from './job-queue.mjs';
 import { createSearchPluginRegistry,                   } from './search-plugin.mjs';
+import { ensureQueryInvalidationHub } from './http-framework-routes.mjs';
 import { createQueryFamilyRegistry,                          } from './query-family.mjs';
 import { createSearchOwnedIndexCapability } from './index-capability.mjs';
 import { createSearchStalenessBridge } from './search-staleness.mjs';
@@ -601,6 +602,11 @@ export default function workbench({
       app.queryFamilies.register(declaration);
       return app;
     };
+    // Query invalidation is a read-side post-commit signal. Install the ONE hub
+    // during construction so buildKernel (startApplication) sees it and engages
+    // the single kernel consumer descriptor before any dispatch is possible.
+    // There is no transport-side dispatch observer to keep in sync.
+    ensureQueryInvalidationHub(app);
     // The search registry `POST /search` executes (#312). Defaults to the app's
     // own plugin registry — the same registry the search lifecycle binds and
     // materializes — so an app that registered plugins needs no extra wiring.

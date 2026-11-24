@@ -14,6 +14,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { DatabaseSync } from 'node:sqlite';
 
 import workbench from '../build/app.mjs';
 import {
@@ -48,8 +49,8 @@ const SQLITE_AUTHORIZER = typeof globalThis.Bun === 'undefined'
 // Boot a real listening app whose principal is injected from the `x-test-user`
 // request header (absent → anonymous, fail closed). Every route runs through the
 // same admission collapse and authorization engine as production.
-async function bootApp(t, { entities = [], setup, authorization } = {}) {
-  const app = workbench({ db: ':memory:', entities });
+async function bootApp(t, { db = ':memory:', entities = [], setup, authorization } = {}) {
+  const app = workbench({ db, entities });
   if (setup) setup(app);
   app.listen(0, {
     principalOf: (req) => {
@@ -87,8 +88,8 @@ async function postJson(origin, path, body, user) {
 // every entity row, delegating every other category to the framework default.
 // `calls` proves the injected instance was actually consulted by the route —
 // a bypassed route would leave it empty.
-function denyingAuthorizationAdapter({ denyPrincipal = false, denyEntity = false } = {}) {
-  const inner = createAuthorizationAdapter();
+function denyingAuthorizationAdapter({ denyPrincipal = false, denyEntity = false, db } = {}) {
+  const inner = createAuthorizationAdapter(db ? { db } : {});
   const calls = [];
   const denied = (input, reasonCode) => ({
     admitted: false,
@@ -408,13 +409,21 @@ function searchNoteEntity() {
   });
 }
 
-async function bootSearchServer(t, authorization) {
+async function bootSearchServer(t, authorization, db = new DatabaseSync(':memory:')) {
   const Note = searchNoteEntity();
-  const adapter = createAuthorizationAdapter();
+  // Wave 1 tightened resource-scope admission: with no database handle a
+  // registered search scope fails closed, so a stand-alone adapter denies
+  // every hit. Use ONE DB-backed adapter for plugin admission and the app's
+  // route/row admission — the same engine REST and /query consult.
+  const adapter = authorization ?? createAuthorizationAdapter({ db });
   const admission = (pluginId) => {
     adapter.registerResource({
       category: 'search',
       name: pluginId,
+      // Bind the SQL table explicitly: the plugin id is not a SQL identifier,
+      // and Wave 1 fails closed when a resource scope cannot be evaluated in
+      // SQL (no implicit single-row fallback).
+      entity: Note,
       scope: ({ is }) => is.owner(),
       fields: { owner: ref('User', { role: 'owner' }) },
     });
@@ -442,8 +451,9 @@ async function bootSearchServer(t, authorization) {
     admission: admission('note-vec'),
   });
   const { app, origin } = await bootApp(t, {
+    db,
     entities: [Note],
-    authorization,
+    authorization: adapter,
     setup: (application) => {
       application.registerSearchPlugin(fts);
       application.registerSearchPlugin(vector);
@@ -586,16 +596,18 @@ test('injected adapter: /query and /query-families post-filter denied rows', asy
 });
 
 test('injected adapter: /search honors the principal route gate', { skip: SQLITE_AUTHORIZER }, async (t) => {
-  const denyGate = denyingAuthorizationAdapter({ denyPrincipal: true });
-  const search = await bootSearchServer(t, denyGate);
+  const db = new DatabaseSync(':memory:');
+  const denyGate = denyingAuthorizationAdapter({ denyPrincipal: true, db });
+  const search = await bootSearchServer(t, denyGate, db);
   const res = await postJson(search.origin, '/search', { mode: 'fts', index: 'note-fts', query: 'coastal' }, 'alice');
   assert.equal(res.status, 401);
   assert.ok(denyGate.calls.some((call) => call.category === 'principal'), 'route gate ran through the injected adapter');
 });
 
 test('injected adapter: /search post-filters denied hits (FTS and hybrid)', { skip: SQLITE_AUTHORIZER }, async (t) => {
-  const denyRows = denyingAuthorizationAdapter({ denyEntity: true });
-  const search = await bootSearchServer(t, denyRows);
+  const db = new DatabaseSync(':memory:');
+  const denyRows = denyingAuthorizationAdapter({ denyEntity: true, db });
+  const search = await bootSearchServer(t, denyRows, db);
 
   const fts = await postJson(search.origin, '/search', {
     mode: 'fts', index: 'note-fts', query: 'coastal', scopeId: 'proj-a', limit: 10,

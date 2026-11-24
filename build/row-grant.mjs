@@ -75,6 +75,19 @@ const GRANT_CLAUSES_CACHE = new WeakMap                                         
 
 
 
+// A declaration may resolve to a bare, already-decided `grant(...)`/`deny(...)`
+// object instead of a clause array (`grant: () => grant(read, subscribe)`).
+// It is a complete capability opinion, not a scope and not an inherit directive.
+// Recognize it structurally but narrowly: a boolean `granted` plus an explicit
+// capability list for an admission, or `granted: false` with a denial reason.
+function bareGrantDecision(value         )                       {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const decision = value                                                 ;
+  if (typeof decision.granted !== 'boolean') return null;
+  if (decision.granted === true && !Array.isArray(decision.capabilities)) return null;
+  return value                 ;
+}
+
 // The runtime `.can` body on a clause — a function receiving `{ is, entity }`
 // and returning a grant()/deny() decision. The declaration-facing type of a
 // clause (scope.ts) types `.can` as the chaining builder; the RUNTIME clause's
@@ -204,6 +217,15 @@ export async function rowCapabilities(
   // Inherit directives were handled and returned above.
   const clauses = grantClauses(entityRecord);
   const is = makeIs(entityRecord, row, principal);
+  // A bare decision is honored EXACTLY: its granted flag and capability list
+  // are the whole authority. `grant(read, subscribe)` never implies write or
+  // admin, and a scope-only array is never silently inferred from it.
+  const bare = bareGrantDecision(clauses);
+  if (bare) {
+    return bare.granted
+      ? { granted: true, capabilities: bare.capabilities, is }
+      : { granted: false, capabilities: [], is };
+  }
   // A scope-only grant confers exactly the read-class capabilities. Keeping
   // this here (not just in mayRow) is what makes fieldCapabilities agree: a
   // field with no own `.can` strong-inherits these, so row reads and field
@@ -380,7 +402,11 @@ function grantClauses(entityRecord              )          {
 
 export function hasOwnCanGrant(entityRecord              )          {
   const grant = grantClauses(entityRecord);
-  return Array.isArray(grant) && grant.some((c) => isRuntimeGrantClause(c));
+  // A bare decision carries its own capability opinion (even a denial), so an
+  // inherit-child refinement must treat it as authority it may narrow, never
+  // as a scope-only parent with no opinion of its own.
+  return bareGrantDecision(grant) !== null
+    || (Array.isArray(grant) && grant.some((c) => isRuntimeGrantClause(c)));
 }
 
 export function inheritedGrant(entityRecord              )                          {
@@ -468,6 +494,14 @@ export async function mayRow(
 )                   {
   try {
     if (entityRecord.grant == null) return false;
+    // A bare `grant(...)`/`deny(...)` decision is already resolved: apply its
+    // exact capability list to this verb directly, even when a caller injects
+    // its own mayVerb — the capability tokens are the one authority.
+    const bare = bareGrantDecision(grantClauses(entityRecord));
+    if (bare) {
+      const required = VERB_CAPABILITY[verb];
+      return bare.granted === true && required !== undefined && bare.capabilities.includes(required);
+    }
     const inherited = inheritedGrant(entityRecord);
     if (inherited) {
       const parentRow = inheritedParentRow(entityRecord, row, principal);

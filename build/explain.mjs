@@ -69,9 +69,22 @@ import { isRuntimeGrantClause } from './scope.mjs';
 
 
 
+
+
 function grantClauses(entityRecord              )          {
   const grant = entityRecord.grant;
   return typeof grant === 'function' ? (grant                 )() : grant;
+}
+
+// A declaration may resolve to a bare grant()/deny() object rather than a
+// clause array. Recognize it narrowly and report its exact capability list —
+// never infer scope-only read-class capabilities from a bare decision.
+function bareGrantDecision(value         )                       {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const decision = value                                                 ;
+  if (typeof decision.granted !== 'boolean') return null;
+  if (decision.granted === true && !Array.isArray(decision.capabilities)) return null;
+  return value                 ;
 }
 
 function checksSource(entityRecord              )                             {
@@ -125,8 +138,19 @@ export async function explain({ entity, row, principal, verb, field }           
   let grantInfo           ;
   let scopeInfo                  ;
   const clauses = grantClauses(entity);
+  const bare = bareGrantDecision(clauses);
 
-  if (clauses && (clauses                    ).inherit) {
+  if (bare) {
+    // No scope or clause body runs for a bare decision: its flags ARE the
+    // decision. mayRow below applies the same list to the requested verb.
+    grantInfo = {
+      type: 'bare',
+      capabilities: bare.granted ? bare.capabilities.map((c) => c.capability) : [],
+      verbAdmitted: false,
+      verbRequired: null,
+    };
+    scopeInfo = null;
+  } else if (clauses && (clauses                    ).inherit) {
     grantInfo = {
       type: 'inherit',
       chain: { parentEntity: (clauses                    ).inherit.name, via: (clauses                    ).via },
@@ -158,7 +182,21 @@ export async function explain({ entity, row, principal, verb, field }           
 
   let admitted = false;
 
-  if (grantInfo.type === 'scope-only') {
+  if (grantInfo.type === 'bare') {
+    // Honor the decision's exact granted flag and capability list. mayRow
+    // applies that same list to the verb, so read+subscribe admits only those
+    // verbs and write/admin stay denied — one authority, no second engine.
+    try {
+      grantInfo.capabilities = bare .granted
+        ? bare .capabilities.map((c                        ) => c.capability)
+        : [];
+      grantInfo.verbAdmitted = await mayRow(entity, verb, row, principal);
+      grantInfo.verbRequired = verb;
+      admitted = grantInfo.verbAdmitted;
+    } catch {
+      admitted = false;
+    }
+  } else if (grantInfo.type === 'scope-only') {
     // Scope-only means row VISIBILITY, not an implicit CRUD grant. Report the
     // exact decision mayRow makes (Wave 1): list/read/subscribe are admitted,
     // create/update/remove/admin are denied. Both the capability list and the

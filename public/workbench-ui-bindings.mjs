@@ -21,16 +21,33 @@ const DEFAULT_CONNECTION_STATUS = 'disconnected';
  * id projects every row a UI actually subscribed to; without this registry it
  * would have to reach into the store's private list cache. Ids are ref-counted
  * so destroying one binding cannot evict an id another binding still uses.
+ *
+ * `lists` holds the LiveList used for an id, and `owned` records which of those
+ * lists a binding created. A binding never tears down a subscription the app
+ * made itself (e.g. with custom `{ fields }` / `{ pace }`).
  */
 const storeIndex = new WeakMap();
 
 function indexFor(store) {
   let index = storeIndex.get(store);
   if (!index) {
-    index = { ids: [], counts: new Map(), watchers: new Set() };
+    index = { ids: [], counts: new Map(), lists: new Map(), owned: new Set(), watchers: new Set() };
     storeIndex.set(store, index);
   }
   return index;
+}
+
+/** Stop the channel subscription and timers a binding created for this id. */
+function releaseList(store, id, list) {
+  if (typeof store?.release === 'function') {
+    store.release(id);
+  } else if (typeof store?.unsubscribe === 'function') {
+    void store.unsubscribe(id);
+  } else if (typeof list?.close === 'function') {
+    // A store without a release seam still gets its subscription stopped; the
+    // binding never leaves a LiveList polling on its own after the last owner.
+    void list.close();
+  }
 }
 
 function rememberId(store, id) {
@@ -45,19 +62,57 @@ function rememberId(store, id) {
   }
   return () => {
     const count = index.counts.get(key) ?? 0;
-    if (count <= 1) {
-      index.counts.delete(key);
-      index.ids = index.ids.filter((known) => String(known) !== key);
-      for (const watcher of index.watchers) watcher();
-    } else {
+    if (count > 1) {
       index.counts.set(key, count - 1);
+      return;
     }
+    // Release before notifying watchers: a throwing watcher must not strand a
+    // subscription or its retry timer.
+    index.counts.delete(key);
+    index.ids = index.ids.filter((known) => String(known) !== key);
+    const list = index.lists.get(key);
+    const owned = index.owned.has(key);
+    index.lists.delete(key);
+    index.owned.delete(key);
+    if (owned && list) releaseList(store, id, list);
+    for (const watcher of index.watchers) watcher();
   };
 }
 
+/**
+ * The LiveList for `id`, reusing an existing one. Calling `subscribe(id)` with
+ * empty options on a row the app already subscribed with custom interest
+ * throws a conflicting-options error; peeking first avoids that. A list the
+ * binding creates is recorded as owned so the last release can tear it down.
+ */
 function listFor(store, id) {
   if (id === undefined || id === null || typeof store?.subscribe !== 'function') return null;
-  return store.subscribe(id);
+  const key = String(id);
+  const index = indexFor(store);
+  if (index.lists.has(key)) return index.lists.get(key);
+  const existing = typeof store.listFor === 'function' ? store.listFor(id) : null;
+  if (existing) {
+    index.lists.set(key, existing);
+    return existing;
+  }
+  let list;
+  try {
+    list = store.subscribe(id);
+  } catch (error) {
+    // The store may have gained a list with custom interest between the peek
+    // and the subscribe; reuse it rather than failing the binding.
+    const raced = typeof store.listFor === 'function' ? store.listFor(id) : null;
+    if (raced) {
+      index.lists.set(key, raced);
+      return raced;
+    }
+    throw error;
+  }
+  if (list) {
+    index.lists.set(key, list);
+    index.owned.add(key);
+  }
+  return list;
 }
 
 /** Every id a store currently has a LiveList for, plus ids observed by bindings. */
@@ -181,9 +236,17 @@ function createHandle(compute, attach, options = {}) {
       if (destroyed) return;
       destroyed = true;
       listeners.clear();
-      if (release) release();
-      if (onAbort) signal?.removeEventListener('abort', onAbort);
-      detach();
+      // A throwing watcher inside `release` must never skip the caller's
+      // AbortSignal or store listener teardown. Every step still runs.
+      try {
+        if (release) release();
+      } finally {
+        try {
+          if (onAbort) signal?.removeEventListener('abort', onAbort);
+        } finally {
+          detach();
+        }
+      }
     },
   };
 
@@ -359,6 +422,12 @@ export function bindAction(store, options = {}) {
 
   const compute = () => {
     const overlayStatus = overlayStatusFor(store, id);
+    // A queued receipt is not terminal. Re-read the overlay on every refresh:
+    // once the durable completion confirms it, promote the receipt so it stays
+    // confirmed even after the authoritative fold releases the overlay.
+    if (result?.status === 'queued' && overlayStatus?.status === 'confirmed') {
+      result = { ...result, ok: true, status: 'confirmed' };
+    }
     let status = result ? (result.ok ? 'confirmed' : 'failed') : 'idle';
     let provenance = result ? (result.ok ? 'confirmed' : 'unknown') : 'unknown';
     if (overlayStatus?.status === 'pending') {

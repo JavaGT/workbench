@@ -68,12 +68,13 @@
 		"test:playwright": "playwright test",
 		"test:coverage": "node scripts/check-coverage.mjs 0",
 		"typecheck": "tsc --noEmit",
+		"typecheck:browser": "tsc -p tsconfig.browser.json --noEmit",
 		"check:annotated-text-single-authority": "node scripts/check-annotated-text-single-authority.mjs",
 		"check:architecture-map": "node scripts/check-architecture-map.mjs",
 		"test:deletion:annotated-text-composition": "node scripts/deletion-test-annotated-text-composition.mjs",
 		"benchmark:annotated-text-composite-resync": "node benchmark/annotated-text-composite-resync.mjs",
 		"benchmark:annotated-text-composite-resync:acceptance": "node benchmark/annotated-text-composite-resync-runner.mjs",
-		"verify:concise": "pnpm lint && pnpm typecheck && pnpm check:annotated-text-single-authority && pnpm check:architecture-map && pnpm test"
+		"verify:concise": "pnpm lint && pnpm typecheck && pnpm typecheck:browser && pnpm check:annotated-text-single-authority && pnpm check:architecture-map && pnpm test"
 	},
 	"devDependencies": {
 		"@playwright/test": "^1.62.1",

@@ -390,3 +390,259 @@ describe('binding provenance and lifecycle', () => {
     handle.destroy();
   });
 });
+
+describe('wave 9 client and binding regressions', () => {
+  function makeBindingStore({ state = { id: '1', title: 'a' }, overlay = null, overlayStatus = null } = {}) {
+    const sources = { render: new Set(), change: new Set(), status: new Set(), listChange: new Set() };
+    const list = {
+      get state() { return state; },
+      status: 'idle',
+      onChange(cb) { sources.listChange.add(cb); return () => sources.listChange.delete(cb); },
+      onStatusChange(cb) { sources.status.add(cb); return () => sources.status.delete(cb); },
+    };
+    const store = {
+      subscribe() { return list; },
+      listIds: () => [],
+      overlayFor() { return overlay; },
+      overlayStatusFor() { return overlayStatus; },
+      onRender(cb) { sources.render.add(cb); return () => sources.render.delete(cb); },
+      onChange(cb) { sources.change.add(cb); return () => sources.change.delete(cb); },
+      onStatusChange(cb) { sources.status.add(cb); return () => sources.status.delete(cb); },
+      dispatch: async () => ({ ok: true }),
+    };
+    return { store, list, sources };
+  }
+
+  function makeLiveStore(channel, fetchImpl) {
+    return createLiveStore({
+      baseUrl: 'https://example.test',
+      name: 'Doc',
+      path: '/docs',
+      channel,
+      fetchImpl,
+      sendMutation: () => ({
+        settlement: Promise.resolve({ status: 'committed' }),
+        completion: Promise.resolve({ status: 'committed' }),
+      }),
+    });
+  }
+
+  const staticFetch = async (url) => {
+    if (String(url).includes('/events-since/')) return json({ events: [] });
+    return json({ snapshot: { id: '1', title: 'a' }, seq: 1 });
+  };
+
+  it('a binding reuses a LiveList the app subscribed with custom options', async () => {
+    const channel = makeFakeChannel();
+    const store = makeLiveStore(channel, staticFetch);
+    const owned = store.subscribe('1', { fields: ['title'], pace: 'slow' });
+    await owned.ready;
+    assert.equal(channel.calls.length, 1);
+
+    const field = bindField(store, { id: '1', field: 'title' });
+    assert.equal(field.get().value, 'a');
+    assert.equal(channel.calls.length, 1,
+      'listFor must peek before subscribing: empty options would throw a conflict');
+    field.destroy();
+    assert.equal(channel.calls.length, 1, 'a borrowed list is never released by the binding');
+    store.close();
+  });
+
+  it('the last binding for an id releases the list it created and can re-subscribe', async () => {
+    const channel = makeFakeChannel();
+    let unsubscribed = 0;
+    const originalUnsubscribe = channel.unsubscribe.bind(channel);
+    channel.unsubscribe = (...args) => { unsubscribed += 1; return originalUnsubscribe(...args); };
+    const store = makeLiveStore(channel, staticFetch);
+
+    const field = bindField(store, { id: '1', field: 'title' });
+    const row = bindList(store, { id: '1' });
+    await tick();
+    assert.equal(channel.calls.length, 1, 'two bindings share one subscription');
+
+    field.destroy();
+    assert.equal(unsubscribed, 0, 'another binding still owns the id');
+    row.destroy();
+    assert.equal(unsubscribed, 1, 'the final release stops the channel subscription');
+    assert.equal(store.listFor('1'), null, 'the released list is evicted from the store cache');
+
+    const again = bindField(store, { id: '1', field: 'title' });
+    await tick();
+    assert.equal(channel.calls.length, 2, 'a new binding can subscribe the id again');
+    again.destroy();
+    store.close();
+  });
+
+  it('a throwing watcher never skips signal and store cleanup on destroy', () => {
+    const { store, sources } = makeBindingStore();
+    let throwInWatcher = false;
+    store.listIds = () => {
+      if (throwInWatcher) throw new Error('watcher boom');
+      return [];
+    };
+    let abortListener = null;
+    const signal = {
+      aborted: false,
+      addEventListener(_type, fn) { abortListener = fn; },
+      removeEventListener(_type, fn) { if (abortListener === fn) abortListener = null; },
+    };
+    // The collection binding registers an index watcher; rememberId's release
+    // notifies it, and the injected listIds failure makes that watcher throw.
+    const all = bindList(store, { signal });
+    const field = bindField(store, { id: '1', field: 'title', signal });
+    throwInWatcher = true;
+
+    assert.throws(() => field.destroy(), /watcher boom/);
+    assert.equal(abortListener, null, 'the AbortSignal listener was removed despite the throw');
+    assert.equal(sources.render.size, 1, 'only the still-live collection binding remains');
+    assert.equal(sources.listChange.size, 0, 'the destroyed field detached its source listener');
+    all.destroy();
+    assert.equal(sources.render.size, 0, 'the remaining handle still detaches cleanly');
+  });
+
+  it('bindAction promotes a queued receipt once its overlay confirms', async () => {
+    const { store, sources } = makeBindingStore();
+    let overlayStatus = { status: 'pending' };
+    store.overlayStatusFor = () => overlayStatus;
+    store.dispatch = async () => ({ ok: false, status: 'queued', opId: 'op1', actionId: 'a1' });
+    const action = bindAction(store, { id: '1', action: 'Doc.update' });
+
+    const receipt = await action.dispatch();
+    assert.equal(receipt.status, 'queued');
+    assert.equal(action.get().status, 'pending');
+    assert.equal(action.get().value.status, 'queued');
+
+    overlayStatus = { status: 'confirmed' };
+    for (const cb of sources.render) cb();
+    assert.equal(action.get().status, 'confirmed');
+    assert.equal(action.get().value.ok, true, 'the queued receipt is re-read as confirmed');
+    assert.equal(action.get().value.status, 'confirmed');
+
+    overlayStatus = null;
+    for (const cb of sources.render) cb();
+    assert.equal(action.get().status, 'confirmed', 'confirmation survives overlay release');
+    action.destroy();
+  });
+
+  it('createScopeLiveStore bounded-backoffs a partial advance that never reaches the gap floor', async () => {
+    let onLive;
+    const channel = {
+      subscribeScope(_scope, _options, handler) { onLive = handler; return Promise.resolve({ currentSeq: 1 }); },
+      unsubscribeScope: async () => {},
+      close() {},
+    };
+    let snapshotSeq = 1;
+    let snapshotCalls = 0;
+    let eventsCalls = 0;
+    const fetchImpl = async (url) => {
+      if (String(url).includes('/events-since')) {
+        eventsCalls += 1;
+        const cursor = Number(String(url).match(/cursor=(\d+)/)?.[1] ?? 0);
+        if (cursor >= 4) return json({ events: [] });
+        // Partial fill: each answer advances by one but stops short of seq 8.
+        snapshotSeq = cursor + 1;
+        return json({ events: [{ seq: snapshotSeq, scope: 'Project:p1', type: 'Note.updated', data: { seq: snapshotSeq } }] });
+      }
+      snapshotCalls += 1;
+      return json({ snapshot: { id: 'n1', seq: snapshotSeq }, seq: snapshotSeq });
+    };
+    const store = createScopeLiveStore({
+      baseUrl: 'https://example.test',
+      scope: 'Project:p1',
+      channel,
+      fetchImpl,
+      validateSnapshot: (snapshot) => snapshot,
+      fold: (snapshot, event) => ({ ...snapshot, last: event.seq }),
+      sendAction: async () => ({ ok: true }),
+      resyncBackoffBase: 1,
+      maxResyncBackoff: 2,
+    });
+    await store.ready;
+    assert.equal(snapshotCalls, 1);
+
+    onLive({ type: 'event', seq: 8, seqSpan: [8, 8], event: { type: 'Note.updated', data: { seq: 8 } } });
+    await tick(80);
+    const snapshotsAfterCap = snapshotCalls;
+    const eventsAfterCap = eventsCalls;
+    await tick(40);
+
+    assert.ok(store.cursor < 8, 'a gap that is never closed cannot advance past its floor');
+    assert.equal(store.status, 'stale');
+    assert.equal(snapshotCalls, 2, 'exactly one forced snapshot, not one per partial advance');
+    assert.equal(snapshotCalls, snapshotsAfterCap, 'no further snapshot loop after the cap');
+    assert.equal(eventsCalls, eventsAfterCap, 'backoff stops at the attempt cap');
+    store.close();
+  });
+
+  it('canFold requires foldable data and a matching entity for live frames', async () => {
+    const channel = makeFakeChannel();
+    const list = makeList(channel, staticFetch);
+    assert.equal(list.canFold('Doc.updated'), true, 'type-only checks still work');
+    assert.equal(list.canFold({ type: 'Doc.updated', data: { id: '1' }, entity: 'Doc' }), true);
+    assert.equal(list.canFold({ type: 'Doc.updated' }), false, 'missing data has no fold');
+    assert.equal(list.canFold({ type: 'Doc.updated', data: [] }), false, 'non-object data has no fold');
+    assert.equal(list.canFold({ type: 'Doc.updated', data: {}, entity: 'Other' }), false, 'foreign entity');
+    assert.equal(list.canFold({ type: 'Doc.updated', data: {}, scope: 'Other:1' }), false, 'foreign scope');
+    assert.equal(list.canFold({ type: 'Doc.body.applied', data: { operation: {} } }), true);
+    assert.equal(list.canFold({ type: 'Doc.body.applied' }), false);
+    assert.equal(list.canFold({ type: 'Doc.removed', entity: 'Doc' }), true, 'removal is data-free');
+
+    await list.subscribe();
+    const changes = [];
+    list.onChange((change) => changes.push(change));
+    channel.emit({ entity: 'Doc', id: '1', seq: 2, seqSpan: [2, 2], event: { type: 'Doc.updated' } });
+    await tick(20);
+    assert.equal(list.cursor, 1, 'a data-less frame never advances the cursor');
+    assert.ok(!changes.some((change) => change.seq === 2));
+
+    channel.emit(envelope(2, 'Doc.updated', { id: '1', title: 'folded' }));
+    await tick(20);
+    assert.equal(list.cursor, 2, 'a valid frame still folds');
+
+    // A mis-routed foreign frame that reaches the list directly must not fold.
+    list._onLiveEnvelope({
+      type: 'event', entity: 'Other', id: '1', seq: 3, seqSpan: [3, 3],
+      event: { type: 'Doc.updated', data: { id: '1', title: 'foreign' } },
+    });
+    assert.equal(list.cursor, 2, 'a foreign-entity frame never advances the cursor');
+    assert.equal(list.state.title, 'folded');
+    await list.close();
+  });
+
+  it('bindConnection observes the connecting transition of a lazy socket', async () => {
+    const makeSocket = () => {
+      const listeners = new Map();
+      return {
+        readyState: 1,
+        addEventListener(type, fn) {
+          if (!listeners.has(type)) listeners.set(type, new Set());
+          listeners.get(type).add(fn);
+        },
+        removeEventListener(type, fn) { listeners.get(type)?.delete(fn); },
+        frame(message) { for (const fn of listeners.get('message') ?? []) fn({ data: JSON.stringify(message) }); },
+        send(raw) {
+          const request = JSON.parse(raw);
+          if (request.type === 'subscribe') {
+            queueMicrotask(() => this.frame({
+              type: 'subscribed', scope: request.scope, entity: request.entity, id: request.id,
+              currentSeq: 0, requestId: request.requestId,
+            }));
+          }
+        },
+        close() { this.readyState = 3; },
+      };
+    };
+    const channel = new LiveChannel('https://example.test', { socketFactory: makeSocket });
+    const bound = bindConnection(channel);
+    const seen = [];
+    bound.subscribe((projection) => seen.push(projection.value));
+    assert.equal(bound.get().value, 'disconnected');
+
+    await channel.subscribe('Doc', '1', {}, () => {});
+    assert.deepEqual(seen, ['connecting', 'connected'],
+      'the declared connecting status is observable, not just an internal state');
+    assert.equal(bound.get().value, 'connected');
+    bound.destroy();
+    channel.close();
+  });
+});

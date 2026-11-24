@@ -466,6 +466,10 @@ class LiveSyncSession {
     if (this._connecting) return this._connecting;
 
     this._state = 'connecting';
+    // The state machine owns the transition; observers must see it too, or a
+    // bindConnection handle misses the first hop of a lazy connection and
+    // reports 'disconnected' until the socket finally opens.
+    this._emitConnectionStatus('connecting');
     const generation = ++this._generation;
     const connecting = new Promise((resolve, reject) => {
       let ws;
@@ -1163,10 +1167,20 @@ export class LiveList {
 
   /** Normalize a live WS envelope to internal shape {seq, seqSpan, event, delta}. */
   _normalizeLive(envelope) {
+    const event = envelope?.event;
     return {
       seq: envelope.seq,
       seqSpan: envelope.seqSpan,
-      event: envelope.event,
+      // Carry the frame's identity onto the event so canFold can reject a
+      // malformed or foreign-entity frame before any cursor advance.
+      event: event && typeof event === 'object' && !Array.isArray(event)
+        ? {
+          ...event,
+          entity: envelope.entity ?? event.entity,
+          id: envelope.id ?? event.id,
+          scope: envelope.scope ?? event.scope,
+        }
+        : event,
       delta: envelope.delta,
       reducers: envelope.reducers,
     };
@@ -1236,8 +1250,8 @@ export class LiveList {
       this._resync().catch(() => {});
       return;
     }
-    if (!this.canFold(event?.type)) {
-      // Fail closed: an unhandled type has no reducer projection. Advancing
+    if (!this.canFold(event)) {
+      // Fail closed: an unhandled or malformed event has no reducer projection. Advancing
       // the cursor here would record a fold that never happened. Keep the
       // envelope buffered and force an authoritative snapshot instead.
       this._bufferEnvelope({ seq: normalized.seq, seqSpan, event, delta, reducers });
@@ -1419,7 +1433,7 @@ export class LiveList {
     this._queue = [];
     for (const envelope of queue) {
       const normalized = this._normalizeLive(envelope);
-      if (!this.canFold(normalized.event?.type)) {
+      if (!this.canFold(normalized.event)) {
         let hi = normalized.seq;
         try { hi = normalizeSeqSpan(normalized.seqSpan ?? normalized.seq)[1]; } catch { /* keep scalar */ }
         if (this._cursor >= hi) continue; // the authoritative snapshot superseded it
@@ -1453,7 +1467,7 @@ export class LiveList {
       let span;
       try { span = normalizeSeqSpan(envelope.seqSpan ?? envelope.seq); } catch { continue; }
       const decision = decideReplay(this._cursor, span);
-      if (decision.kind === 'gap' || !this.canFold(envelope?.event?.type)) {
+      if (decision.kind === 'gap' || !this.canFold(envelope?.event)) {
         floor = floor == null ? span[1] : Math.min(floor, span[1]);
       }
     }
@@ -1495,20 +1509,38 @@ export class LiveList {
     let expected = this._cursor + 1;
     for (const row of rows) {
       if (row.seq !== expected) return false;
-      if (!this.canFold(row.type)) return false;
+      if (!this.canFold({ type: row.type, data: row.data })) return false;
       expected += 1;
     }
     return true;
   }
 
-  /** True only for a type the one `_applyEvent` reducer actually handles. */
-  canFold(type) {
+  /**
+   * True only when the one `_applyEvent` reducer can project this input.
+   *
+   * A type string answers the grammar question (also used for batch preflight
+   * and the public predicate). A full event additionally answers the data
+   * question: CRUD/field-op reducers read `event.data`, so a frame without a
+   * plain-object payload has no fold to record and must not advance the cursor.
+   * A frame that names an entity/id/scope other than this list's is foreign and
+   * is rejected the same way. Entity removal is intentionally data-free.
+   */
+  canFold(eventOrType) {
+    const type = typeof eventOrType === 'string' ? eventOrType : eventOrType?.type;
     if (typeof type !== 'string') return false;
     const parts = type.split('.');
     if (parts.some((part) => part.length === 0)) return false;
-    if (parts.length === 2) return HANDLED_CRUD_VERBS.has(parts[1]);
-    if (parts.length === 3) return HANDLED_FIELD_OPS.has(parts[2]);
-    return false;
+    const crud = parts.length === 2 && HANDLED_CRUD_VERBS.has(parts[1]);
+    const fieldOp = parts.length === 3 && HANDLED_FIELD_OPS.has(parts[2]);
+    if (!crud && !fieldOp) return false;
+    if (typeof eventOrType === 'string') return true;
+
+    const event = eventOrType;
+    if (event.entity !== undefined && String(event.entity) !== String(this._entity)) return false;
+    if (event.id !== undefined && String(event.id) !== String(this._id)) return false;
+    if (event.scope !== undefined && event.scope !== `${this._entity}:${String(this._id)}`) return false;
+    if (crud && parts[1] === 'removed') return true;
+    return isPlainJsonObject(event.data);
   }
 
   _isKnownEventType(type) { return this.canFold(type); }
@@ -1519,7 +1551,7 @@ export class LiveList {
    *   3-part = entity.field.op  (field-specific: ordered, map, log ops)
    */
   _applyEvent(event, delta) {
-    if (!this.canFold(event?.type)) return;
+    if (!this.canFold(event)) return;
     const parts = event.type.split('.');
 
     if (parts.length === 2) {
@@ -2297,6 +2329,27 @@ export function createLiveStore({ baseUrl, name, path, channel, fetchImpl, repli
     return list;
   }
 
+  /**
+   * Release a cached LiveList once no consumer owns it: drop the store's
+   * forwarding listeners, evict it from every cache, and tear down its channel
+   * subscription and retry timers. Bindings call this when the last reference
+   * to an id goes away; a list the app subscribed itself is never released by
+   * a binding, because bindings only release lists they created.
+   */
+  function releaseLiveList(id) {
+    const list = _listCache.get(id);
+    if (!list) return;
+    _listCache.delete(id);
+    _listOptions.delete(id);
+    _listUnsubs.get(id)?.();
+    _listUnsubs.delete(id);
+    _listChangeUnsubs.get(id)?.();
+    _listChangeUnsubs.delete(id);
+    _listStatusUnsubs.get(id)?.();
+    _listStatusUnsubs.delete(id);
+    void list.close();
+  }
+
   // --- Overlay queries ---
 
   function overlayFor(id) {
@@ -2702,6 +2755,10 @@ export function createLiveStore({ baseUrl, name, path, channel, fetchImpl, repli
 
   const store = {
     subscribe: _subscribeLiveList,
+    /** Cached LiveList for an id, or null — peek without creating a subscription. */
+    listFor(id) { return _listCache.get(id) ?? null; },
+    /** Release a list created via subscribe when its last owning binding leaves. */
+    release: releaseLiveList,
     /** Ids of every cached LiveList — read-only input for collection bindings. */
     listIds() { return [..._listCache.keys()]; },
     dispatch,
@@ -5850,6 +5907,10 @@ export function createScopeLiveStore({
     setStoreStatus('resyncing');
     resyncPromise = (async () => {
       const startCursor = cursor;
+      // The floor we are trying to close, captured before replay moves the
+      // cursor. A partial advance that still sits below this floor is not
+      // progress against the gap we escalated for.
+      const targetFloor = gapFloor;
       if (forceSnapshot) {
         await loadSnapshot();
       } else {
@@ -5871,15 +5932,27 @@ export function createScopeLiveStore({
 
       if (hasUnresolvedGap()) {
         const progressed = cursor > startCursor;
-        if (progressed && !forceSnapshot && snapshotEscalated) snapshotEscalated = false;
+        const reachedFloor = targetFloor == null || cursor >= targetFloor;
+        // Only clear the escalation when replay actually reached the floor.
+        // Otherwise every bounded retry re-forces a fresh snapshot, the
+        // attempt counter is reset below, and the gap loop never terminates.
+        if (progressed && reachedFloor && !forceSnapshot && snapshotEscalated) snapshotEscalated = false;
         if (!snapshotEscalated) {
           // One escalation to an authoritative snapshot for this gap.
           snapshotEscalated = true;
           await loadSnapshot();
+          if (hasUnresolvedGap()) {
+            // The forced snapshot did not cover the gap either: fail closed
+            // with bounded backoff instead of re-entering the replay loop.
+            stalled = true;
+            setStoreStatus('stale');
+            scheduleResync();
+          }
         } else {
           // Snapshot also failed to pass the gap: fail closed and back off.
           stalled = true;
           setStoreStatus('stale');
+          scheduleResync();
         }
       } else {
         snapshotEscalated = false;
@@ -5890,7 +5963,9 @@ export function createScopeLiveStore({
     try {
       await resyncPromise;
       succeeded = true;
-      if (!stalled) resyncAttempt = 0;
+      // A stall keeps its attempt counter: backoff must keep growing while the
+      // gap is unresolved, and only a real recovery resets it.
+      if (!stalled && !hasUnresolvedGap()) resyncAttempt = 0;
     } catch {
       scheduleResync();
     } finally {

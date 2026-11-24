@@ -16,6 +16,7 @@ import {
   createBackupManager,
   BACKUP_FORMAT_VERSION,
 } from '../build/backup.mjs';
+import * as safety from '../build/backup/safety.mjs';
 
 const BACKUP_DIR_NAME = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d{3}Z-[0-9a-f]{12}$/;
 
@@ -641,4 +642,105 @@ test('the backup API surface is re-exported from workbench/internal', { timeout:
   assert.equal(typeof internal.createBackupManager, 'function');
   assert.equal(internal.BACKUP_FORMAT_VERSION, 1);
   assert.deepEqual(internal.DEFAULT_RETENTION, { daily: 7, hourly: 3 });
+});
+
+// The crash-safety invariants are ONE authority: backup.ts and recovery.ts must
+// both resolve layout/id validation, completeness, quarantine sweeps,
+// quick_check, schema identity and verified blob containment to the SAME
+// functions in backup/safety.ts — not two hand-copied implementations that can
+// drift apart. Both the structural binding and the shared behavior are pinned.
+test('backup and recovery share one crash-safety authority', { timeout: 120000 }, async () => {
+  const runtime = (name) => readFileSync(new URL(`../build/${name}`, import.meta.url), 'utf8');
+  const backupRuntime = runtime('backup.mjs');
+  const recoveryRuntime = runtime('recovery.mjs');
+
+  // Structural: both emitted loops import the shared module and neither keeps
+  // a private copy of the invariants.
+  for (const [name, code] of [['backup', backupRuntime], ['recovery', recoveryRuntime]]) {
+    assert.match(code, /from '\.\/backup\/safety\.mjs'/, `${name} imports the shared authority`);
+    for (const local of [
+      'isCompleteBackupDir', 'isDirectory', 'quickCheckOf', 'schemaIdentityOf',
+      'verifyMaterialization', 'verifyRestoreMaterialization', 'moveToQuarantine', 'formatTimestamp',
+      'readCompleteManifest', 'compareLedgerEntry', 'sanitizeMessage', 'sanitizeError',
+    ]) {
+      assert.doesNotMatch(code, new RegExp(`function ${local}\\b`), `${name} has no private ${local}`);
+    }
+  }
+
+  // The authority surface both loops depend on is exported, with no 'any'.
+  for (const name of [
+    'BACKUP_FORMAT_VERSION', 'BACKUP_NAME', 'isValidBackupId', 'formatTimestamp',
+    'parseBackupTimestamp', 'isDirectory', 'isCompleteBackupDir', 'writeDiagnostic',
+    'createQuarantineMover', 'quarantineIncompleteBackups', 'quickCheckOf',
+    'schemaIdentityOf', 'verifyMaterialization', 'readCompleteManifest',
+    'listCompleteBackups', 'compareLedgerEntry', 'createMessageSanitizer',
+    'readMigrationLedger',
+  ]) {
+    assert.ok(name in safety, `${name} is exported by the shared authority`);
+  }
+
+  const root = tempRoot();
+  try {
+    const dir = join(root, 'owned');
+    const opened = openSqliteAdapter({ directory: dir, name: 'app' });
+    try {
+      opened.handle.exec('CREATE TABLE parity_note (id TEXT PRIMARY KEY, body TEXT)');
+      const writeCoordinator = createWriteQueue();
+      opened.writeCoordinator = writeCoordinator;
+      const backup = await createBackupManager({ source: opened, writeCoordinator }).backup();
+      assert.equal(backup.ok, true, 'a real backup exists to check the shared recomputations');
+      const backupDir = join(dir, 'backups', backup.backupId);
+
+      // Layout / id authority: the same regex + validator both loops use.
+      assert.match(backup.backupId, safety.BACKUP_NAME);
+      assert.equal(safety.isValidBackupId(backup.backupId), true);
+      assert.equal(safety.isValidBackupId('../escape'), false, 'a user id cannot escape backups/');
+      assert.equal(safety.isValidBackupId(123), false);
+      assert.equal(safety.isDirectory(backupDir), true);
+      assert.equal(safety.isCompleteBackupDir(backupDir), true, 'the shared completeness gate accepts the real backup');
+
+      // quick_check + schema identity authority: recomputing through the shared
+      // functions reproduces exactly what the backup manifest recorded and what
+      // recovery validates against.
+      const quick = safety.quickCheckOf(opened.handle);
+      assert.equal(quick.ok, backup.manifest.integrityResult.ok);
+      assert.deepEqual(safety.schemaIdentityOf(opened.handle), {
+        platformSchemaIdentity: backup.manifest.platformSchemaIdentity,
+        appSchemaIdentity: backup.manifest.appSchemaIdentity,
+      });
+      assert.deepEqual(safety.readMigrationLedger(opened.handle), backup.manifest.migrationLedgerState);
+      // Both modes come from the one function: backup lets a PRAGMA error throw;
+      // recovery supplies a sanitizer and gets a failure finding instead.
+      const throwing = { prepare: () => ({ all: () => { throw new Error('boom'); } }) };
+      assert.throws(() => safety.quickCheckOf(throwing), /boom/);
+      const wrapped = safety.quickCheckOf(throwing, { describeError: (err) => `wrapped:${err.message}` });
+      assert.equal(wrapped.ok, false);
+      assert.deepEqual(wrapped.findings, [{ severity: 'error', message: 'wrapped:boom' }]);
+
+      // Containment authority: a regular file verifies, a symlink that escapes
+      // the blob directory is refused, and the two call sites' exact wording is
+      // preserved by the directoryLabel parameter.
+      const blobsDir = join(backupDir, 'blobs');
+      writeFileSync(join(blobsDir, 'real.byte'), 'abc');
+      assert.deepEqual(safety.verifyMaterialization('g1', blobsDir, [{ name: 'real.byte', size: 3 }]), { ok: true });
+      writeFileSync(join(root, 'outside.byte'), 'abcd');
+      symlinkSync(join(root, 'outside.byte'), join(blobsDir, 'escape.byte'));
+      const escaped = safety.verifyMaterialization('g1', blobsDir, [{ name: 'escape.byte', size: 4 }]);
+      assert.equal(escaped.ok, false);
+      assert.match(escaped.reason, /symlink/);
+      const missingDir = join(root, 'never-created');
+      assert.equal(
+        safety.verifyMaterialization('g1', missingDir, [{ name: 'x', size: 1 }]).reason,
+        'materialize for g1 ran before the blob directory existed',
+      );
+      assert.equal(
+        safety.verifyMaterialization('g1', missingDir, [{ name: 'x', size: 1 }], { directoryLabel: 'target blob directory' }).reason,
+        'materialize for g1 ran before the target blob directory existed',
+      );
+    } finally {
+      opened.close();
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

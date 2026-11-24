@@ -64,23 +64,18 @@
 // missing bytes (fresh target) or stale bytes (live restore).
 
 import { openSqliteDatabase, type SqliteDatabase } from './sqlite-driver.ts';
-import { createHash, randomBytes } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import {
   chmodSync,
   copyFileSync,
   existsSync,
-  lstatSync,
   mkdirSync,
   readFileSync,
   readdirSync,
-  realpathSync,
   renameSync,
   rmSync,
-  statSync,
-  writeFileSync,
 } from 'node:fs';
 import path from 'node:path';
-import { frameworkTableNames } from './schema-table-census.ts';
 import { getLog } from './log.ts';
 import { createWriteQueue } from './write-queue.ts';
 import { MIGRATION_LEDGER_TABLE } from './migration-ledger.ts';
@@ -89,16 +84,29 @@ import type {
   BackupWriteCoordinator,
   BackupManifest,
   BackupMigrationLedgerState,
-  MaterializedBlobFile,
 } from './backup.ts';
 import type { IntegrityFinding, IntegrityReport } from './db-adapter.ts';
-import { BACKUP_FORMAT_VERSION } from './backup.ts';
-
-// The backup directory naming shared with the S1/A3 backup manager
-// (`backups/<timestamp>-<id>/`). A backup id is opaque to restore: it is a
-// filesystem name, validated here so a user-supplied id can never escape
-// backups/ via a path separator or '..'.
-const BACKUP_NAME = /^(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d{3}Z)-([0-9a-f]+)$/;
+// The crash-safety authority is shared with the backup loop: layout/id
+// validation, completeness, quarantine sweep, quick_check, schema identity and
+// verified blob containment all resolve to these exact functions.
+import {
+  BACKUP_FORMAT_VERSION,
+  compareLedgerEntry,
+  createMessageSanitizer,
+  createQuarantineMover,
+  formatTimestamp,
+  isCompleteBackupDir,
+  isDirectory,
+  isValidBackupId,
+  listCompleteBackups,
+  quarantineIncompleteBackups,
+  quickCheckOf,
+  readMigrationLedger,
+  schemaIdentityOf,
+  verifyMaterialization,
+  writeDiagnostic,
+  type MaterializedBlobFile,
+} from './backup/safety.ts';
 
 // The owned-directory vocabulary (kept in sync with sqlite-adapter.ts's
 // MANAGED_SUBDIRECTORIES — the S1 section's directory-guard tests pin it):
@@ -119,53 +127,8 @@ const STAGE_PREFIX = 'data.sqlite.recovering-';
 // untrusted input, so a manifest-chosen table name is refused (review #83).
 const MIGRATION_LEDGER = MIGRATION_LEDGER_TABLE;
 
-function foldedNamespace(namespace: string): string {
-  return namespace.toLowerCase();
-}
-
-// Ordering for the namespaced ledger's applied versions uses the same folded
-// namespace identity as the migration runner, then version.
-function compareLedgerEntry(a: LedgerEntry, b: LedgerEntry): number {
-  const aNamespace = foldedNamespace(a.namespace);
-  const bNamespace = foldedNamespace(b.namespace);
-  if (aNamespace !== bNamespace) return aNamespace < bNamespace ? -1 : 1;
-  return a.version - b.version;
-}
-
-// Upper bound on error messages persisted in diagnostics / logged (review #82
-// finding 4 policy): stage + identifier + a short sanitized reason, never row
-// data and never blob bytes.
 export const MAX_RECOVERY_DIAGNOSTIC_ERROR_LENGTH = 500;
-
-function sanitizeMessage(value: string): string {
-  const singleLine = String(value)
-    .replace(/[\u0000-\u001f\u007f]/g, ' ')
-    .trim();
-  const redacted = singleLine.replace(/\S{129,}/g, (run) => `<redacted-${run.length}>`);
-  return redacted.slice(0, MAX_RECOVERY_DIAGNOSTIC_ERROR_LENGTH);
-}
-
-function sanitizeError(err: unknown): string {
-  if (err instanceof Error) return sanitizeMessage(err.message);
-  if (typeof err === 'string') return sanitizeMessage(err);
-  return sanitizeMessage(String(err));
-}
-
-function sha256hex(value: string): string {
-  return createHash('sha256').update(value).digest('hex');
-}
-
-function formatTimestamp(date: Date): string {
-  return date.toISOString().replace(/:/g, '-');
-}
-
-function isDirectory(p: string): boolean {
-  try {
-    return statSync(p).isDirectory();
-  } catch {
-    return false;
-  }
-}
+const { sanitizeError } = createMessageSanitizer(MAX_RECOVERY_DIAGNOSTIC_ERROR_LENGTH);
 
 // Deep-equality for the manifest comparison surfaces (arrays of strings and the
 // migration ledger object). Order matters for both, so JSON comparison is the
@@ -466,79 +429,27 @@ export function createRecoveryManager(options: RecoveryManagerOptions): Recovery
     return target;
   }
 
-  function writeDiagnostic(dir: string, diagnostic: Readonly<{ at: string; stage: string; error: string; detail?: Record<string, unknown> }>): void {
-    writeFileSync(path.join(dir, 'diagnostic.json'), `${JSON.stringify(diagnostic, null, 2)}\n`, { mode: 0o600 });
-  }
-
-  function moveToQuarantine(dir: string): string {
-    let target = path.join(quarantineDir, path.basename(dir));
-    let suffix = 0;
-    while (existsSync(target)) {
-      suffix += 1;
-      target = path.join(quarantineDir, `${path.basename(dir)}.q${suffix}`);
-    }
-    renameSync(dir, target);
-    return target;
-  }
-
-  function isCompleteBackupDir(dir: string): boolean {
-    try {
-      if (!existsSync(path.join(dir, 'snapshot.sqlite'))) return false;
-      const manifest = JSON.parse(readFileSync(path.join(dir, 'manifest.json'), 'utf8')) as {
-        status?: unknown;
-        formatVersion?: unknown;
-      };
-      return manifest.formatVersion === BACKUP_FORMAT_VERSION && manifest.status === 'complete';
-    } catch {
-      return false;
-    }
-  }
-
-  function readCompleteManifest(dir: string): BackupManifest | null {
-    try {
-      const manifest = JSON.parse(readFileSync(path.join(dir, 'manifest.json'), 'utf8')) as BackupManifest;
-      if (manifest.formatVersion !== BACKUP_FORMAT_VERSION || manifest.status !== 'complete') return null;
-      return manifest;
-    } catch {
-      return null;
-    }
-  }
+  // Quarantine policy is the shared authority's — the same mover, diagnostic
+  // writer and completeness check backup.ts uses. Only recovery's stale-stage
+  // sweep and its wording stay local.
+  const moveToQuarantine = createQuarantineMover(quarantineDir);
 
   function list(): readonly RecoveryListing[] {
-    return readdirSync(backupsDir)
-      .filter((entry) => isDirectory(path.join(backupsDir, entry)))
-      .map((entry) => {
-        const dir = path.join(backupsDir, entry);
-        const manifest = readCompleteManifest(dir);
-        return manifest === null ? null : { backupId: entry, directory: dir, manifest, createdAt: manifest.createdAt };
-      })
-      .filter((entry): entry is RecoveryListing => entry !== null)
-      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    return listCompleteBackups<BackupManifest>(backupsDir);
   }
 
   // Quarantine sweep (mirrors backup.ts's reconcile): crash leftovers (a dir
   // without a valid complete manifest) and stale recovery stage files move to
   // quarantine/. Failures on individual entries are logged and skipped.
   function reconcileNow(): { quarantined: string[] } {
-    const quarantined: string[] = [];
-    for (const entry of readdirSync(backupsDir)) {
-      const dir = path.join(backupsDir, entry);
-      if (!isDirectory(dir)) continue;
-      if (isCompleteBackupDir(dir)) continue;
-      try {
-        if (!existsSync(path.join(dir, 'diagnostic.json'))) {
-          writeDiagnostic(dir, {
-            at: now().toISOString(),
-            stage: 'quarantine',
-            error: 'incomplete backup directory quarantined by recovery reconcile',
-            detail: { dir: entry },
-          });
-        }
-        quarantined.push(moveToQuarantine(dir));
-      } catch (err) {
-        getLog().warn('system', 'recovery reconcile failed to quarantine an incomplete backup', { error: sanitizeError(err), dir });
-      }
-    }
+    const quarantined = quarantineIncompleteBackups({
+      backupsDir,
+      diagnosticError: 'incomplete backup directory quarantined by recovery reconcile',
+      moveToQuarantine,
+      now,
+      onFailure: (err, dir) =>
+        getLog().warn('system', 'recovery reconcile failed to quarantine an incomplete backup', { error: sanitizeError(err), dir }),
+    });
     for (const entry of readdirSync(root)) {
       if (!entry.startsWith(STAGE_PREFIX)) continue;
       const file = path.join(root, entry);
@@ -608,7 +519,7 @@ export function createRecoveryManager(options: RecoveryManagerOptions): Recovery
   }
 
   function validateBackupId(backupId: unknown): string | null {
-    if (typeof backupId !== 'string' || !BACKUP_NAME.test(backupId)) {
+    if (!isValidBackupId(backupId)) {
       return 'invalid backupId — expected <ISO-timestamp>-<hex> (e.g. 2026-01-01T00-00-00.000Z-abcd1234ef567890)';
     }
     return null;
@@ -649,7 +560,7 @@ export function createRecoveryManager(options: RecoveryManagerOptions): Recovery
       // a quick_check report) and require it to match the manifest — an
       // integrityResult that the snapshot does not reproduce (removed,
       // falsified, or stale) fails closed (issue #82 contract, review #83).
-      const recordedIntegrity = quickCheckOf(db);
+      const recordedIntegrity = quickCheckOf(db, { describeError: sanitizeError });
       if (recordedIntegrity.ok !== manifest.integrityResult.ok) {
         failures.push('snapshot integrity does not match the manifest integrityResult');
       }
@@ -993,7 +904,7 @@ export function createRecoveryManager(options: RecoveryManagerOptions): Recovery
     const destBlobDir = path.join(targetRoot, 'blobs');
     for (const generation of generations) {
       const report = await blobs.materializeRestoreGeneration(generation, backupBlobsDir, destBlobDir);
-      const verified = verifyRestoreMaterialization(generation, destBlobDir, report);
+      const verified = verifyMaterialization(generation, destBlobDir, report, { directoryLabel: 'target blob directory' });
       if (!verified.ok) throw new Error(verified.reason);
     }
   }
@@ -1295,84 +1206,12 @@ export function createRecoveryManager(options: RecoveryManagerOptions): Recovery
   });
 }
 
-// ---- sqlite-snapshot-side helpers (mirror backup.ts) ----------------------
+// ---- sqlite-snapshot-side helpers -----------------------------------------
 
-// The SAME quick_check report the backup side records in the manifest
-// (backup.ts quickCheckOf) — the faithful recompute comparison for
-// integrityResult (review #83).
-function quickCheckOf(db: SqliteDatabase): IntegrityReport {
-  try {
-    const rows = db.prepare('PRAGMA quick_check').all() as Array<{ quick_check: string }>;
-    const findings: IntegrityFinding[] = [];
-    for (const row of rows) {
-      if (row.quick_check !== 'ok') findings.push({ severity: 'error', message: row.quick_check });
-    }
-    return { ok: findings.length === 0, checkedAt: new Date().toISOString(), findings };
-  } catch (err) {
-    return {
-      ok: false,
-      checkedAt: new Date().toISOString(),
-      findings: [{ severity: 'error', message: sanitizeError(err) }],
-    };
-  }
-}
-
-// Verify a restore-materialization report against what actually landed in the
-// target's blob directory (mirrors backup.ts verifyMaterialization): every
-// reported file must exist under destBlobDir, be a regular file, and match the
-// reported byte size. A symlink is refused outright and every reported path
-// must resolve inside the blob directory's OWN realpath — no launderable byte.
-type RestoreMaterializationVerification = Readonly<{ ok: true } | { ok: false; reason: string }>;
-function verifyRestoreMaterialization(
-  generation: string,
-  destBlobDir: string,
-  report: readonly MaterializedBlobFile[] | undefined,
-): RestoreMaterializationVerification {
-  if (!Array.isArray(report)) {
-    return { ok: false, reason: `materialize for ${generation} did not report the files it wrote` };
-  }
-  if (report.length === 0) {
-    return { ok: false, reason: `materialize for ${generation} reported no files — its bytes were not written` };
-  }
-  let realBlobDir: string;
-  try {
-    realBlobDir = realpathSync(destBlobDir);
-  } catch {
-    return { ok: false, reason: `materialize for ${generation} ran before the target blob directory existed` };
-  }
-  for (const entry of report) {
-    if (!entry || typeof entry.name !== 'string' || typeof entry.size !== 'number' || !Number.isInteger(entry.size) || entry.size < 0) {
-      return { ok: false, reason: `materialize for ${generation} reported a malformed file entry` };
-    }
-    const name = entry.name;
-    if (name === '' || name === '.' || name === '..' || name.includes('/') || name.includes('\\') || path.isAbsolute(name)) {
-      return { ok: false, reason: `materialize for ${generation} reported a path outside the target blob directory` };
-    }
-    const entryPath = path.join(destBlobDir, name);
-    let stat: ReturnType<typeof statSync>;
-    try {
-      const link = lstatSync(entryPath);
-      if (link.isSymbolicLink()) {
-        return { ok: false, reason: `materialize for ${generation} reported a symlink, which cannot be a verified blob byte: ${name}` };
-      }
-      const resolved = realpathSync(entryPath);
-      if (resolved !== realBlobDir && !resolved.startsWith(realBlobDir + path.sep)) {
-        return { ok: false, reason: `materialize for ${generation} resolved outside the target blob directory: ${name}` };
-      }
-      stat = statSync(resolved);
-    } catch {
-      return { ok: false, reason: `materialize for ${generation} reported a file that was not written: ${name}` };
-    }
-    if (!stat.isFile()) {
-      return { ok: false, reason: `materialize for ${generation} reported a non-file entry: ${name}` };
-    }
-    if (stat.size !== entry.size) {
-      return { ok: false, reason: `materialize for ${generation} reported ${entry.size} bytes but ${name} is ${stat.size} bytes` };
-    }
-  }
-  return { ok: true };
-}
-
+// Shared crash-safety recomputations (quickCheckOf, schemaIdentityOf, and
+// verified blob containment) now live in ./backup/safety.ts — the one authority
+// the backup manifest and this validator both call. Only recovery's stricter
+// PRAGMA integrity_check stays local.
 function integrityCheckOf(db: SqliteDatabase): IntegrityReport {
   try {
     const rows = db.prepare('PRAGMA integrity_check').all() as Array<{ integrity_check: string }>;
@@ -1392,29 +1231,9 @@ function integrityCheckOf(db: SqliteDatabase): IntegrityReport {
   }
 }
 
-// Recompute the schema identity exactly the way the backup manager derived it
-// when the manifest was written (backup.ts schemaIdentityOf): one fingerprint
-// over every framework-owned table present, one per remaining app table.
-function schemaIdentityOf(db: SqliteDatabase): { platformSchemaIdentity: string; appSchemaIdentity: string[] } {
-  const rows = db
-    .prepare("SELECT name, sql FROM sqlite_master WHERE type = 'table' AND sql IS NOT NULL")
-    .all() as Array<{ name: string; sql: string }>;
-  const sqlByName = new Map(rows.map((row) => [row.name, row.sql]));
-  const framework = new Set(frameworkTableNames);
-  const platformTables = frameworkTableNames.filter((name) => sqlByName.has(name)).slice().sort();
-  const platformSchemaIdentity = sha256hex(platformTables.map((name) => `${name}:${sqlByName.get(name)!}`).join('\n'));
-  const appSchemaIdentity = rows
-    .filter((row) => !framework.has(row.name) && row.name !== MIGRATION_LEDGER)
-    .map((row) => `${row.name}:${sha256hex(row.sql)}`)
-    .sort();
-  return { platformSchemaIdentity, appSchemaIdentity };
-}
-
-// Recompute the migration ledger that EXISTS in a snapshot using the table
-// name the manifest recorded (never assuming a fresh reset). SECURITY (review
-// #83): the manifest is untrusted input and this name is interpolated into
-// SQL, so the ONE DECLARED ledger table name is enforced before any statement
-// is built — a manifest-chosen table is a validation failure, never SQL.
+// The manifest is untrusted input: enforce the ONE DECLARED ledger table name
+// before the shared recomputation, with recovery's own error wording (review
+// #83). readMigrationLedger in backup/safety.ts does the actual read.
 function migrationLedgerOf(db: SqliteDatabase, manifest: BackupManifest): BackupMigrationLedgerState {
   const declaredTable = manifest.migrationLedgerState?.table ?? MIGRATION_LEDGER;
   if (declaredTable !== MIGRATION_LEDGER) {
@@ -1422,16 +1241,7 @@ function migrationLedgerOf(db: SqliteDatabase, manifest: BackupManifest): Backup
       `manifest declares an unsupported migration ledger table '${declaredTable}' — only '${MIGRATION_LEDGER}' is restored`,
     );
   }
-  const hasTable = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(MIGRATION_LEDGER));
-  if (!hasTable) return { table: MIGRATION_LEDGER, appliedVersions: [], maxVersion: 0 };
-  const rows = db
-    .prepare(`SELECT namespace, version FROM ${MIGRATION_LEDGER} ORDER BY namespace, version`)
-    .all() as Array<{ namespace: string; version: number }>;
-  const appliedVersions = rows
-    .map((row) => ({ namespace: row.namespace, version: Number(row.version) }))
-    .sort(compareLedgerEntry);
-  const maxVersion = appliedVersions.reduce((max, entry) => Math.max(max, entry.version), 0);
-  return { table: MIGRATION_LEDGER, appliedVersions, maxVersion };
+  return readMigrationLedger(db);
 }
 
 // ---- CLI ------------------------------------------------------------------

@@ -24,13 +24,15 @@
 //      `setAuthorizer` is forwarded only if the underlying engine supports it
 //      (never shimmed as a silent no-op so authorizer-gated features fail
 //      closed on runtimes without `sqlite3_set_authorizer`).
-//   5. Online WAL-safe `backupDatabase()` via `VACUUM INTO` (with proper SQL
-//      string quoting, existing-file overwrite parity, and partial-file cleanup
-//      on error).
+//   5. Online WAL-safe `backupDatabase()` via `VACUUM INTO` into a sibling temp
+//      file, published by one atomic rename (with proper SQL string quoting and
+//      temp-file cleanup on error). A pre-existing destination is never removed
+//      before the snapshot succeeds.
 //   6. `enableLoadExtension(false)` no-op / `enableLoadExtension(true)`
 //      fail-closed, plus uniform closed-handle errors (`/not open/i`).
 
-import { existsSync, rmSync, statSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { renameSync, rmSync } from 'node:fs';
 
 import { setForeignKeys,               } from './driver.mjs';
 
@@ -308,8 +310,20 @@ export function openSqliteDatabase(location        , options                    
   }
   const db = options === undefined
     ? new nodeSqlite .DatabaseSync(location)
-    : new nodeSqlite .DatabaseSync(location, options);
+    : new nodeSqlite .DatabaseSync(location, nodeOpenOptions(options));
   return db                             ;
+}
+
+// `SqliteOpenOptions` also carries Bun-only flags (`open`, `defensive`). Passing
+// them through to Node would change behavior — `open: false` creates a CLOSED
+// DatabaseSync — so only the options Node actually understands cross the seam.
+function nodeOpenOptions(options                   )                          {
+  const filtered                          = {};
+  if (options.readOnly !== undefined) filtered.readOnly = options.readOnly;
+  if (options.enableForeignKeyConstraints !== undefined) filtered.enableForeignKeyConstraints = options.enableForeignKeyConstraints;
+  if (options.allowExtension !== undefined) filtered.allowExtension = options.allowExtension;
+  if (options.timeout !== undefined) filtered.timeout = options.timeout;
+  return filtered;
 }
 
 function quotedSqlString(value        )         {
@@ -324,9 +338,7 @@ function isSafeSchemaIdentifier(name        )          {
  * WAL-safe online snapshot of `db` into `destination`.
  *
  * On Node: delegates to `node:sqlite`'s `backup()`.
- * On Bun: runs SQLite's `VACUUM INTO` (which captures a consistent online
- * snapshot including committed WAL frames) with proper SQL quoting and
- * partial-file cleanup on failure.
+ * On Bun: the atomic `VACUUM INTO` path below.
  */
 export async function backupDatabase(
   db                ,
@@ -339,7 +351,22 @@ export async function backupDatabase(
       ? nodeSqlite .backup(nativeDb, destination)
       : nodeSqlite .backup(nativeDb, destination, options);
   }
+  return backupDatabaseViaVacuum(db, destination, options);
+}
 
+/**
+ * The Bun `VACUUM INTO` backup path, separated from runtime detection so its
+ * atomicity contract is directly testable on any runtime. `VACUUM INTO` captures
+ * a consistent online snapshot including committed WAL frames; the snapshot is
+ * written to a sibling temp path and published with one atomic rename, so a
+ * pre-existing destination is either the old complete file or the new complete
+ * file — never deleted, truncated, or half-written.
+ */
+export async function backupDatabaseViaVacuum(
+  db                ,
+  destination        ,
+  options                      ,
+)                  {
   if (!db.isOpen) {
     throw new Error('database is not open');
   }
@@ -351,32 +378,20 @@ export async function backupDatabase(
     throw new TypeError(`invalid backup source schema name: ${sourceSchema}`);
   }
 
-  // `VACUUM INTO` refuses an existing target file, whereas `node:sqlite`'s
-  // `backup()` overwrites a pre-existing regular file. Remove a pre-existing
-  // regular file (never a directory) before writing for cross-runtime parity.
-  let existedBefore = false;
-  if (existsSync(destination)) {
-    existedBefore = true;
-    try {
-      if (statSync(destination).isFile()) {
-        rmSync(destination, { force: true });
-      }
-    } catch {
-      /* let VACUUM INTO report any filesystem error */
-    }
-  }
-
+  // Same directory (same filesystem) keeps the final rename atomic. A UUID
+  // suffix means VACUUM INTO never sees an existing target, even on a retry.
+  const tmpPath = `${destination}.tmp-${randomUUID()}`;
   const schemaPrefix = sourceSchema ? `${sourceSchema} ` : '';
   try {
-    db.exec(`VACUUM ${schemaPrefix}INTO ${quotedSqlString(destination)}`);
+    db.exec(`VACUUM ${schemaPrefix}INTO ${quotedSqlString(tmpPath)}`);
+    renameSync(tmpPath, destination);
   } catch (err) {
-    if (!existedBefore) {
-      for (const suffix of ['', '-wal', '-shm']) {
-        try {
-          rmSync(`${destination}${suffix}`, { force: true });
-        } catch {
-          /* best-effort cleanup of failed snapshot target */
-        }
+    // Clean only our own temp artifacts. The destination is never touched here.
+    for (const suffix of ['', '-wal', '-shm']) {
+      try {
+        rmSync(`${tmpPath}${suffix}`, { force: true });
+      } catch {
+        /* best-effort cleanup of failed snapshot target */
       }
     }
     throw err;

@@ -782,6 +782,9 @@ function executionFailure(error         , context                          = {},
 }
 
 const BATCH_HANDLER_FAILURE = Symbol('workbench.batch-handler-failure');
+// Marks a transaction that settled on an already-committed retry: the outcome
+// is returned as-is without post-commit fan-out (no new commit happened).
+const DEDUPED_IN_TXN = Symbol('workbench.deduped-in-txn');
 
 function batchHandlerFailure(error         , actionIndex        ) {
   return Object.freeze({ [BATCH_HANDLER_FAILURE]: true, error, actionIndex });
@@ -932,6 +935,49 @@ function checkLiveDedupe(db         , scope        , actionId        ) {
   });
 }
 
+// The full dedupe decision for one (scope, actionId), shared by the pre-handler
+// check AND the in-transaction recheck. Two concurrent retries can both pass the
+// pre-handler check before either commits; the serialized transaction re-runs
+// this exact decision so the loser settles to the winner's stored outcome instead
+// of colliding on the (scope, actionId) receipt PK.
+function singleDispatchDedupe(db         , { scope, actionId, request, receiptMatches, livePipeline }
+
+
+
+
+
+ ) {
+  const mixed = livePipeline ? checkMixedDedupe(db, scope, actionId, request, receiptMatches) : null;
+  if (mixed) return mixed;
+  const durable = checkDurableDedupe(db, scope, actionId, request, receiptMatches);
+  if (durable) return durable;
+  if (livePipeline) {
+    const live = checkLiveDedupe(db, scope, actionId);
+    if (live) return live;
+  }
+  return null;
+}
+
+function batchDispatchDedupe(db         , { scope, actionId, actions, livePipeline }
+
+
+
+
+ ) {
+  const mixed = livePipeline
+    ? checkMixedDedupe(db, scope, actionId, actions, (receipt, retryActions) =>
+      receipt.actionType === '$batch' && receipt.actionData === canonicalStringify(retryActions))
+    : null;
+  if (mixed) return mixed;
+  const durable = checkDurableBatchDedupe(db, scope, actionId, actions);
+  if (durable) return durable;
+  if (livePipeline) {
+    const live = checkLiveDedupe(db, scope, actionId);
+    if (live) return live;
+  }
+  return null;
+}
+
 // The stable event handle for tier routing. A handler-emitted event may be a
 // raw `{ type, ... }` with no attached handle — parse it; an unparseable type
 // yields undefined (treated as the durable lane, i.e. no live routing).
@@ -955,8 +1001,10 @@ function handleOfEvent(event     )      {
 // Post-commit delivery can no longer turn a committed mutation into a failure.
 async function commitEvents(db     , events     , {
   now, actionId, principal, payload, pipeline, livePipeline, tierOfEvent, scope, type, authorize, historyCommit, handler,
-  erasureActionContext, authorization, contributionPolicies = null, writeQueue = null, commitHook = null,
+  erasureActionContext, authorization, contributionPolicies = null, writeQueue = null, commitHook = null, recheckDedupe = null,
 }
+
+
 
 
 
@@ -1011,6 +1059,14 @@ async function commitEvents(db     , events     , {
     // A denied action rolls back the entire transaction — no partial state.
     // Post-commit consumers (afterCommit) remain outside the txn as before.
     committed = await runTransaction(async () => {
+      // Concurrent-retry backstop: both callers can pass the pre-handler dedupe
+      // before either commits. The writeQueue serializes transaction entry, so
+      // the loser sees the winner's receipt here — settle to that exact stored
+      // outcome BEFORE authorize, any inTransaction handler, projections, and
+      // insertReceipt (which would otherwise collide on the (scope, actionId) PK).
+      const deduped = recheckDedupe?.(db            );
+      if (deduped) return { [DEDUPED_IN_TXN]: true, outcome: deduped };
+
       if (authorize) {
         if (Array.isArray(payload)) {
           for (const action of payload) {
@@ -1213,6 +1269,10 @@ async function commitEvents(db     , events     , {
     }
     return executionFailure(err, { actionId }, undefined, commitHook);
   }
+
+  // A retry that lost the race returns the winner's stored outcome as-is. No
+  // new commit happened, so there is nothing to fan out.
+  if (committed?.[DEDUPED_IN_TXN]) return committed.outcome;
 
   // Post-commit fan-out: the durable consumers see the durable events, the
   // live consumers see the live events (a consumer that must observe BOTH tiers
@@ -1506,6 +1566,8 @@ export function createServer({ handlers = {}, authorize, db, pipeline = durableM
   }
 
   // ---- durable path (db engaged) — async, SQLite-backed ----
+  // A caller-supplied WriteQueue is THE platform mutex; never substitute a
+  // private one for it (that would let other coordinated writers interleave).
   const serverWriteQueue = writeQueue ?? createWriteQueue();
 
   // The durable dispatch: authorize (Fork C, outside txn — revoked-principal
@@ -1563,19 +1625,9 @@ export function createServer({ handlers = {}, authorize, db, pipeline = durableM
     // under a different owning scope is independent action identity, and a
     // zero-event action is durably deduped via its receipt even though it left
     // no _Log row to key on.
-    const mixedDedupe = livePipeline
-      ? checkMixedDedupe(db, scope, actionId, request, handler.dedupeReceiptMatches)
-      : null;
-    if (mixedDedupe) return mixedDedupe;
-    const dedupe = checkDurableDedupe(db, scope, actionId, request, handler.dedupeReceiptMatches);
+    const dedupeArgs = { scope, actionId, request, receiptMatches: handler.dedupeReceiptMatches, livePipeline };
+    const dedupe = singleDispatchDedupe(db, dedupeArgs);
     if (dedupe) return dedupe;
-    // S3/A2 — a retried live-tier action settles via its minimized receipt
-    // (no second apply) before the handler re-runs. Mirrors the durable dedupe,
-    // reading the `_NoHistoryReceipt` table instead of `_ActionReceipt`.
-    if (livePipeline) {
-      const liveDedupe = checkLiveDedupe(db, scope, actionId);
-      if (liveDedupe) return liveDedupe;
-    }
 
     // Run the handler — events only, no DB writes (Fork A: entity-as-projection).
     // The handler may be sync or async.
@@ -1600,6 +1652,7 @@ export function createServer({ handlers = {}, authorize, db, pipeline = durableM
       now, actionId, principal, payload, pipeline, livePipeline, tierOfEvent, scope, type, authorize, historyCommit,
       handler: handler.inTransaction || historyCommit?.handlerInputs ? handler : null, erasureActionContext,
       authorization, contributionPolicies, writeQueue: serverWriteQueue, commitHook,
+      recheckDedupe: (txnDb) => singleDispatchDedupe(txnDb, dedupeArgs),
     });
     return committed;
   }
@@ -1669,21 +1722,9 @@ export function createServer({ handlers = {}, authorize, db, pipeline = durableM
 
     // Dedupe the whole batch by its owning-stream action receipt (Wave 4.9) —
     // same (scope, actionId) identity as `dispatch`, one grammar for both.
-    const mixedDedupe = livePipeline
-      ? checkMixedDedupe(db, scope, actionId, actions, (receipt, retryActions) =>
-        receipt.actionType === '$batch' && receipt.actionData === canonicalStringify(retryActions))
-      : null;
-    if (mixedDedupe) return mixedDedupe;
-    const dedupe = checkDurableBatchDedupe(db, scope, actionId, actions);
+    const dedupeArgs = { scope, actionId, actions, livePipeline };
+    const dedupe = batchDispatchDedupe(db, dedupeArgs);
     if (dedupe) return dedupe;
-    // S3/A2 — a retried live-tier batch settles via its minimized receipt.
-    // The receipt stores no envelope, so a reused actionId under the same scope
-    // always dedupes (idempotency contract: same actionId, same settled
-    // outcome); the durable batch's envelope fingerprint does not exist here.
-    if (livePipeline) {
-      const liveDedupe = checkLiveDedupe(db, scope, actionId);
-      if (liveDedupe) return liveDedupe;
-    }
 
     // Run every handler, concatenating their emitted events. Handlers are pure
     // (events only, no DB writes — Fork A), so the batch runs them in order and
@@ -1767,6 +1808,7 @@ export function createServer({ handlers = {}, authorize, db, pipeline = durableM
       now, actionId, principal, payload: actions, pipeline, livePipeline, tierOfEvent, scope, type: '$batch', authorize, historyCommit,
       handler: runInTxn ? runHandlers : null,
       authorization, contributionPolicies, writeQueue: serverWriteQueue, commitHook,
+      recheckDedupe: (txnDb) => batchDispatchDedupe(txnDb, dedupeArgs),
     });
     return committed;
   }

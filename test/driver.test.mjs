@@ -11,8 +11,12 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
+import { backupDatabaseViaVacuum, openSqliteDatabase } from '../build/sqlite-driver.mjs';
 import { txn, begin, commit, rollback, upsert, wrapDriver } from '../build/driver.mjs';
 import { text, ref, scope, grant, read, write, subscribe, everyone, principal } from '../build/index.mjs';
 import workbench, { entity } from '../build/internal.mjs';
@@ -163,4 +167,107 @@ test('a fake driver wrapping a real :memory: db serves entity CRUD end-to-end', 
   const got = await fetch(`${origin}/notes/${encodeURIComponent(row.id)}`);
   assert.equal(got.status, 200);
   assert.equal((await got.json()).body, 'hello');
+});
+
+// ---- Bun backup atomicity (backupDatabaseViaVacuum) -----------------------
+// The Bun branch of backupDatabase writes into a sibling temp path and publishes
+// with one atomic rename. It is exercised directly here (on any runtime) so a
+// pre-existing destination is provably never removed before the snapshot lands.
+
+function backupDir() {
+  return mkdtempSync(join(tmpdir(), 'workbench-backup-atomic-'));
+}
+
+test('VACUUM INTO backup publishes via a sibling temp file and atomic rename (pre-existing destination replaced, no temp leftovers)', async () => {
+  const dir = backupDir();
+  const dest = join(dir, "backup's.sqlite");
+  const source = openSqliteDatabase(join(dir, 'source.sqlite'));
+  try {
+    source.exec('CREATE TABLE seed (id INTEGER PRIMARY KEY, label TEXT)');
+    source.prepare('INSERT INTO seed (label) VALUES (?)').run('committed-row');
+    writeFileSync(dest, 'OLD-DESTINATION-CONTENT');
+
+    const pages = await backupDatabaseViaVacuum(source, dest);
+    assert.ok(pages >= 1);
+    assert.equal(readFileSync(dest, 'utf8').includes('OLD-DESTINATION-CONTENT'), false);
+
+    const restored = openSqliteDatabase(dest, { readOnly: true });
+    try {
+      assert.equal(restored.prepare('SELECT label FROM seed WHERE id = 1').get()?.label, 'committed-row');
+    } finally {
+      restored.close();
+    }
+    assert.deepEqual(readdirSync(dir).filter((name) => name.includes('.tmp-')), [], 'no temp snapshot files remain');
+  } finally {
+    source.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a failed VACUUM INTO keeps a pre-existing destination untouched and cleans every temp artifact', async () => {
+  const dir = backupDir();
+  const dest = join(dir, 'backup.sqlite');
+  writeFileSync(dest, 'KEEP-THIS-FILE');
+  const temps = [];
+  const brokenDb = {
+    isOpen: true,
+    exec(sql) {
+      const match = /VACUUM INTO '((?:[^']|'')+)'/.exec(sql);
+      assert.ok(match, `expected a VACUUM INTO statement, got ${sql}`);
+      const tmp = match[1].replaceAll("''", "'");
+      temps.push(tmp);
+      writeFileSync(tmp, 'PARTIAL-SNAPSHOT');
+      writeFileSync(`${tmp}-wal`, 'PARTIAL-WAL');
+      throw new Error('vacuum failed');
+    },
+    prepare() { throw new Error('page count must not run after a failed snapshot'); },
+  };
+  try {
+    await assert.rejects(backupDatabaseViaVacuum(brokenDb, dest), /vacuum failed/);
+    assert.equal(readFileSync(dest, 'utf8'), 'KEEP-THIS-FILE', 'destination never removed or truncated on failure');
+    for (const tmp of temps) {
+      for (const suffix of ['', '-wal', '-shm']) {
+        assert.equal(existsSync(`${tmp}${suffix}`), false, `temp artifact ${tmp}${suffix} was cleaned`);
+      }
+    }
+    assert.deepEqual(readdirSync(dir).filter((name) => name.includes('.tmp-')), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a failed rename cleans the temp snapshot and never removes the pre-existing destination', async () => {
+  const dir = backupDir();
+  const dest = join(dir, 'destination-dir');
+  mkdirSync(dest); // renameSync(file, dir) fails — a real publish error
+  const source = openSqliteDatabase(join(dir, 'source.sqlite'));
+  try {
+    source.exec('CREATE TABLE t (id INTEGER PRIMARY KEY)');
+    await assert.rejects(backupDatabaseViaVacuum(source, dest));
+    assert.equal(statSync(dest).isDirectory(), true, 'pre-existing destination is untouched');
+    assert.deepEqual(readdirSync(dir).filter((name) => name.includes('.tmp-')), [], 'temp snapshot was cleaned');
+  } finally {
+    source.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('openSqliteDatabase filters Bun-only options out of the Node path', () => {
+  const dir = backupDir();
+  try {
+    const db = openSqliteDatabase(join(dir, 'opts.sqlite'), {
+      open: false, // Bun-only: must not leak into Node and create a closed db
+      defensive: true,
+      timeout: 50,
+      enableForeignKeyConstraints: true,
+      allowExtension: false,
+    });
+    try {
+      assert.equal(db.isOpen, true, 'Node DatabaseSync stays open');
+    } finally {
+      db.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

@@ -2,6 +2,11 @@
 
 Workbench is a framework for collaborative, persisted, realtime applications. Its language names the seams app authors declare and the framework executes.
 
+## Start here
+
+`docs/AGENT-QUICKSTART.md` is the 1-page agent map (entrypoints, invariants, checks, workflow).
+Historical `DECISIONLOG.md` and `PLANS.md` are archived under `docs/archive/` — grep, never read whole.
+
 ## Language
 
 **Entity**:

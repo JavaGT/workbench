@@ -205,6 +205,40 @@ export interface LiveFanoutHandle {
   close(): void;
 }
 
+// The ONE subscribe-row admission for delivery re-checks. Delivery-time
+// re-authorization (live-delivery-core.ts), the public delivery seam
+// (live-delivery-public.ts), and the fan-out's own emit/flush re-checks all
+// consult this function; subscribe-time admission (live-admission.ts) makes the
+// same adapter-first decision inline. An injected authorization adapter is the
+// authority when present — the same seam REST dispatch uses — otherwise the
+// framework row-grant runs, unchanged. This is what keeps a policy adapter in
+// charge of BOTH ends of live delivery instead of only one.
+export async function admitSubscribeRow(
+  entity: LiveEntityRecord,
+  row: unknown,
+  principal: Principal,
+  deps: { mayVerb?: MayVerb | null; authorization?: AuthorizationAdapter | null },
+): Promise<boolean> {
+  if (!row) return false;
+  try {
+    if (deps.authorization) {
+      const decision = await deps.authorization.admit({
+        category: 'entity',
+        verb: 'subscribe',
+        operation: 'subscribe',
+        principal,
+        entity: entity as never,
+        row,
+        resourceId: (row as { id?: unknown } | null | undefined)?.id as string | null | undefined,
+      });
+      return decision.admitted;
+    }
+    return await mayRow(entity as never, 'subscribe', row, principal, (deps.mayVerb ?? undefined) as never);
+  } catch {
+    return false;
+  }
+}
+
 // ---- Live fan-out -----------------------------------------------------------
 
 function entityHasDeltaSuppressingKind(entityRecord: LiveEntityRecord): boolean {
@@ -497,10 +531,10 @@ export function createLiveFanout({ mayVerb = null, authorization = null }: { may
     // keeps any surviving buffer from delivering to a removed subscriber.
     if (!byScope.get(scope)?.has(conn)) return;
 
-    if (!(await mayRow(entityRecord as never, 'subscribe', authzRow, conn.principal ?? anonymous, mayVerb as never))) return;
+    if (!(await admitSubscribeRow(entityRecord, authzRow, conn.principal ?? anonymous, { mayVerb, authorization }))) return;
 
     // Field-read admission (S5/A3), re-checked at flush time — admission can
-    // change between emit and flush, mirroring the mayRow re-check above. An
+    // change between emit and flush, mirroring the subscribe-admission re-check above. An
     // ephemeral field the principal cannot read is never drained to them.
     if (entry.field !== null) {
       const readableFields = await readableFieldNames(entityRecord as never, authzRow, conn.principal ?? anonymous, authorization);
@@ -601,7 +635,7 @@ export function createLiveFanout({ mayVerb = null, authorization = null }: { may
         continue;
       }
       const principal = conn.principal ?? anonymous;
-      if (!removed && !(await mayRow(entityRecord as never, 'subscribe', authzRow, principal, mayVerb as never))) {
+      if (!removed && !(await admitSubscribeRow(entityRecord, authzRow, principal, { mayVerb, authorization }))) {
         continue;
       }
 

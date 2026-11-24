@@ -23,13 +23,13 @@ import { resolveAnnotatedTextOwningScope } from './annotated-text-field.ts';
 import { rawRow } from './entity/query.ts';
 import { projectRowForRecipient } from './entity/projection.ts';
 import { mayReadField, readableFieldNames } from './field-admission.ts';
-import { mayRow } from './row-grant.ts';
 import type { AuthorizationAdapter } from './authorization-adapter.ts';
 import { ensureStream, ensureLease, hashClientNonce, resolveStream, resolveLease, acknowledgeAndPruneSnapshot, countLiveLeases, AUTHORING_STREAM_LIMITS } from './annotated-text-authoring-stream.ts';
 import { createPrincipalSnapshotDelivery, isPrincipalSnapshotScope, validatePrincipalSnapshotDeclarations } from './principal-snapshot-delivery.ts';
 import type { PrincipalSnapshotAuthorize } from './principal-snapshot-delivery.ts';
 import type { Principal } from './principal.ts';
 import type { FrameworkLog } from './log.ts';
+import { admitSubscribeRow } from './live-fanout.ts';
 import type { LiveDatabase, LiveEntityRecord, MayVerb, FieldDescriptor } from './live-fanout.ts';
 import type { CompiledSubscriptionRule, SubscriptionRule } from './subscription-rule.ts';
 
@@ -235,24 +235,6 @@ export function createOwnedLiveDelivery({ db, entities, mayVerb, authorization, 
   }
 
   const aggregateRevision = (): number => Number(db.prepare("SELECT revision FROM _CommittedRevision WHERE name = 'actions'").get()!.revision);
-  // The one subscribe-row admission for this app-integrated seam (S5/A2): an
-  // injected adapter is THE authority for both subscribe-time admission and
-  // re-authorization; without one the framework mayVerb engine runs, unchanged.
-  async function admitSubscribeRow(entity: LiveEntityRecord, row: unknown, principal: Principal): Promise<boolean> {
-    if (authorization) {
-      const decision = await authorization.admit({
-        category: 'entity',
-        verb: 'subscribe',
-        operation: 'subscribe',
-        principal,
-        entity: entity as never,
-        row,
-        resourceId: (row as { id?: unknown } | null | undefined)?.id as string | null | undefined,
-      });
-      return decision.admitted;
-    }
-    return mayRow(entity as never, 'subscribe', row, principal, mayVerb as never);
-  }
   async function aggregateSnapshot({ principal, scope, declaration, patchCapable = false }: { principal: Principal; scope: string; declaration: SnapshotDeclaration; patchCapable?: boolean }): Promise<PublicBootstrapResult> {
     const handle = tryParseScopeKey(scope);
     // No transaction crosses authorization awaits. Each attempt detaches a
@@ -300,12 +282,12 @@ export function createOwnedLiveDelivery({ db, entities, mayVerb, authorization, 
       const projectScope = projectEntity.scopeFilter(principal);
       const projectRow = db.prepare(`SELECT * FROM ${projectEntity.name} AS t0 WHERE ${projectScope.sql} AND t0.id = :id`)
         .get({ ...projectScope.params, id: project.id });
-      if (!projectRow || !(await admitSubscribeRow(projectEntity as never, projectRow, principal))) return null;
+      if (!projectRow || !(await admitSubscribeRow(projectEntity, projectRow, principal, { mayVerb, authorization }))) return null;
     }
     const { sql, params } = document.entity.scopeFilter(principal);
     const row = db.prepare(`SELECT * FROM ${document.entity.name} AS t0 WHERE ${sql} AND t0.id = :id`)
       .get({ ...params, id: document.documentId });
-    if (!row || !(await admitSubscribeRow(document.entity as never, row, principal))) return null;
+    if (!row || !(await admitSubscribeRow(document.entity, row, principal, { mayVerb, authorization }))) return null;
     // Field-read admission (S5/A3) on the annotated-text field: a principal who
     // cannot READ the field must not receive document content, snapshot
     // recovery, or fold envelopes — the same admission the row projection runs.

@@ -108,12 +108,28 @@ export function createAnnotatedTextCaretLive({ db, resolveEntity, mayVerb, fanou
   const slots = new Map<string, CaretSlot>();
   const key = (conn: CaretConnection, entity: string, id: string, field: string) => `${conn.id}\0${entity}\0${id}\0${field}`;
 
-  async function rowFor(entity: CaretEntityRecord, id: string, principal: unknown): Promise<{ raw: unknown; row: unknown } | null> {
+  async function rowFor(entity: CaretEntityRecord, id: string, principal: unknown): Promise<{ raw: Record<string, unknown>; row: unknown } | null> {
     const { sql, params } = entity.scopeFilter(principal);
-    const raw = db.prepare(`SELECT * FROM ${entity.name} AS t0 WHERE ${sql} AND t0.id = :id`).get({ ...params, id });
+    const raw = db.prepare(`SELECT * FROM ${entity.name} AS t0 WHERE ${sql} AND t0.id = :id`).get({ ...params, id }) as Record<string, unknown> | undefined;
     if (!raw) return null;
     const row = entity.hydrate ? entity.hydrate(raw, principal) : raw;
     return await mayRow(entity, 'subscribe', row, principal, mayVerb) ? { raw, row } : null;
+  }
+
+  // Authorize ONE recipient against a document row that was loaded once for the
+  // whole broadcast. The full row is never re-read per recipient: a payload-free
+  // scope-visibility probe keeps the per-principal row-scope half of the grant,
+  // hydrate redacts per principal, and mayRow runs the capability half. The same
+  // check is cheap enough to repeat immediately before delivery, so a revoke or
+  // deletion landing during the projection window still retracts instead of
+  // delivering on stale access. hydrate receives a shallow copy because it may
+  // project from (and mutate) its input and the raw row is now shared.
+  function authorizeSharedRow(entity: CaretEntityRecord, id: string, raw: Record<string, unknown>, principal: unknown): unknown | null {
+    const { sql, params } = entity.scopeFilter(principal);
+    const visible = db.prepare(`SELECT 1 AS visible FROM ${entity.name} AS t0 WHERE ${sql} AND t0.id = :id LIMIT 1`).get({ ...params, id });
+    if (!visible) return null;
+    const row = entity.hydrate ? entity.hydrate({ ...raw }, principal) : raw;
+    return row ?? null;
   }
 
   async function update(conn: CaretConnection, message: unknown): Promise<void> {
@@ -178,45 +194,54 @@ export function createAnnotatedTextCaretLive({ db, resolveEntity, mayVerb, fanou
       }
     }
 
-    for (const [recipient] of fanout.recipients(scope, input.field)) {
-      const recipientState = await rowFor(entity, input.id, recipient.principal);
-      if (!recipientState) {
+    // The document row was loaded ONCE for this broadcast (the source's
+    // rowFor above). Every recipient is projected and delivered concurrently
+    // against that shared row — no serial chain of full row reads and awaits
+    // across all subscribers.
+    const recipients = [...fanout.recipients(scope, input.field)];
+    const caret = { offset: input.offset, ...(input.selection === undefined ? {} : { selection: input.selection }) };
+    await Promise.all(recipients.map(async ([recipient]) => {
+      const maySubscribe = (row: unknown) => mayRow(entity, 'subscribe', row, recipient.principal, mayVerb);
+      const retract = () => {
         if (slot.recipients.delete(recipient) && !recipient.closed) {
-          recipient.send({ type: 'annotated-text-caret', version: 1, entity: input.entity, id: input.id, field: input.field, change: { op: 'remove', presence: slot.presence } });
+          recipient.send({ type: 'annotated-text-caret', version: 1, entity: entity.name, id: input.id, field: input.field, change: { op: 'remove', presence: slot.presence } });
         }
-        continue;
+      };
+      const stillCurrent = () => slots.get(slotKey) === slot && slot.generation === generation && !recipient.closed && fanout.hasCaretInterest(recipient, scope, input.field);
+
+      let row = authorizeSharedRow(entity, input.id, source.raw, recipient.principal);
+      if (row === null || !(await maySubscribe(row))) {
+        retract();
+        return;
       }
       try {
-         const projected = await projectAnnotatedTextCaretSnapshot({ db, entity, row: recipientState.row, principal: recipient.principal, fieldName: input.field, descriptor, caret: { offset: input.offset, ...(input.selection === undefined ? {} : { selection: input.selection }) }, presence: slot.presence });
-         const value = Object.freeze({
-           ...projected,
-           name: sourceName,
-           // Attribution only: the source principal's stable id, carried on every
-           // frame so a recipient can attribute the marker to its author. "Self"
-           // is decided by the connection-scoped presence token (`own`), never by
-           // comparing sourceId — two tabs of one principal share the id.
-           sourceId: typeof sourcePrincipal?.id === 'string' ? sourcePrincipal.id : '',
-         });
-        if (slots.get(slotKey) !== slot || slot.generation !== generation || recipient.closed || !fanout.hasCaretInterest(recipient, scope, input.field)) continue;
+        const projected = await projectAnnotatedTextCaretSnapshot({ db, entity, row, principal: recipient.principal, fieldName: input.field, descriptor, caret, presence: slot.presence });
+        const value = Object.freeze({
+          ...projected,
+          name: sourceName,
+          // Attribution only: the source principal's stable id, carried on every
+          // frame so a recipient can attribute the marker to its author. "Self"
+          // is decided by the connection-scoped presence token (`own`), never by
+          // comparing sourceId — two tabs of one principal share the id.
+          sourceId: typeof sourcePrincipal?.id === 'string' ? sourcePrincipal.id : '',
+        });
+        if (!stillCurrent()) return;
         // Re-authorize immediately before delivery: a subscription/row revoke
         // that landed during the projection window must not deliver on stale
-        // access. (The projection itself authorizes against a fresh row, but
-        // the send races any revocation between that read and this moment.)
-        if (!(await rowFor(entity, input.id, recipient.principal))) {
-          if (slot.recipients.delete(recipient) && !recipient.closed) {
-            recipient.send({ type: 'annotated-text-caret', version: 1, entity: entity.name, id: input.id, field: input.field, change: { op: 'remove', presence: slot.presence } });
-          }
-          continue;
+        // access. The scope probe re-reads committed state, so a deleted row is
+        // caught without a second full document-row load.
+        row = authorizeSharedRow(entity, input.id, source.raw, recipient.principal);
+        if (row === null || !(await maySubscribe(row))) {
+          retract();
+          return;
         }
         recipient.send({ type: 'annotated-text-caret', version: 1, entity: entity.name, id: input.id, field: input.field, change: { op: 'upsert', value } });
         slot.recipients.add(recipient);
       } catch {
-        if (slots.get(slotKey) !== slot || slot.generation !== generation || recipient.closed || !fanout.hasCaretInterest(recipient, scope, input.field)) continue;
-        if (slot.recipients.delete(recipient) && !recipient.closed) {
-          recipient.send({ type: 'annotated-text-caret', version: 1, entity: entity.name, id: input.id, field: input.field, change: { op: 'remove', presence: slot.presence } });
-        }
+        if (!stillCurrent()) return;
+        retract();
       }
-    }
+    }));
   }
 
   /** Re-project an existing slot's last value for a late-joining recipient

@@ -12,6 +12,7 @@ import {
   createAnnotatedTextRecipientSource,
   projectAnnotatedTextRecipient,
   authoringRedactionsForRecipient,
+  isProtectorActive,
   type AuthoringRedaction,
 } from './annotated-text-recipient-projection.ts';
 import { projectAnnotatedTextCaretForRecipient } from './annotated-text-caret-projection.ts';
@@ -39,7 +40,6 @@ import { annotationRangeRows } from './annotated-text-storage.ts';
 import {
   canonicalToWireIntervals,
   coversWholeDocument,
-  offsetIntervalsIntersect,
   sortAndMergeIntervals,
 } from './annotated-text-ranges.ts';
 
@@ -500,17 +500,24 @@ export async function evaluateAnnotatedTextVisibility({
     storedFieldsByFamily.set(familyName, byId);
   }
 
-  // Determine active protectors and evaluate access for each.
+  // Determine active protectors and evaluate access for each. Activation uses
+  // the one shared policy; wholeDocument is also needed below to decide whether
+  // a denied protector restricts the whole document.
   const deniedIntervals: Array<{ start: number; end: number }> = [];
   for (const protector of protectorRows) {
     if (orphanIds.has(protector.id)) continue;
     const targets = targetsByProtector.get(protector.id);
     if (!targets || targets.length === 0) continue;
     const ownRanges = rangesByAnnotation.get(protector.id) ?? [];
-    if (ownRanges.length === 0) continue;
+    if (!isProtectorActive({
+      protectedTargetIds: targets,
+      ownRanges,
+      knownTargetIds: allTargetIds,
+      rangesForTarget: (targetId) => rangesByAnnotation.get(targetId),
+      textLength,
+      onUnknownTarget: (targetId) => fail(`protector '${protector.id}' names an unknown protected target '${targetId}'`),
+    })) continue;
     const wholeDocument = coversWholeDocument(ownRanges, textLength);
-    const active = wholeDocument || offsetIntervalsIntersect(ownRanges, targets.flatMap((targetId) => rangesByAnnotation.get(targetId) ?? []));
-    if (!active) continue;
 
     const fieldEntries = declarationsByFamily.get(protector.family) ?? [];
     const fields: Record<string, unknown> = {};
@@ -760,14 +767,15 @@ function loadRecipientProjectionSource({ db, prefix, descriptor, documentId, fam
     if (own) own.push(range);
     else relevantRanges.set(range.annotationId, [range]);
   }
-  const activeProtectors = protectorAnnotations.filter((annotation) => {
-    const own = relevantRanges.get(annotation.id) ?? [];
-    const wholeDocument = coversWholeDocument(own, text.length);
-    return annotation.protectedTargetIds!.some((targetId) => {
-      if (!annotationById.has(targetId)) fail(`protector '${annotation.id}' names an unknown protected target '${targetId}'`);
-      return wholeDocument || offsetIntervalsIntersect(own, relevantRanges.get(targetId) ?? []);
-    });
-  });
+  const knownProtectorTargetIds = new Set(annotationById.keys());
+  const activeProtectors = protectorAnnotations.filter((annotation) => isProtectorActive({
+    protectedTargetIds: annotation.protectedTargetIds,
+    ownRanges: relevantRanges.get(annotation.id) ?? [],
+    knownTargetIds: knownProtectorTargetIds,
+    rangesForTarget: (targetId) => relevantRanges.get(targetId),
+    textLength: text.length,
+    onUnknownTarget: (targetId) => fail(`protector '${annotation.id}' names an unknown protected target '${targetId}'`),
+  }));
   return { sourceFor, activeProtectors };
 }
 

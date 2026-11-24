@@ -14,6 +14,7 @@ import {
   sortAndMergeIntervals,
 } from './annotated-text-ranges.mjs';
 
+
 // Snapshot minting needs the canonical intervals to bind an authoring token,
 // but those intervals must never serialize with the recipient.
 const recipientRedactionIntervals = new WeakMap          ();
@@ -58,6 +59,45 @@ export function mapVisibleOffsetToCanonical(offset        , affinity            
 }
 
 function fail(message        )        { throw new Error(`annotated-text recipient projection: ${message}`); }
+
+/**
+ * The one protector-activation policy, shared by canonical snapshot projection
+ * and recipient projection. A protecting annotation is active only when it is
+ * not orphaned, owns at least one range, and either covers the whole document
+ * or intersects a protected target's range. A whole-document protector covers
+ * every target; a rangeless protector or target can never activate.
+ *
+ * Stale protectedTargetIds are invalid canonical state and fail closed through
+ * `onUnknownTarget`. All targets are validated before the result is returned,
+ * so an early activating target cannot hide a later stale one.
+ */
+export function isProtectorActive({
+  protectedTargetIds,
+  ownRanges,
+  knownTargetIds,
+  rangesForTarget,
+  textLength,
+  orphan = false,
+  onUnknownTarget,
+}
+
+
+
+
+
+
+
+ )          {
+  if (orphan || !protectedTargetIds?.length || ownRanges.length === 0) return false;
+  const wholeDocument = coversWholeDocument(ownRanges, textLength);
+  let active = false;
+  for (const targetId of protectedTargetIds) {
+    if (!knownTargetIds.has(targetId)) onUnknownTarget?.(targetId);
+    const targetRanges = rangesForTarget(targetId);
+    if (wholeDocument || (targetRanges && offsetIntervalsIntersect(ownRanges, targetRanges))) active = true;
+  }
+  return active;
+}
 
 function freeze(value     ) {
   if (value && typeof value === 'object' && !Object.isFrozen(value)) {
@@ -263,32 +303,24 @@ export function projectAnnotatedTextRecipient({ source, descriptor, decisions }
     measurements.push(measurement);
   }
 
-  // Protector activation: a protector range must intersect a protected target's
-  // range. Whole-document (0..textLength) protectors cover everything. A stale
-  // protectedTargetIds entry (naming an annotation that does not exist) is
-  // invalid canonical state and fails closed — validate EVERY target id before
-  // any intersection break. A rangeless protector or target (its only range was
-  // displaced by an exclusive apply) is legal but can never activate.
-  for (const annotation of annotations.values()) {
-    if (!Object.hasOwn(meta.protectingFamilies, annotation.family) || !annotation.protectedTargetIds?.length) continue;
-    for (const targetId of annotation.protectedTargetIds) {
-      if (!annotations.has(targetId)) fail(`protector '${annotation.id}' names an unknown protected target '${targetId}'`);
-    }
-  }
+  // Protector activation uses the one shared policy. isProtectorActive also
+  // validates EVERY protectedTargetIds entry before returning, so a stale id
+  // fails closed even when an earlier target already activates.
+  const knownTargetIds = new Set(annotations.keys());
   const active = new Set        ();
   for (const annotation of annotations.values()) {
     if (!Object.hasOwn(meta.protectingFamilies, annotation.family) || !annotation.protectedTargetIds?.length) continue;
-    const ownRanges = rangesOf(rangeByAnnotation.get(annotation.id));
-    if (ownRanges.length === 0) continue;
-    const wholeDocument = coversWholeDocument(ownRanges, textLength);
-    for (const targetId of annotation.protectedTargetIds) {
-      const targetRanges = rangeByAnnotation.get(targetId);
-      const intersects = targetRanges ? offsetIntervalsIntersect(ownRanges, rangesOf(targetRanges)) : false;
-      if (wholeDocument || intersects) {
-        active.add(annotation.id);
-        break;
-      }
-    }
+    if (isProtectorActive({
+      protectedTargetIds: annotation.protectedTargetIds,
+      ownRanges: rangesOf(rangeByAnnotation.get(annotation.id)),
+      knownTargetIds,
+      rangesForTarget: (targetId) => {
+        const ranges = rangeByAnnotation.get(targetId);
+        return ranges === undefined ? undefined : rangesOf(ranges);
+      },
+      textLength,
+      onUnknownTarget: (targetId) => fail(`protector '${annotation.id}' names an unknown protected target '${targetId}'`),
+    })) active.add(annotation.id);
   }
 
   const outcomes = new Map                ();

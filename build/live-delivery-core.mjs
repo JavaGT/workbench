@@ -34,7 +34,6 @@ import { prepareCached } from './driver.mjs';
 import { readRevision } from './live-revision.mjs';
 import { readDeletedRowAnchor } from './deleted-row-anchor.mjs';
 import { EventKind, parseEventType } from './event-handle.mjs';
-import { mayRow } from './row-grant.mjs';
 
 import { tryParseScopeKey } from './scope-handle.mjs';
 
@@ -42,7 +41,7 @@ import { tryParseScopeKey } from './scope-handle.mjs';
 import { anonymous, principalKeyOf } from './principal.mjs';
 
 
-import { normalizeRevocationScope } from './live-fanout.mjs';
+import { admitSubscribeRow, normalizeRevocationScope } from './live-fanout.mjs';
 import { createCollectionSubscription } from './collection-subscription.mjs';
 
 import { collectionDeliveryEnvelope } from './live-delivery-envelope.mjs';
@@ -205,7 +204,10 @@ export function createLiveDeliveryCore({ db, entities, mayVerb, authorization, p
   // path (a committed deletion or a reauthorization denial): keyed by scope +
   // the last observed seq, so concurrent deliveries of the SAME invalidation
   // publish exactly once. A later invalidation (new events) gets a new key and
-  // publishes again; entries are pruned when the scope is reauthorized.
+  // publishes again; entries are pruned when the scope is reauthorized or its
+  // last subscriber detaches. The map is also bounded FIFO below, so a scope
+  // that is revoked and never reauthorized can never pin an entry forever.
+  const PUBLISHED_REVOCATION_MAX_ENTRIES = 128;
   const publishedRevocations = new Map              ();
 
   // ---- Wake-burst shared committed-batch read --------------------------------
@@ -349,6 +351,12 @@ export function createLiveDeliveryCore({ db, entities, mayVerb, authorization, p
     const dedupKey = lastSeq === null ? scope : `${scope}\u0000${lastSeq}`;
     if (publishedRevocations.has(dedupKey)) return;
     publishedRevocations.set(dedupKey, true);
+    // Map iteration order is insertion order, so the oldest key is evicted
+    // first. A scope revoked with no surviving subscriber cannot leak its key.
+    if (publishedRevocations.size > PUBLISHED_REVOCATION_MAX_ENTRIES) {
+      const oldest = publishedRevocations.keys().next().value;
+      if (oldest !== undefined) publishedRevocations.delete(oldest);
+    }
     revoke(anonymous, { category: 'entity', key: scope });
   }
 
@@ -502,28 +510,12 @@ export function createLiveDeliveryCore({ db, entities, mayVerb, authorization, p
     }
   }
 
-  async function checkMayRow(entityRec                  , row                         , principal           )                   {
-    try {
-      // Re-authorization goes through the injected authorization adapter (S5/A2)
-      // when one is wired — the SAME seam subscribe-time admission uses — so a
-      // policy adapter owns both ends of the live path (the ticket's single-path
-      // requirement). Without an adapter the framework row-grant runs, unchanged.
-      if (authorization) {
-        const decision = await authorization.admit({
-          category: 'entity',
-          verb: 'subscribe',
-          operation: 'subscribe',
-          principal,
-          entity: entityRec         ,
-          row,
-          resourceId: (row                                       )?.id                             ,
-        });
-        return decision.admitted;
-      }
-      return await mayRow(entityRec         , 'subscribe', row, principal, mayVerb         );
-    } catch {
-      return false;
-    }
+  // Dependency-bound alias of the one subscribe admission. The policy itself
+  // lives in admitSubscribeRow (live-fanout.ts), shared with subscribe-time
+  // admission, the public delivery seam, and the fan-out re-checks — so there is
+  // no second adapter/mayRow decision path inside the core.
+  function checkMayRow(entityRec                  , row                         , principal           )                   {
+    return admitSubscribeRow(entityRec, row, principal, { mayVerb, authorization });
   }
 
   function isTerminalRemoval(event                                         , entityName        )          {
@@ -554,6 +546,10 @@ export function createLiveDeliveryCore({ db, entities, mayVerb, authorization, p
       set.delete(subId);
       if (set.size === 0) byScope.delete(sub.scope);
     }
+    // With no subscriber left on this scope, its dedup keys have nothing left
+    // to deduplicate against — drop them so a permanently revoked scope cannot
+    // accumulate entries in publishedRevocations.
+    if (!byScope.has(sub.scope)) prunePublishedRevocations(sub.scope);
     return sub;
   }
 
@@ -718,7 +714,7 @@ export function createLiveDeliveryCore({ db, entities, mayVerb, authorization, p
         }
         if (auth && !(await checkMayRow(sub.entityRec, auth.row, sub.principal))) {
           if (!revocationDriven) publishRevocationForScope(sub.scope, events.length > 0 ? events[events.length - 1].seq : null);
-          removeSub(subId); log?.error?.('live', 'mayRow denied', { scope: sub.scope }); return;
+          removeSub(subId); log?.error?.('live', 'subscribe denied', { scope: sub.scope }); return;
         }
         if (!sub.active) return;
         const resyncEnvelope = sub.resyncEnvelope;

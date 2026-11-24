@@ -389,8 +389,27 @@ function parseV16Transition(value: unknown, entity: string, field: string, seenI
   invalidEnvelope(entity, field, 16);
 }
 
-function parseV16RegionOperation(operation: Record<string, unknown>, entity: string, field: string): Omit<CanonicalRegionEdit, 'id' | 'before' | 'after' | 'facts' | 'familyProof' | 'wireVersion'> {
-  const keys = ['affectedIds', 'afterDigest', 'beforeDigest', 'from', 'kind', 'text', 'to', 'transitions'];
+// V16 closed operation grammar: the v16 region.edit surface plus the complete
+// bounded before/after witness (declarationFingerprint, emptied, witnessBefore,
+// witnessAfter). Unknown keys reject; every nested value passes the same
+// canonical checks the constructor applied before the bytes were stored. All
+// validation lives in this one parser — there is no second, narrower
+// region-operation grammar beside it.
+function parseV16Operation(operation: Record<string, unknown>, entity: string, field: string): Omit<CanonicalRegionEdit, 'id' | 'before' | 'after' | 'facts' | 'familyProof' | 'wireVersion'> {
+  const keys = [
+    'affectedIds',
+    'afterDigest',
+    'beforeDigest',
+    'declarationFingerprint',
+    'emptied',
+    'from',
+    'kind',
+    'text',
+    'to',
+    'transitions',
+    'witnessAfter',
+    'witnessBefore',
+  ];
   if (!exactKeys(operation, keys) || operation.kind !== 'region.edit') invalidEnvelope(entity, field, 16);
   if (!Number.isSafeInteger(operation.from) || !Number.isSafeInteger(operation.to) || (operation.to as number) < (operation.from as number)) {
     invalidEnvelope(entity, field, 16);
@@ -419,6 +438,12 @@ function parseV16RegionOperation(operation: Record<string, unknown>, entity: str
   const transitions = Object.freeze(
     (operation.transitions as readonly unknown[]).map((entry) => parseV16Transition(entry, entity, field, seenIds)),
   );
+  if (typeof operation.declarationFingerprint !== 'string' || !SHA256_HEX.test(operation.declarationFingerprint)) {
+    throw regionLimitError(`${entity}.${field}.operated v16 declarationFingerprint is not a SHA-256 digest`);
+  }
+  const emptied = parseV16Emptied(operation.emptied, entity, field);
+  const witnessBefore = parseV16WitnessSide(operation.witnessBefore, entity, field);
+  const witnessAfter = parseV16WitnessSide(operation.witnessAfter, entity, field);
   return Object.freeze({
     kind: 'region.edit',
     from: operation.from as number,
@@ -428,50 +453,6 @@ function parseV16RegionOperation(operation: Record<string, unknown>, entity: str
     beforeDigest: operation.beforeDigest,
     afterDigest: operation.afterDigest,
     affectedIds: Object.freeze([...ids]),
-    declarationFingerprint: null,
-    witnessBefore: null,
-    witnessAfter: null,
-  });
-}
-
-// V16 closed operation grammar: the v16 region.edit surface plus the complete
-// bounded before/after witness (declarationFingerprint, emptied, witnessBefore,
-// witnessAfter). Unknown keys reject; every nested value passes the same
-// canonical checks the constructor applied before the bytes were stored.
-function parseV16Operation(operation: Record<string, unknown>, entity: string, field: string): Omit<CanonicalRegionEdit, 'id' | 'before' | 'after' | 'facts' | 'familyProof' | 'wireVersion'> {
-  const keys = [
-    'affectedIds',
-    'afterDigest',
-    'beforeDigest',
-    'declarationFingerprint',
-    'emptied',
-    'from',
-    'kind',
-    'text',
-    'to',
-    'transitions',
-    'witnessAfter',
-    'witnessBefore',
-  ];
-  if (!exactKeys(operation, keys) || operation.kind !== 'region.edit') invalidEnvelope(entity, field, 16);
-  const base = parseV16RegionOperation({
-    affectedIds: operation.affectedIds,
-    afterDigest: operation.afterDigest,
-    beforeDigest: operation.beforeDigest,
-    from: operation.from,
-    kind: 'region.edit',
-    text: operation.text,
-    to: operation.to,
-    transitions: operation.transitions,
-  }, entity, field);
-  if (typeof operation.declarationFingerprint !== 'string' || !SHA256_HEX.test(operation.declarationFingerprint)) {
-    throw regionLimitError(`${entity}.${field}.operated v16 declarationFingerprint is not a SHA-256 digest`);
-  }
-  const emptied = parseV16Emptied(operation.emptied, entity, field);
-  const witnessBefore = parseV16WitnessSide(operation.witnessBefore, entity, field);
-  const witnessAfter = parseV16WitnessSide(operation.witnessAfter, entity, field);
-  return Object.freeze({
-    ...base,
     declarationFingerprint: operation.declarationFingerprint,
     emptied,
     witnessBefore,

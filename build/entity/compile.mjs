@@ -38,7 +38,7 @@ import { effectEntries, validateEffectDeclaration } from '../effect-compiler.mjs
 import { triggerList } from '../schedule.mjs';
 import { compileMembershipAuthz } from '../auth/membership.mjs';
 import { collectSideTableStrategies } from '../side-table-strategy.mjs';
-import { createEntityProjection, createConditionalHistoryProjection, createConditionalCreateHistoryProjection } from './projection.mjs';
+import { createEntityProjection, createConditionalHistoryProjection, createConditionalCreateHistoryProjection, projectRowForRecipient } from './projection.mjs';
 import { createCrudHandlers, materializeCreateDefaults } from './crud.mjs';
 import { installEntityQueries, rawRow } from './query.mjs';
 import { validateScheduleTrigger, autoStateScheduleTrigger, stateEffectEntries, assertSqlIdentifier, mintToken } from './schedule-compile.mjs';
@@ -707,10 +707,9 @@ export function entity                                                          
       });
 
       installEntityQueries(boundRecord, {
-        name,
-        hydrate: hydrate       ,
-        deserializeStoredCells,
+        name, hydrate: hydrate       , deserializeStoredCells,
         db: queryDb,
+        projectRead: projectRowForRecipient       ,
       });
 
       const insert = (cells     ) => {

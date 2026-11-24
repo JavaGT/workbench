@@ -24,7 +24,10 @@ The hand-maintained browser surface is `public/**/*.mjs`.
    (`src/driver.ts`, `src/sqlite-driver.ts`). No second write path, no direct app writes.
 2. **Fail-closed authorization.** Route gate + row gate are on by default; grants are
    functions, allowlists only. Every transport and live event re-authorizes through the ONE
-   check registry. Never add a magic-word or parallel auth path.
+   check registry. Never add a magic-word or parallel auth path. In application handlers
+   prefer `Entity.findByIdFor(id, principal)` / `Entity.findAllFor(principal, where?)`;
+   unscoped `findAll()` / `findById()` are trusted internal primitives that bypass read
+   authorization and field projection.
 3. **Singular system.** One way per thing: no second machine (write path, auth engine, fold),
    no second reconciliation path. A new general mechanism retires the special case it
    generalizes in the same change.

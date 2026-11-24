@@ -1,6 +1,7 @@
-import { lowerToSql } from '../scope-sql.mjs';
+import { lowerToSql, rowMatchesScope,                        } from '../scope-sql.mjs';
 import { applyNearest,                  } from '../vector.mjs';
 
+import { mayRow,                   } from '../row-grant.mjs';
 
 
 
@@ -14,6 +15,24 @@ import { applyNearest,                  } from '../vector.mjs';
 
 
 
+
+
+// The recipient projection is injected by the entity compiler rather than
+// imported here: ./projection.ts already imports rawRow from this module, and a
+// query.ts → projection.ts import would add a new dependency cycle.
+
+
+// A principal is MANDATORY on the scoped read helpers. findById/findAll default
+// to a null principal precisely to bypass read authorization (trusted internal
+// queries); letting an application handler omit it here would silently reopen
+// that bypass. Throw before touching the database so an agent can never omit it.
+function requirePrincipal(method        , principal         )                                 {
+  if (principal === null || principal === undefined) {
+    throw new TypeError(
+      `${method} requires an explicit principal — use findById/findAll only for trusted internal reads`,
+    );
+  }
+}
 
 
 
@@ -122,13 +141,33 @@ export function makeQueryBuilder({ name, predicate, hydrate, defaultLimit = null
 
 export function installEntityQueries(
   record                            ,
-  { name, hydrate, deserializeStoredCells, db }
+  { name, hydrate, deserializeStoredCells, db, projectRead }
+
 
 
 
 
    ,
 ) {
+  const entityRecord = record                           ;
+
+  // One fail-closed read decision for a materialized row. Both halves are
+  // required: the compiled read scope decides row VISIBILITY (a scope-only
+  // grant confers read to every row it is handed, so mayRow alone would fail
+  // open across tenants), while the row grant's runtime `.can` decides the
+  // read capability (mayVerb). Finally the field-read projection strips every
+  // field this principal cannot read. Null means "not found" — never a partial
+  // or unauthorized row.
+  async function readForPrincipal(row     , principal           )                      {
+    if (record.grant == null) return null;
+    const readScope = record.readScope                                                                ;
+    const scopeAst = record.scopeAst;
+    if (readScope) {
+      if (!scopeAst || !rowMatchesScope({ ...readScope, ast: scopeAst }                     , row, principal)) return null;
+    }
+    if (!(await mayRow(entityRecord, 'read', row, principal))) return null;
+    return await projectRead(entityRecord, row, principal);
+  }
   record.findOne = (predicate         ) => {
     const { sql, params } = lowerToSql(predicate                                    )                 ;
     const row = preparedEntityStatement(db, `SELECT * FROM ${name} AS t0 WHERE ${sql} LIMIT 1`)
@@ -153,6 +192,28 @@ export function installEntityQueries(
   record.findById = (id        , principal          = null) => {
     const row = preparedEntityStatement(db, `SELECT * FROM ${name} AS t0 WHERE t0.id = :id`).get({ id });
     return row ? hydrate(row, principal) : null;
+  };
+
+  // Principal-scoped reads: the safe default for application handlers. Unscoped
+  // findById/findAll remain available as trusted internal primitives, but these
+  // helpers are the ones agent-written handlers should reach for — the
+  // principal cannot be omitted, and the row is authorized and projected before
+  // it is returned.
+  record.findByIdFor = async (id        , principal           )                      => {
+    requirePrincipal('findByIdFor', principal);
+    const row = (record.findById                                                    )(id, principal);
+    return row ? await readForPrincipal(row, principal) : null;
+  };
+
+  record.findAllFor = async (principal           , predicate          )                 => {
+    requirePrincipal('findAllFor', principal);
+    const source = await (record.findAll                                                       )(predicate);
+    const rows        = [];
+    for (const row of source) {
+      const admitted = await readForPrincipal(row, principal);
+      if (admitted) rows.push(admitted);
+    }
+    return rows;
   };
 
   record.hydrate = (row     , principal          = null, dispatch          = null) =>

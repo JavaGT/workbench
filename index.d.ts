@@ -1502,11 +1502,32 @@ export interface BoundWorkbenchEntity<Row extends object = Record<string, unknow
   create(payload: Partial<Row> & Record<string, unknown>): Row;
   insert(payload: Partial<Row> & Record<string, unknown>): Row;
   delete(id: string): void;
+  /**
+   * Unscoped/internal-friendly read primitive: reads the raw hydrated row with
+   * NO tenant/row-level authorization and NO field-level projection. Trusted
+   * framework/internal code only — application handlers should use
+   * {@link findByIdFor} instead.
+   */
   findById(id: string, principal?: Principal): Row | null;
+  /** Unscoped/internal-friendly read primitive; see {@link findById}. Application handlers should use {@link findAllFor}. */
   findOne(where: QueryPredicate): Row | null;
+  /** Unscoped/internal-friendly read primitive: every row, no authorization or field projection. Application handlers should use {@link findAllFor}. */
   findAll(): HydratedRows<Row>;
+  /** Unscoped/internal-friendly read primitive; see {@link findAll}. Application handlers should use {@link findAllFor}. */
   findAll(where: QueryPredicate): QueryBuilder<Row>;
   getOrFail(id: string, principal?: Principal): Row;
+  /**
+   * Fail-closed, principal-scoped read: enforces the compiled read scope and
+   * row grant and projects only readable fields. Returns null when the row is
+   * missing or the principal may not read it. Throws if principal is omitted.
+   */
+  findByIdFor(id: string, principal: Principal): Promise<Row | null>;
+  /**
+   * Fail-closed, principal-scoped read: filters out unauthorized rows and
+   * projects only readable fields. Returns [] when none are readable. Throws
+   * if principal is omitted.
+   */
+  findAllFor(principal: Principal, where?: QueryPredicate): Promise<Row[]>;
 }
 
 // S3 — live data tier vocabulary. `history` | `live` are entity tiers;

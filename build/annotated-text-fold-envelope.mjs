@@ -22,7 +22,6 @@ import { evaluateAnnotatedTextVisibility } from './annotated-text-snapshot.mjs';
 import {
   restoreTextFamilySerialized,
   textFamilyBasis,
-  textFamilyCheckpoint,
   textFamilyElementCount,
   materializeText,
 
@@ -120,7 +119,7 @@ import { rawRow } from './entity/query.mjs';
 
 
 
-// The v13 operated-event facts bag is one exact key set (mirrors
+// The v14 operated-event facts bag is one exact key set (mirrors
 // annotated-text-operated-facts.mjs and the row projection). Anything else —
 // including a block-era facts bag — fails closed and falls through.
 const OPERATED_FACTS_KEYS = ['actorId', 'annotation', 'annotationUpdates', 'emptiedAnnotations', 'family', 'lifecycle', 'measurements', 'ranges', 'removedAnnotationIds', 'result', 'selectedRange'];
@@ -198,7 +197,9 @@ export async function tryBuildAnnotatedTextFoldEnvelopes(ctx         , { db, doc
   if (!document || document.descriptor?.kind !== 'annotatedText') return null;
   const event = ctx.event;
   const data = event?.data;
-  if (!data || (data.version !== 13 && data.version !== 14) || data.id !== document.documentId) return null;
+  // Retired v13/v15 never reached the committed log (the operated-event gate
+  // admits only v14/v16), so v13 is rejected here fail-closed rather than folded.
+  if (!data || data.version !== 14 || data.id !== document.documentId) return null;
 
   let evHandle;
   try {
@@ -221,10 +222,9 @@ export async function tryBuildAnnotatedTextFoldEnvelopes(ctx         , { db, doc
     return null;
   }
   const facts = data.facts;
-  if ((data.version === 13 && (!facts.family || typeof facts.family !== 'object' || Array.isArray(facts.family)))
-    || (data.version === 14 && facts.family !== null)) {
-    return null;
-  }
+  // v14 carries no canonical family in its facts bag; the fold verifies against
+  // the family restored from the committed checkpoint instead.
+  if (facts.family !== null) return null;
 
   // Only contiguous whole-document text edits fold. annotation.apply-range and
   // annotation.remove change no text (before.frontier === after.frontier) and
@@ -333,9 +333,7 @@ export async function tryBuildAnnotatedTextFoldEnvelopes(ctx         , { db, doc
   // proven fully visible, its projected text equals `materializeText(committed)`.
   let committedText        ;
   try {
-    if ((data.version === 13 && (facts.family.id !== document.documentId
-      || JSON.stringify(textFamilyCheckpoint(committed)) !== JSON.stringify(facts.family)))
-      || JSON.stringify(committed.checkpoint.frontier) !== JSON.stringify(data.after.frontier)
+    if (JSON.stringify(committed.checkpoint.frontier) !== JSON.stringify(data.after.frontier)
       || JSON.stringify(committed.checkpoint.frontier) === JSON.stringify(data.before.frontier)
       || !frontierDominates(committed.checkpoint.frontier, data.before.frontier)
       || !opsWellFormed(foldable.operations, data.before.frontier)) {

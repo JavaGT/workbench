@@ -7,6 +7,12 @@
 // recipient-visible offsets (hidden intervals removed).
 
 import { getAnnotatedTextCompiledMetadata } from './annotated-text-field.ts';
+import {
+  canonicalToWireIntervals,
+  coversWholeDocument,
+  offsetIntervalsIntersect,
+  sortAndMergeIntervals,
+} from './annotated-text-ranges.ts';
 
 // Snapshot minting needs the canonical intervals to bind an authoring token,
 // but those intervals must never serialize with the recipient.
@@ -91,12 +97,6 @@ type CanonicalRanges = AnnotatedTextRecipientRange | AnnotatedTextRecipientRange
 function rangesOf(value: CanonicalRanges | undefined): readonly AnnotatedTextRecipientRange[] {
   if (value === undefined) return [];
   return Array.isArray(value) ? value : [value];
-}
-
-function rangeCollectionsIntersect(left: CanonicalRanges, right: CanonicalRanges): boolean {
-  const leftRanges = rangesOf(left);
-  const rightRanges = rangesOf(right);
-  return leftRanges.some((own) => rightRanges.some((target) => own.start < target.end && target.start < own.end));
 }
 
 export interface AnnotatedTextRecipientMeasurement {
@@ -278,12 +278,12 @@ export function projectAnnotatedTextRecipient({ source, descriptor, decisions }:
   const active = new Set<string>();
   for (const annotation of annotations.values()) {
     if (!Object.hasOwn(meta.protectingFamilies, annotation.family) || !annotation.protectedTargetIds?.length) continue;
-    const ownRanges = rangeByAnnotation.get(annotation.id);
-    if (!ownRanges) continue;
-    const wholeDocument = rangesOf(ownRanges).some((own) => own.start === 0 && own.end === textLength);
+    const ownRanges = rangesOf(rangeByAnnotation.get(annotation.id));
+    if (ownRanges.length === 0) continue;
+    const wholeDocument = coversWholeDocument(ownRanges, textLength);
     for (const targetId of annotation.protectedTargetIds) {
       const targetRanges = rangeByAnnotation.get(targetId);
-      const intersects = targetRanges ? rangeCollectionsIntersect(ownRanges, targetRanges) : false;
+      const intersects = targetRanges ? offsetIntervalsIntersect(ownRanges, rangesOf(targetRanges)) : false;
       if (wholeDocument || intersects) {
         active.add(annotation.id);
         break;
@@ -311,7 +311,7 @@ export function projectAnnotatedTextRecipient({ source, descriptor, decisions }:
   for (const id of active) {
     if (outcomes.get(id) !== 'deny') continue;
     const ownRanges = rangesOf(rangeByAnnotation.get(id));
-    if (ownRanges.some((range) => range.start === 0 && range.end === textLength)) {
+    if (coversWholeDocument(ownRanges, textLength)) {
       restricted = true;
       break;
     }
@@ -325,34 +325,29 @@ export function projectAnnotatedTextRecipient({ source, descriptor, decisions }:
     recipientRedactionIntervals.set(result, []);
     return Object.freeze(result);
   }
-  deniedIntervals.sort((left, right) => left.start - right.start || right.end - left.end);
-  const merged: Array<{ start: number; end: number; placeholder: any }> = [];
-  for (const interval of deniedIntervals) {
-    const prior = merged.at(-1);
-    if (prior && interval.start <= prior.end) {
-      prior.end = Math.max(prior.end, interval.end);
-    } else {
-      merged.push({ ...interval });
-    }
-  }
+  const merged = sortAndMergeIntervals(deniedIntervals);
+  const wireIntervals = canonicalToWireIntervals(merged);
 
   // Build the recipient-visible text (hidden intervals replaced by their
   // placeholder) and map canonical offsets to visible offsets.
   let text = '';
   let offset = 0;
   const authoring: Array<{ visibleStart: number; start: number; end: number }> = [];
-  const redactions = merged.map((interval) => {
+  const redactions = wireIntervals.map((interval, index) => {
     text += canonicalText.slice(offset, interval.start);
-    const visibleStart = text.length;
     offset = interval.end;
-    authoring.push(Object.freeze({ visibleStart, start: interval.start, end: interval.end }));
-    return { start: visibleStart, end: visibleStart, placeholder: interval.placeholder };
+    authoring.push(Object.freeze({
+      visibleStart: interval.visibleStart,
+      start: interval.start,
+      end: interval.end,
+    }));
+    return { start: interval.visibleStart, end: interval.visibleStart, placeholder: merged[index].placeholder };
   });
   text += canonicalText.slice(offset);
 
   const visibleOffsetFor = (canonicalOffset: number) => {
     let hidden = 0;
-    for (const interval of authoring) {
+    for (const interval of wireIntervals) {
       if (canonicalOffset < interval.start) break;
       // An offset at or inside a hidden interval maps to the interval's visible
       // marker position (zero-width); never to an unrelated earlier offset.

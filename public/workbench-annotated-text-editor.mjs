@@ -3,16 +3,23 @@
 // selections crossing them; these helpers translate between display and wire
 // coordinates (issue #33 step 8, document-wide).
 import {
+  changedRange,
   classifyDisplayOffset,
   displayToWirePosition,
   placeholderDisplayWidth,
   projectRedactionsOverEdit,
   projectRedactionsOverText,
+  scalarEnd,
+  scalarStart,
   selectionCrossesDisplayRedaction,
   wireToDisplayPosition,
 } from './workbench-annotated-text-redaction-coords.mjs';
 import { applyOffsetTextEdit } from './workbench-annotated-text-continuous.mjs';
 import { tryResolveRangesOffsets, shiftOffsetRangesOverEdit } from './workbench-annotated-text-snapshot.mjs';
+
+// The coordinate aggregator re-exports these from the editor, so the editor
+// keeps the bindings while the single implementation lives in the leaf module.
+export { changedRange, scalarEnd, scalarStart };
 
 // The blockless document renders as ONE contentEditable root span. The root
 // holds interval marker spans (annotation runs) and redaction placeholders
@@ -20,31 +27,6 @@ import { tryResolveRangesOffsets, shiftOffsetRangesOverEdit } from './workbench-
 // walking the root's text in document order rather than assuming one direct
 // text child.
 const BLOCK_ID = 'b';
-
-export function scalarStart(text, offset) {
-  if (offset > 0 && offset < text.length && text.charCodeAt(offset) >= 0xdc00 && text.charCodeAt(offset) <= 0xdfff
-    && text.charCodeAt(offset - 1) >= 0xd800 && text.charCodeAt(offset - 1) <= 0xdbff) return offset - 1;
-  return offset;
-}
-
-export function scalarEnd(text, offset) {
-  if (offset > 0 && offset < text.length && text.charCodeAt(offset) >= 0xdc00 && text.charCodeAt(offset) <= 0xdfff
-    && text.charCodeAt(offset - 1) >= 0xd800 && text.charCodeAt(offset - 1) <= 0xdbff) return offset + 1;
-  return offset;
-}
-
-export function changedRange(before, after) {
-  let from = 0;
-  while (from < before.length && from < after.length && before[from] === after[from]) from += 1;
-  from = scalarStart(before, scalarStart(after, from));
-  let beforeEnd = before.length;
-  let afterEnd = after.length;
-  while (beforeEnd > from && afterEnd > from && before[beforeEnd - 1] === after[afterEnd - 1]) {
-    beforeEnd -= 1;
-    afterEnd -= 1;
-  }
-  return { from, to: scalarEnd(before, beforeEnd), text: after.slice(from, scalarEnd(after, afterEnd)) };
-}
 
 // Project a caret offset through the single edit between `before` and `after`.
 // Offsets before the edit are unchanged, offsets after it shift by the length

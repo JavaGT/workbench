@@ -10,7 +10,6 @@ import {
 } from '../build/annotated-text-continuous.mjs';
 import {
   planTextOffsetEdit,
-  planAnnotationApplyOffsets,
   planAnnotationRemove,
   planTextRangeApply,
 } from '../build/annotated-text-plan.mjs';
@@ -188,13 +187,6 @@ test('delete that does not empty a covering range leaves emptiedAnnotations empt
   assert.equal(materializePlan(family, plan), 'acd');
   assert.deepEqual(plan.facts.emptiedAnnotations, []);
   assert.equal(plan.after.structuralRevision, 1);
-});
-
-test('planAnnotationApplyOffsets is rejected as block-era', () => {
-  assert.throws(
-    () => planAnnotationApplyOffsets(),
-    (error) => error.code === 'position-invalid' && /block-era|planTextRangeApply/.test(error.message),
-  );
 });
 
 test('removes an annotation and freezes the compact operated result', () => {

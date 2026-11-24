@@ -95,7 +95,7 @@ client. It has no field, persistence, live, history, or declaration wiring in
 T1. Tests validate the grammar itself, not static field-law flags.
 
 Field operation **wire versions** (public v9 offset edits vs internal durable
-`operated`) are separate from this RGA grammar — the projection admits only
-the span-native `operated` v13; the v1–v11 lattice was retired and is never
-replayed (ADR 0008, issue #23). See
+`operated`) are separate from this RGA grammar — the operated-event gate admits
+only `operated` v14 (live authoring) and v16 (region edits); retired v13/v15 and
+the v1–v11 lattice fail closed and are never replayed (issue #315). See
 [`../annotated-text-public-v9-operated-lattice.md`](../annotated-text-public-v9-operated-lattice.md).

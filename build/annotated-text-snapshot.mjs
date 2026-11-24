@@ -36,6 +36,12 @@ import { scopeOf } from './scope-handle.mjs';
 
 
 import { annotationRangeRows } from './annotated-text-storage.mjs';
+import {
+  canonicalToWireIntervals,
+  coversWholeDocument,
+  offsetIntervalsIntersect,
+  sortAndMergeIntervals,
+} from './annotated-text-ranges.mjs';
 
 function fail(message        )        {
   throw new Error(`annotated-text snapshot: ${message}`);
@@ -308,10 +314,6 @@ function iterateArrayRows(db     , query        , ...params           )         
   return statement.values(...params);
 }
 
-function rangesIntersect(left                                           , right                                           )          {
-  return left.some((own) => right.some((target) => own.start < target.end && target.start < own.end));
-}
-
 /**
  * Lightweight protector-only visibility evaluation for hot authoring and live
  * fold paths (#292). Checks retired state and evaluates ONLY protecting
@@ -506,8 +508,8 @@ export async function evaluateAnnotatedTextVisibility({
     if (!targets || targets.length === 0) continue;
     const ownRanges = rangesByAnnotation.get(protector.id) ?? [];
     if (ownRanges.length === 0) continue;
-    const wholeDocument = ownRanges.some((range) => range.start === 0 && range.end === textLength);
-    const active = wholeDocument || targets.some((targetId) => rangesIntersect(ownRanges, rangesByAnnotation.get(targetId) ?? []));
+    const wholeDocument = coversWholeDocument(ownRanges, textLength);
+    const active = wholeDocument || offsetIntervalsIntersect(ownRanges, targets.flatMap((targetId) => rangesByAnnotation.get(targetId) ?? []));
     if (!active) continue;
 
     const fieldEntries = declarationsByFamily.get(protector.family) ?? [];
@@ -541,23 +543,13 @@ export async function evaluateAnnotatedTextVisibility({
     return { fullyVisible: true, restricted: false, redactions: [] };
   }
 
-  deniedIntervals.sort((left, right) => left.start - right.start || right.end - left.end);
-  const merged                                        = [];
-  for (const interval of deniedIntervals) {
-    const prior = merged.at(-1);
-    if (prior && interval.start <= prior.end) {
-      prior.end = Math.max(prior.end, interval.end);
-    } else {
-      merged.push({ ...interval });
-    }
-  }
-  let visibleCursor = 0;
-  let canonicalOffset = 0;
-  const redactions                       = merged.map((interval) => {
-    visibleCursor += interval.start - canonicalOffset;
-    canonicalOffset = interval.end;
-    return Object.freeze({ visibleStart: visibleCursor, start: interval.start, end: interval.end });
-  });
+  const merged = sortAndMergeIntervals(deniedIntervals);
+  const redactions                       = canonicalToWireIntervals(merged)
+    .map((interval) => Object.freeze({
+      visibleStart: interval.visibleStart,
+      start: interval.start,
+      end: interval.end,
+    }));
   return { fullyVisible: false, restricted: false, redactions };
 }
 
@@ -770,10 +762,10 @@ function loadRecipientProjectionSource({ db, prefix, descriptor, documentId, fam
   }
   const activeProtectors = protectorAnnotations.filter((annotation) => {
     const own = relevantRanges.get(annotation.id) ?? [];
-    const wholeDocument = own.some((range) => range.start === 0 && range.end === text.length);
+    const wholeDocument = coversWholeDocument(own, text.length);
     return annotation.protectedTargetIds .some((targetId) => {
       if (!annotationById.has(targetId)) fail(`protector '${annotation.id}' names an unknown protected target '${targetId}'`);
-      return wholeDocument || rangesIntersect(own, relevantRanges.get(targetId) ?? []);
+      return wholeDocument || offsetIntervalsIntersect(own, relevantRanges.get(targetId) ?? []);
     });
   });
   return { sourceFor, activeProtectors };

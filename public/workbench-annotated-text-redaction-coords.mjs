@@ -93,16 +93,42 @@ export function placeholderDisplayWidth(redactions = []) {
   return total;
 }
 
-function scalarStart(text, offset) {
+// The surrogate/diff helpers are defined ONCE here — this module is a leaf
+// (zero imports) — and re-exported by the editor and imported by the snapshot,
+// so no consumer keeps a private copy of the UTF-16 scalar grammar.
+
+/** Back a UTF-16 offset off a low-surrogate half onto its scalar start. */
+export function scalarStart(text, offset) {
   if (offset > 0 && offset < text.length && text.charCodeAt(offset) >= 0xdc00 && text.charCodeAt(offset) <= 0xdfff
     && text.charCodeAt(offset - 1) >= 0xd800 && text.charCodeAt(offset - 1) <= 0xdbff) return offset - 1;
   return offset;
 }
 
-function scalarEnd(text, offset) {
+/** Push a UTF-16 offset past a low-surrogate half onto its scalar end. */
+export function scalarEnd(text, offset) {
   if (offset > 0 && offset < text.length && text.charCodeAt(offset) >= 0xdc00 && text.charCodeAt(offset) <= 0xdfff
     && text.charCodeAt(offset - 1) >= 0xd800 && text.charCodeAt(offset - 1) <= 0xdbff) return offset + 1;
   return offset;
+}
+
+/**
+ * The single scalar-aligned edit between two texts: common prefix/suffix are
+ * trimmed, then both bounds back off to UTF-16 scalar edges so an astral
+ * character is never split. Shared by the editor, redaction projector and
+ * snapshot range shifter.
+ */
+export function changedRange(before, after) {
+  let from = 0;
+  while (from < before.length && from < after.length && before[from] === after[from]) from += 1;
+  let beforeEnd = before.length;
+  let afterEnd = after.length;
+  while (beforeEnd > from && afterEnd > from && before[beforeEnd - 1] === after[afterEnd - 1]) {
+    beforeEnd -= 1;
+    afterEnd -= 1;
+  }
+  from = scalarStart(before, scalarStart(after, from));
+  beforeEnd = scalarEnd(before, beforeEnd);
+  return { from, to: beforeEnd, text: after.slice(from, scalarEnd(after, afterEnd)) };
 }
 
 /**
@@ -144,16 +170,6 @@ export function projectRedactionsOverEdit(redactions = [], from, to, text, affin
  */
 export function projectRedactionsOverText(redactions = [], beforeText, afterText, affinity = 'right') {
   if (redactions.length === 0 || beforeText === afterText) return redactions;
-  let from = 0;
-  while (from < beforeText.length && from < afterText.length && beforeText[from] === afterText[from]) from += 1;
-  let beforeEnd = beforeText.length;
-  let afterEnd = afterText.length;
-  while (beforeEnd > from && afterEnd > from && beforeText[beforeEnd - 1] === afterText[afterEnd - 1]) {
-    beforeEnd -= 1;
-    afterEnd -= 1;
-  }
-  from = scalarStart(beforeText, scalarStart(afterText, from));
-  beforeEnd = scalarEnd(beforeText, beforeEnd);
-  const text = afterText.slice(from, scalarEnd(afterText, afterEnd));
-  return projectRedactionsOverEdit(redactions, from, beforeEnd, text, affinity);
+  const { from, to, text } = changedRange(beforeText, afterText);
+  return projectRedactionsOverEdit(redactions, from, to, text, affinity);
 }

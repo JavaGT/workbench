@@ -1,5 +1,6 @@
 import { createAnnotatedTextSnapshotSessionBinding, getAnnotatedTextSnapshotSessionBinding } from './workbench-annotated-text-snapshot-internal.mjs';
 import { projectEndpointToOffset, resolveOffsetToEndpoint } from './workbench-annotated-text-continuous.mjs';
+import { changedRange, scalarStart } from './workbench-annotated-text-redaction-coords.mjs';
 
 const deeplyFrozen = new WeakSet();
 
@@ -306,17 +307,8 @@ export function shiftOffsetRangesOverEdit(ranges, from, to, text) {
 
 export function shiftOffsetRangesOverText(ranges, beforeText, afterText) {
   if (!Array.isArray(ranges) || ranges.length === 0 || beforeText === afterText) return ranges;
-  let from = 0;
-  while (from < beforeText.length && from < afterText.length && beforeText[from] === afterText[from]) from += 1;
-  let beforeEnd = beforeText.length;
-  let afterEnd = afterText.length;
-  while (beforeEnd > from && afterEnd > from && beforeText[beforeEnd - 1] === afterText[afterEnd - 1]) {
-    beforeEnd -= 1;
-    afterEnd -= 1;
-  }
-  from = scalarStart(beforeText, scalarStart(afterText, from));
-  beforeEnd = scalarEnd(beforeText, beforeEnd);
-  return shiftOffsetRangesOverEdit(ranges, from, beforeEnd, afterText.slice(from, scalarEnd(afterText, afterEnd)));
+  const { from, to, text } = changedRange(beforeText, afterText);
+  return shiftOffsetRangesOverEdit(ranges, from, to, text);
 }
 
 export function materializeAnnotatedTextSnapshot(snapshot, handle, options = {}) {
@@ -468,7 +460,7 @@ export function projectPendingAnnotatedTextDocument(document, action, options) {
   const start = edit.kind === 'text.insert' ? edit.at.offset : edit.from.offset;
   const end = edit.kind === 'text.insert' ? start : edit.to.offset;
   if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start || end > text.length) return document;
-  if (splitsSurrogate(text, start) || splitsSurrogate(text, end)) return document;
+  if (scalarStart(text, start) !== start || scalarStart(text, end) !== end) return document;
   const inserted = edit.kind === 'text.insert' || edit.kind === 'text.replace' ? edit.text : '';
   const spliced = `${text.slice(0, start)}${inserted}${text.slice(end)}`;
   const ranges = Array.isArray(document.ranges) && document.ranges.some((range) => isOffsetRange(range))
@@ -591,23 +583,6 @@ function projectAnnotationApply(document, edit, options) {
   });
 }
 
-function splitsSurrogate(text, offset) {
-  return offset > 0 && offset < text.length
-    && text.charCodeAt(offset - 1) >= 0xd800 && text.charCodeAt(offset - 1) <= 0xdbff
-    && text.charCodeAt(offset) >= 0xdc00 && text.charCodeAt(offset) <= 0xdfff;
-}
-
-// Bounds may land between a surrogate pair when the transition crosses an
-// astral character; back off to the scalar boundary so offsets stay on
-// character edges (mirrors the editor's changedRange scalar handling).
-function scalarStart(text, offset) {
-  if (offset > 0 && offset < text.length && text.charCodeAt(offset) >= 0xdc00 && text.charCodeAt(offset) <= 0xdfff
-    && text.charCodeAt(offset - 1) >= 0xd800 && text.charCodeAt(offset - 1) <= 0xdbff) return offset - 1;
-  return offset;
-}
-
-function scalarEnd(text, offset) {
-  if (offset > 0 && offset < text.length && text.charCodeAt(offset) >= 0xdc00 && text.charCodeAt(offset) <= 0xdfff
-    && text.charCodeAt(offset - 1) >= 0xd800 && text.charCodeAt(offset - 1) <= 0xdbff) return offset + 1;
-  return offset;
-}
+// Scalar-boundary handling lives in the leaf `redaction-coords` module: bounds
+// may land between a surrogate pair when a transition crosses an astral
+// character, so all three public consumers back off to the same scalar edges.

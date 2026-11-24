@@ -26,6 +26,7 @@ import {
   type FrameworkOwnedObject,
 } from './schema-table-census.ts';
 import type { OwnedObjectSet } from './framework-table-names.ts';
+import { structCellColumn } from './field-strategy.ts';
 import { migrationIdentityKey } from './migration-identity.ts';
 
 export type ObjectKind = 'table' | 'index' | 'trigger' | 'virtual-table';
@@ -93,6 +94,10 @@ export interface SchemaExternalTableDeclaration {
   readonly columns: readonly string[];
 }
 
+export interface SchemaExternalIndexDeclaration {
+  readonly name: string;
+}
+
 export interface SchemaDeclaration {
   readonly name: string;
   readonly tables?: readonly SchemaTableDeclaration[];
@@ -100,6 +105,9 @@ export interface SchemaDeclaration {
   // Triggers the fixture/application created out-of-band on external or
   // framework tables, declared as schema-owned knowledge for the census.
   readonly externalTriggers?: readonly { name: string }[];
+  // Indexes a co-tenant created on external/framework tables — declared
+  // knowledge, same non-exclusive attribution as external tables/triggers.
+  readonly externalIndexes?: readonly SchemaExternalIndexDeclaration[];
   readonly virtualTables?: readonly SchemaVirtualTableDeclaration[];
   readonly migrations?: readonly SchemaMigrationDeclaration[];
 }
@@ -267,7 +275,7 @@ function entityMainColumns(entity: EntityDeclaration): ColumnInfo[] {
     if (field.kind === 'computed' && field.mode === 'pull') continue;
     if (field.kind === 'struct') {
       for (const cell of Object.keys((field.cells ?? {}) as Record<string, unknown>)) {
-        columns.push({ name: `${name}_${cell}`, type: 'TEXT' });
+        columns.push({ name: structCellColumn(name, cell), type: 'TEXT' });
       }
       continue;
     }
@@ -484,6 +492,15 @@ export function buildOwnershipCensus(input: CensusInput): CensusResult {
       if (refuseReserved('trigger', trigger.name, 'schema', schema.name)) continue;
       if (!book.census.has(censusKey('trigger', trigger.name))) {
         book.claim('trigger', trigger.name, 'schema', schema.name);
+      }
+    }
+    // External indexes are declared knowledge, not exclusive ownership: another
+    // participant may declare the same index. A framework-reserved name is
+    // still refused, exactly as for external tables and triggers.
+    for (const index of schema.externalIndexes ?? []) {
+      if (refuseReserved('index', index.name, 'schema', schema.name)) continue;
+      if (!book.census.has(censusKey('index', index.name))) {
+        book.claim('index', index.name, 'schema', schema.name);
       }
     }
   }

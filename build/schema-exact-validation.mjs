@@ -62,6 +62,8 @@ import { censusKey, classifyObservedObject,                                     
 
 
 
+
+
 function folded(name        )         {
   return name.toLowerCase();
 }
@@ -196,7 +198,7 @@ function declaredDefault(column                                                 
 
 function indexSqlTermsAndWhere(db               , indexName        , xinfoTerms                                )                                            {
   const row = db.prepare("SELECT sql FROM sqlite_schema WHERE type = 'index' AND lower(name) = lower(?)").get(indexName);
-  const sql = row === undefined ? '' : String(row.sql ?? '');
+  const sql = row == null ? '' : String(row.sql ?? '');
   if (sql === '') {
     // Auto-indexes (origin 'u'/'pk' from UNIQUE/PK constraints) have no stored
     // SQL — derive their terms from PRAGMA index_xinfo column names instead.
@@ -478,7 +480,7 @@ function validateTable(db               , census                                
     return;
   }
   const live = db.prepare("SELECT sql FROM sqlite_schema WHERE type = 'table' AND lower(name) = lower(?)").get(table.name);
-  if (live === undefined) {
+  if (live == null) {
     push('missing-table', 'schema', owner, 'table', table.name, 'is declared but absent from the live schema');
     return;
   }
@@ -506,7 +508,7 @@ function validateVirtualTable(db               , census                         
     return;
   }
   const live = db.prepare("SELECT sql FROM sqlite_schema WHERE type = 'table' AND lower(name) = lower(?)").get(virtualTable.name);
-  if (live === undefined) {
+  if (live == null) {
     push('missing-table', 'plugin', pluginId, 'virtual-table', virtualTable.name, 'is declared but absent from the live schema');
     return;
   }
@@ -516,7 +518,7 @@ function validateVirtualTable(db               , census                         
   }
   for (const shadow of virtualTable.shadowTables) {
     const shadowLive = db.prepare("SELECT type FROM sqlite_schema WHERE type = 'table' AND lower(name) = lower(?)").get(shadow);
-    if (shadowLive === undefined) {
+    if (shadowLive == null) {
       push('missing-table', 'plugin', pluginId, 'shadow-table', shadow,
         `of virtual table "${virtualTable.name}" is declared but absent from the live schema`);
     }
@@ -560,7 +562,7 @@ export function validateExactSchema(
       const objectKind = entry.objectKind === 'table' ? 'table' : entry.objectKind;
       const ownerKind = entry.kind;
       const owner = entry.owner;
-      if (live === undefined) {
+      if (live == null) {
         push('missing-object', ownerKind, owner, objectKind, entry.name, 'is declared by the lifecycle census but absent from the live schema');
       } else if (entry.objectKind === 'virtual-table' && !/^CREATE\s+VIRTUAL\s+TABLE/i.test(String(live.sql ?? ''))) {
         push('object-kind', ownerKind, owner, 'virtual-table', entry.name, 'is declared as a virtual table but exists as an ordinary table');

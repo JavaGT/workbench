@@ -1,3 +1,5 @@
+import { structCellColumn } from './field-strategy.ts';
+
 interface Descriptor {
   kind: string;
   type?: string;
@@ -50,7 +52,7 @@ function rowProperties(fields: Readonly<Record<string, Descriptor>>): string[] {
   for (const [name, desc] of Object.entries(fields)) {
     if (desc.kind === 'struct') {
       for (const [cellName] of Object.entries(desc.cells || {})) {
-        lines.push(`${name}_${cellName}: string`);
+        lines.push(`${structCellColumn(name, cellName)}: string`);
       }
       continue;
     }

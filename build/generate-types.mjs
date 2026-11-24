@@ -1,3 +1,5 @@
+import { structCellColumn } from './field-strategy.mjs';
+
 
 
 
@@ -50,7 +52,7 @@ function rowProperties(fields                                      )           {
   for (const [name, desc] of Object.entries(fields)) {
     if (desc.kind === 'struct') {
       for (const [cellName] of Object.entries(desc.cells || {})) {
-        lines.push(`${name}_${cellName}: string`);
+        lines.push(`${structCellColumn(name, cellName)}: string`);
       }
       continue;
     }

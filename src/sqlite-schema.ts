@@ -16,6 +16,27 @@ const ALLOWED_TRIGGER_EVENTS = new Set(['insert', 'update', 'delete']);
 
 const IDENTIFIER_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
+// Fail-fast mirror of schema-table-census.frameworkReservedNames (folded). The
+// census is the authority and re-checks reserved names at boot with the derived
+// registry; this local copy exists only because importing the registry here
+// would create an initialization cycle through ddl.ts (which calls
+// defineSqliteSchema at module top level). Keep the two sets in lockstep.
+const FRAMEWORK_RESERVED_NAMES: ReadonlySet<string> = Object.freeze(new Set(
+  (`blobstore _operationalconsumerdeclaration _operationalconsumerfailure _pendingblob
+    _log _v16capabilityclaim _cursor _actionreceipt _historyordercounter
+    _committedrevision _historycursor _nohistoryreceipt _liverevision
+    _invalidationledger _compositechange _compositechangecursor _schedulereceipt
+    _job _privateactionfact _privateactionfactdependency _postcommiteffect
+    _projectedcursor _consumercursor _worker _principalsnapshotrevision
+    _deletedrowanchor _schemamigration _searchstaleness _derivedresource
+    _schemamaintenance idx_blob_status idx__log_actionid
+    idx__actionreceipt_scope_history idx__compositechange_actionid
+    idx__private_action_fact_dependency_entity idx__post_commit_effect_claim
+    idx__post_commit_effect_key_order idx__job_claim idx__job_scope_status
+    user session idx_session_schedule_createdat inbox credential invitation
+    apikey twofactor`).split(/\s+/),
+));
+
 function requireName(value: unknown, label: string): string {
   if (typeof value !== 'string' || value.length === 0 || value.includes('\0')) {
     throw new Error(`${label} must be a non-empty string without NUL bytes`);
@@ -403,11 +424,13 @@ interface SqliteSchemaInput {
   tables?: unknown;
   externalTables?: unknown;
   externalTriggers?: unknown;
+  externalIndexes?: unknown;
   migrations?: unknown;
   virtualTables?: unknown;
 }
 
 interface LooseExternalTable { name?: unknown; columns?: unknown; }
+interface LooseExternalIndex { name?: unknown; table?: unknown; }
 interface LooseTable {
   name?: unknown; columns?: unknown; primaryKey?: unknown; indexes?: unknown;
   foreignKeys?: unknown; unique?: unknown; check?: unknown; strict?: unknown;
@@ -539,6 +562,35 @@ function validateSpec(input: unknown): void {
       throw new Error(`duplicate external trigger "${(trigger as LooseTrigger).name}"`);
     }
     seenExternalTriggers.add(triggerKey);
+  }
+
+  // Indexes a co-tenant created on external (or framework) tables. The schema
+  // never creates or drops them — it only declares their names so the startup
+  // census can attribute them instead of reporting them as undeclared drift.
+  // String entries are accepted for parity with the other external-declaration
+  // surfaces and normalised to `{ name }` on the compiled schema.
+  if (spec.externalIndexes !== undefined && !Array.isArray(spec.externalIndexes)) {
+    throw new Error('schema externalIndexes must be an array');
+  }
+  const externalIndexes = (spec.externalIndexes ?? []) as unknown[];
+  const seenExternalIndexes = new Set<string>();
+  for (const index of externalIndexes) {
+    const name = typeof index === 'string'
+      ? index
+      : (index !== null && typeof index === 'object' ? (index as LooseExternalIndex).name : undefined);
+    requireIdentifier(name, 'external index name');
+    if (typeof index !== 'string' && (index as LooseExternalIndex).table !== undefined) {
+      requireIdentifier((index as LooseExternalIndex).table, `table for external index "${name}"`);
+    }
+    const indexKey = folded(name as string);
+    if (indexKey.startsWith('sqlite_')) {
+      throw new Error(`external index "${name}" uses the reserved sqlite_ prefix`);
+    }
+    if (FRAMEWORK_RESERVED_NAMES.has(indexKey)) {
+      throw new Error(`external index "${name}" uses a framework-reserved name`);
+    }
+    if (seenExternalIndexes.has(indexKey)) throw new Error(`duplicate external index "${name}"`);
+    seenExternalIndexes.add(indexKey);
   }
 
   // A virtual table claims a real table name, so it must not collide with an
@@ -852,6 +904,9 @@ export interface SqliteSchemaSpec {
   // Triggers the fixture/application created out-of-band (on external or
   // framework tables); declared as schema-owned knowledge for the census.
   externalTriggers?: readonly { name: string }[];
+  // Indexes a co-tenant created on external/framework tables; declared so the
+  // census can attribute them without this schema creating or dropping them.
+  externalIndexes?: readonly (string | { name: string; table?: string })[];
   virtualTables?: readonly SqliteVirtualTableSpec[];
   migrations?: readonly SqliteMigrationSpec[];
 }
@@ -864,6 +919,8 @@ export interface SqliteSchemaDescription {
   externalTables: readonly { name: string; columns: readonly string[] }[];
   /** Triggers supplied outside this schema's lifecycle, retained for startup census validation. */
   externalTriggers: readonly { name: string }[];
+  /** Indexes supplied outside this schema's lifecycle, retained for startup census validation. */
+  externalIndexes: readonly { name: string; table?: string }[];
   virtualTables: readonly SqliteVirtualTableSpec[];
   triggers: readonly SqliteTriggerSpec[];
   migrations: readonly SqliteMigrationSpec[];
@@ -905,6 +962,10 @@ export function defineSqliteSchema(spec: SqliteSchemaInput): SqliteSchemaDescrip
     columns: Object.freeze([...table.columns]),
   })));
   const externalTriggers = Object.freeze((validated.externalTriggers ?? []).map((trigger) => Object.freeze({ name: trigger.name })));
+  const externalIndexes = Object.freeze((validated.externalIndexes ?? []).map((index) => Object.freeze({
+    name: typeof index === 'string' ? index : index.name,
+    ...(typeof index === 'string' || index.table === undefined ? {} : { table: index.table }),
+  })));
   const virtualTables = Object.freeze((validated.virtualTables ?? []).map((virtualTable) => Object.freeze({
     ...virtualTable,
     options: Object.freeze([...virtualTable.options]),
@@ -930,6 +991,7 @@ export function defineSqliteSchema(spec: SqliteSchemaInput): SqliteSchemaDescrip
     tables,
     externalTables,
     externalTriggers,
+    externalIndexes,
     virtualTables,
     triggers,
     migrations: Object.freeze(migrations),

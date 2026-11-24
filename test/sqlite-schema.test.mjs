@@ -2,6 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { defineSqliteSchema } from '../build/server.mjs';
+import { buildOwnershipCensus, censusKey } from '../build/schema-census.mjs';
+import { validateExactSchema } from '../build/schema-exact-validation.mjs';
 
 function taskSchema(overrides = {}) {
   return defineSqliteSchema({
@@ -364,4 +366,109 @@ test('legacy Scope-shaped declarations validate and emit identical DDL', () => {
   } finally {
     db.close();
   }
+});
+
+// ---------------------------------------------------------------------------
+// externalIndexes — non-destructive co-tenancy
+// ---------------------------------------------------------------------------
+
+test('externalIndexes are frozen declaration-only knowledge, never created or dropped by prepare', () => {
+  const schema = defineSqliteSchema({
+    name: 'co-tenant',
+    tables: [{ name: 'Local', columns: [{ name: 'id', type: 'text', primaryKey: true }] }],
+    externalTables: [{ name: 'Project', columns: ['id', 'owner', 'status'] }],
+    externalIndexes: ['Project_owner_idx', { name: 'Project_status_idx', table: 'Project' }],
+  });
+
+  assert.deepEqual(schema.externalIndexes, [
+    { name: 'Project_owner_idx' },
+    { name: 'Project_status_idx', table: 'Project' },
+  ]);
+  assert.ok(Object.isFrozen(schema.externalIndexes));
+  assert.ok(schema.externalIndexes.every((index) => Object.isFrozen(index)));
+  assert.deepEqual(schema.ddl, [
+    'CREATE TABLE IF NOT EXISTS "Local" (\n  "id" TEXT PRIMARY KEY\n);',
+  ]);
+
+  const db = new DatabaseSync(':memory:');
+  try {
+    db.exec('CREATE TABLE "Project" (id TEXT PRIMARY KEY, owner TEXT, status TEXT)');
+    db.exec('CREATE INDEX "Project_owner_idx" ON "Project" (owner)');
+    schema.prepare(db);
+    assert.deepEqual(
+      db.prepare("SELECT name FROM sqlite_schema WHERE type = 'index' AND name NOT LIKE 'sqlite_%' ORDER BY name").all().map((row) => row.name),
+      ['Project_owner_idx'],
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test('externalIndexes reject unsafe, duplicate, and framework-reserved names before SQLite is touched', () => {
+  const base = { name: 'co-tenant', tables: [] };
+  assert.throws(() => defineSqliteSchema({ ...base, externalIndexes: 'not-an-array' }), /externalIndexes must be an array/i);
+  assert.throws(() => defineSqliteSchema({ ...base, externalIndexes: [''] }), /external index name/i);
+  assert.throws(() => defineSqliteSchema({ ...base, externalIndexes: ['has space'] }), /identifier/i);
+  assert.throws(() => defineSqliteSchema({ ...base, externalIndexes: ['A_idx', 'a_IDX'] }), /duplicate external index/i);
+  assert.throws(() => defineSqliteSchema({ ...base, externalIndexes: ['sqlite_autoindex_Project_1'] }), /sqlite_/i);
+  assert.throws(() => defineSqliteSchema({ ...base, externalIndexes: ['idx__job_claim'] }), /framework-reserved/i);
+  assert.throws(
+    () => defineSqliteSchema({ ...base, externalIndexes: [{ name: 'ok_idx', table: 'bad-table' }] }),
+    /table for external index/i,
+  );
+});
+
+test('externalIndexes reject every name in the authoritative framework reserved namespace', async () => {
+  const { frameworkReservedNames } = await import('../build/schema-table-census.mjs');
+  for (const name of frameworkReservedNames) {
+    assert.throws(
+      () => defineSqliteSchema({ name: 'co-tenant', tables: [], externalIndexes: [name] }),
+      /reserved/i,
+      `framework-reserved name "${name}" must be rejected`,
+    );
+  }
+});
+
+test('declared externalIndexes pass census-backed exact validation (existence + classification)', () => {
+  const db = new DatabaseSync(':memory:');
+  try {
+    db.exec('CREATE TABLE "Note" (id TEXT PRIMARY KEY, owner TEXT)');
+    db.exec('CREATE INDEX "note_owner_idx" ON "Note" (owner)');
+    const schema = defineSqliteSchema({
+      name: 'co-tenant',
+      tables: [],
+      externalTables: [{ name: 'Note', columns: ['id', 'owner'] }],
+      externalIndexes: ['note_owner_idx'],
+    });
+    const { census, errors } = buildOwnershipCensus({
+      framework: { tables: [], indexes: [], triggers: [], virtualTables: [] },
+      schemaDeclarations: [schema],
+    });
+    assert.deepEqual(errors, []);
+    assert.deepEqual(
+      census.get(censusKey('index', 'note_owner_idx')),
+      { kind: 'schema', owner: 'co-tenant', objectKind: 'index', name: 'note_owner_idx' },
+    );
+    assert.deepEqual(validateExactSchema(db, census, [schema], { validateCensus: true }), []);
+  } finally {
+    db.close();
+  }
+});
+
+test('null-returning .get() is treated as a miss by exact validation (bun:sqlite semantics)', () => {
+  const schema = defineSqliteSchema({
+    name: 'bun',
+    tables: [{ name: 'Thing', columns: [{ name: 'id', type: 'text', primaryKey: true }] }],
+  });
+  const census = new Map([
+    [censusKey('table', 'Thing'), { kind: 'schema', owner: 'bun', objectKind: 'table', name: 'Thing' }],
+  ]);
+  // bun:sqlite returns null (not undefined) when a .get() query misses.
+  const nullMissDb = {
+    prepare() {
+      return { all: () => [], get: () => null };
+    },
+  };
+  const errors = validateExactSchema(nullMissDb, census, [schema], { validateCensus: true });
+  assert.deepEqual(errors.map((error) => error.code).sort(), ['missing-object', 'missing-table']);
 });

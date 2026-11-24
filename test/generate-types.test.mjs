@@ -79,6 +79,22 @@ test('generateTypes: link field emits struct sub-cell handles', () => {
   assert.ok(types.includes('tier:'), 'should include sub-cell tier');
 });
 
+test('generateTypes: struct row columns use the authoritative double-underscore name', () => {
+  const Doc = entity('Doc', {
+    body: text(),
+    owner: ref('User', { role: 'owner' }),
+    share: link({ tier: text(), token: text() }, { tiers: ['view'], tokenIntent: 'autogen' }),
+    grant: () => [scope(({ is }) => is.owner()).can(() => grant(read))],
+  });
+
+  const types = generateTypes([Doc]);
+
+  assertTypesCompile(types);
+  assert.ok(types.includes('share__tier: string'), types);
+  assert.ok(types.includes('share__token: string'), types);
+  assert.ok(!types.includes('share_tier:'), 'single underscore is not a generated column');
+});
+
 test('generateTypes: computed field (pull) excluded from row', () => {
   const Note = entity('Note', {
     body: text(),

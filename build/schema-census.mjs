@@ -26,6 +26,7 @@ import {
 
 } from './schema-table-census.mjs';
 
+import { structCellColumn } from './field-strategy.mjs';
 import { migrationIdentityKey } from './migration-identity.mjs';
 
 
@@ -98,6 +99,13 @@ import { migrationIdentityKey } from './migration-identity.mjs';
 
 
 
+
+
+
+
+
+
+                                                               
 
 
 
@@ -267,7 +275,7 @@ function entityMainColumns(entity                   )               {
     if (field.kind === 'computed' && field.mode === 'pull') continue;
     if (field.kind === 'struct') {
       for (const cell of Object.keys((field.cells ?? {})                           )) {
-        columns.push({ name: `${name}_${cell}`, type: 'TEXT' });
+        columns.push({ name: structCellColumn(name, cell), type: 'TEXT' });
       }
       continue;
     }
@@ -484,6 +492,15 @@ export function buildOwnershipCensus(input             )               {
       if (refuseReserved('trigger', trigger.name, 'schema', schema.name)) continue;
       if (!book.census.has(censusKey('trigger', trigger.name))) {
         book.claim('trigger', trigger.name, 'schema', schema.name);
+      }
+    }
+    // External indexes are declared knowledge, not exclusive ownership: another
+    // participant may declare the same index. A framework-reserved name is
+    // still refused, exactly as for external tables and triggers.
+    for (const index of schema.externalIndexes ?? []) {
+      if (refuseReserved('index', index.name, 'schema', schema.name)) continue;
+      if (!book.census.has(censusKey('index', index.name))) {
+        book.claim('index', index.name, 'schema', schema.name);
       }
     }
   }

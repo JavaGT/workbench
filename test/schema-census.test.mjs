@@ -422,6 +422,75 @@ test('reserved namespace: an external trigger declaration claiming a framework t
   assert.deepEqual(errorCodes(result), ['reserved-namespace']);
 });
 
+test('external indexes on external tables are schema-owned knowledge for the census', () => {
+  const schema = {
+    name: 'app',
+    tables: [],
+    externalTables: [{ name: 'Note', columns: ['id', 'owner'] }],
+    externalIndexes: [{ name: 'note_owner_idx' }, { name: 'note_status_idx' }],
+  };
+  const result = buildOwnershipCensus({
+    schemaDeclarations: [schema],
+    observed: [
+      { type: 'table', name: 'Note' },
+      { type: 'index', name: 'note_owner_idx' },
+      { type: 'index', name: 'note_status_idx' },
+    ],
+  });
+  assert.deepEqual(errorCodes(result), [], `unexpected errors: ${JSON.stringify(result.errors)}`);
+  assert.deepEqual(result.census.get(censusKey('index', 'note_owner_idx')), {
+    kind: 'schema', owner: 'app', objectKind: 'index', name: 'note_owner_idx',
+  });
+  assert.equal(result.census.get(censusKey('index', 'note_status_idx')).owner, 'app');
+  for (const name of ['note_owner_idx', 'note_status_idx']) {
+    assert.equal(classifyObservedObject({ type: 'index', name }, result.census).kind, 'owned');
+  }
+});
+
+test('an undeclared observed index still fails closed alongside declared external indexes', () => {
+  const schema = { name: 'app', tables: [], externalIndexes: [{ name: 'declared_idx' }] };
+  const result = buildOwnershipCensus({
+    schemaDeclarations: [schema],
+    observed: [{ type: 'index', name: 'declared_idx' }, { type: 'index', name: 'ghost_idx' }],
+  });
+  assert.deepEqual(errorCodes(result), ['undeclared']);
+  assert.equal(result.errors[0].name, 'ghost_idx');
+});
+
+test('reserved namespace: an external index declaration claiming a framework index name', () => {
+  const schema = { name: 'app', tables: [], externalIndexes: [{ name: 'idx__job_claim' }] };
+  const result = buildOwnershipCensus({ schemaDeclarations: [schema] });
+  assert.deepEqual(errorCodes(result), ['reserved-namespace']);
+});
+
+// ---------------------------------------------------------------------------
+// Struct column naming — one authority (structCellColumn)
+// ---------------------------------------------------------------------------
+
+test('entity struct columns use the authoritative double-underscore name in the census', () => {
+  const Widget = {
+    name: 'Widget',
+    fields: { meta: { kind: 'struct', type: 'link', cells: { owner: {} } } },
+  };
+  const referencing = (column) => ({
+    name: 'app',
+    tables: [{
+      name: 'Ref',
+      columns: [{ name: 'id', type: 'text', primaryKey: true }, { name: 'ownerRef', type: 'text' }],
+      foreignKeys: [{ columns: ['ownerRef'], references: { table: 'Widget', columns: [column] } }],
+    }],
+  });
+  assert.deepEqual(
+    errorCodes(buildOwnershipCensus({ schemaDeclarations: [referencing('meta__owner')], entities: [Widget] })),
+    [],
+  );
+  assert.deepEqual(
+    errorCodes(buildOwnershipCensus({ schemaDeclarations: [referencing('meta_owner')], entities: [Widget] })),
+    ['fk-column'],
+    'the single-underscore spelling is not a generated struct column',
+  );
+});
+
 test('reserved registry exports: without-auth-compile is a subset of the full registry', () => {
   for (const name of frameworkReservedNamesWithoutAuthCompile) {
     assert.ok(frameworkReservedNames.has(name), `full registry must include ${name}`);

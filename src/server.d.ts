@@ -1045,6 +1045,8 @@ export interface SqliteSchemaResult {
   readonly externalTables: readonly { readonly name: string; readonly columns: readonly string[] }[];
   /** Triggers supplied outside this schema's lifecycle, used for startup census validation. */
   readonly externalTriggers: readonly { readonly name: string }[];
+  /** Indexes supplied outside this schema's lifecycle, used for startup census validation. */
+  readonly externalIndexes: readonly { readonly name: string; readonly table?: string }[];
   readonly virtualTables: readonly Readonly<VirtualTableDeclaration>[];
   readonly triggers: readonly Readonly<TriggerDeclaration>[];
   readonly migrations: readonly NamespacedMigration[];
@@ -1061,6 +1063,8 @@ export function defineSqliteSchema(spec: {
   name: string;
   externalTables?: readonly { name: string; columns: readonly string[] }[];
   externalTriggers?: readonly { name: string }[];
+  /** Co-tenant-owned index names, declared for census attribution only — never created or dropped by `prepare`. */
+  externalIndexes?: readonly (string | { name: string; table?: string })[];
   virtualTables?: readonly VirtualTableDeclaration[];
   tables: readonly TableDeclaration[];
   migrations?: readonly NamespacedMigration[];

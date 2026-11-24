@@ -1,4 +1,4 @@
-import { scope, everyone, grant, read, tick, date, schedule } from '../build/index.mjs';
+import { scope, everyone, grant, read, write, tick, date, schedule } from '../build/index.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
@@ -322,7 +322,9 @@ test('admitSystemMutation DENIES non-system principal', () => {
 test('e2e: clock-dispatch dispatch updates row through projection (ADMITTED)', async (t) => {
   const publishedAt = date();
   const Blog = entity('BlogSched', {
-    grant: scope(() => everyone()).can(() => grant(read)),
+    // The reaper dispatch projects a real update: declare the scope AND write
+    // capability as a compiled grant clause array, not a bare clause object.
+    grant: () => [scope(() => everyone()).can(() => grant(read, write))],
         status: { kind: 'value', type: 'text' }, publishedAt,
 
     schedule: {

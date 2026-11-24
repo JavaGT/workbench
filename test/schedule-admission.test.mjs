@@ -230,7 +230,10 @@ function setupAppServer() {
   const publishedAt = date();
   const status = { kind: 'value', type: 'text' };
   const Blog = entity('BlogE2E', {
-    grant: scope(() => everyone()).can(() => grant(read)),
+    // The wired dispatch projects the scheduler update: declare the scope AND
+    // the write capability as a compiled grant clause array (a bare clause
+    // object does not survive entity compilation and confers nothing).
+    grant: () => [scope(() => everyone()).can(() => grant(read, write))],
         publishedAt, status,
 
     schedule: {

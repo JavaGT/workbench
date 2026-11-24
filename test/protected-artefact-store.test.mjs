@@ -3,21 +3,41 @@ import { test } from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 
 import workbench from '../build/index.mjs';
-import { defineSqliteSchema } from '../build/server.mjs';
+import { defineSqliteSchema, frameworkTableNames } from '../build/server.mjs';
 
 // Fixture tables the tests create out-of-band and the app's protected-artefact
 // writes mutate; declared through the externalTables seam for the settled census.
 const fixtureSchema = defineSqliteSchema({
   name: 'protected-artefact-store-fixtures',
   tables: [],
-  externalTables: [
-    { name: 'SpeakerObservation', columns: ['id', 'profileId', 'vector', 'createdAt'] },
-    { name: 'Base', columns: ['id'] },
-    { name: 'Parent', columns: ['id'] },
-    { name: 'Child', columns: ['id', 'profileId'] },
-  ],
-  externalTriggers: [{ name: 'obs_escape' }],
+  externalTables: [],
 });
+
+// Boot validates the settled census against SQLite (fail closed). Each test
+// creates only the out-of-band tables/triggers it needs, so declare exactly the
+// objects present in its database: no missing census entry, no undeclared
+// drift. Framework-owned names already have their own authority.
+function censusSchema(db) {
+  const reserved = new Set(frameworkTableNames.map((name) => String(name).toLowerCase()));
+  const externalTables = [];
+  const externalTriggers = [];
+  const objects = db.prepare(
+    "SELECT type, name FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' AND type IN ('table', 'trigger') ORDER BY type, name",
+  ).all();
+  for (const object of objects) {
+    const name = String(object.name);
+    if (reserved.has(name.toLowerCase())) continue;
+    if (object.type === 'trigger') {
+      externalTriggers.push({ name });
+      continue;
+    }
+    const columns = db.prepare(`PRAGMA table_xinfo("${name.replaceAll('"', '""')}")`).all()
+      .filter((column) => Number(column.hidden) === 0)
+      .map((column) => String(column.name));
+    externalTables.push({ name, columns: columns.length > 0 ? columns : ['id'] });
+  }
+  return defineSqliteSchema({ name: 'protected-artefact-store-fixtures', tables: [], externalTables, externalTriggers });
+}
 
 const scope = 'Project:project-1';
 const user = { type: 'user', id: 'u1', attributes: {} };
@@ -83,7 +103,7 @@ function commitRequest(overrides = {}) {
 async function appWith(actions) {
   const db = new DatabaseSync(':memory:');
   db.exec('CREATE TABLE SpeakerObservation (id TEXT PRIMARY KEY, profileId TEXT NOT NULL, vector TEXT NOT NULL, createdAt TEXT NOT NULL)');
-  const app = workbench({ schema: fixtureSchema, db, actions });
+  const app = workbench({ schema: censusSchema(db), db, actions });
   await app.start();
   return { app, db };
 }
@@ -215,7 +235,7 @@ test('protected writes reject views, shadowed tables, triggers, and foreign-key 
   for (const entry of cases) {
     const db = new DatabaseSync(':memory:');
     entry.setup(db);
-    const app = workbench({ schema: fixtureSchema, db, actions: [observationAction()] });
+    const app = workbench({ schema: censusSchema(db), db, actions: [observationAction()] });
     await app.start();
     const result = await app.dispatch(commitRequest());
     assert.equal(result.ok, false, entry.name);
@@ -287,7 +307,7 @@ test('malformed protectedArtefacts declarations fail at app assembly', async () 
   for (const protectedArtefacts of declarations) {
     const db = new DatabaseSync(':memory:');
     db.exec('CREATE TABLE SpeakerObservation (id TEXT PRIMARY KEY)');
-    const app = workbench({ schema: fixtureSchema, db, actions: [{ type: 'x.commit', authorize: () => true, protectedArtefacts, handler: () => [] }] });
+    const app = workbench({ schema: censusSchema(db), db, actions: [{ type: 'x.commit', authorize: () => true, protectedArtefacts, handler: () => [] }] });
     await assert.rejects(app.start(), /protectedArtefacts/);
   }
 });

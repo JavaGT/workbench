@@ -15,35 +15,33 @@ import { defineSqliteSchema } from '../build/server.mjs';
 // externalTables/externalTriggers seams so the settled census attributes them
 // to this schema. Declaring does not create them and does not grant write
 // authority — the guard under test still denies every access.
-const fixtureSchema = defineSqliteSchema({
-  name: 'erasure-directive-fixtures',
-  tables: [],
-  externalTables: [
-    { name: 'DomainSource', columns: ['id'] },
-    { name: 'DomainCleanup', columns: ['id'] },
-    { name: 'DomainSourceIntegrity', columns: ['sourceId', 'value'] },
-    { name: 'OtherTable', columns: ['id'] },
-    { name: 'BaseTable', columns: ['id'] },
-    { name: 'Parent', columns: ['id'] },
-    { name: 'Child', columns: ['id'] },
-    { name: '_ApplicationDeletion', columns: ['id', 'status'] },
-    { name: '_ApplicationCleanupOutbox', columns: ['id', 'deletionId'] },
-    { name: '_ApplicationChild', columns: ['id', 'parentId'] },
-    { name: '_ApplicationParent', columns: ['id'] },
-    { name: '_ApplicationPrivate', columns: ['id'] },
-    { name: '__ApplicationPrivate', columns: ['id'] },
-    { name: '_Application Private', columns: ['id'] },
-    { name: '_Application"Private', columns: ['id'] },
-  ],
-  externalTriggers: [
-    { name: 'source_trigger' },
-    { name: 'source_view_trigger' },
-    { name: 'other_trigger' },
-    { name: 'log_trigger' },
-    { name: 'domain_source_integrity' },
-    { name: 'cleanup_escape' },
-  ],
-});
+// Boot now validates the settled census against SQLite (fail closed). Each
+// test creates only the out-of-band tables/triggers it needs — including the
+// deliberately non-canonical underscore identifiers — so declare exactly the
+// objects present in its database. Declaring does not create them and does not
+// grant the erasure guard any authority: the guard's own allowlist still
+// decides every read and write. Framework-owned names keep their one authority.
+function fixtureSchema(db) {
+  const reserved = new Set(frameworkTableNames.map((name) => String(name).toLowerCase()));
+  const externalTables = [];
+  const externalTriggers = [];
+  const objects = db.prepare(
+    "SELECT type, name FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' AND type IN ('table', 'trigger') ORDER BY type, name",
+  ).all();
+  for (const object of objects) {
+    const name = String(object.name);
+    if (reserved.has(name.toLowerCase())) continue;
+    if (object.type === 'trigger') {
+      externalTriggers.push({ name });
+      continue;
+    }
+    const columns = db.prepare(`PRAGMA table_xinfo("${name.replaceAll('"', '""')}")`).all()
+      .filter((column) => Number(column.hidden) === 0)
+      .map((column) => String(column.name));
+    externalTables.push({ name, columns: columns.length > 0 ? columns : ['id'] });
+  }
+  return defineSqliteSchema({ name: 'erasure-directive-fixtures', tables: [], externalTables, externalTriggers });
+}
 
 const scope = 'Project:project-1';
 const oldData = JSON.stringify({ projectId: 'project-1', id: 'artefact-1', sensitive: 'remove-me' });
@@ -101,7 +99,7 @@ function app(db, makeDirective, erasure = true) {
   const privilege = erasure === true ? true : {
     tables: erasure.tables ?? ['DomainCleanup'], readTables: erasure.readTables ?? [], ...erasure,
   };
-  return workbench({ db, schema: fixtureSchema, actions: [{
+  return workbench({ db, schema: fixtureSchema(db), actions: [{
     type: 'lifecycle.purge', erasure: privilege, history: { cursor: 'excluded' }, authorize: () => true,
     handler(context) {
       return { events: [{ type: 'lifecycle.purged', scope, data: { done: true } }], directive: makeDirective(context.db) };
@@ -296,7 +294,7 @@ test('preparation receives authentic frozen action/subject context with canonica
 
 test('preparation action context is snapshotted before the handler can mutate its request', async () => {
   const db = fixture(); let observed;
-  const instance = workbench({ db, schema: fixtureSchema, actions: [{
+  const instance = workbench({ db, schema: fixtureSchema(db), actions: [{
     type: 'lifecycle.purge', erasure: { tables: [], readTables: [], prepare({ context }) { observed = JSON.parse(JSON.stringify(context)); } },
     history: { cursor: 'excluded' }, authorize: () => true,
     handler(context) {
@@ -319,7 +317,7 @@ test('preparation action context is snapshotted before the handler can mutate it
 
 test('preparation action context is snapshotted before authorization can mutate its request', async () => {
   const db = fixture(); let observed; let authorizationCalls = 0;
-  const instance = workbench({ db, schema: fixtureSchema, actions: [{
+  const instance = workbench({ db, schema: fixtureSchema(db), actions: [{
     type: 'lifecycle.purge', erasure: { tables: [], readTables: [], prepare({ context }) { observed = JSON.parse(JSON.stringify(context)); } },
     history: { cursor: 'excluded' },
     authorize({ payload, principal }) {
@@ -364,17 +362,18 @@ test('preparation reads reject undeclared, internal, case-variant, temp, view, a
 });
 
 test('preparation reads declared triggered application tables but writes cannot invoke their triggers', async () => {
-  const db = fixture();
-  db.exec(`
+  const triggeredSchema = `
     CREATE TABLE DomainSource (id TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE TABLE DomainSourceIntegrity (sourceId TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE TRIGGER domain_source_integrity AFTER INSERT ON DomainSource BEGIN
       INSERT INTO DomainSourceIntegrity (sourceId, value) VALUES (NEW.id, NEW.value);
     END;
     INSERT INTO DomainSource (id, value) VALUES ('source-1', 'canonical');
-  `);
+  `;
+  const readDb = fixture();
+  readDb.exec(triggeredSchema);
   let observed;
-  const reader = app(db, directive, {
+  const reader = app(readDb, directive, {
     tables: [], readTables: ['DomainSource'],
     prepare({ reads }) { observed = reads.find('DomainSource', { id: 'source-1' })[0].value; },
   });
@@ -383,15 +382,20 @@ test('preparation reads declared triggered application tables but writes cannot 
   assert.equal(readResult.ok, true);
   assert.equal(observed, 'canonical');
 
-  const writer = app(db, directive, {
+  // An app owns the single write coordinator for its database handle, so the
+  // writer gets an identically seeded handle of its own rather than a second
+  // uncoordinated queue on the reader's handle.
+  const writeDb = fixture();
+  writeDb.exec(triggeredSchema);
+  const writer = app(writeDb, directive, {
     tables: ['DomainSource'], readTables: [],
     prepare({ writes }) { writes.insert('DomainSource', { id: 'escape', value: 'must-not-run' }); },
   });
   await writer.start();
   const writeResult = await writer.dispatch({ actionId: 'write-triggered-app-table', type: 'lifecycle.purge', payload: {}, principal: { type: 'user', id: 'u1' }, scope });
   assert.equal(writeResult.ok, false);
-  assert.equal(db.prepare('SELECT 1 FROM DomainSource WHERE id = ?').get('escape'), undefined);
-  assert.equal(db.prepare('SELECT 1 FROM DomainSourceIntegrity WHERE sourceId = ?').get('escape'), undefined);
+  assert.equal(writeDb.prepare('SELECT 1 FROM DomainSource WHERE id = ?').get('escape'), undefined);
+  assert.equal(writeDb.prepare('SELECT 1 FROM DomainSourceIntegrity WHERE sourceId = ?').get('escape'), undefined);
 });
 
 test('preparation failure rolls back its writes, purge event, receipt, and erasure', async () => {
@@ -489,7 +493,7 @@ test('private projection replay does not invoke erasure preparation', async () =
 
 test('ordinary actions cannot opt into erasure preparation', async () => {
   const db = fixture();
-  const ordinary = workbench({ db, schema: fixtureSchema, actions: [{
+  const ordinary = workbench({ db, schema: fixtureSchema(db), actions: [{
     type: 'ordinary.action', erasure: { tables: [], readTables: [], prepare() {} }, authorize: () => true, handler: () => [],
   }] });
   await assert.rejects(ordinary.start(), /must exclude its history cursor/);
@@ -530,7 +534,7 @@ test('a stale erasure manifest rolls back its new event and leaves existing hist
 
 test('only an explicitly privileged, cursor-excluded registered action can return an erasure directive', async () => {
   const db = fixture();
-  const unprivileged = workbench({ db, schema: fixtureSchema, actions: [{
+  const unprivileged = workbench({ db, schema: fixtureSchema(db), actions: [{
     type: 'not.purge', history: { cursor: 'excluded' }, authorize: () => true,
     handler(context) { return { events: [], directive: directive(context.db) }; },
   }] });
@@ -538,7 +542,8 @@ test('only an explicitly privileged, cursor-excluded registered action can retur
   const result = await unprivileged.dispatch({ actionId: 'not-purge', type: 'not.purge', payload: {}, principal: { type: 'user', id: 'u1' }, scope });
   assert.equal(result.ok, false);
   assert.equal(db.prepare('SELECT eventType FROM _Log WHERE scope = ? AND seq = 1').get(scope).eventType, 'artefact.deleted');
-  const invalid = workbench({ db: new DatabaseSync(':memory:'), schema: fixtureSchema, actions: [{
+  const invalidDb = new DatabaseSync(':memory:');
+  const invalid = workbench({ db: invalidDb, schema: fixtureSchema(invalidDb), actions: [{
     type: 'bad.purge', erasure: true, authorize: () => true, handler: () => [],
   }] });
   await assert.rejects(invalid.start(), /must exclude its history cursor/);
@@ -596,7 +601,7 @@ test('erasure prunes durableHistory frame cursors and erases private facts so er
       },
     },
   });
-  const instance = workbench({ db, schema: fixtureSchema, history, actions: [
+  const instance = workbench({ db, schema: fixtureSchema(db), history, actions: [
     {
       type: 'document.set', authorize: () => true,
       handler({ payload }) {

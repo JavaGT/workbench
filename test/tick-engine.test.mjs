@@ -1,4 +1,4 @@
-import { scope, everyone, grant, read, tick, date, schedule, text } from '../build/index.mjs';
+import { scope, everyone, grant, read, write, tick, date, schedule, text } from '../build/index.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
@@ -434,7 +434,9 @@ test('admitSystemMutation admits and denies the 3-part scheduler source through 
 test('e2e: tick dispatch updates row through projection', async (t) => {
   const statusDesc = { kind: 'value', type: 'text' };
   const Blog = entity('BlogTick', {
-    grant: scope(() => everyone()).can(() => grant(read)),
+    // The tick dispatch projects a real update: declare the scope AND write
+    // capability as a compiled grant clause array, not a bare clause object.
+    grant: () => [scope(() => everyone()).can(() => grant(read, write))],
         status: statusDesc,
 
     schedule: {
@@ -489,7 +491,9 @@ test('e2e: tick dispatch updates row through projection', async (t) => {
 test('listen tick dispatch waits behind the app write queue', async (t) => {
   const statusDesc = { kind: 'value', type: 'text' };
   const Blog = entity('BlogTickQueue', {
-    grant: scope(() => everyone()).can(() => grant(read)),
+    // The tick dispatch projects a real update: declare the scope AND write
+    // capability as a compiled grant clause array, not a bare clause object.
+    grant: () => [scope(() => everyone()).can(() => grant(read, write))],
         status: statusDesc,
 
     schedule: {

@@ -10,21 +10,35 @@ import workbench, {
   entity, resolveStrategy, validateMutation, ValidationError, createProjectedAsyncConsumer, resolveProjectedAsyncTriggerTypes, reconcileProjectedRecovery } from '../build/internal.mjs';
 import { readProjectedCursorFence } from '../build/projected-async.mjs';
 import { principal } from '../build/principal.mjs';
-import { defineSqliteSchema } from '../build/server.mjs';
+import { defineSqliteSchema, frameworkTableNames } from '../build/server.mjs';
 
 // Fixture tables the tests create out-of-band and the app's projections write;
 // declared through the externalTables seam for the settled census.
-const fixtureSchema = defineSqliteSchema({
-  name: 'projected-async-fixtures',
-  tables: [],
-  externalTables: [
-    { name: 'Post', columns: ['id', 'title', 'score', 'hotRank'] },
-    { name: 'PostDirect', columns: ['id', 'title', 'score', 'hotRank'] },
-    { name: 'PostCtx', columns: ['id', 'title', 'score', 'hotRank'] },
-    { name: 'Blog', columns: ['id', 'title', 'score', 'hotRank'] },
-    { name: 'Plain', columns: ['id', 'title'] },
-  ],
-});
+// Boot validates the settled census against SQLite (fail closed). Each test
+// creates only the out-of-band tables it needs, so declare exactly the objects
+// present in its database: no missing census entry, no undeclared drift.
+// Framework-owned names already have their own authority.
+function fixtureSchema(db) {
+  const reserved = new Set(frameworkTableNames.map((name) => String(name).toLowerCase()));
+  const externalTables = [];
+  const externalTriggers = [];
+  const objects = db.prepare(
+    "SELECT type, name FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' AND type IN ('table', 'trigger') ORDER BY type, name",
+  ).all();
+  for (const object of objects) {
+    const name = String(object.name);
+    if (reserved.has(name.toLowerCase())) continue;
+    if (object.type === 'trigger') {
+      externalTriggers.push({ name });
+      continue;
+    }
+    const columns = db.prepare(`PRAGMA table_xinfo("${name.replaceAll('"', '""')}")`).all()
+      .filter((column) => Number(column.hidden) === 0)
+      .map((column) => String(column.name));
+    externalTables.push({ name, columns: columns.length > 0 ? columns : ['id'] });
+  }
+  return defineSqliteSchema({ name: 'projected-async-fixtures', tables: [], externalTables, externalTriggers });
+}
 
 test('projected cursor accessor returns undefined when the fence row is absent', () => {
   const db = new DatabaseSync(':memory:');
@@ -145,7 +159,7 @@ test('projected.async value is computed and stored after create dispatch', async
     grant: () => [scope(() => everyone()).can(() => grant(read, write, subscribe))],
   });
 
-  const app = workbench({ schema: fixtureSchema, db });
+  const app = workbench({ schema: fixtureSchema(db), db });
   app.mount('/posts', Post);
   app.listen(0, { principalOf: () => principal({ type: 'user', id: 'alice' }) });
   await app.ready;
@@ -187,7 +201,7 @@ test('projected.async compute receives the committed db handle', async (t) => {
     grant: () => [scope(() => everyone()).can(() => grant(read, write, subscribe))],
   });
 
-  const app = workbench({ schema: fixtureSchema, db: appDb });
+  const app = workbench({ schema: fixtureSchema(appDb), db: appDb });
   app.mount('/postctx', PostCtx);
   app.listen(0, { principalOf: () => principal({ type: 'user', id: 'alice' }) });
   await app.ready;
@@ -222,7 +236,7 @@ test('projected.async value is recomputed after update', async (t) => {
     grant: () => [scope(() => everyone()).can(() => grant(read, write, subscribe))],
   });
 
-  const app = workbench({ schema: fixtureSchema, db });
+  const app = workbench({ schema: fixtureSchema(db), db });
   app.mount('/posts', Post);
   app.listen(0, { principalOf: () => principal({ type: 'user', id: 'alice' }) });
   await app.ready;
@@ -274,7 +288,7 @@ test('projected.async compute failure leaves the column unchanged', async (t) =>
     grant: () => [scope(() => everyone()).can(() => grant(read, write, subscribe))],
   });
 
-  const app = workbench({ schema: fixtureSchema, db });
+  const app = workbench({ schema: fixtureSchema(db), db });
   app.mount('/posts', Post);
   app.listen(0, { principalOf: () => principal({ type: 'user', id: 'alice' }) });
   await app.ready;
@@ -330,7 +344,7 @@ test('projected.async compute failure is logged on the projected channel', async
   });
 
   const lines = [];
-  const app = workbench({ schema: fixtureSchema, db, log: { output: (level, channel, msg, ctx) => lines.push({ level, channel, msg, ctx }) } });
+  const app = workbench({ schema: fixtureSchema(db), db, log: { output: (level, channel, msg, ctx) => lines.push({ level, channel, msg, ctx }) } });
   app.mount('/posts', Post);
   app.listen(0, { principalOf: () => principal({ type: 'user', id: 'alice' }) });
   await app.ready;
@@ -383,7 +397,7 @@ test('projected.async field is rejected in client create payload (readonly)', as
     grant: () => [scope(() => everyone()).can(() => grant(read, write, subscribe))],
   });
 
-  const app = workbench({ schema: fixtureSchema, db });
+  const app = workbench({ schema: fixtureSchema(db), db });
   app.mount('/posts', Post);
   app.listen(0, { principalOf: () => principal({ type: 'user', id: 'alice' }) });
   await app.ready;
@@ -423,7 +437,7 @@ test('computed.stored value is stored immediately in the create response', async
     grant: () => [scope(() => everyone()).can(() => grant(read, write, subscribe))],
   });
 
-  const app = workbench({ schema: fixtureSchema, db });
+  const app = workbench({ schema: fixtureSchema(db), db });
   app.mount('/blogs', Blog);
   app.listen(0, { principalOf: () => principal({ type: 'user', id: 'alice' }) });
   await app.ready;
@@ -459,7 +473,7 @@ test('computed.stored value is recomputed on update', async (t) => {
     grant: () => [scope(() => everyone()).can(() => grant(read, write, subscribe))],
   });
 
-  const app = workbench({ schema: fixtureSchema, db });
+  const app = workbench({ schema: fixtureSchema(db), db });
   app.mount('/blogs', Blog);
   app.listen(0, { principalOf: () => principal({ type: 'user', id: 'alice' }) });
   await app.ready;
@@ -503,7 +517,7 @@ test('computed.stored compute failure rolls back the mutation', async (t) => {
     grant: () => [scope(() => everyone()).can(() => grant(read, write, subscribe))],
   });
 
-  const app = workbench({ schema: fixtureSchema, db });
+  const app = workbench({ schema: fixtureSchema(db), db });
   app.mount('/blogs', Blog);
   app.listen(0, { principalOf: () => principal({ type: 'user', id: 'alice' }) });
   await app.ready;
@@ -549,7 +563,7 @@ test('projected.async with from:created only recomputes on create, not update', 
     grant: () => [scope(() => everyone()).can(() => grant(read, write, subscribe))],
   });
 
-  const app = workbench({ schema: fixtureSchema, db });
+  const app = workbench({ schema: fixtureSchema(db), db });
   app.mount('/posts', Post);
   app.listen(0, { principalOf: () => principal({ type: 'user', id: 'alice' }) });
   await app.ready;
@@ -594,7 +608,7 @@ test('projected.async with from:updated only recomputes on update', async (t) =>
     grant: () => [scope(() => everyone()).can(() => grant(read, write, subscribe))],
   });
 
-  const app = workbench({ schema: fixtureSchema, db });
+  const app = workbench({ schema: fixtureSchema(db), db });
   app.mount('/posts', Post);
   app.listen(0, { principalOf: () => principal({ type: 'user', id: 'alice' }) });
   await app.ready;
@@ -639,7 +653,7 @@ test('projected.async without from recomputes on both create and update (default
     grant: () => [scope(() => everyone()).can(() => grant(read, write, subscribe))],
   });
 
-  const app = workbench({ schema: fixtureSchema, db });
+  const app = workbench({ schema: fixtureSchema(db), db });
   app.mount('/posts', Post);
   app.listen(0, { principalOf: () => principal({ type: 'user', id: 'alice' }) });
   await app.ready;
@@ -690,7 +704,7 @@ test('compute counter advances with each successful compute, survives across eve
     grant: () => [scope(() => everyone()).can(() => grant(read, write, subscribe))],
   });
 
-  const app = workbench({ schema: fixtureSchema, db });
+  const app = workbench({ schema: fixtureSchema(db), db });
   app.mount('/posts', Post);
   app.listen(0, { principalOf: () => principal({ type: 'user', id: 'alice' }) });
   await app.ready;
@@ -759,7 +773,10 @@ test('compute counter advances with each successful compute, survives across eve
 
     grant: () => [scope(() => everyone()).can(() => grant(read, write, subscribe))],
   });
-  const app2 = workbench({ schema: fixtureSchema, db });
+  // An app owns the one write coordinator for its database handle, so the
+  // second app uses its own handle (the boot creates framework DDL on it).
+  const db2 = new DatabaseSync(':memory:');
+  const app2 = workbench({ schema: fixtureSchema(db2), db: db2 });
   app2.mount('/failposts', PostWithFailure);
   app2.listen(0, { principalOf: () => principal({ type: 'user', id: 'alice' }) });
   await app2.ready;
@@ -773,12 +790,13 @@ test('compute counter advances with each successful compute, survives across eve
   await new Promise((resolve) => setTimeout(resolve, 100));
 
   assert.equal(computeCount, 1, 'compute attempted once');
-  const failCursor = db.prepare(
+  const failCursor = db2.prepare(
     "SELECT lastSeq FROM _ProjectedCursor WHERE entity = 'PostWithFail' AND field = 'hotRank'",
   ).get();
   assert.equal(failCursor, undefined, 'no cursor row — compute failure did not advance');
 
   app2.httpServer.close();
+  db2.close();
 });
 
 // --- raster.crdt / polyline.crdt constructors ---
@@ -887,7 +905,7 @@ test('projected.async compute can findAll related entities', async (t) => {
     grant: () => [scope(() => everyone()).can(() => grant(read, write, subscribe))],
   });
 
-  const app = workbench({ schema: fixtureSchema, db, entities: [TPost, TComment] });
+  const app = workbench({ schema: fixtureSchema(db), db, entities: [TPost, TComment] });
   _TCommentBound = app.entity(TComment);
   app.mount('/tpost', TPost);
   app.mount('/tcomment', TComment);
@@ -957,7 +975,7 @@ test('read response includes projected cursor headers for staleness detection', 
     grant: () => [scope(() => everyone()).can(() => grant(read, write, subscribe))],
   });
 
-  const app = workbench({ schema: fixtureSchema, db });
+  const app = workbench({ schema: fixtureSchema(db), db });
   app.mount('/posts', Post);
   await app.ddl();
   app.listen(0, { principalOf: () => principal({ type: 'user', id: 'alice' }) });
@@ -1125,7 +1143,7 @@ test('app.ready runs the projected recovery sweep (backfill before serving)', as
   db.prepare("INSERT INTO _Log (scope, seq, eventType, eventData, actionId, committedAt) VALUES ('Post:p1',1,'Post.created',:d,'a1','2026-01-01T00:00:00Z')").run({ d: '{}' });
   db.prepare("INSERT INTO _Cursor (scope, lastSeq) VALUES ('Post:p1', 1)").run();
 
-  const app = workbench({ schema: fixtureSchema, db });
+  const app = workbench({ schema: fixtureSchema(db), db });
   app.mount('/posts', Post);
   app.listen(0, { principalOf: () => principal({ type: 'user', id: 'alice' }) });
   await app.ready;

@@ -3,19 +3,36 @@ import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 
 import workbench from '../build/index.mjs';
-import { readCommittedCursor, defineSqliteSchema } from '../build/server.mjs';
+import { readCommittedCursor, defineSqliteSchema, frameworkTableNames } from '../build/server.mjs';
 
 // The fixture tables the tests create out-of-band and the application
 // projections write; declared through the externalTables seam so the census
 // attributes them to this schema instead of rejecting them as undeclared.
-const fixtureSchema = defineSqliteSchema({
-  name: 'registered-action-fixtures',
-  tables: [],
-  externalTables: [
-    { name: 'Source', columns: ['id', 'projectId', 'name'] },
-    { name: 'ExternalWrite', columns: ['id'] },
-  ],
-});
+// Boot validates the settled census against SQLite (fail closed). Each test
+// creates only the out-of-band tables it needs, so declare exactly the objects
+// present in its database: no missing census entry, no undeclared drift.
+// Framework-owned names already have their own authority.
+function fixtureSchema(db) {
+  const reserved = new Set(frameworkTableNames.map((name) => String(name).toLowerCase()));
+  const externalTables = [];
+  const externalTriggers = [];
+  const objects = db.prepare(
+    "SELECT type, name FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' AND type IN ('table', 'trigger') ORDER BY type, name",
+  ).all();
+  for (const object of objects) {
+    const name = String(object.name);
+    if (reserved.has(name.toLowerCase())) continue;
+    if (object.type === 'trigger') {
+      externalTriggers.push({ name });
+      continue;
+    }
+    const columns = db.prepare(`PRAGMA table_xinfo("${name.replaceAll('"', '""')}")`).all()
+      .filter((column) => Number(column.hidden) === 0)
+      .map((column) => String(column.name));
+    externalTables.push({ name, columns: columns.length > 0 ? columns : ['id'] });
+  }
+  return defineSqliteSchema({ name: 'registered-action-fixtures', tables: [], externalTables, externalTriggers });
+}
 
 function sourceAction(_db, authorize = () => true) {
   return {
@@ -42,7 +59,7 @@ function sourceAction(_db, authorize = () => true) {
 async function appWith(action) {
   const db = new DatabaseSync(':memory:');
   db.exec('CREATE TABLE Source (id TEXT PRIMARY KEY, projectId TEXT NOT NULL, name TEXT NOT NULL)');
-  const app = workbench({ db, actions: [action(db)], schema: fixtureSchema });
+  const app = workbench({ db, actions: [action(db)], schema: fixtureSchema(db) });
   await app.start();
   return { app, db };
 }
@@ -109,7 +126,7 @@ test('registered action re-enters the public writer without releasing its transa
     }],
   };
   db.exec('CREATE TABLE Source (id TEXT PRIMARY KEY, projectId TEXT NOT NULL, name TEXT NOT NULL)');
-  app = workbench({ db, actions: [action], schema: fixtureSchema });
+  app = workbench({ db, actions: [action], schema: fixtureSchema(db) });
   await app.start();
 
   const dispatch = app.dispatch({
@@ -147,7 +164,7 @@ test('a failed re-entrant writer stays inside the dispatch rollback', async () =
       throw new Error('reject re-entrant action');
     },
   };
-  app = workbench({ db, actions: [action], schema: fixtureSchema });
+  app = workbench({ db, actions: [action], schema: fixtureSchema(db) });
   await app.start();
 
   const result = await app.dispatch({

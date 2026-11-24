@@ -3,19 +3,36 @@ import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 
 import workbench, { admin, authorizedRows, createAuthorizationAdapter, entity, everyone, grant, map, membership, postCommitEffect, read, ref, scope, subscribe, text, write } from '../build/index.mjs';
-import { defineSqliteSchema } from '../build/server.mjs';
+import { defineSqliteSchema, frameworkTableNames } from '../build/server.mjs';
 
 // Fixture tables the tests create out-of-band and application projections
 // write (Artefact) or private-fact projections write (PrivateProjection);
 // declared through the externalTables seam for the settled census.
-const fixtureSchema = defineSqliteSchema({
-  name: 'post-commit-effects-fixtures',
-  tables: [],
-  externalTables: [
-    { name: 'Artefact', columns: ['id', 'project'] },
-    { name: 'PrivateProjection', columns: ['value'] },
-  ],
-});
+// Boot now validates the settled census against SQLite (fail closed). Each
+// test creates only the out-of-band tables it exercises, so declare exactly the
+// objects present in its database: no missing census entry, no undeclared
+// drift. Framework-owned names already have their own authority.
+function fixtureSchema(db) {
+  const reserved = new Set(frameworkTableNames.map((name) => String(name).toLowerCase()));
+  const externalTables = [];
+  const externalTriggers = [];
+  const objects = db.prepare(
+    "SELECT type, name FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' AND type IN ('table', 'trigger') ORDER BY type, name",
+  ).all();
+  for (const object of objects) {
+    const name = String(object.name);
+    if (reserved.has(name.toLowerCase())) continue;
+    if (object.type === 'trigger') {
+      externalTriggers.push({ name });
+      continue;
+    }
+    const columns = db.prepare(`PRAGMA table_xinfo("${name.replaceAll('"', '""')}")`).all()
+      .filter((column) => Number(column.hidden) === 0)
+      .map((column) => String(column.name));
+    externalTables.push({ name, columns: columns.length > 0 ? columns : ['id'] });
+  }
+  return defineSqliteSchema({ name: 'post-commit-effects-fixtures', tables: [], externalTables, externalTriggers });
+}
 
 const principal = { type: 'user', id: 'editor', attributes: {} };
 
@@ -51,7 +68,7 @@ async function setup(t, options = {}) {
   const db = new DatabaseSync(':memory:');
   db.exec("CREATE TABLE Artefact (id TEXT PRIMARY KEY, project TEXT NOT NULL); INSERT INTO Artefact VALUES ('a1', 'source')");
   const ran = { handlers: 0, io: 0 };
-  const app = workbench({ db, schema: fixtureSchema, actions: [transferAction({ ...options, ran })] });
+  const app = workbench({ db, schema: fixtureSchema(db), actions: [transferAction({ ...options, ran })] });
   await app.start();
   t.after(async () => { await app.shutdown(); db.close(); });
   return { app, db, ran };
@@ -110,7 +127,7 @@ test('authorizedRows requires the same principal capability on both project rows
     },
   };
   const db = new DatabaseSync(':memory:');
-  const app = workbench({ db, schema: fixtureSchema, entities: [Project], actions: [action] });
+  const app = workbench({ db, schema: fixtureSchema(db), entities: [Project], actions: [action] });
   await app.start();
   t.after(async () => { await app.shutdown(); db.close(); });
   db.prepare('INSERT INTO TransferProject (id, name, owner) VALUES (?, ?, ?)').run('source', 'Source', 'editor');
@@ -153,7 +170,7 @@ test('registered durable actions consult the app-injected authorization adapter 
     },
     registerResource: (input) => defaultAdapter.registerResource(input),
   };
-  const app = workbench({ db, schema: fixtureSchema, entities: [Project], actions: [action] });
+  const app = workbench({ db, schema: fixtureSchema(db), entities: [Project], actions: [action] });
   app._authorization = spy; // what serve.ts listen() stashes from { authorization }
   await app.start();
   t.after(async () => { await app.shutdown(); db.close(); });
@@ -196,7 +213,7 @@ test('an injected adapter denial blocks the registered durable action', async (t
     },
     registerResource: () => {},
   };
-  const app = workbench({ db, schema: fixtureSchema, entities: [Project], actions: [action] });
+  const app = workbench({ db, schema: fixtureSchema(db), entities: [Project], actions: [action] });
   app._authorization = denying;
   await app.start();
   t.after(async () => { await app.shutdown(); db.close(); });
@@ -227,7 +244,7 @@ test('authorizedRows binds a post-compilation membership declaration and checks 
     handler: () => { handled += 1; return []; },
   };
   const db = new DatabaseSync(':memory:');
-  const app = workbench({ db, schema: fixtureSchema, entities: [Project], actions: [action] });
+  const app = workbench({ db, schema: fixtureSchema(db), entities: [Project], actions: [action] });
   await app.start();
   t.after(async () => { await app.shutdown(); db.close(); });
   db.prepare('INSERT INTO MembershipTransferProject (id, name, owner) VALUES (?, ?, ?)').run('source', 'Source', 'owner');
@@ -294,7 +311,7 @@ test('authorizedRows requires an explicit admin grant on every selected row and 
     handler: () => { handled += 1; return []; },
   };
   const db = new DatabaseSync(':memory:');
-  const app = workbench({ db, schema: fixtureSchema, entities: [Project, NoAdminProject, ScopeOnlyProject, ScopedAdminProject], actions: [action, noAdminAction, malformedAction, scopeOnlyAction, outOfScopeAction] });
+  const app = workbench({ db, schema: fixtureSchema(db), entities: [Project, NoAdminProject, ScopeOnlyProject, ScopedAdminProject], actions: [action, noAdminAction, malformedAction, scopeOnlyAction, outOfScopeAction] });
   await app.start();
   t.after(async () => { await app.shutdown(); db.close(); });
   db.prepare('INSERT INTO AdminAuthorizedRowsProject (id, name, owner) VALUES (?, ?, ?)').run('source', 'Source', 'editor');
@@ -351,7 +368,7 @@ test('private fact projection is bound to its declaring action when event types 
     eventTypes: ['shared.private.event'], privateFact: true,
     apply(_event, tx, { privateFact }) { tx.prepare('INSERT INTO PrivateProjection VALUES (?)').run(privateFact.after.value); },
   };
-  const app = workbench({ db, schema: fixtureSchema, actions: [
+  const app = workbench({ db, schema: fixtureSchema(db), actions: [
     {
       type: 'private.owner', authorize: () => true,
       handler: () => ({ events: [{ type: 'shared.private.event', scope: 'r:1', data: {} }], privateFact: { before: {}, after: { value: 'owned' } } }),
@@ -377,7 +394,7 @@ test('batch rejects a private-fact-projection action before any handler runs whi
   const db = new DatabaseSync(':memory:');
   db.exec('CREATE TABLE PrivateProjection (value TEXT NOT NULL)');
   const ran = { ordinary: 0, private: 0 };
-  const app = workbench({ db, schema: fixtureSchema, actions: [
+  const app = workbench({ db, schema: fixtureSchema(db), actions: [
     {
       type: 'ordinary.batchable', authorize: () => true,
       handler: () => {
@@ -445,7 +462,7 @@ test('private-fact projection receives canonical fact while public durable recor
       },
     }],
   };
-  const app = workbench({ db, schema: fixtureSchema, actions: [action] });
+  const app = workbench({ db, schema: fixtureSchema(db), actions: [action] });
   await app.start();
   t.after(async () => { await app.shutdown(); db.close(); });
   const result = await app.dispatch({ actionId: 'private-project', scope: 'owner:o1', type: action.type, payload: {}, principal });
@@ -467,7 +484,7 @@ test('private-fact projection fails closed for missing or forged durable facts',
     eventTypes: ['private.required'], privateFact: true,
     apply(_event, tx, context) { tx.prepare('INSERT INTO PrivateProjection VALUES (?, ?)').run(context.privateFact.after.id, context.privateFact.after.value); },
   };
-  const app = workbench({ db, schema: fixtureSchema, actions: [{
+  const app = workbench({ db, schema: fixtureSchema(db), actions: [{
     type: 'private.required', authorize: () => true,
     handler: () => ({ events: [{ type: 'private.required', scope: 'recipient:r1', data: {} }] }),
     projections: [projection],
@@ -489,7 +506,7 @@ test('private fact is withheld from ordinary projections and private projection 
   const db = new DatabaseSync(':memory:');
   db.exec('CREATE TABLE PrivateProjection (value TEXT NOT NULL)');
   let ordinaryArguments;
-  const app = workbench({ db, schema: fixtureSchema, actions: [{
+  const app = workbench({ db, schema: fixtureSchema(db), actions: [{
     type: 'private.rollback', authorize: () => true,
     handler: () => ({
       events: [{ type: 'private.rollback.committed', scope: 'recipient:r1', data: {} }],
@@ -524,7 +541,7 @@ test('canonical private fact is deeply immutable and replay remains repeatable',
   const db = new DatabaseSync(':memory:');
   db.exec('CREATE TABLE PrivateProjection (id TEXT PRIMARY KEY, value TEXT NOT NULL)');
   let observed;
-  const app = workbench({ db, schema: fixtureSchema, actions: [{
+  const app = workbench({ db, schema: fixtureSchema(db), actions: [{
     type: 'private.immutable', authorize: () => true,
     handler: () => ({
       events: [{ type: 'private.immutable.committed', scope: 'recipient:r1', data: {} }],
@@ -559,7 +576,7 @@ test('canonical private fact is deeply immutable and replay remains repeatable',
 test('private replay rejects duplicate receipt references transactionally', async (t) => {
   const db = new DatabaseSync(':memory:');
   db.exec('CREATE TABLE PrivateProjection (value TEXT NOT NULL)');
-  const app = workbench({ db, schema: fixtureSchema, actions: [{
+  const app = workbench({ db, schema: fixtureSchema(db), actions: [{
     type: 'private.duplicate', authorize: () => true,
     handler: () => ({
       events: [{ type: 'private.duplicate.committed', scope: 'recipient:r1', data: {} }],
@@ -584,7 +601,7 @@ test('private replay rejects duplicate receipt references transactionally', asyn
 
 test('private replay validates every fact before current-projection filtering', async (t) => {
   const db = new DatabaseSync(':memory:');
-  const app = workbench({ db, schema: fixtureSchema });
+  const app = workbench({ db, schema: fixtureSchema(db) });
   await app.start();
   t.after(async () => { await app.shutdown(); db.close(); });
   const receipt = db.prepare(
@@ -618,7 +635,7 @@ test('private replay validates every fact before current-projection filtering', 
 test('private replay corruption rolls back projections applied earlier in the transaction', async (t) => {
   const db = new DatabaseSync(':memory:');
   db.exec('CREATE TABLE PrivateProjection (value TEXT NOT NULL)');
-  const app = workbench({ db, schema: fixtureSchema, actions: [{
+  const app = workbench({ db, schema: fixtureSchema(db), actions: [{
     type: 'private.replay.atomic', authorize: () => true,
     handler: () => ({
       events: [{ type: 'private.replay.atomic.committed', scope: 'recipient:r1', data: {} }],
@@ -713,7 +730,7 @@ test('expired ownership cannot heartbeat or complete before recovery', async (t)
 
 test('effects require a canonical private before/after envelope', async (t) => {
   const db = new DatabaseSync(':memory:');
-  const app = workbench({ db, schema: fixtureSchema, actions: [{
+  const app = workbench({ db, schema: fixtureSchema(db), actions: [{
     type: 'invalid.fact', authorize: () => true,
     handler: () => ({
       events: [],
@@ -731,7 +748,7 @@ test('effects require a canonical private before/after envelope', async (t) => {
 
 test('effects reject private fact keys erased by JSON serialization without persisting action state', async (t) => {
   const db = new DatabaseSync(':memory:');
-  const app = workbench({ db, schema: fixtureSchema, actions: [{
+  const app = workbench({ db, schema: fixtureSchema(db), actions: [{
     type: 'undefined.fact', authorize: () => true,
     handler: () => ({
       events: [{ type: 'undefined.fact.committed', scope: 'project:p', data: {} }],

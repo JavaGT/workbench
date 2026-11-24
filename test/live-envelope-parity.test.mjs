@@ -19,6 +19,8 @@ import { createLiveDeliveryWebSocket } from '../build/live-delivery-websocket.mj
 import { executeFrameworkDDL } from '../build/ddl.mjs';
 import { envelopeDiagnostics, isAuthoritativeEnvelope } from '../build/event-delivery.mjs';
 import { createLiveDeliverySession } from '../public/workbench-client.mjs';
+import { scope } from '../build/scope.mjs';
+import { grant, read, subscribe } from '../build/grant.mjs';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -123,14 +125,14 @@ function makeEntities() {
     fields: { title: { kind: 'value', type: 'text' } },
     scopeFilter: () => ({ sql: '1=1', params: {} }),
     hydrate: (row) => ({ ...row }),
-    grant: [],
+    grant: [scope(() => true).can(() => grant(read, subscribe))],
   };
   const project = {
     name: 'Project',
     fields: { name: { kind: 'value', type: 'text' } },
     scopeFilter: () => ({ sql: '1=1', params: {} }),
     hydrate: (row) => ({ ...row }),
-    grant: [],
+    grant: [scope(() => true).can(() => grant(read, subscribe))],
   };
   return new Map([['Note', note], ['Project', project]]);
 }

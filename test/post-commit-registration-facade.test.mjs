@@ -13,16 +13,34 @@ import workbench, {
   subscribe,
 } from '../build/index.mjs';
 import { entity } from '../build/internal.mjs';
-import { defineSqliteSchema } from '../build/server.mjs';
+import { defineSqliteSchema, frameworkTableNames } from '../build/server.mjs';
 
 // Fixture table created out-of-band and written by the app's projection.
-const fixtureSchema = defineSqliteSchema({
-  name: 'post-commit-registration-facade-fixtures',
-  tables: [],
-  externalTables: [
-    { name: 'Artefact', columns: ['id', 'project'] },
-  ],
-});
+// Boot validates the settled census against SQLite (fail closed). Each test
+// creates only the out-of-band tables it needs, so declare exactly the objects
+// present in its database: no missing census entry, no undeclared drift.
+// Framework-owned names already have their own authority.
+function fixtureSchema(db) {
+  const reserved = new Set(frameworkTableNames.map((name) => String(name).toLowerCase()));
+  const externalTables = [];
+  const externalTriggers = [];
+  const objects = db.prepare(
+    "SELECT type, name FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' AND type IN ('table', 'trigger') ORDER BY type, name",
+  ).all();
+  for (const object of objects) {
+    const name = String(object.name);
+    if (reserved.has(name.toLowerCase())) continue;
+    if (object.type === 'trigger') {
+      externalTriggers.push({ name });
+      continue;
+    }
+    const columns = db.prepare(`PRAGMA table_xinfo("${name.replaceAll('"', '""')}")`).all()
+      .filter((column) => Number(column.hidden) === 0)
+      .map((column) => String(column.name));
+    externalTables.push({ name, columns: columns.length > 0 ? columns : ['id'] });
+  }
+  return defineSqliteSchema({ name: 'post-commit-registration-facade-fixtures', tables: [], externalTables, externalTriggers });
+}
 import {
   operationalConsumerAdmin,
   createPostCommitEffectRunner,
@@ -62,7 +80,7 @@ test('app registers operational consumers via public options without selecting f
   const db = new DatabaseSync(':memory:');
   const app = workbench({
     db,
-    schema: fixtureSchema,
+    schema: fixtureSchema(db),
     entities: [noteEntity()],
     operationalConsumers: [consumer],
   });
@@ -102,7 +120,7 @@ test('host auto-wires postCommitEffects; createPostCommitEffectRunner remains ad
   db.exec("CREATE TABLE Artefact (id TEXT PRIMARY KEY, project TEXT NOT NULL); INSERT INTO Artefact VALUES ('a1', 'source')");
   const app = workbench({
     db,
-    schema: fixtureSchema,
+    schema: fixtureSchema(db),
     actions: [{
       type: 'artefact.transfer',
       authorize: () => true,

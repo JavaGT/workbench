@@ -129,7 +129,7 @@ function makeNoteEntity() {
     hydrate: (row) => ({ ...row }),
     scopeFilter: () => ({ sql: '1=1', params: {} }),
     fields: { title: { kind: 'value' } },
-    grant: [],
+    grant: [scope(() => true).can(() => grant(read, write, subscribe))],
   };
 }
 
@@ -143,7 +143,7 @@ function makeAnnotatedTextEntity() {
     hydrate: (row) => ({ ...row }),
     scopeFilter: () => ({ sql: '1=1', params: {} }),
     fields: { body: { kind: 'annotatedText' } },
-    grant: [],
+    grant: [scope(() => true).can(() => grant(read, write, subscribe))],
   };
 }
 
@@ -504,7 +504,7 @@ function makeDocWithEphemeralEntity() {
     hydrate: (row) => ({ ...row }),
     scopeFilter: () => ({ sql: '1=1', params: {} }),
     fields: { body: { kind: 'annotatedText' }, cursor: { kind: 'ephemeral' } },
-    grant: [],
+    grant: [scope(() => true).can(() => grant(read, write, subscribe))],
   };
 }
 

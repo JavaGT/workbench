@@ -71,7 +71,7 @@ function makeNoteDb() {
     fields: { title: { kind: 'value', type: 'text' } },
     scopeFilter: () => ({ sql: '1=1', params: {} }),
     hydrate: (row) => ({ ...row }),
-    grant: [],
+    grant: [scope(() => true).can(() => grant(read, write, subscribe))],
   };
   return { db, entities: new Map([['Note', note]]) };
 }

@@ -72,6 +72,10 @@ function installSchema(db) {
   executeDDL(Project, db);
   db.exec("INSERT INTO Project (id, owner) VALUES ('p1', 'u1')");
   executeDDL(declaredEntity(), db);
+  // Every boot now validates the settled census: the schema declares this
+  // out-of-band ledger, so create it here for every case (the helper is
+  // idempotent, so cases that seed it explicitly stay valid).
+  installCorrectionLedger(db);
 }
 
 function membershipOf(family, start, end) {

@@ -678,6 +678,9 @@ test('serveAuthorizedBlob / handleAuthorizedBlobRequest works directly as a reus
     name: 'audio',
     scope: ({ is }) => is.owner(),
     fields: { owner: ref('User', { role: 'owner' }) },
+    // This helper is a DB-less policy fixture: opt in to the single-row scope
+    // evaluation that a missing SQL table can no longer trigger implicitly.
+    allowRowScopeFallback: true,
   });
 
   const ownerRow = { id: 'a1', owner: 'alice' };

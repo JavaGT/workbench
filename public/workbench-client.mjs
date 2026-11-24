@@ -3814,7 +3814,7 @@ export function createLiveDeliverySession({
     const settlement = createSettlement(operation);
     if (!initialized || closed || status === 'unavailable' || status === 'revoked') {
       settleOperation(operation, { status: terminalStatus() });
-      return { ok: false, status: 'failed-rolled-back', opId: actionId, settlement, failure: new ClientClosedError('Live delivery is unavailable') };
+      return { ok: false, status: 'failed-rolled-back', opId: actionId, settlement, failure: normalizeFailure(new ClientClosedError('Live delivery is unavailable')) };
     }
     operations.set(actionId, operation);
     publish();
@@ -3822,7 +3822,7 @@ export function createLiveDeliverySession({
       settleOperation(operation, { status: terminalStatus() });
       operations.delete(actionId);
       publish();
-      return { ok: false, status: 'failed-rolled-back', opId: actionId, settlement, failure: new ClientClosedError('Live delivery is unavailable') };
+      return { ok: false, status: 'failed-rolled-back', opId: actionId, settlement, failure: normalizeFailure(new ClientClosedError('Live delivery is unavailable')) };
     }
     return submitAction(operation);
   }
@@ -3836,7 +3836,7 @@ export function createLiveDeliverySession({
         settleOperation(operation, { status: 'revoked' });
         operations.delete(operation.actionId);
         publish();
-        return { ok: false, status: 'failed-rolled-back', opId: operation.actionId, settlement: operation.settlement, failure: new ClientClosedError('Live delivery access was revoked') };
+        return { ok: false, status: 'failed-rolled-back', opId: operation.actionId, settlement: operation.settlement, failure: normalizeFailure(new ClientClosedError('Live delivery access was revoked')) };
       }
       if (receipt?.ok === false) {
         operation.outcome = 'rejected';
@@ -3857,7 +3857,7 @@ export function createLiveDeliverySession({
         operation.error = failure;
         settleOperation(operation, { status: 'failed', error: failure });
         publish();
-        return { ok: false, status: 'failed-rolled-back', opId: operation.actionId, settlement: operation.settlement, failure };
+        return { ok: false, status: 'failed-rolled-back', opId: operation.actionId, settlement: operation.settlement, failure: normalizeFailure(failure) };
       }
       const confirmedThrough = receipt?.confirmedThrough;
       if (snapshotOnly && (!Number.isSafeInteger(confirmedThrough) || confirmedThrough < 0 || receipt?.actionId !== operation.actionId)) {
@@ -3900,7 +3900,7 @@ export function createLiveDeliverySession({
         settleOperation(operation, { status: 'revoked' });
         operations.delete(operation.actionId);
         publish();
-        return { ok: false, status: 'failed-rolled-back', opId: operation.actionId, settlement: operation.settlement, failure: new ClientClosedError('Live delivery access was revoked') };
+        return { ok: false, status: 'failed-rolled-back', opId: operation.actionId, settlement: operation.settlement, failure: normalizeFailure(new ClientClosedError('Live delivery access was revoked')) };
       }
       // A delivery echo proves the action reached the committed recipient
       // stream even when its request promise fails after that point. An
@@ -3923,7 +3923,7 @@ export function createLiveDeliverySession({
       if (status === 'revoked') {
         operation.outcome = 'rejected';
         settleOperation(operation, { status: 'revoked' });
-        return { ok: false, status: 'failed-rolled-back', opId: operation.actionId, settlement: operation.settlement, failure: new ClientClosedError('Live delivery access was revoked') };
+        return { ok: false, status: 'failed-rolled-back', opId: operation.actionId, settlement: operation.settlement, failure: normalizeFailure(new ClientClosedError('Live delivery access was revoked')) };
       }
       if (receipt?.ok === false) {
         operation.outcome = 'rejected';
@@ -3942,7 +3942,7 @@ export function createLiveDeliverySession({
         operation.error = receipt.failure ?? receipt.error ?? receipt;
         settleOperation(operation, { status: 'failed', error: operation.error });
         publish();
-        return { ok: false, status: 'failed-rolled-back', opId: operation.actionId, settlement: operation.settlement, failure: operation.error };
+        return { ok: false, status: 'failed-rolled-back', opId: operation.actionId, settlement: operation.settlement, failure: normalizeFailure(operation.error) };
       }
       if (!receipt || receipt.ok !== true || receipt.actionId !== operation.actionId) {
         throw new Error('batch dispatch returned an invalid receipt');
@@ -3978,7 +3978,7 @@ export function createLiveDeliverySession({
         settleOperation(operation, { status: 'revoked' });
         operations.delete(operation.actionId);
         publish();
-        return { ok: false, status: 'failed-rolled-back', opId: operation.actionId, settlement: operation.settlement, failure: new ClientClosedError('Live delivery access was revoked') };
+        return { ok: false, status: 'failed-rolled-back', opId: operation.actionId, settlement: operation.settlement, failure: normalizeFailure(new ClientClosedError('Live delivery access was revoked')) };
       }
       // Same commit-proof escapes as submitAction: a delivery echo or an
       // accepted-patch attribution (#156 round 3) proves the batch committed
@@ -4005,16 +4005,16 @@ export function createLiveDeliverySession({
       || Object.keys(action).length !== 2
       || !isJsonValue(action.payload))) {
       settleOperation(rejectedOperation, { status: 'failed', error: new TypeError('batch requires a non-empty action array') });
-      return { ok: false, status: 'failed-rolled-back', opId: actionId, settlement: rejectedSettlement, failure: new TypeError('batch requires a non-empty action array') };
+      return { ok: false, status: 'failed-rolled-back', opId: actionId, settlement: rejectedSettlement, failure: normalizeFailure(new TypeError('batch requires a non-empty action array')) };
     }
     if (typeof sendBatch !== 'function') {
       const failure = new TypeError('sendBatch is required');
       settleOperation(rejectedOperation, { status: 'failed', error: failure });
-      return { ok: false, status: 'failed-rolled-back', opId: actionId, settlement: rejectedSettlement, failure };
+      return { ok: false, status: 'failed-rolled-back', opId: actionId, settlement: rejectedSettlement, failure: normalizeFailure(failure) };
     }
     if (!initialized || closed || status === 'unavailable' || status === 'revoked') {
       settleOperation(rejectedOperation, { status: terminalStatus() });
-      return { ok: false, status: 'failed-rolled-back', opId: actionId, settlement: rejectedSettlement, failure: new ClientClosedError('Live delivery is unavailable') };
+      return { ok: false, status: 'failed-rolled-back', opId: actionId, settlement: rejectedSettlement, failure: normalizeFailure(new ClientClosedError('Live delivery is unavailable')) };
     }
     const retainedActions = freezeClone(structuredClone(actions));
     const batchEnvelope = Object.freeze({ actionId, actions: retainedActions });
@@ -4035,7 +4035,7 @@ export function createLiveDeliverySession({
       settleOperation(operation, { status: terminalStatus() });
       operations.delete(actionId);
       publish();
-      return { ok: false, status: 'failed-rolled-back', opId: actionId, settlement: operation.settlement, failure: new ClientClosedError('Live delivery is unavailable') };
+      return { ok: false, status: 'failed-rolled-back', opId: actionId, settlement: operation.settlement, failure: normalizeFailure(new ClientClosedError('Live delivery is unavailable')) };
     }
     return submitBatch(operation);
   }
@@ -4047,13 +4047,13 @@ export function createLiveDeliverySession({
       const settlement = createSettlement(rejectedOperation);
       const failure = new TypeError('operation is not awaiting transport retry');
       settleOperation(rejectedOperation, { status: 'failed', error: failure });
-      return { ok: false, status: 'failed-rolled-back', opId, settlement, failure };
+      return { ok: false, status: 'failed-rolled-back', opId, settlement, failure: normalizeFailure(failure) };
     }
     if (!((status === 'live' && !reconnecting) || await admit(operation)) || !canTransmit(operation)) {
       settleOperation(operation, { status: terminalStatus() });
       operations.delete(opId);
       publish();
-      return { ok: false, status: 'failed-rolled-back', opId, settlement: operation.settlement, failure: new ClientClosedError('Live delivery is unavailable') };
+      return { ok: false, status: 'failed-rolled-back', opId, settlement: operation.settlement, failure: normalizeFailure(new ClientClosedError('Live delivery is unavailable')) };
     }
     operation.deliveryError = null;
     return operation.batch ? submitBatch(operation) : submitAction(operation);
@@ -4235,7 +4235,7 @@ export function createLiveDeliveryHttpSession({
     });
     let receipt;
     try { receipt = await response.json(); } catch {
-      if (!response.ok) return { ok: false, failure: new Error(`action dispatch failed with HTTP ${response.status}`) };
+      if (!response.ok) return { ok: false, failure: normalizeFailure(new Error(`action dispatch failed with HTTP ${response.status}`)) };
       throw new Error(`action dispatch failed with HTTP ${response.status}`);
     }
     if (!response.ok) return receipt?.ok === false ? receipt : { ok: false, failure: receipt };
@@ -4250,7 +4250,7 @@ export function createLiveDeliveryHttpSession({
     });
     let receipt;
     try { receipt = await response.json(); } catch {
-      if (!response.ok) return { ok: false, failure: new Error(`batch dispatch failed with HTTP ${response.status}`) };
+      if (!response.ok) return { ok: false, failure: normalizeFailure(new Error(`batch dispatch failed with HTTP ${response.status}`)) };
       throw new Error(`batch dispatch failed with HTTP ${response.status}`);
     }
     if (!response.ok) return receipt?.ok === false ? receipt : { ok: false, failure: receipt };
@@ -4899,7 +4899,7 @@ export function createAnnotatedTextHttpSession({ baseUrl, context, historySessio
     return blocks.get('document') === session.snapshot?.text;
   }
   function localAuthoringConflict() {
-    return { ok: false, failure: new Error('annotated text changed before queued operation could be submitted') };
+    return { ok: false, failure: normalizeFailure(new Error('annotated text changed before queued operation could be submitted')) };
   }
   function splitsSurrogate(text, offset) {
     return offset > 0 && offset < text.length
@@ -4940,7 +4940,7 @@ export function createAnnotatedTextHttpSession({ baseUrl, context, historySessio
     const resolvedActionId = actionId ?? mintActionId();
     const blocks = new Map([['document', queuedBasis]]);
     if (!alreadyProjected && applyQueuedTextCommand(queuedBasis, command, resolvedActionId) == null) {
-      return Promise.resolve({ ok: false, failure: new TypeError('annotated text position splits a surrogate pair') });
+      return Promise.resolve({ ok: false, failure: normalizeFailure(new TypeError('annotated text position splits a surrogate pair')) });
     }
     if (!reserved) queuedAuthoringMutations += 1;
     // Queued text is an explicit optimistic placeholder. Publish it immediately
@@ -5082,7 +5082,7 @@ export function createAnnotatedTextHttpSession({ baseUrl, context, historySessio
       queuedDocumentText = null;
       replayPendingDisplayEdits([]);
     }
-    const result = { ok: false, failure: new ClientClosedError('Annotated text document is unavailable') };
+    const result = { ok: false, failure: normalizeFailure(new ClientClosedError('Annotated text document is unavailable')) };
     for (const waiter of burst.waiters) waiter.resolve(result);
     publishAnnotatedDocument();
   }
@@ -5137,22 +5137,22 @@ export function createAnnotatedTextHttpSession({ baseUrl, context, historySessio
       flushOpenInsertBurst();
       if (!at || typeof at !== 'object' || !Number.isSafeInteger(at.offset) || at.offset < 0
         || (at.affinity !== 'left' && at.affinity !== 'right')) {
-        return Promise.resolve({ ok: false, failure: new TypeError('annotated text paste requires a valid at position') });
+        return Promise.resolve({ ok: false, failure: normalizeFailure(new TypeError('annotated text paste requires a valid at position')) });
       }
       if (typeof text !== 'string' || text.length === 0) {
-        return Promise.resolve({ ok: false, failure: new TypeError('annotated text pasted text must be non-empty') });
+        return Promise.resolve({ ok: false, failure: normalizeFailure(new TypeError('annotated text pasted text must be non-empty')) });
       }
       if (!annotation || typeof annotation !== 'object'
         || typeof annotation.family !== 'string' || annotation.family.length === 0
         || (annotation.fields !== undefined && (typeof annotation.fields !== 'object' || annotation.fields === null || Array.isArray(annotation.fields)))) {
-        return Promise.resolve({ ok: false, failure: new TypeError('annotated text paste requires an annotation family') });
+        return Promise.resolve({ ok: false, failure: normalizeFailure(new TypeError('annotated text paste requires an annotation family')) });
       }
       const command = { kind: 'annotation.paste', mutationId, at, text, annotation: { family: annotation.family, ...(annotation.fields ? { fields: { ...annotation.fields } } : {}) } };
       return queueAuthoringMutation(command, (current, actionId) => dispatchNow(current, actionId));
     },
     replace(input) {
       flushOpenInsertBurst();
-      if (!input || typeof input !== 'object') return { ok: false, failure: new TypeError('annotated text replace requires from, to, and text') };
+      if (!input || typeof input !== 'object') return { ok: false, failure: normalizeFailure(new TypeError('annotated text replace requires from, to, and text')) };
       // An insert (empty selection) must NOT be sent as text.replace: the
       // server rejects a replace with an empty delete range. Route it to
       // text.insert so editor keystrokes and IME inserts submit correctly.
@@ -5658,8 +5658,16 @@ export function createAuthClient({ baseUrl, fetchImpl } = {}) {
 // success value is the server body: a query page for the family/entity calls,
 // a hits + staleness response for search. `credentials: 'include'` sends the
 // fail-closed session cookie, exactly like the CRUD store.
-export function createQueryClient({ baseUrl, fetchImpl } = {}) {
+export function createQueryClient({ baseUrl, fetchImpl, cacheSize } = {}) {
   const fetchFn = fetchImpl ?? globalThis.fetch;
+  const maxCachedPages = Number.isSafeInteger(cacheSize) && cacheSize > 0 ? cacheSize : 32;
+  // Bounded LRU of executed pages. Query calls still FETCH (the existing
+  // contract); the cache is an explicit read surface for consumers that want a
+  // last-known page, plus the target of an invalidation-triggered refetch.
+  const pageCache = new Map();
+  const inFlight = new Map();
+  const heldRevisions = new Map();
+  const invalidationTargets = new Map();
 
   async function post(path, request, opts = {}) {
     const headers = { 'Content-Type': 'application/json', ...(opts?.headers ?? {}) };
@@ -5678,15 +5686,143 @@ export function createQueryClient({ baseUrl, fetchImpl } = {}) {
     return decoded.value;
   }
 
+  function pageKey(kind, name, request) {
+    return JSON.stringify([kind, name, request ?? {}]);
+  }
+
+  function acceptQueryPage(page) {
+    if (!page || !Number.isSafeInteger(page.revision) || typeof page.queryIdentity !== 'string') {
+      throw new WorkbenchFailureError(clientFailure('invalid-input', 'query page is missing a revision token or identity'));
+    }
+    const held = heldRevisions.get(page.queryIdentity);
+    return held !== undefined && page.revision < held ? 'reject-stale' : 'accept';
+  }
+
+  function rememberPage(key, kind, name, request, page, invalidationId) {
+    pageCache.delete(key);
+    pageCache.set(key, { kind, name, request, page, invalidationId });
+    while (pageCache.size > maxCachedPages) pageCache.delete(pageCache.keys().next().value);
+    if (typeof invalidationId === 'string' && invalidationId.length > 0) {
+      let keys = invalidationTargets.get(invalidationId);
+      if (!keys) { keys = new Set(); invalidationTargets.set(invalidationId, keys); }
+      keys.add(key);
+    }
+  }
+
+  function fetchPage(kind, name, request, opts) {
+    const key = pageKey(kind, name, request);
+    const pending = inFlight.get(key);
+    // In-flight dedup: two consumers asking for the same page (including a
+    // polling refetch racing a caller) share ONE HTTP request.
+    if (pending) return pending;
+    const path = kind === 'entity'
+      ? `/query/${encodeURIComponent(name)}`
+      : `/query-families/${encodeURIComponent(name)}`;
+    const promise = (async () => {
+      const page = await post(path, request, opts);
+      if (!page || !Array.isArray(page.rows) || typeof page.queryIdentity !== 'string') {
+        throw new WorkbenchFailureError(clientFailure('internal', 'query endpoint returned an invalid page'));
+      }
+      if (acceptQueryPage(page) === 'reject-stale') {
+        throw new WorkbenchFailureError(clientFailure('conflict', 'stale query page'));
+      }
+      const held = heldRevisions.get(page.queryIdentity);
+      if (held === undefined || page.revision > held) heldRevisions.set(page.queryIdentity, page.revision);
+      rememberPage(key, kind, name, request, page, opts?.invalidationId);
+      return page;
+    })();
+    inFlight.set(key, promise);
+    promise.then(
+      () => { if (inFlight.get(key) === promise) inFlight.delete(key); },
+      () => { if (inFlight.get(key) === promise) inFlight.delete(key); },
+    );
+    return promise;
+  }
+
+  function invalidationBody(input = {}) {
+    return {
+      id: input.id,
+      ...(input.entity !== undefined ? { entity: input.entity } : {}),
+      ...(input.family !== undefined ? { family: input.family } : {}),
+      ...(input.sinceRevision !== undefined ? { sinceRevision: input.sinceRevision } : {}),
+      ...(input.scope !== undefined ? { scope: input.scope } : {}),
+      ...(input.fields !== undefined ? { fields: input.fields } : {}),
+      ...(input.scopeField !== undefined ? { scopeField: input.scopeField } : {}),
+    };
+  }
+
+  async function refreshCachedQueryPages(invalidationId) {
+    const keys = invalidationId === undefined
+      ? [...pageCache.keys()]
+      : [...(invalidationTargets.get(invalidationId) ?? [])];
+    const refreshed = [];
+    for (const key of keys) {
+      const entry = pageCache.get(key);
+      if (!entry) continue;
+      refreshed.push(await fetchPage(entry.kind, entry.name, entry.request, { invalidationId: entry.invalidationId }));
+    }
+    return refreshed;
+  }
+
   return {
     queryEntity(entity, request, opts) {
-      return post(`/query/${encodeURIComponent(entity)}`, request, opts);
+      return fetchPage('entity', entity, request, opts);
     },
     queryFamily(name, request, opts) {
-      return post(`/query-families/${encodeURIComponent(name)}`, request, opts);
+      return fetchPage('family', name, request, opts);
     },
     search(request, opts) {
       return post('/search', request, opts);
+    },
+    acceptQueryPage,
+    getCachedQueryPage(kind, name, request) {
+      return pageCache.get(pageKey(kind, name, request))?.page;
+    },
+    clearQueryCache() {
+      pageCache.clear();
+      invalidationTargets.clear();
+    },
+    refreshCachedQueryPages,
+    registerQueryInvalidation(input, opts) {
+      return post('/queries/register', invalidationBody(input), opts);
+    },
+    changedSince(input, opts) {
+      return post('/queries/changed-since', invalidationBody(input), opts);
+    },
+    unregisterQueryInvalidation(input, opts) {
+      return post('/queries/unregister', { id: input?.id }, opts);
+    },
+    // Polling is opt-in and bounded by one timer. A changed/resync signal
+    // refetches the affected cached pages through the SAME deduped fetch path;
+    // existing queryEntity/queryFamily callers are untouched.
+    watchQueryInvalidation(options = {}) {
+      const { id, entity, family, intervalMs = 2000, onChanged, onError, signal } = options;
+      let sinceRevision = options.sinceRevision;
+      let stopped = false;
+      let timer = null;
+      const tick = async () => {
+        if (stopped || signal?.aborted) return;
+        try {
+          const result = await post('/queries/changed-since', invalidationBody({ id, entity, family, sinceRevision }));
+          if (Number.isSafeInteger(result?.revision)) sinceRevision = result.revision;
+          if (result?.kind === 'changed' || result?.kind === 'resync') {
+            const pages = await refreshCachedQueryPages(id);
+            if (typeof onChanged === 'function') await onChanged(result, pages);
+          }
+        } catch (error) {
+          if (typeof onError === 'function') onError(error);
+        } finally {
+          if (!stopped && !signal?.aborted) timer = setTimeout(tick, intervalMs);
+        }
+      };
+      timer = setTimeout(tick, 0);
+      const stop = () => {
+        if (stopped) return;
+        stopped = true;
+        if (timer !== null) clearTimeout(timer);
+      };
+      if (signal) signal.addEventListener('abort', stop, { once: true });
+      return stop;
     },
   };
 }

@@ -634,7 +634,7 @@ export type LiveDeliverySettlement = {
 
 export type LiveDeliveryDispatchResult =
   | { ok: true; status: 'committed'; opId: string; settlement: LiveDeliverySettlement; value?: unknown }
-  | { ok: false; status: 'failed-rolled-back'; opId: string; settlement: LiveDeliverySettlement; failure: unknown }
+  | { ok: false; status: 'failed-rolled-back'; opId: string; settlement: LiveDeliverySettlement; failure: WorkbenchFailure }
   | { ok: false; status: 'outcome-unknown'; opId: string; settlement: LiveDeliverySettlement; deliveryError: { message: string } };
 
 export interface LiveDeliverySessionConfig<Snapshot, Payload = unknown> {
@@ -866,7 +866,7 @@ export interface ScopeOperation<Payload = unknown> {
  */
 export type ScopeDispatchResult =
   | { ok: true; status: 'committed'; opId: string; settlement?: LiveDeliverySettlement; value?: unknown }
-  | { ok: false; status: 'failed-rolled-back'; opId: string; settlement?: LiveDeliverySettlement; failure: unknown }
+  | { ok: false; status: 'failed-rolled-back'; opId: string; settlement?: LiveDeliverySettlement; failure: WorkbenchFailure }
   | { ok: false; status: 'outcome-unknown'; opId: string; settlement?: LiveDeliverySettlement; failure: unknown };
 
 export interface ScopeLiveStoreConfig<Snapshot> {
@@ -928,11 +928,38 @@ export function createAuthClient(config?: AuthClientConfig): AuthClient;
 export interface QueryClientOptions {
   baseUrl?: string;
   fetchImpl?: typeof globalThis.fetch;
+  /** Maximum number of recently executed pages retained by the bounded LRU. */
+  cacheSize?: number;
 }
 
 export interface QueryRequestOptions {
   signal?: AbortSignal;
   headers?: Record<string, string>;
+  /** Binds the fetched page to a registered query invalidation for refetch. */
+  invalidationId?: string;
+}
+
+export interface QueryInvalidationRegistrationInput {
+  readonly id: string;
+  readonly scope: string;
+  readonly entity?: string;
+  readonly family?: string;
+  readonly fields?: readonly string[];
+  readonly scopeField?: string;
+}
+
+export interface QueryInvalidationPollInput {
+  readonly id: string;
+  readonly entity?: string;
+  readonly family?: string;
+  readonly sinceRevision: number;
+}
+
+export interface QueryInvalidationWatchOptions extends QueryInvalidationPollInput {
+  readonly intervalMs?: number;
+  readonly onChanged?: (signal: QueryInvalidationSignal, pages: readonly QueryPage[]) => void | Promise<void>;
+  readonly onError?: (error: unknown) => void;
+  readonly signal?: AbortSignal;
 }
 
 /**
@@ -1011,6 +1038,33 @@ export interface QueryClient {
     opts?: QueryRequestOptions,
   ): Promise<QueryPage<Row>>;
   search(request: QuerySearchRequest, opts?: QueryRequestOptions): Promise<QuerySearchResponse>;
+
+  /** Pure revision comparison: 'reject-stale' when the page predates a held page. */
+  acceptQueryPage(page: QueryPage): QueryPageDecision;
+  /** The last executed page for an identical request, or undefined. */
+  getCachedQueryPage(
+    kind: 'entity' | 'family',
+    name: string,
+    request: QueryEntityRequest | QueryFamilyRequest,
+  ): QueryPage | undefined;
+  clearQueryCache(): void;
+  /** Refetch cached pages (optionally only those bound to one invalidation id). */
+  refreshCachedQueryPages(invalidationId?: string): Promise<QueryPage[]>;
+
+  registerQueryInvalidation(
+    input: QueryInvalidationRegistrationInput,
+    opts?: QueryRequestOptions,
+  ): Promise<{ ok: true; revision: number }>;
+  changedSince(
+    input: QueryInvalidationPollInput,
+    opts?: QueryRequestOptions,
+  ): Promise<QueryInvalidationSignal>;
+  unregisterQueryInvalidation(
+    input: { id: string },
+    opts?: QueryRequestOptions,
+  ): Promise<{ ok: true; revision: number }>;
+  /** Returns a stop function; polling is opt-in and bounded to one timer. */
+  watchQueryInvalidation(options: QueryInvalidationWatchOptions): () => void;
 }
 
 export function createQueryClient(options?: QueryClientOptions): QueryClient;

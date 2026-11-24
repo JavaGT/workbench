@@ -202,7 +202,7 @@ const scopeFailedResultWithSettlement: ScopeDispatchResult = {
     opId: 'op-2',
     wait: async () => ({ opId: 'op-2', status: 'failed', error: new Error('failed') }),
   },
-  failure: new Error('failed'),
+  failure: { category: 'internal', message: 'failed' },
 };
 const scopeUnknownResultWithSettlement: ScopeDispatchResult = {
   ok: false,

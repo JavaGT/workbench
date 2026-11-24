@@ -219,6 +219,12 @@ export class QueryContentionError extends Error {
 
 
 
+
+
+
+
+
+
 const CONTRACT_KEYS = Object.freeze(['entity', 'filters', 'where', 'expression', 'sort', 'pageSize']);
 const FILTER_KEYS = Object.freeze(['field', 'op', 'value']);
 const TERM_KEYS = Object.freeze(['kind', 'field', 'op', 'value']);
@@ -753,6 +759,22 @@ export function keysetSql(sortColumn        , direction                , cursor 
   )`;
 }
 
+/**
+ * Rebuild the keyset cursor that starts AFTER one row of an executed page.
+ * `QueryPage.sortValues` carries the raw (pre-hydration) key so a route that
+ * post-filters admitted rows can hand the client a cursor anchored on the last
+ * row it actually returned, using the same compiled sort key as the page.
+ */
+export function queryCursorForRow(page           , index        )                     {
+  const row = page.rows[index];
+  if (!row || row.id === undefined || row.id === null) return null;
+  return Object.freeze({
+    queryIdentity: page.queryIdentity,
+    sortValue: page.sortValues?.[index] ?? null,
+    id: String(row.id),
+  });
+}
+
 export function selectAuthorizedPage(
   db         ,
   entity             ,
@@ -881,6 +903,7 @@ export function selectAuthorizedPage(
     hasMore,
     nextCursor,
     queryIdentity: input.identity,
+    sortValues: Object.freeze(rawRows.map((raw) => customSort ? raw.__wb_sort_value : raw[sortField ])),
     ...(input.offset !== undefined ? { offset: input.offset } : {}),
     ...(input.includeCount === true ? { count: filteredTotal, filteredTotal } : {}),
     ...(input.includeTotal === true ? { total } : {}),

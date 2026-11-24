@@ -167,6 +167,12 @@ export interface QueryPage {
   readonly hasMore: boolean;
   readonly nextCursor: QueryCursor | null;
   readonly queryIdentity: string;
+  /**
+   * The raw sort key of each row, parallel to `rows`. HTTP routes use it to
+   * rebuild a keyset cursor AFTER an authorization post-filter removes rows;
+   * it is internal pagination evidence, never part of the JSON page body.
+   */
+  readonly sortValues?: readonly unknown[];
   readonly offset?: number;
   readonly count?: number;
   readonly filteredTotal?: number;
@@ -753,6 +759,22 @@ export function keysetSql(sortColumn: string, direction: 'asc' | 'desc', cursor:
   )`;
 }
 
+/**
+ * Rebuild the keyset cursor that starts AFTER one row of an executed page.
+ * `QueryPage.sortValues` carries the raw (pre-hydration) key so a route that
+ * post-filters admitted rows can hand the client a cursor anchored on the last
+ * row it actually returned, using the same compiled sort key as the page.
+ */
+export function queryCursorForRow(page: QueryPage, index: number): QueryCursor | null {
+  const row = page.rows[index];
+  if (!row || row.id === undefined || row.id === null) return null;
+  return Object.freeze({
+    queryIdentity: page.queryIdentity,
+    sortValue: page.sortValues?.[index] ?? null,
+    id: String(row.id),
+  });
+}
+
 export function selectAuthorizedPage(
   db: QueryDb,
   entity: QueryEntity,
@@ -881,6 +903,7 @@ export function selectAuthorizedPage(
     hasMore,
     nextCursor,
     queryIdentity: input.identity,
+    sortValues: Object.freeze(rawRows.map((raw) => customSort ? raw.__wb_sort_value : raw[sortField!])),
     ...(input.offset !== undefined ? { offset: input.offset } : {}),
     ...(input.includeCount === true ? { count: filteredTotal, filteredTotal } : {}),
     ...(input.includeTotal === true ? { total } : {}),

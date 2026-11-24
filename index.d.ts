@@ -1,4 +1,7 @@
-/// <reference types="node" />
+// Browser consumers of `workbench/client` import types from this module. Keep
+// Node-only globals opt-in through the explicit `node:*` imports below instead
+// of a transitive triple-slash types reference, which would leak into DOM-only
+// programs that never ask for Node types.
 
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import type { SearchPlugin, SearchPluginRegistry } from './src/server.js';

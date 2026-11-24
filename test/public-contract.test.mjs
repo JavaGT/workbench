@@ -97,6 +97,58 @@ const PRIVATE_ENTRYPOINTS = Object.freeze([
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 
+// --- Runtime <-> .d.ts two-way export parity --------------------------------
+//
+// The supported entrypoints each ship a hand-maintained declaration file
+// beside an emitted/public runtime module. A runtime export with no declaration
+// is invisible to TypeScript consumers; a declared value with no runtime
+// binding is a broken promise. Type-only exports (interface/type) are ignored:
+// they intentionally have no runtime counterpart.
+const DECLARATION_ENTRYPOINTS = Object.freeze([
+  { dts: 'index.d.ts', runtime: '../build/index.mjs' },
+  { dts: 'src/server.d.ts', runtime: '../build/server.mjs' },
+  { dts: 'annotated-text.d.ts', runtime: '../build/annotated-text-public.mjs' },
+  { dts: 'annotated-text-authoring.d.ts', runtime: '../build/annotated-text-authoring-public.mjs' },
+  { dts: 'annotated-text-coords.d.ts', runtime: '../public/workbench-annotated-text-coords.mjs' },
+]);
+
+/**
+ * Parse declared RUNTIME VALUES from a declaration file:
+ *   export [declare] [abstract] [async] (class|function|const|let|var|enum|namespace) Name
+ *   export default [function|class] Name      -> the `default` runtime key
+ *   export { A, B as C } [from '...']          -> re-exported value bindings
+ * `export type { ... }`, `export interface` and `export type X = ...` are
+ * deliberately excluded — they have no runtime binding.
+ */
+function parseRuntimeValueDeclarations(source) {
+  const values = new Set();
+  for (const match of source.matchAll(/^\s*export\s+(?:declare\s+)?(?:abstract\s+)?(?:async\s+)?(?:class|function|const|let|var|enum|namespace)\s+([A-Za-z0-9_$]+)/gm)) {
+    values.add(match[1]);
+  }
+  for (const match of source.matchAll(/^\s*export\s+default\s+(?:(?:async\s+)?(?:function|class)\s+)?[A-Za-z0-9_$]+/gm)) {
+    values.add('default');
+  }
+  for (const match of source.matchAll(/^\s*export\s*\{([^}]*)\}/gm)) {
+    for (const piece of match[1].split(',')) {
+      const name = piece.trim().replace(/^type\s+/, '').split(/\s+as\s+/).pop()?.trim();
+      if (name) values.add(name);
+    }
+  }
+  return values;
+}
+
+for (const { dts, runtime } of DECLARATION_ENTRYPOINTS) {
+  test(`${dts} declares every runtime export and nothing absent at runtime`, async () => {
+    const declared = parseRuntimeValueDeclarations(readFileSync(join(root, dts), 'utf8'));
+    const runtimeExports = new Set(Object.keys(await import(new URL(runtime, import.meta.url).href)));
+
+    const undeclared = [...runtimeExports].filter((name) => !declared.has(name)).sort();
+    assert.deepEqual(undeclared, [], `${dts} missing declarations for runtime exports: ${undeclared.join(', ')}`);
+    const absent = [...declared].filter((name) => !runtimeExports.has(name)).sort();
+    assert.deepEqual(absent, [], `${dts} declares values absent at runtime: ${absent.join(', ')}`);
+  });
+}
+
 test('the packed package exposes the supported runtime contract', () => {
   const consumer = mkdtempSync(join(tmpdir(), 'workbench-public-contract-'));
   try {

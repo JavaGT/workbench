@@ -48,6 +48,33 @@ function decideReplay(cursor, seqOrSpan) {
 }
 // --- END GENERATED from src/replay-decision.ts ---
 
+// The one confirmation-fence rule for authoritative settlement: an authoritative
+// cursor at or past the disclosed confirmation covers the operation; an absent
+// disclosure is always covered. Both fold-echo engines and every authoritative
+// path (event echo, live state replacement, snapshot patch, snapshot recovery)
+// use this predicate, so the fence cannot drift between them.
+function coversConfirmation(cursor, confirmedCursor) {
+  return confirmedCursor == null || cursor >= confirmedCursor;
+}
+
+// One Replay-decision-backed verdict for composite snapshot patches. A patch
+// carries composites (head..tail); encoding the recipient as head-1 makes
+// decideReplay's `expected = cursor+1` land exactly on the patch's `from`, so
+// duplicate / next / gap keep the same grammar as live event replay. Anchor
+// continuity and the stale-regression guard stay patch-specific.
+function snapshotPatchVerdict(cursor, head, tail) {
+  const decision = decideReplay(cursor.composite - 1, [head.composite, tail.composite]);
+  // A patch ending behind the held composite is stale state, never an idempotent
+  // replay: it may carry changes the recipient already folded differently.
+  if (tail.composite < cursor.composite) return { status: 'resync' };
+  if (decision.kind === 'gap') return { status: 'resync' };
+  if (cursor.anchor === head.anchor && cursor.composite === head.composite) {
+    return { status: 'next', cursor: { anchor: tail.anchor, composite: decision.cursor } };
+  }
+  if (cursor.anchor === tail.anchor && cursor.composite === tail.composite) return { status: 'duplicate' };
+  return { status: 'resync' };
+}
+
 // Shared capped-exponential-backoff delay. Pure: timers and attempt counters
 // stay at the call sites, which differ in reset/clear semantics.
 function backoffDelay(attempt, base, max) {
@@ -67,7 +94,20 @@ function deepFreeze(value) {
 // ---------------------------------------------------------------------------
 
 function shouldReconcile(_operation, { confirmedCursor, echoCursor }) {
-  return echoCursor != null && (confirmedCursor == null || echoCursor >= confirmedCursor);
+  return echoCursor != null && coversConfirmation(echoCursor, confirmedCursor);
+}
+
+// The one authoritative echo-settlement contract shared by createLiveDeliverySession
+// and createScopeLiveStore: record the committed cursor on the operation,
+// require the engine's eligibility rule, and require that cursor to cover the
+// confirmation fence. `fenceCursor` is the normalized cursor for composite
+// streams; `finalize` is the engine's retirement (settle+delete or plain delete).
+function reconcileAuthoritative(operation, cursor, fenceCursor, eligible, finalize) {
+  operation.echoCursor = cursor;
+  if (!eligible(operation)) return false;
+  if (!shouldReconcile(operation, { confirmedCursor: operation.confirmedCursor, echoCursor: fenceCursor })) return false;
+  finalize(operation);
+  return true;
 }
 
 function makeOperation({ actionId, ...extra }) {
@@ -1190,7 +1230,12 @@ export class LiveList {
             };
             await this._installTextReducers(normalized.reducers);
             this._applyEvent(normalized.event, normalized.delta);
-            this._cursor = row.seq;
+            // Advance through the shared Replay decision, not a hand-assigned
+            // seq. The whole-batch pre-check guarantees this is `next`; a
+            // different verdict is a contract violation and fails the batch.
+            const decision = decideReplay(this._cursor, normalized.seqSpan);
+            if (decision.kind !== 'next') throw new Error('replay batch cursor verdict is not next');
+            this._cursor = decision.cursor;
           }
         }
       }
@@ -2993,12 +3038,11 @@ export function createLiveDeliverySession({
     const actionId = envelope.event?.actionId;
     const operation = actionId ? operations.get(actionId) : null;
     if (operation) {
-      operation.echoCursor = cursor;
-      if (operation.delivered
-        && (operation.confirmedCursor == null || cursorAnchor(cursor) >= operation.confirmedCursor)) {
-        settleOperation(operation, { status: 'reconciled' });
-        operations.delete(actionId);
-      }
+      reconcileAuthoritative(
+        operation, cursor, cursorAnchor(cursor),
+        (op) => op.delivered,
+        () => { settleOperation(operation, { status: 'reconciled' }); operations.delete(actionId); },
+      );
     }
     publish();
     return { status: operation ? 'confirmed' : 'applied' };
@@ -3029,10 +3073,9 @@ export function createLiveDeliverySession({
     lastSnapshotInstalledFromReceipt = false;
     // A whole-state replacement names no per-action echo, so every delivered
     // operation whose confirmed receipt fence the replacement cursor covers is
-    // reconciled — the same settlement rule applyEvent uses for an echo.
+    // reconciled — the same fence rule applyEvent uses for an echo.
     for (const [actionId, operation] of operations) {
-      if (operation.delivered
-        && (operation.confirmedCursor == null || cursorAnchor(cursor) >= operation.confirmedCursor)) {
+      if (operation.delivered && coversConfirmation(cursorAnchor(cursor), operation.confirmedCursor)) {
         settleOperation(operation, { status: 'reconciled' });
         operations.delete(actionId);
       }
@@ -3265,7 +3308,8 @@ export function createLiveDeliverySession({
     // envelope presenting (or repeating) the currently held token is a replay
     // or forgery — fail closed through snapshot recovery.
     if (valid.some((checked) => checked.projectionToken === projectionToken)) return { status: 'resync' };
-    // 2. Cursor decisions (design §9), evaluated against the CHAIN: the first
+    // 2. Cursor verdict (design §9) comes from the shared Replay decision via
+    // snapshotPatchVerdict — never an ad-hoc composite comparison. The first
     // envelope must continue the recipient's cursor exactly; later links are
     // already proven contiguous by validation. The ANCHOR may jump FORWARD in
     // `to`: the server projected this state AT its current _Cursor head
@@ -3276,14 +3320,9 @@ export function createLiveDeliverySession({
     // trusting idempotent replay.
     const head = valid[0].from;
     const tail = valid[valid.length - 1].to;
-    if (tail.composite < cursor.composite) {
-      return { status: 'resync' };
-    }
-    if (cursor.anchor !== head.anchor || cursor.composite !== head.composite) {
-      // duplicate / stale / gap / incomparable all recover through a snapshot.
-      if (cursor.anchor === tail.anchor && cursor.composite === tail.composite) return { status: 'duplicate' };
-      return { status: 'resync' };
-    }
+    const verdict = snapshotPatchVerdict(cursor, head, tail);
+    if (verdict.status === 'resync') return { status: 'resync' };
+    if (verdict.status === 'duplicate') return { status: 'duplicate' };
     // 3-4. Apply EVERY envelope's operations in order to ONE fresh immutable
     // copy; any throw discards it — the base never lands half-patched.
     // Copy-on-write spine (#156 round 2): instead of an O(graph) deep clone,
@@ -3308,7 +3347,7 @@ export function createLiveDeliverySession({
     // routed-invisible, may reconcile optimistic state — never an empty patch
     // alone (cross-exam 6).
     baseSnapshot = nextSnapshot;
-    cursor = { anchor: tail.anchor, composite: tail.composite };
+    cursor = verdict.cursor;
     lastSnapshotInstalledFromReceipt = false;
     projectionToken = valid[valid.length - 1].projectionToken;
     const echoed = new Set();
@@ -3324,8 +3363,7 @@ export function createLiveDeliverySession({
     // than the receipt's own confirmation.
     for (const [actionId, operation] of operations) {
       const settleable = echoed.has(actionId) || routedInvisible.has(actionId);
-      if (settleable
-        && (operation.confirmedCursor == null || cursorAnchor(cursor) >= operation.confirmedCursor)) {
+      if (settleable && coversConfirmation(cursorAnchor(cursor), operation.confirmedCursor)) {
         // Mark the commit proof for the late receipt path: it must take the
         // committed escape (never report a spurious failure) and skip the
         // now-pointless recovery bootstrap. resolveSettlement is idempotent,
@@ -3350,7 +3388,7 @@ export function createLiveDeliverySession({
         && operation.confirmedThrough != null
         && snapshotGeneration > operation.receiptSnapshotGeneration
         && receiptGenerationAtStart >= operation.receiptGeneration
-        && cursorAnchor(cursor) >= operation.confirmedThrough) {
+        && coversConfirmation(cursorAnchor(cursor), operation.confirmedThrough)) {
         settleOperation(operation, { status: 'reconciled' });
         operations.delete(actionId);
       }
@@ -5446,14 +5484,16 @@ export function createScopeLiveStore({
     cursor = decision.cursor;
     const ownOperation = event.actionId ? operations.get(event.actionId) : null;
     if (ownOperation) {
-      ownOperation.echoCursor = cursor;
       // A committed echo for this actionId proves the action committed, so it
       // reconciles the operation even when it was retained as an
       // outcome-unknown placeholder (delivered is false) after a transport throw.
-      const reconcile = ownOperation.delivered || ownOperation.status === 'failed';
-      if (reconcile && shouldReconcile(ownOperation, { confirmedCursor: ownOperation.confirmedCursor, echoCursor: cursor })) {
-        operations.delete(event.actionId);
-      }
+      // The decision is the shared one from createLiveDeliverySession; only the
+      // retirement differs (this engine has no settlement object to resolve).
+      reconcileAuthoritative(
+        ownOperation, cursor, cursor,
+        (op) => op.delivered || op.status === 'failed',
+        () => operations.delete(event.actionId),
+      );
     }
     publish();
     return { status: ownOperation ? 'confirmed' : 'applied', cursor };

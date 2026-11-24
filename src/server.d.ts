@@ -1,4 +1,6 @@
-/// <reference types="node" />
+// `workbench/client` reaches this module through index.d.ts. Node globals stay
+// opt-in via the explicit `node:*` imports below rather than a transitive
+// triple-slash types reference in a browser-only program.
 
 import type { Readable } from 'node:stream';
 import type {
@@ -206,6 +208,11 @@ export interface VectorPluginOptions {
   readonly version: string;
   readonly source: VectorPluginSource;
   readonly modelSpace: VectorModelSpace;
+  // Escape hatch for LOW-LEVEL UNIT FIXTURES ONLY (never a production app):
+  // return raw candidate hits without re-authorizing each row through an
+  // admission adapter. The default fails closed — an index whose hits cannot be
+  // re-authorized returns no disclosure.
+  readonly unsafeAllowUnauthorizedSearch?: boolean;
 }
 export interface SearchEntityCensus {
   readonly count: number;

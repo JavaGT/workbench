@@ -14,6 +14,8 @@ import type {
   QueryCursor,
   QueryFamilyRequest,
   QueryPage,
+  QueryPageDecision,
+  QueryInvalidationSignal,
 } from './index.js';
 import type { AnnotatedTextRange, AnnotatedTextRedactionMarker } from './annotated-text-coords.js';
 

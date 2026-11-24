@@ -16,9 +16,9 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 
 import * as client from '../public/workbench-client.mjs';
 import { decideReplay, normalizeSeqSpan } from '../build/replay-decision.mjs';
@@ -72,6 +72,31 @@ test('every declared value export exists at runtime', () => {
   for (const name of declared.types) {
     assert.ok(!declared.values.has(name), `${name} cannot be both a value and a type-only export`);
   }
+});
+
+// A browser consumer of `workbench/client` must not inherit Node-only global
+// types through a transitive `/// <reference types="node" />` from a declaration
+// it never asked for. Follow the relative declaration import graph from
+// client.d.ts and fail if any reached file carries that directive.
+test('client.d.ts does not transitively reference Node types', () => {
+  const visited = new Set();
+  const queue = [dtsPath];
+  const leaking = [];
+  while (queue.length > 0) {
+    const file = queue.shift();
+    if (visited.has(file)) continue;
+    visited.add(file);
+    const source = readFileSync(file, 'utf8');
+    if (/^\s*\/\/\/\s*<reference\s+types=["']node["']\s*\/?\s*>/m.test(source)) leaking.push(file);
+    for (const match of source.matchAll(/['"](\.\.?\/[^'"]+)['"]/g)) {
+      const specifier = match[1];
+      if (!/\.(?:js|d\.ts)$/.test(specifier)) continue;
+      const resolved = resolve(join(dirname(file), specifier.replace(/\.js$/, '.d.ts')));
+      if (existsSync(resolved)) queue.push(resolved);
+    }
+  }
+  assert.ok(visited.size > 1, 'client.d.ts graph should reach shared declarations');
+  assert.deepEqual(leaking, [], `browser client must not pull in Node triple-slash references: ${leaking.join(', ')}`);
 });
 
 // --- ScopeDispatchResult.settlement contract (#239) ------------------------
@@ -158,6 +183,50 @@ test('ScopeDispatchResult.settlement optionality matches its runtime producers',
   assert.equal(Object.hasOwn(await applied, 'settlement'), true,
     'document-path applyAnnotation must carry the live-delivery settlement');
   docSession.close();
+});
+
+// --- snapshot-patch cursor verdict is built on the shared Replay decision ---
+function extractSnapshotPatchVerdict() {
+  const source = readFileSync(join(root, 'public/workbench-client.mjs'), 'utf8');
+  const start = source.indexOf('function snapshotPatchVerdict(cursor, head, tail) {');
+  assert.ok(start !== -1, 'client missing snapshotPatchVerdict helper');
+  let depth = 0;
+  let end = -1;
+  for (let i = source.indexOf('{', start); i < source.length; i += 1) {
+    if (source[i] === '{') depth += 1;
+    else if (source[i] === '}') {
+      depth -= 1;
+      if (depth === 0) { end = i + 1; break; }
+    }
+  }
+  assert.ok(end > start, 'snapshotPatchVerdict helper is not balanced');
+  const factory = new Function('decideReplay', `${source.slice(start, end)}\nreturn snapshotPatchVerdict;`);
+  return factory(decideReplay);
+}
+
+test('snapshotPatchVerdict derives its cursor verdict from decideReplay', () => {
+  const verdict = extractSnapshotPatchVerdict();
+  const cursor = (a, c) => ({ anchor: a, composite: c });
+  const cases = [
+    // [held, patch from, patch to, expected status, expected next composite]
+    [cursor(1, 1), cursor(1, 1), cursor(1, 2), 'next', 2],
+    [cursor(1, 1), cursor(1, 1), cursor(1, 4), 'next', 4],
+    [cursor(1, 1), cursor(1, 1), cursor(3, 2), 'next', 2], // anchor may jump forward
+    [cursor(1, 2), cursor(1, 1), cursor(1, 2), 'duplicate'],
+    [cursor(1, 5), cursor(1, 1), cursor(1, 2), 'resync'], // stale regression, not a replay
+    [cursor(1, 1), cursor(1, 3), cursor(1, 4), 'resync'], // gap: patch starts ahead
+    [cursor(2, 1), cursor(1, 1), cursor(1, 2), 'resync'], // anchor mismatch, not at tail
+    [cursor(2, 2), cursor(1, 1), cursor(2, 2), 'duplicate'], // tail matches held, anchor chain
+    [cursor(1, 1), cursor(1, 1), cursor(1, 1), 'next', 1], // inclusive empty patch stays next
+  ];
+  for (const [held, head, tail, status, nextComposite] of cases) {
+    const result = verdict(held, head, tail);
+    assert.equal(result.status, status, `verdict for ${JSON.stringify({ held, head, tail })}`);
+    if (status === 'next') {
+      assert.equal(result.cursor.composite, nextComposite);
+      assert.equal(result.cursor.anchor, tail.anchor);
+    }
+  }
 });
 
 // --- decideReplay / normalizeSeqSpan parity -------------------------------

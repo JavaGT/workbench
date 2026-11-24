@@ -114,17 +114,25 @@ function scheduleIndexNames(entity           )                                  
     .map((fieldName) => ({ name: `idx_${entity.name}_schedule_${fieldName}`, fieldName }));
 }
 
-function scheduleIndexDDL(entity           )           {
-  return scheduleIndexNames(entity).map(({ name, fieldName }) => (
-    `CREATE INDEX IF NOT EXISTS ${quoteIdent(name)} ` +
-    `ON ${quoteIdent(entity.name)} (${quoteIdent(fieldName)});`
-  ));
-}
-
 function refIndexes(entity           )                                             {
   return Object.entries(fieldsOf(entity) ?? {})
-    .filter(([, descriptor]) => physicalRef(entity, descriptor))
+    .filter(([, descriptor]) => indexableRef(entity, descriptor))
     .map(([fieldName]) => ({ name: `idx_${entity.name}_${fieldName}`, fieldName }));
+}
+
+// Every declared ref that names a resolvable FK target needs an index for the
+// relation's lookup path, whether or not the declaration also asked for a
+// PHYSICAL constraint. `physicalRef` still gates FK/NOT NULL emission (that is
+// the schema's storage authority); only the index widens here. An unresolved
+// logical ref (a string target with no compiled entity) has no FK column to
+// index, so it stays excluded — the historical contract for that case.
+function indexableRef(entity           , descriptor                                        )          {
+  const target = descriptor?.target;
+  const name = typeof target === 'string' ? undefined : target?.name;
+  return descriptor?.kind === 'value'
+    && descriptor.type === 'ref'
+    && isMainTableField(descriptor)
+    && Boolean(name || target === entity.name);
 }
 
 function physicalRef(entity           , descriptor                                        )          {
@@ -181,8 +189,52 @@ function nonUniqueIndexes(entity           )                                    
   }));
 }
 
+
+
+
+
+
+
+// SQLite names indexes in one case-insensitive namespace. A ref field (often
+// marked `indexed: true`) whose name is ALSO declared as a single-field entry in
+// `indexes` used to emit two `CREATE INDEX IF NOT EXISTS idx_E_f` statements:
+// the second is a silent no-op at runtime but a real duplicate in the generated
+// migration and in the ownership census. First declaration wins.
+function dedupeIndexes(indexes                           )                   {
+  const used = new Set        ();
+  const result                   = [];
+  for (const index of indexes) {
+    const key = index.name.toLowerCase();
+    if (used.has(key)) continue;
+    used.add(key);
+    result.push(index);
+  }
+  return result;
+}
+
+function refIndexDescriptors(entity           )                   {
+  return refIndexes(entity).map(({ name, fieldName }) => ({ name, fields: [fieldName], unique: false }));
+}
+
+function scheduleIndexDescriptors(entity           )                   {
+  return scheduleIndexNames(entity).map(({ name, fieldName }) => ({ name, fields: [fieldName], unique: false }));
+}
+
+function uniqueIndexDescriptors(entity           )                   {
+  return uniqueIndexes(entity).map(({ name, fields }) => ({ name, fields, unique: true }));
+}
+
+function nonUniqueIndexDescriptors(entity           )                   {
+  return nonUniqueIndexes(entity).map(({ name, fields }) => ({ name, fields, unique: false }));
+}
+
 export function generatedIndexNames(entity           )           {
-  return [...refIndexes(entity), ...scheduleIndexNames(entity), ...uniqueIndexes(entity), ...nonUniqueIndexes(entity)].map(({ name }) => name);
+  return dedupeIndexes([
+    ...refIndexDescriptors(entity),
+    ...scheduleIndexDescriptors(entity),
+    ...uniqueIndexDescriptors(entity),
+    ...nonUniqueIndexDescriptors(entity),
+  ]).map(({ name }) => name);
 }
 
 // Generate the main table DDL for one entity.
@@ -245,15 +297,19 @@ export function generateDDL(entity           )           {
   // Preserve the documented main-table/side-table ordering. Indexes are
   // independent trailing statements, which also keeps generated migrations
   // stable for callers that inspect the table statements by position.
-  statements.push(...scheduleIndexDDL(entity));
-  for (const { name, fieldName } of refIndexes(entity)) {
-    statements.push(`CREATE INDEX IF NOT EXISTS ${quoteIdent(name)} ON ${quoteIdent(entity.name)} (${quoteIdent(fieldName)});`);
-  }
-  for (const { name, fields: indexFields } of uniqueIndexes(entity)) {
-    statements.push(`CREATE UNIQUE INDEX IF NOT EXISTS ${quoteIdent(name)} ON ${quoteIdent(entity.name)} (${indexFields.map(quoteIdent).join(', ')});`);
-  }
-  for (const { name, fields: indexFields } of nonUniqueIndexes(entity)) {
-    statements.push(`CREATE INDEX IF NOT EXISTS ${quoteIdent(name)} ON ${quoteIdent(entity.name)} (${indexFields.map(quoteIdent).join(', ')});`);
+  // One deduplicated index set drives both the emitted DDL and the names the
+  // ownership census claims, so a single field can never produce two colliding
+  // CREATE INDEX statements.
+  for (const index of dedupeIndexes([
+    ...scheduleIndexDescriptors(entity),
+    ...refIndexDescriptors(entity),
+    ...uniqueIndexDescriptors(entity),
+    ...nonUniqueIndexDescriptors(entity),
+  ])) {
+    const create = index.unique
+      ? 'CREATE UNIQUE INDEX IF NOT EXISTS'
+      : 'CREATE INDEX IF NOT EXISTS';
+    statements.push(`${create} ${quoteIdent(index.name)} ON ${quoteIdent(entity.name)} (${index.fields.map(quoteIdent).join(', ')});`);
   }
 
   return statements;

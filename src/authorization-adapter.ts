@@ -539,7 +539,13 @@ export function createAuthorizationAdapter(options: AuthorizationAdapterOptions 
       && 'inherit' in scopeInput
       && Boolean((scopeInput as { inherit?: unknown }).inherit);
 
-    if (typeof scopeInput === 'function') {
+    if (typeof scopeInput === 'function' || isInheritDirective) {
+      // Build the ONE check registry for BOTH compile paths. An inherit
+      // directive's `.where()` refinement is a scope predicate too: it must see
+      // the same `is.*` checks, `fields`, and `entityName` an own scope sees.
+      // The inherit path used to compile with the compiler's empty defaults,
+      // so a child `.where(({ is }) => is.owner())` threw "no check 'owner'"
+      // at registration instead of lowering to SQL.
       const fields = (input.fields ?? input.entity?.fields ?? {}) as Record<string, unknown>;
       const builtRegistry = buildCheckRegistry({
         fields,
@@ -575,14 +581,21 @@ export function createAuthorizationAdapter(options: AuthorizationAdapterOptions 
           mergedRegistry[key] = entry;
         }
       }
-      template = compileReadScope(scopeInput, {
-        fields,
-        where,
-        registry: mergedRegistry,
-        entityName: tableName,
-      });
-    } else if (isInheritDirective) {
-      template = compileInheritScope(scopeInput as { inherit: unknown; via?: unknown }, { where });
+      if (typeof scopeInput === 'function') {
+        template = compileReadScope(scopeInput, {
+          fields,
+          where,
+          registry: mergedRegistry,
+          entityName: tableName,
+        });
+      } else {
+        template = compileInheritScope(scopeInput as { inherit: unknown; via?: unknown }, {
+          where,
+          fields,
+          registry: mergedRegistry,
+          entityName: tableName,
+        });
+      }
     } else if (scopeInput === undefined && input.entity?.readScope && input.entity?.scopeAst) {
       template = {
         sql: input.entity.readScope.sql,

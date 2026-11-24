@@ -719,14 +719,28 @@ export function lowerToSql(ast         , ctx               = {})                
       // params object (and so bindReadScope fills it once for the whole tree).
       case 'join': {
         const parentAlias = `j${state.n += 1}`;
-        const inner = lower2(node.parentAst           , {
+        const innerResult = lower2(node.parentAst           , {
           alias: parentAlias,
           state,
           params,
           where: ctx.where,
         });
+        // The parent scope is lowered as a sub-tree with its own nearest slot.
+        // Carry it up into this scope's result: dropping it would silently turn
+        // an inherited `.nearest()` predicate into `1=1`, so the
+        // query layer would never post-filter by vector similarity. Two nearest
+        // predicates (parent + child refinement) are one too many — fail closed.
+        if (innerResult.nearest !== null) {
+          if (nearestResult !== null) {
+            throw new NonCompilableError(
+              'only one .nearest() predicate is allowed per scope',
+              { where: ctx.where },
+            );
+          }
+          nearestResult = innerResult.nearest;
+        }
         const joinOn = `${parentAlias}.id = ${col(node.via)}`;
-        return `EXISTS (SELECT 1 FROM ${node.parentName} AS ${parentAlias} WHERE ${joinOn} AND (${inner}))`;
+        return `EXISTS (SELECT 1 FROM ${node.parentName} AS ${parentAlias} WHERE ${joinOn} AND (${innerResult.sql}))`;
       }
       // A map-membership check: the row is admitted iff the side-table
       // has a row whose owner FK points at THIS entity row AND whose member column
@@ -797,8 +811,10 @@ export function lowerToSql(ast         , ctx               = {})                
 // A thin alias so the `join` case can recurse into lowerToSql for the parent's
 // AST under a different alias while threading the same param state. Named so the
 // recursion reads as "lower this sub-AST" rather than a bare self-reference.
-function lower2(ast         , ctx              )         {
-  return lowerToSql(ast, ctx).sql;
+// Returns the FULL lowering result (not just `.sql`) so a nearest predicate in
+// the inherited AST survives re-lowering instead of being dropped to `1=1`.
+function lower2(ast         , ctx              )                                {
+  return lowerToSql(ast, ctx);
 }
 
 // The compiled read-scope template: the parameterized SQL fragment plus the

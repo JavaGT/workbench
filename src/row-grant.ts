@@ -32,6 +32,55 @@ import { operationCategory } from './operation.ts';
 // A WeakMap keeps this cache bounded by the entity records themselves.
 const GRANT_CLAUSES_CACHE = new WeakMap<object, { declaration: unknown; clauses: unknown }>();
 
+// One authorization WALK = one top-level mayRow/rowCapabilities call. The cycle
+// guard and the ancestor-row memo are per-call, never module-global: a global
+// visited set would reject a later legitimate request, and a stale memo could
+// outlive a row change. Passing the same walk down an inherit chain is what makes
+// a cycle fail closed (deny) instead of overflowing the stack, and what makes a
+// diamond/multi-hop check load each ancestor row at most once.
+interface AuthzWalk {
+  readonly mayRowVisiting: Set<string>;
+  readonly rowCapsVisiting: Set<string>;
+  readonly ancestorRows: Map<string, unknown>;
+  readonly contributesVisiting: Set<string>;
+  readonly contributesMemo: Map<string, boolean>;
+  /** Once ANY guard sees a revisit, the whole walk denies — fail closed. */
+  cycleDetected: boolean;
+}
+
+function newAuthzWalk(): AuthzWalk {
+  return {
+    mayRowVisiting: new Set(),
+    rowCapsVisiting: new Set(),
+    ancestorRows: new Map(),
+    contributesVisiting: new Set(),
+    contributesMemo: new Map(),
+    cycleDetected: false,
+  };
+}
+
+// Stable per-object identity for records and rows that have no id. Rows WITH an
+// id key by that id so two hydrations of the same row share one memo entry; two
+// different rows with no id stay distinct via a WeakMap-assigned token.
+const IDENTITY_KEYS = new WeakMap<object, string>();
+let nextIdentityKey = 1;
+function identityKey(value: object): string {
+  let key = IDENTITY_KEYS.get(value);
+  if (key === undefined) {
+    key = `o${nextIdentityKey += 1}`;
+    IDENTITY_KEYS.set(value, key);
+  }
+  return key;
+}
+
+function rowKey(record: EntityRecord, row: unknown): string {
+  const id = (row as { id?: unknown } | null | undefined)?.id;
+  const rowPart = row !== null && typeof row === 'object'
+    ? (id === null || id === undefined ? identityKey(row) : `id:${String(id)}`)
+    : `primitive:${String(row)}`;
+  return `${identityKey(record)}\u0000${rowPart}`;
+}
+
 // A check-registry entry as the runtime half sees it. `run` is the per-row
 // boolean face; `harvest` belongs to the scope compiler (not consumed here).
 interface CheckEntry {
@@ -132,6 +181,7 @@ export async function protectingAnnotationCapabilities(
     let effectiveRecord = entityRecord;
     let effectiveRow = row;
     const seen = new Set<EntityRecord>();
+    const walk = newAuthzWalk();
 
     while (true) {
       const inherited = inheritedGrant(effectiveRecord);
@@ -139,7 +189,7 @@ export async function protectingAnnotationCapabilities(
       if (seen.has(effectiveRecord)) return { granted: false, capabilities: [] };
       seen.add(effectiveRecord);
 
-      const parentRow = inheritedParentRow(effectiveRecord, effectiveRow, principal);
+      const parentRow = inheritedParentRow(effectiveRecord, effectiveRow, principal, walk);
       if (parentRow == null) return { granted: false, capabilities: [] };
       const parentRecord = resolveInheritedParent(effectiveRecord, inherited) as EntityRecord | null;
       if (!parentRecord) return { granted: false, capabilities: [] };
@@ -187,76 +237,93 @@ export async function rowCapabilities(
   entityRecord: EntityRecord,
   row: unknown,
   principal: unknown,
+  walk: AuthzWalk = newAuthzWalk(),
 ): Promise<RowDecision> {
-  // An inherit-child has no own `.can` body — its grant is an `inherit` directive,
-  // not a runtime clause. The capability half must resolve the parent the same way
-  // `mayRow` resolves the parent (D1): load the parent row via the `via` FK and run
-  // the PARENT's `.can`. Otherwise a no-`.can` field's `defaults` is {granted:false}
-  // and every inherit-child field without an explicit `.can` is silently unreadable
-  // — the §6 "strong-inherit is half-built" trap. `mayRow` already recurses; this
-  // is the field-defaults half of the same move (one capability-resolution path).
-  const inherited = inheritedGrant(entityRecord);
-  if (inherited) {
-    // A child `.can` refines the inherited authority instead of replacing it:
-    // run it against the child row and intersect its capabilities with the
-    // parent's (a scope-only parent contributes none, so the child decides).
-    if (typeof inherited.childCan === 'function') {
-      return await inheritChildCapabilities(entityRecord, row, principal);
+  // A cyclic inherit graph (A → B → A) must fail closed, not recurse forever.
+  // The identity is the (entity, row) pair; a diamond that reaches the same
+  // ancestor twice is fine because the guard tracks only the CURRENT stack.
+  const key = rowKey(entityRecord, row);
+  const deny = (): RowDecision => ({ granted: false, capabilities: [], is: makeIs(entityRecord, row, principal) });
+  if (walk.cycleDetected || walk.rowCapsVisiting.has(key)) {
+    walk.cycleDetected = true;
+    return deny();
+  }
+  walk.rowCapsVisiting.add(key);
+  try {
+    // An inherit-child has no own `.can` body — its grant is an `inherit` directive,
+    // not a runtime clause. The capability half must resolve the parent the same way
+    // `mayRow` resolves the parent (D1): load the parent row via the `via` FK and run
+    // the PARENT's `.can`. Otherwise a no-`.can` field's `defaults` is {granted:false}
+    // and every inherit-child field without an explicit `.can` is silently unreadable
+    // — the §6 "strong-inherit is half-built" trap. `mayRow` already recurses; this
+    // is the field-defaults half of the same move (one capability-resolution path).
+    const inherited = inheritedGrant(entityRecord);
+    if (inherited) {
+      // A child `.can` refines the inherited authority instead of replacing it:
+      // run it against the child row and intersect its capabilities with the
+      // parent's (a scope-only parent contributes none, so the child decides).
+      if (typeof inherited.childCan === 'function') {
+        const decision = await inheritChildCapabilities(entityRecord, row, principal, walk);
+        return walk.cycleDetected ? deny() : decision;
+      }
+      const parentRow = inheritedParentRow(entityRecord, row, principal, walk);
+      if (!parentRow) return deny();
+      const parentRecord = resolveInheritedParent(entityRecord, inherited) as EntityRecord;
+      const decision = await rowCapabilities(parentRecord, parentRow, principal, walk);
+      return walk.cycleDetected ? deny() : decision;
     }
-    const parentRow = inheritedParentRow(entityRecord, row, principal);
-    if (!parentRow) return { granted: false, capabilities: [], is: makeIs(entityRecord, row, principal) };
-    const parentRecord = resolveInheritedParent(entityRecord, inherited) as EntityRecord;
-    return await rowCapabilities(parentRecord, parentRow, principal);
-  }
-  // Resolve through the SAME `grantClauses` the sibling resolvers use
-  // (hasOwnCanGrant / inheritedGrant). A grant may be a function (a thunk
-  // returning the clause array) OR a bare clause array — `owner.only()` returns
-  // the array directly, and the compile half (resolveGrantClauses) already
-  // accepts that shape. Resolving it here too is one reconciliation path: the
-  // handwritten thunk and the `owner.only()` expansion run the identical code.
-  // Inherit directives were handled and returned above.
-  const clauses = grantClauses(entityRecord);
-  const is = makeIs(entityRecord, row, principal);
-  // A bare decision is honored EXACTLY: its granted flag and capability list
-  // are the whole authority. `grant(read, subscribe)` never implies write or
-  // admin, and a scope-only array is never silently inferred from it.
-  const bare = bareGrantDecision(clauses);
-  if (bare) {
-    return bare.granted
-      ? { granted: true, capabilities: bare.capabilities, is }
-      : { granted: false, capabilities: [], is };
-  }
-  // A scope-only grant confers exactly the read-class capabilities. Keeping
-  // this here (not just in mayRow) is what makes fieldCapabilities agree: a
-  // field with no own `.can` strong-inherits these, so row reads and field
-  // reads share one authority while every write stays denied.
-  if (isScopeOnlyClauses(clauses)) {
-    return { granted: true, capabilities: SCOPE_ONLY_CAPABILITIES, is };
-  }
-  const clause = Array.isArray(clauses)
-    ? clauses.find((c) => isRuntimeGrantClause(c))
-    : null;
-  if (!clause) return { granted: false, capabilities: [], is };
+    // Resolve through the SAME `grantClauses` the sibling resolvers use
+    // (hasOwnCanGrant / inheritedGrant). A grant may be a function (a thunk
+    // returning the clause array) OR a bare clause array — `owner.only()` returns
+    // the array directly, and the compile half (resolveGrantClauses) already
+    // accepts that shape. Resolving it here too is one reconciliation path: the
+    // handwritten thunk and the `owner.only()` expansion run the identical code.
+    // Inherit directives were handled and returned above.
+    const clauses = grantClauses(entityRecord);
+    const is = makeIs(entityRecord, row, principal);
+    // A bare decision is honored EXACTLY: its granted flag and capability list
+    // are the whole authority. `grant(read, subscribe)` never implies write or
+    // admin, and a scope-only array is never silently inferred from it.
+    const bare = bareGrantDecision(clauses);
+    if (bare) {
+      return bare.granted
+        ? { granted: true, capabilities: bare.capabilities, is }
+        : { granted: false, capabilities: [], is };
+    }
+    // A scope-only grant confers exactly the read-class capabilities. Keeping
+    // this here (not just in mayRow) is what makes fieldCapabilities agree: a
+    // field with no own `.can` strong-inherits these, so row reads and field
+    // reads share one authority while every write stays denied.
+    if (isScopeOnlyClauses(clauses)) {
+      return { granted: true, capabilities: SCOPE_ONLY_CAPABILITIES, is };
+    }
+    const clause = Array.isArray(clauses)
+      ? clauses.find((c) => isRuntimeGrantClause(c))
+      : null;
+    if (!clause) return { granted: false, capabilities: [], is };
 
-  // resolveDecision awaits the body once and rejects an escaped (un-awaited)
-  // check; here the body returns a grant()/deny() object, not a boolean, so we
-  // run the body directly under the same backstop by inspecting its result.
-  let decision: GrantDecision | undefined;
-  await resolveDecision(
-    async () => {
-      decision = await (clause.can as unknown as RuntimeClauseBody)({ is, entity: row });
-      // hand the backstop a boolean so its thenable-escape check applies to the
-      // body's control flow, not to the grant object it returns.
-      return decision.granted;
-    },
-    [],
-    { where: `the .can grant body on entity('${entityRecord.name}')` },
-  );
-  const grantDecision = decision as GrantDecision;
-  const result = grantDecision.granted
-    ? { granted: true, capabilities: grantDecision.capabilities ?? [] }
-    : { granted: false, capabilities: [] };
-  return { ...result, is };
+    // resolveDecision awaits the body once and rejects an escaped (un-awaited)
+    // check; here the body returns a grant()/deny() object, not a boolean, so we
+    // run the body directly under the same backstop by inspecting its result.
+    let decision: GrantDecision | undefined;
+    await resolveDecision(
+      async () => {
+        decision = await (clause.can as unknown as RuntimeClauseBody)({ is, entity: row });
+        // hand the backstop a boolean so its thenable-escape check applies to the
+        // body's control flow, not to the grant object it returns.
+        return decision.granted;
+      },
+      [],
+      { where: `the .can grant body on entity('${entityRecord.name}')` },
+    );
+    const grantDecision = decision as GrantDecision;
+    const result = grantDecision.granted
+      ? { granted: true, capabilities: grantDecision.capabilities ?? [] }
+      : { granted: false, capabilities: [] };
+    return { ...result, is };
+  } finally {
+    walk.rowCapsVisiting.delete(key);
+  }
 }
 
 // Run a child's `inherit(Parent, { via }).can(fn)` refinement. The parent's
@@ -272,35 +339,63 @@ type InheritCanBody = (ctx: { is: Record<string, CheckFnFunc>; entity: unknown }
 // capabilities? Distinguishes "scope-only parent, no capability opinion" from
 // "parent's .can denied" — a denied parent must never be re-granted by a child
 // refinement. A cycle fails closed (no authority contributed).
-function contributesCapabilities(record: EntityRecord, seen = new Set<EntityRecord>()): boolean {
-  if (seen.has(record)) return false;
-  seen.add(record);
-  if (hasOwnCanGrant(record)) return true;
-  const inherited = inheritedGrant(record);
-  if (!inherited) return false;
-  if (typeof inherited.childCan === 'function') return true;
-  const parent = resolveInheritedParent(record, inherited) as EntityRecord | null;
-  return parent ? contributesCapabilities(parent, seen) : false;
+function contributesCapabilities(record: EntityRecord, walk: AuthzWalk = newAuthzWalk()): boolean {
+  const key = identityKey(record);
+  const cached = walk.contributesMemo.get(key);
+  if (cached !== undefined) return cached;
+  // A cycle in the inherit graph contributes no authority. `visiting` tracks
+  // only the current stack, so a diamond that reaches this record from two
+  // branches is resolved once and then served from `memo` (not mistaken for a
+  // cycle).
+  if (walk.contributesVisiting.has(key)) {
+    walk.cycleDetected = true;
+    return false;
+  }
+  walk.contributesVisiting.add(key);
+  let result = false;
+  try {
+    if (hasOwnCanGrant(record)) {
+      result = true;
+    } else {
+      const inherited = inheritedGrant(record);
+      if (!inherited) {
+        result = false;
+      } else if (typeof inherited.childCan === 'function') {
+        result = true;
+      } else {
+        const parent = resolveInheritedParent(record, inherited) as EntityRecord | null;
+        result = parent ? contributesCapabilities(parent, walk) : false;
+      }
+    }
+  } finally {
+    walk.contributesVisiting.delete(key);
+  }
+  walk.contributesMemo.set(key, result);
+  return result;
 }
 
 async function inheritChildCapabilities(
   entityRecord: EntityRecord,
   row: unknown,
   principal: unknown,
+  walk: AuthzWalk = newAuthzWalk(),
 ): Promise<RowDecision> {
   const is = makeIs(entityRecord, row, principal);
   const denied = (): RowDecision => ({ granted: false, capabilities: [], is });
+  if (walk.cycleDetected) return denied();
   const inherited = inheritedGrant(entityRecord);
   const childCan = inherited?.childCan as InheritCanBody | undefined;
   if (!inherited || typeof childCan !== 'function') return denied();
 
-  const parentRow = inheritedParentRow(entityRecord, row, principal);
+  const parentRow = inheritedParentRow(entityRecord, row, principal, walk);
   if (!parentRow) return denied();
   const parentRecord = resolveInheritedParent(entityRecord, inherited) as EntityRecord;
-  const parent = await rowCapabilities(parentRecord, parentRow, principal);
+  const parent = await rowCapabilities(parentRecord, parentRow, principal, walk);
+  if (walk.cycleDetected) return denied();
   // A parent that has a capability opinion and DENIED stays denied — the child
   // may only narrow, never re-grant. A scope-only parent has no such opinion.
-  if (contributesCapabilities(parentRecord) && !parent.granted) return denied();
+  if (contributesCapabilities(parentRecord, walk) && !parent.granted) return denied();
+  if (walk.cycleDetected) return denied();
 
   let childDecision: GrantDecision | undefined;
   await resolveDecision(
@@ -467,14 +562,23 @@ function principalId(principal: unknown): unknown {
 // `authz` (optional) overrides the mayVerb engine used — the live server injects
 // its own mayVerb param (apps/tests can customize authorization there), so it
 // passes that through; REST dispatch uses the framework default.
-function inheritedParentRow(entityRecord: EntityRecord, row: unknown, principal: unknown): unknown {
+function inheritedParentRow(entityRecord: EntityRecord, row: unknown, principal: unknown, walk?: AuthzWalk): unknown {
   const inherited = inheritedGrant(entityRecord);
   if (!inherited) return null;
   const parentId = (row as Record<string, unknown> | null | undefined)?.[inherited.via];
   if (parentId == null) return null;
   const parentRecord = resolveInheritedParent(entityRecord, inherited);
   if (typeof (parentRecord as { findById?: unknown } | null | undefined)?.findById !== 'function') return null;
-  return (parentRecord as { findById: (id: string, principal: unknown) => unknown }).findById(String(parentId), principal);
+  // Per-call ancestor memo: a diamond or a multi-hop chain re-uses the first
+  // findById result (including a null miss) instead of re-querying the same FK.
+  // The key names both the parent record and the FK id; principal is fixed for
+  // one walk, so it needs no place in the key.
+  const memo = walk?.ancestorRows;
+  const key = `${identityKey(parentRecord as object)}\u0000${String(parentId)}`;
+  if (memo?.has(key)) return memo.get(key);
+  const found = (parentRecord as { findById: (id: string, principal: unknown) => unknown }).findById(String(parentId), principal);
+  memo?.set(key, found ?? null);
+  return found;
 }
 
 function resolveInheritedParent(entityRecord: EntityRecord, inherited: InheritDirective): unknown {
@@ -491,7 +595,18 @@ export async function mayRow(
   row: unknown,
   principal: unknown,
   authz: MayVerbFn = mayVerb,
+  walk: AuthzWalk = newAuthzWalk(),
 ): Promise<boolean> {
+  // Cycle guard on the (entity, row) pair currently on the recursion stack.
+  // A cyclic inherit graph denies the verb instead of recursing forever; a
+  // diamond that revisits an ancestor after it returned is not a cycle because
+  // the identity is removed in `finally`.
+  const key = rowKey(entityRecord, row);
+  if (walk.cycleDetected || walk.mayRowVisiting.has(key)) {
+    walk.cycleDetected = true;
+    return false;
+  }
+  walk.mayRowVisiting.add(key);
   try {
     if (entityRecord.grant == null) return false;
     // A bare `grant(...)`/`deny(...)` decision is already resolved: apply its
@@ -504,17 +619,17 @@ export async function mayRow(
     }
     const inherited = inheritedGrant(entityRecord);
     if (inherited) {
-      const parentRow = inheritedParentRow(entityRecord, row, principal);
+      const parentRow = inheritedParentRow(entityRecord, row, principal, walk);
       if (!parentRow) return false;
       const parentRecord = resolveInheritedParent(entityRecord, inherited) as EntityRecord;
-      const parentAdmitted = await mayRow(parentRecord, verb, parentRow, principal, authz);
-      if (!parentAdmitted) return false;
+      const parentAdmitted = await mayRow(parentRecord, verb, parentRow, principal, authz, walk);
+      if (walk.cycleDetected || !parentAdmitted) return false;
       // An inherit child with its own `.can` must additionally pass that
       // refinement (its capabilities are already intersected with the
       // parent's); a plain inherit is unchanged — one recursion, no new path.
       if (typeof inherited.childCan === 'function') {
-        const decision = await inheritChildCapabilities(entityRecord, row, principal);
-        if (!decision.granted) return false;
+        const decision = await inheritChildCapabilities(entityRecord, row, principal, walk);
+        if (walk.cycleDetected || !decision.granted) return false;
         const required = VERB_CAPABILITY[verb];
         return required ? decision.capabilities.includes(required) : false;
       }
@@ -532,6 +647,8 @@ export async function mayRow(
     return await authz(entityRecord, verb, row, principal);
   } catch {
     return false;
+  } finally {
+    walk.mayRowVisiting.delete(key);
   }
 }
 

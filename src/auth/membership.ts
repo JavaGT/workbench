@@ -84,7 +84,7 @@ interface MembershipEntityRecord {
   fields: Record<string, FieldDescriptor>;
   grant?: unknown;
   registry?: Record<string, { harvest?: unknown }>;
-  readScope?: { sql: string; params: Record<string, unknown> };
+  readScope?: { sql: string; params: Record<string, unknown>; nearest?: ReadScopeTemplate['nearest'] };
   scopeAst?: unknown;
   scopeFilter?: (principal: unknown) => { sql: string; params: Record<string, unknown> };
 }
@@ -224,8 +224,15 @@ export function membership(entityRecord: MembershipEntityRecord, config: Members
     entityName,
   });
 
+  // Carry the compiled nearest config onto the replacement template. Dropping
+  // it made the query layer treat a nearest-bearing scope as a plain 1=1 SQL
+  // filter — the vector post-filter silently disappeared after the overlay.
   const newReadScope = readScopeResult
-    ? Object.freeze({ sql: readScopeResult.sql, params: readScopeResult.params })
+    ? Object.freeze({
+        sql: readScopeResult.sql,
+        params: readScopeResult.params,
+        nearest: readScopeResult.nearest,
+      })
     : undefined;
   const newScopeAst = readScopeResult ? readScopeResult.ast : undefined;
 

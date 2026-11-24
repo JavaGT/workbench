@@ -1,7 +1,7 @@
 // Registered query families (#225, ADR-0009 phase 2): Scope-style dynamic
 // typed values (catalog + element rows) queried through a registered family.
 
-import { text, ref, number, boolean, grant, read, subscribe, scope } from '../build/index.mjs';
+import { text, ref, number, boolean, grant, read, subscribe, scope, everyone } from '../build/index.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
@@ -11,6 +11,7 @@ import { principal } from '../build/principal.mjs';
 import {
   createQueryInvalidationHub,
   readCommittedRevision,
+  QueryScopedReadError,
 } from '../build/query-scoped-read.mjs';
 import {
   compileQueryFamily,
@@ -453,4 +454,88 @@ test('family registration rejects a value column with the wrong declared type', 
     }),
     /valueColumns.text 'numberValue' must be a text field/,
   );
+});
+
+// ---- can-only grants are not family-queryable (#225 authz hole) -------------
+//
+// A family composes the host, catalog, and element grants into its SQL. If any
+// of the three has no compiled readScope, its scopeFilter is `1=1` (relying on
+// the runtime .can engine that a family never runs) and every family query
+// would silently widen to the whole table.
+
+function canOnlyClone(source, name) {
+  return entity(name, {
+    ...source.fields,
+    // AST-valued scope predicate → grant exists, no compiled readScope.
+    grant: () => [scope(everyone()).can(() => grant(read, subscribe))],
+  });
+}
+
+test('a query family fails closed when host, catalog, or elements are can-only', () => {
+  const slice = makeSlice();
+  const canHost = canOnlyClone(slice.Artefact, 'CanOnlyFamHost');
+  const canCatalog = canOnlyClone(slice.ValueSet, 'CanOnlyFamCatalog');
+  const canElements = canOnlyClone(slice.ValueElement, 'CanOnlyFamElements');
+  for (const entityRecord of [canHost, canCatalog, canElements]) {
+    assert.equal(entityRecord.readScope, undefined);
+    assert.equal(entityRecord.scopeFilter(alice).sql, '1=1', 'can-only grant relies on runtime .can');
+  }
+
+  const base = {
+    name: 'canOnlyProbe',
+    catalog: slice.ValueSet,
+    elements: slice.ValueElement,
+    hostKey: 'hostId',
+    fieldKey: 'fieldId',
+    typeField: 'valueType',
+    valueColumns: {
+      text: 'textValue',
+      number: 'numberValue',
+      epoch: 'epochValue',
+      boolean: 'booleanValue',
+      option: 'optionValue',
+    },
+  };
+  const compiles = [
+    ['host', { ...base, host: canHost }],
+    ['catalog', { ...base, host: slice.Artefact, catalog: canCatalog }],
+    ['elements', { ...base, host: slice.Artefact, elements: canElements }],
+  ];
+  for (const [role, declaration] of compiles) {
+    assert.throws(
+      () => compileQueryFamily(declaration),
+      (err) => err instanceof QueryScopedReadError && /UNSCOPED_ENTITY/.test(err.message),
+      `${role} must fail closed at family compile`,
+    );
+  }
+});
+
+test('a family refuses to execute once one of its entities loses its readScope', () => {
+  const { db, Artefact, ValueSet, ValueElement } = setup();
+  try {
+    const family = familyOf({ Artefact, ValueSet, ValueElement });
+    const request = {
+      fieldId: 'f-text',
+      op: 'eq',
+      value: 'red apple',
+      sort: { field: 'id', direction: 'asc' },
+      pageSize: 10,
+    };
+    // The scoped family works before the mutation.
+    assert.deepEqual(executeQueryFamily(db, family, alice, request).rows.map((row) => row.id), ['a1']);
+
+    const original = ValueElement.readScope;
+    ValueElement.readScope = undefined;
+    try {
+      assert.throws(
+        () => executeQueryFamily(db, family, alice, request),
+        (err) => err instanceof QueryScopedReadError && /UNSCOPED_ENTITY/.test(err.message),
+      );
+    } finally {
+      ValueElement.readScope = original;
+    }
+    assert.deepEqual(executeQueryFamily(db, family, alice, request).rows.map((row) => row.id), ['a1']);
+  } finally {
+    db.close();
+  }
 });

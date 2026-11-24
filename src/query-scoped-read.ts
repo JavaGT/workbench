@@ -74,6 +74,13 @@ export interface QueryEntity {
   scopeFilter?(principal: unknown): { sql: string; params: Record<string, unknown> };
   deserializeRow?(row: Record<string, unknown>): Record<string, unknown>;
   readonly scopeAst?: unknown;
+  /**
+   * Compiled SQL read scope. Its presence is what makes an entity queryable:
+   * a can-only grant (no scope clause) leaves this undefined, and its
+   * scopeFilter admits every row for the runtime .can layer to post-filter.
+   * The query layer has no such post-filter, so it must reject the entity.
+   */
+  readonly readScope?: unknown;
 }
 
 export interface QueryFilter {
@@ -221,6 +228,20 @@ const SORT_KEYS = Object.freeze(['field', 'direction']);
 
 function fail(message: string): never {
   throw new QueryScopedReadError(message);
+}
+
+/**
+ * A query can only be authorized when the entity carries a compiled SQL row
+ * scope. A `.can-only` grant leaves `readScope` undefined and its scopeFilter
+ * returns `1=1` — safe for REST/live, which post-filter each row through the
+ * runtime grant, but a full-table leak here because the query layer trusts the
+ * compiled scope as the whole authorization decision. Fail closed, in one
+ * place, for every query entry point.
+ */
+export function assertQueryableEntity(entity: QueryEntity): void {
+  if (!entity.readScope) {
+    fail(`UNSCOPED_ENTITY: entity '${entity.name}' has no compiled readScope; a can-only grant is not queryable.`);
+  }
 }
 
 function assertKeys(value: object, allowed: readonly string[], label: string): void {
@@ -533,6 +554,7 @@ export function compileQueryContract(
   const contract = input as QueryContract;
   if (contract.entity !== entity.name) fail('contract entity does not match the compiled entity.');
   identifier(entity.name, 'entity name');
+  assertQueryableEntity(entity);
   const declared = fieldsOf(entity);
   if (contract.filters !== undefined && !Array.isArray(contract.filters)) fail('filters must be an array.');
   if ((contract.filters?.length ?? 0) > FILTERS_MAX) fail('filters must contain at most 16 entries.');
@@ -627,6 +649,10 @@ export function readCommittedRevision(db: QueryDb): number {
 }
 
 function grantFilter(entity: QueryEntity, principal: unknown): { sql: string; params: Record<string, unknown> } {
+  // Every SQL page (and the invalidation hub's admission recheck) funnels
+  // through here; keep the can-only guard on the choke point as well as on the
+  // public entry points so a direct selectAuthorizedPage caller cannot bypass it.
+  assertQueryableEntity(entity);
   if (typeof entity.scopeFilter !== 'function') fail('entity has no compiled grant filter.');
   const filter = entity.scopeFilter(principal);
   if (!filter || typeof filter.sql !== 'string') fail('compiled grant filter is malformed.');
@@ -934,6 +960,7 @@ export function executeQueryPage(
   compiled: CompiledQuery,
   options: ExecuteQueryPageOptions = {},
 ): QueryPage {
+  assertQueryableEntity(entity);
   if (compiled.entity !== entity.name) fail('compiled query does not match the entity.');
   return withRevisionFence(db, () => runPage(db, entity, principal, compiled, options));
 }

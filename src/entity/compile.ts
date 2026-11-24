@@ -517,8 +517,17 @@ export function entity<const Name extends string, const Declaration extends Reco
     scopeAst,
     scopeFilter(principal: any) {
       if (this.grant == null) return { sql: '1=0', params: {} };
-      if (!readScope) return { sql: '1=1', params: {} };
-      const bound = bindReadScope(readScope, principal);
+      // Read the LIVE readScope from the record. The proxy's mutableAuth set
+      // trap allows membership() and other post-compilation augmentations to
+      // replace `readScope`; closing over the compile-time value would leave
+      // scopeFilter silently disagreeing with `entity.readScope` — the field
+      // the query layer now trusts to decide whether an entity is queryable.
+      // NOTE: `1=1` here is intentional for a can-only grant: REST/live list
+      // post-filter those rows through the runtime .can engine. The query
+      // layer does NOT, and rejects such entities before reaching this point.
+      const activeReadScope: typeof readScope = (this as any).readScope;
+      if (!activeReadScope) return { sql: '1=1', params: {} };
+      const bound = bindReadScope(activeReadScope, principal);
       return bound ? { sql: bound.sql, params: bound.params } : { sql: '1=1', params: {} };
     },
     effects: validatedEffects,

@@ -1,7 +1,7 @@
 // Query-scoped reads (#225, ADR-0009): authorized pages with a revision token,
 // keyset pagination, invalidation + bounded refetch, and stale-response rejection.
 
-import { text, ref, number, date, grant, read, subscribe, scope } from '../build/index.mjs';
+import { text, ref, number, date, grant, read, subscribe, scope, everyone } from '../build/index.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
@@ -19,6 +19,7 @@ import {
   QueryScopedReadError,
 } from '../build/query-scoped-read.mjs';
 import { created, updated, fieldSet } from '../build/event-handle.mjs';
+import { compileReadScope } from '../build/scope-sql.mjs';
 
 const alice = principal({ type: 'user', id: 'alice' });
 const bob = principal({ type: 'user', id: 'bob' });
@@ -659,6 +660,99 @@ test('optimistic overlay previews safe fields and flags membership-uncertain wri
     const membership = overlayOptimisticQueryPage(page, [{ id: 'n1', verb: 'update', fields: { status: 'closed' } }], compiled);
     assert.equal(membership.membershipUncertain, true);
     assert.equal(membership.rows.find((row) => row.id === 'n1').status, 'open', 'membership writes are not guessed into the page');
+  } finally {
+    db.close();
+  }
+});
+
+// ---- can-only grants are not queryable (#225 authz hole) --------------------
+//
+// `scope(everyone())` passes an AST as the scope predicate, so no readScope is
+// compiled. scopeFilter then returns `1=1` on purpose: REST/live post-filter
+// each row through the runtime .can engine. The query layer has no such
+// post-filter, so it must reject the entity instead of reading the whole table.
+
+test('a can-only entity fails closed at compile and execute and never yields a row', () => {
+  const CanOnly = entity('CanOnly', {
+    body: text(),
+    owner: ref('User', { role: 'owner', readonly: true }),
+    // AST-valued scope predicate → grant exists, no compiled readScope.
+    grant: () => [scope(everyone()).can(() => grant(read, subscribe))],
+  });
+  const db = new DatabaseSync(':memory:');
+  try {
+    for (const sql of generateFrameworkDDL()) db.exec(sql);
+    for (const sql of generateDDL(CanOnly)) db.exec(sql);
+    db.prepare('INSERT INTO CanOnly (id, body, owner) VALUES (?, ?, ?)').run('c1', 'secret', 'bob');
+
+    assert.equal(CanOnly.readScope, undefined, 'this grant compiles no SQL row scope');
+    assert.equal(CanOnly.scopeFilter(alice).sql, '1=1', 'the grant still relies on runtime .can post-filtering');
+
+    assert.throws(
+      () => compileQueryContract({
+        entity: 'CanOnly',
+        sort: { field: 'id', direction: 'asc' },
+        pageSize: 10,
+      }, CanOnly),
+      (err) => err instanceof QueryScopedReadError && /UNSCOPED_ENTITY/.test(err.message),
+    );
+
+    // A contract compiled elsewhere must not be enough to read the table.
+    const compiled = Object.freeze({
+      entity: 'CanOnly',
+      identity: 'can-only-probe',
+      filters: [],
+      where: null,
+      sort: { field: 'id', direction: 'asc' },
+      pageSize: 10,
+      maxPageSize: 100,
+      dependencyFields: [],
+    });
+    assert.throws(
+      () => executeQueryPage(db, CanOnly, alice, compiled),
+      (err) => err instanceof QueryScopedReadError && /UNSCOPED_ENTITY/.test(err.message),
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test('scopeFilter follows a readScope installed after compilation, and the query gate follows it', () => {
+  const LiveScope = entity('LiveScope', {
+    body: text(),
+    owner: ref('User', { role: 'owner', readonly: true }),
+    grant: () => [scope(everyone()).can(() => grant(read, subscribe))],
+  });
+  const db = new DatabaseSync(':memory:');
+  try {
+    for (const sql of generateFrameworkDDL()) db.exec(sql);
+    for (const sql of generateDDL(LiveScope)) db.exec(sql);
+    db.prepare('INSERT INTO LiveScope (id, body, owner) VALUES (?, ?, ?)').run('l1', 'alice-note', 'alice');
+    db.prepare('INSERT INTO LiveScope (id, body, owner) VALUES (?, ?, ?)').run('l2', 'bob-note', 'bob');
+
+    const compiledBefore = {
+      entity: 'LiveScope',
+      sort: { field: 'id', direction: 'asc' },
+      pageSize: 10,
+    };
+    assert.throws(() => compileQueryContract(compiledBefore, LiveScope), /UNSCOPED_ENTITY/);
+
+    const scope = compileReadScope(({ is }) => is.owner(), {
+      fields: LiveScope.fields,
+      where: 'a readScope installed after compilation',
+      registry: LiveScope.registry,
+      entityName: 'LiveScope',
+    });
+    LiveScope.readScope = { sql: scope.sql, params: scope.params };
+    LiveScope.scopeAst = scope.ast;
+
+    const filtered = LiveScope.scopeFilter(alice);
+    assert.equal(filtered.sql, scope.sql, 'scopeFilter reads the live readScope, not the compile-time one');
+    assert.ok(Object.values(filtered.params).includes('alice'));
+
+    const compiled = compileQueryContract(compiledBefore, LiveScope);
+    assert.deepEqual(executeQueryPage(db, LiveScope, alice, compiled).rows.map((row) => row.id), ['l1']);
+    assert.deepEqual(executeQueryPage(db, LiveScope, bob, compiled).rows.map((row) => row.id), ['l2']);
   } finally {
     db.close();
   }

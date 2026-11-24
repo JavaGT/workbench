@@ -212,6 +212,13 @@ export class QueryContentionError extends Error {
 
 
 
+
+
+
+
+
+
+
 const CONTRACT_KEYS = Object.freeze(['entity', 'filters', 'where', 'expression', 'sort', 'pageSize']);
 const FILTER_KEYS = Object.freeze(['field', 'op', 'value']);
 const TERM_KEYS = Object.freeze(['kind', 'field', 'op', 'value']);
@@ -221,6 +228,20 @@ const SORT_KEYS = Object.freeze(['field', 'direction']);
 
 function fail(message        )        {
   throw new QueryScopedReadError(message);
+}
+
+/**
+ * A query can only be authorized when the entity carries a compiled SQL row
+ * scope. A `.can-only` grant leaves `readScope` undefined and its scopeFilter
+ * returns `1=1` — safe for REST/live, which post-filter each row through the
+ * runtime grant, but a full-table leak here because the query layer trusts the
+ * compiled scope as the whole authorization decision. Fail closed, in one
+ * place, for every query entry point.
+ */
+export function assertQueryableEntity(entity             )       {
+  if (!entity.readScope) {
+    fail(`UNSCOPED_ENTITY: entity '${entity.name}' has no compiled readScope; a can-only grant is not queryable.`);
+  }
 }
 
 function assertKeys(value        , allowed                   , label        )       {
@@ -533,6 +554,7 @@ export function compileQueryContract(
   const contract = input                 ;
   if (contract.entity !== entity.name) fail('contract entity does not match the compiled entity.');
   identifier(entity.name, 'entity name');
+  assertQueryableEntity(entity);
   const declared = fieldsOf(entity);
   if (contract.filters !== undefined && !Array.isArray(contract.filters)) fail('filters must be an array.');
   if ((contract.filters?.length ?? 0) > FILTERS_MAX) fail('filters must contain at most 16 entries.');
@@ -627,6 +649,10 @@ export function readCommittedRevision(db         )         {
 }
 
 function grantFilter(entity             , principal         )                                                   {
+  // Every SQL page (and the invalidation hub's admission recheck) funnels
+  // through here; keep the can-only guard on the choke point as well as on the
+  // public entry points so a direct selectAuthorizedPage caller cannot bypass it.
+  assertQueryableEntity(entity);
   if (typeof entity.scopeFilter !== 'function') fail('entity has no compiled grant filter.');
   const filter = entity.scopeFilter(principal);
   if (!filter || typeof filter.sql !== 'string') fail('compiled grant filter is malformed.');
@@ -934,6 +960,7 @@ export function executeQueryPage(
   compiled               ,
   options                          = {},
 )            {
+  assertQueryableEntity(entity);
   if (compiled.entity !== entity.name) fail('compiled query does not match the entity.');
   return withRevisionFence(db, () => runPage(db, entity, principal, compiled, options));
 }

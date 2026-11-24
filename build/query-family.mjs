@@ -13,6 +13,7 @@ import {
   compileFilterPredicate,
   compileHostFilter,
   queryAuthorizationFields,
+  assertQueryableEntity,
   QueryScopedReadError,
   QUERY_EXPRESSION_MAX_LEAVES,
   QUERY_OPERATORS,
@@ -220,6 +221,12 @@ export function compileQueryFamily(input         )                      {
   identifier(declaration.host.name, 'host entity');
   identifier(declaration.catalog.name, 'catalog entity');
   identifier(declaration.elements.name, 'elements entity');
+  // All three grants are compiled SQL row scopes: catalog and element
+  // scopeFilters are composed into subqueries, so a can-only entity (no
+  // readScope → 1=1) would widen every family query to the whole table.
+  assertQueryableEntity(declaration.host);
+  assertQueryableEntity(declaration.catalog);
+  assertQueryableEntity(declaration.elements);
   const hostKey = requireColumn(declaration.elements, declaration.hostKey, 'hostKey', ['text', 'ref']);
   const fieldKey = requireColumn(declaration.elements, declaration.fieldKey, 'fieldKey', ['text', 'ref']);
   const typeField = requireColumn(declaration.catalog, declaration.typeField, 'typeField', ['text']);
@@ -452,6 +459,11 @@ export function executeQueryFamily(
 )            {
   if (!request || typeof request !== 'object' || Array.isArray(request)) fail('family request must be an object.');
   assertKeys(request, REQUEST_KEYS, 'family request');
+  // Re-check at execute time: a family (or one of its entities) can be mutated
+  // after registration, and a compiled family object can be supplied directly.
+  assertQueryableEntity(family.host);
+  assertQueryableEntity(family.catalog);
+  assertQueryableEntity(family.elements);
   const input = request                      ;
 
   const hasLegacyDynamic = input.fieldId !== undefined || input.op !== undefined || input.value !== undefined;

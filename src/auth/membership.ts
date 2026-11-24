@@ -357,13 +357,13 @@ function buildCheckEntry(entityName: string, fieldName: string, dbRoles: string[
         `SELECT 1 FROM ${table} WHERE ${ownerCol} = :__owner AND ${MEMBER_COLUMN} = :__member AND role IN (${conditions.join(', ')})`,
       );
       return (
-        stmt.get({ __owner: row.id, __member: principal.id, ...roleParams }) !== undefined
+        stmt.get({ __owner: row.id, __member: principal.id, ...roleParams }) != null
       );
     }
     const stmt = db.prepare(
       `SELECT 1 FROM ${table} WHERE ${ownerCol} = :__owner AND ${MEMBER_COLUMN} = :__member`,
     );
-    return stmt.get({ __owner: row.id, __member: principal.id }) !== undefined;
+    return stmt.get({ __owner: row.id, __member: principal.id }) != null;
   };
 
   return { harvest, run };

@@ -408,6 +408,7 @@ interface SqliteSchemaInput {
   externalTables?: unknown;
   externalTriggers?: unknown;
   externalIndexes?: unknown;
+  adoptTables?: unknown;
   migrations?: unknown;
   virtualTables?: unknown;
 }
@@ -800,6 +801,140 @@ function validateColumnList(columns: unknown, knownColumns: ReadonlyMap<string, 
   }
 }
 
+// ---------------------------------------------------------------------------
+// Adoption of app-owned tables
+// ---------------------------------------------------------------------------
+//
+// An app that predates Workbench already owns tables in the same SQLite file.
+// The census needs to know they are declared (so boot does not report them as
+// undeclared drift), but this schema must never create, alter, or drop them.
+// `externalTables` / `externalIndexes` are the declaration surfaces; this is
+// the ONE place that reads them out of a live database and produces those
+// declarations. Consumers get a one-line call instead of hand-rolled PRAGMA
+// SQL, and every name is validated before any declaration is produced.
+
+/** The read-only slice of a database handle adoption needs (PRAGMAs + sqlite_schema). */
+export interface AdoptableDb {
+  prepare(sql: string): { all(...params: unknown[]): Array<Record<string, unknown>> };
+}
+
+/** Declaration-only knowledge produced by adoption. Nothing here is created. */
+export interface AdoptedExternalTables {
+  readonly externalTables: readonly { name: string; columns: readonly string[] }[];
+  readonly externalIndexes: readonly { name: string; table?: string }[];
+}
+
+export interface AdoptExternalTablesOptions {
+  /**
+   * Compile a full schema description instead of returning raw declarations.
+   * With `name` supplied, `tables` may add Workbench-owned tables to that schema.
+   */
+  name?: string;
+  tables?: readonly SqliteTableSpec[];
+}
+
+export interface AdoptTablesInput {
+  db: AdoptableDb;
+  tables: readonly string[];
+}
+
+// Validate the requested names, read each table's columns from the authoritative
+// pragma, then attribute every non-SQLite index on those tables. Unknown tables,
+// non-ordinary tables, bad identifiers, and framework-reserved names all fail
+// closed here — before a schema can be compiled from the result.
+function introspectAdoptedTables(db: AdoptableDb, tableNames: readonly string[]): AdoptedExternalTables {
+  if (db === null || typeof db !== 'object' || typeof db.prepare !== 'function') {
+    throw new TypeError('adoptExternalTables requires a database handle with prepare()');
+  }
+  if (!Array.isArray(tableNames) || tableNames.length === 0) {
+    throw new TypeError('adoptExternalTables requires a non-empty array of table names');
+  }
+
+  const tables: Array<{ name: string; columns: readonly string[] }> = [];
+  const ownersByFoldedName = new Map<string, string>();
+  for (const candidate of tableNames) {
+    const name = requireIdentifier(candidate, 'adopted table name');
+    const key = folded(name);
+    if (key.startsWith('sqlite_')) throw new Error(`adopted table "${name}" uses the reserved sqlite_ prefix`);
+    if (FRAMEWORK_RESERVED_NAMES.has(key)) throw new Error(`adopted table "${name}" uses a framework-reserved name`);
+    if (ownersByFoldedName.has(key)) throw new Error(`duplicate adopted table "${name}"`);
+
+    const live = db.prepare("SELECT type, sql FROM sqlite_schema WHERE lower(name) = lower(?)").all(name);
+    if (live.length === 0) throw new Error(`adopted table "${name}" does not exist in the live schema`);
+    if (String(live[0].type) !== 'table' || /^CREATE\s+VIRTUAL\s+TABLE/i.test(String(live[0].sql ?? ''))) {
+      throw new Error(`adopted table "${name}" is not an ordinary table`);
+    }
+    const columns = db.prepare('SELECT name FROM pragma_table_info(?) ORDER BY cid').all(name)
+      .map((row) => requireIdentifier(row.name, `column in adopted table "${name}"`));
+    if (columns.length === 0) throw new Error(`adopted table "${name}" has no columns`);
+
+    tables.push(Object.freeze({ name, columns: Object.freeze(columns) }));
+    ownersByFoldedName.set(key, name);
+  }
+
+  const indexes: Array<{ name: string; table?: string }> = [];
+  const seenIndexes = new Set<string>();
+  for (const row of db.prepare("SELECT name, tbl_name FROM sqlite_schema WHERE type = 'index' AND name NOT LIKE 'sqlite_%'").all()) {
+    const owner = ownersByFoldedName.get(folded(String(row.tbl_name ?? '')));
+    if (owner === undefined) continue;
+    const name = requireIdentifier(row.name, `index on adopted table "${owner}"`);
+    const key = folded(name);
+    if (key.startsWith('sqlite_')) continue;
+    if (FRAMEWORK_RESERVED_NAMES.has(key)) throw new Error(`adopted index "${name}" uses a framework-reserved name`);
+    if (seenIndexes.has(key)) throw new Error(`duplicate adopted index "${name}"`);
+    seenIndexes.add(key);
+    indexes.push(Object.freeze({ name, table: owner }));
+  }
+
+  return Object.freeze({
+    externalTables: Object.freeze(tables),
+    externalIndexes: Object.freeze(indexes),
+  });
+}
+
+/**
+ * Adopt existing app-owned tables as declaration-only knowledge for the
+ * Workbench startup census. The tables and their non-SQLite indexes are read
+ * from the live schema; this function never mutates it. With `options.name`,
+ * returns a complete compiled schema (optionally with `options.tables`); by
+ * default returns `{ externalTables, externalIndexes }` for `defineSqliteSchema`.
+ */
+export function adoptExternalTables(
+  db: AdoptableDb,
+  tableNames: readonly string[],
+  options?: AdoptExternalTablesOptions,
+): AdoptedExternalTables | SqliteSchemaDescription {
+  if (options?.name !== undefined) {
+    return defineSqliteSchema({
+      name: options.name,
+      tables: options.tables ?? [],
+      adoptTables: { db, tables: tableNames },
+    });
+  }
+  return introspectAdoptedTables(db, tableNames);
+}
+
+// Explicit declarations win over adopted ones of the same name; the two are
+// never allowed to become duplicate census claims. Adoption is additive only.
+function mergeAdoptedDeclarations(declared: unknown, adopted: readonly { name: string; table?: string }[]): unknown[] {
+  const merged: unknown[] = [];
+  const seen = new Set<string>();
+  for (const entry of (Array.isArray(declared) ? declared : []) as unknown[]) {
+    const name = typeof entry === 'string' ? entry : (entry as { name?: unknown } | null)?.name;
+    const key = folded(requireName(name, 'external declaration name'));
+    if (seen.has(key)) throw new Error(`duplicate external declaration "${String(name)}"`);
+    seen.add(key);
+    merged.push(entry);
+  }
+  for (const entry of adopted) {
+    const key = folded(entry.name);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(entry);
+  }
+  return merged;
+}
+
 // The runtime migration ledger is the namespaced (namespace, version) ledger
 // (workbench#90). Namespaces are independent, so the same version in two
 // namespaces is legitimate; reserved-namespace impersonation and declaration
@@ -890,6 +1025,9 @@ export interface SqliteSchemaSpec {
   // Indexes a co-tenant created on external/framework tables; declared so the
   // census can attribute them without this schema creating or dropping them.
   externalIndexes?: readonly (string | { name: string; table?: string })[];
+  // App-owned tables to adopt from a live database in one line. Resolved into
+  // externalTables/externalIndexes before validation; never created or dropped.
+  adoptTables?: AdoptTablesInput;
   virtualTables?: readonly SqliteVirtualTableSpec[];
   migrations?: readonly SqliteMigrationSpec[];
 }
@@ -914,8 +1052,24 @@ export interface SqliteSchemaDescription {
 }
 
 export function defineSqliteSchema(spec: SqliteSchemaInput): SqliteSchemaDescription {
-  validateSpec(spec);
-  const validated = spec as SqliteSchemaSpec;
+  let input: SqliteSchemaInput = spec;
+  if (spec.adoptTables !== undefined) {
+    const adoption = spec.adoptTables as AdoptTablesInput | null;
+    if (adoption === null || typeof adoption !== 'object') {
+      throw new TypeError('adoptTables must be an object with db and tables');
+    }
+    if (!Array.isArray(adoption.tables)) {
+      throw new TypeError('adoptTables.tables must be an array of table names');
+    }
+    const adopted = introspectAdoptedTables(adoption.db, adoption.tables);
+    input = {
+      ...spec,
+      externalTables: mergeAdoptedDeclarations(spec.externalTables, adopted.externalTables),
+      externalIndexes: mergeAdoptedDeclarations(spec.externalIndexes, adopted.externalIndexes),
+    };
+  }
+  validateSpec(input);
+  const validated = input as SqliteSchemaSpec;
   const tables = Object.freeze(validated.tables.map((table) => Object.freeze({
     ...table,
     columns: Object.freeze(table.columns.map((column) => Object.freeze({ ...column }))),

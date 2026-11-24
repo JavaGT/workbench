@@ -84,6 +84,7 @@ Not a fourth loop — transport over the machine.
 | Module | Role |
 | --- | --- |
 | `app.mjs` | Two-phase declaration plus singular `start()` / transport selection |
+| `app-schema-boot.mjs` | Focused sibling of `app.mjs`: DB-input discrimination (path/adapter/raw node+bun handle) and the twelve-phase schema boot lifecycle that settles and validates the census before traffic |
 | `serve.mjs` | HTTP server, CSRF, live transport attachment |
 | `http-crud-dispatch.mjs` | CRUD → kernel.dispatch |
 | `http-framework-routes.mjs` | snapshot / events-since / blobs / jobs / SDK |

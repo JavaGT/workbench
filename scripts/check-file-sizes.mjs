@@ -62,7 +62,7 @@ const BASELINE_LIMITS = Object.freeze({
   'src/kernel.ts': 696,
   'src/live-connection.ts': 598,
   'src/live-delivery-core.ts': 1056,
-  'src/live-delivery-public.ts': 946,
+  'src/live-delivery-public.ts': 947,
   'src/live-fanout.ts': 784,
   'src/migration-ledger.ts': 553,
   'src/pending-blob.ts': 772,

@@ -148,6 +148,8 @@ export interface SearchStalenessBridge {
   engage(db: DbHandle): void;
   bindWriteQueue(writeQueue: { run<T>(fn: () => Promise<T> | T): Promise<T> } | null): void;
   pending(): readonly SearchStalenessRecord[];
+  pendingPage(limit: number): readonly SearchStalenessRecord[];
+  pendingCount(): number;
   notifySourceChange(input: SearchSourceChangeInput): SearchStalenessNotice;
   onRevocation(principal: Principal, resourceScope: RevocationResourceScope): void;
   drain(): Promise<SearchDrainSummary>;
@@ -379,13 +381,12 @@ export function createSearchStalenessBridge(options: SearchStalenessBridgeOption
       JSON.stringify(merged.affected), merged.payload, merged.tier, at, merged.committedAt);
   }
 
-  function readAll(): StalenessRow[] {
+  function readRows(limit?: number): StalenessRow[] {
     ensureTable();
-    return requireDb().prepare(
-      `SELECT sourceResource, sourceKey, kind, priority, affected, tier, changedAt, committedAt
-       FROM ${tableName}
-       ORDER BY priority DESC, changedAt ASC`,
-    ).all() as unknown as StalenessRow[];
+    const sql = `SELECT sourceResource, sourceKey, kind, priority, affected, tier, changedAt, committedAt FROM ${tableName} ORDER BY priority DESC, changedAt ASC`;
+    return (limit === undefined
+      ? requireDb().prepare(sql).all()
+      : requireDb().prepare(`${sql} LIMIT ?`).all(Math.max(1, Math.floor(limit)))) as unknown as StalenessRow[];
   }
 
   function deleteRecord(record: SearchStalenessRecord): void {
@@ -516,9 +517,9 @@ export function createSearchStalenessBridge(options: SearchStalenessBridgeOption
     writeQueue = next ?? null;
   }
 
-  function pending(): readonly SearchStalenessRecord[] {
-    return Object.freeze(readAll().map(parseRecord));
-  }
+  const pending = (): readonly SearchStalenessRecord[] => Object.freeze(readRows().map(parseRecord));
+  const pendingPage = (limit: number): readonly SearchStalenessRecord[] => Object.freeze(readRows(limit).map(parseRecord));
+  const pendingCount = (): number => { ensureTable(); return Number((requireDb().prepare(`SELECT COUNT(*) AS count FROM ${tableName}`).get() as { count?: unknown } | undefined)?.count ?? 0); };
 
   function notifySourceChange(input: SearchSourceChangeInput): SearchStalenessNotice {
     const normalized = normalizeSourceChange(input);
@@ -633,16 +634,9 @@ export function createSearchStalenessBridge(options: SearchStalenessBridgeOption
   }
 
   return Object.freeze({
-    get tableName() {
-      return tableName;
-    },
-    engage,
-    bindWriteQueue,
-    pending,
-    notifySourceChange,
-    onRevocation,
-    drain,
-    triggerCensus,
+    get tableName() { return tableName; },
+    engage, bindWriteQueue, pending, pendingPage, pendingCount,
+    notifySourceChange, onRevocation, drain, triggerCensus,
     stalenessDdl: () => searchStalenessDdl(tableName),
   });
 }

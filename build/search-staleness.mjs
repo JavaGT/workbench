@@ -162,6 +162,8 @@ export const SEARCH_STALENESS_PRIORITY_HIGH = 1;
 
 
 
+
+
 const BARE_SQL_IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 // The ledger's default table name is the registry's RESERVED name
 // (SEARCH_STALENESS_LEDGER_TABLE): the registry refuses a plugin declaration
@@ -379,13 +381,12 @@ export function createSearchStalenessBridge(options                             
       JSON.stringify(merged.affected), merged.payload, merged.tier, at, merged.committedAt);
   }
 
-  function readAll()                 {
+  function readRows(limit         )                 {
     ensureTable();
-    return requireDb().prepare(
-      `SELECT sourceResource, sourceKey, kind, priority, affected, tier, changedAt, committedAt
-       FROM ${tableName}
-       ORDER BY priority DESC, changedAt ASC`,
-    ).all()                             ;
+    const sql = `SELECT sourceResource, sourceKey, kind, priority, affected, tier, changedAt, committedAt FROM ${tableName} ORDER BY priority DESC, changedAt ASC`;
+    return (limit === undefined
+      ? requireDb().prepare(sql).all()
+      : requireDb().prepare(`${sql} LIMIT ?`).all(Math.max(1, Math.floor(limit))))                             ;
   }
 
   function deleteRecord(record                       )       {
@@ -516,9 +517,9 @@ export function createSearchStalenessBridge(options                             
     writeQueue = next ?? null;
   }
 
-  function pending()                                   {
-    return Object.freeze(readAll().map(parseRecord));
-  }
+  const pending = ()                                   => Object.freeze(readRows().map(parseRecord));
+  const pendingPage = (limit        )                                   => Object.freeze(readRows(limit).map(parseRecord));
+  const pendingCount = ()         => { ensureTable(); return Number((requireDb().prepare(`SELECT COUNT(*) AS count FROM ${tableName}`).get()                                   )?.count ?? 0); };
 
   function notifySourceChange(input                         )                        {
     const normalized = normalizeSourceChange(input);
@@ -633,16 +634,9 @@ export function createSearchStalenessBridge(options                             
   }
 
   return Object.freeze({
-    get tableName() {
-      return tableName;
-    },
-    engage,
-    bindWriteQueue,
-    pending,
-    notifySourceChange,
-    onRevocation,
-    drain,
-    triggerCensus,
+    get tableName() { return tableName; },
+    engage, bindWriteQueue, pending, pendingPage, pendingCount,
+    notifySourceChange, onRevocation, drain, triggerCensus,
     stalenessDdl: () => searchStalenessDdl(tableName),
   });
 }

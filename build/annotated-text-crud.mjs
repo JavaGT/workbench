@@ -301,31 +301,22 @@ function captureNativeTextHistory({
  )                          {
   const data = events[0]?.data;
   if (!data) throw new ValidationError('annotated text operation did not emit an event');
-  const afterFamily = textFamilyAfterEvent(beforeFamily, data);
-  const declarations = historyAnnotationDeclarations(descriptor);
-  const beforePrepared = beforeImages.map((image) => historyImageWithOffsets(image, beforeFamily));
-  const beforeById = new Map(beforePrepared.map((image) => [image.id, image]));
-  const afterImages = storedImagesFromTextPostimage({ marker: data.facts?.result, descriptor, family: afterFamily, beforeById });
-  const transition = textAnnotationTransition({ before: beforePrepared, after: afterImages, beforeFamily, afterFamily });
   const edit = command.edit       ;
   if (edit.kind === 'text.delete' || edit.kind === 'text.replace') {
+    if (!beforeFamily || !beforeImages) throw new ValidationError('annotated text delete history has no preimage');
     const marker = data.facts?.result;
     const from = marker?.from;
     const to = marker?.to;
     if (!Number.isSafeInteger(from) || !Number.isSafeInteger(to) || to <= from) {
       throw new ValidationError('annotated text delete history has no valid edit window');
     }
-    if (edit.kind === 'text.replace') {
-      const operation = canonicalTextOp(data.operation?.operations?.[1]);
-      if (operation[5][0] !== 'insert') throw new ValidationError('annotated text replacement history has no insert contribution');
+    if (edit.kind === 'text.replace' && canonicalTextOp(data.operation?.operations?.[1])[5][0] !== 'insert') {
+      throw new ValidationError('annotated text replacement history has no insert contribution');
     }
+    const beforePrepared = beforeImages.map((image) => historyImageWithOffsets(image, beforeFamily));
     return captureDeleteContribution({
-      documentId: command.id,
-      family: beforeFamily,
-      fromUtf16: from,
-      toUtf16: to,
-      annotations: beforePrepared,
-      declarations,
+      documentId: command.id, family: beforeFamily, fromUtf16: from, toUtf16: to,
+      annotations: beforePrepared, declarations: historyAnnotationDeclarations(descriptor),
     });
   }
 
@@ -340,7 +331,14 @@ function captureNativeTextHistory({
       text: payload[2],
       scalarCount: scalarCount(payload[2]),
     };
+    let transition                                         ;
     if (edit.kind === 'annotation.paste') {
+      if (!beforeFamily || !beforeImages) throw new ValidationError('annotated text paste history has no preimage');
+      const afterFamily = textFamilyAfterEvent(beforeFamily, data);
+      const beforePrepared = beforeImages.map((image) => historyImageWithOffsets(image, beforeFamily));
+      const beforeById = new Map(beforePrepared.map((image) => [image.id, image]));
+      const afterImages = storedImagesFromTextPostimage({ marker: data.facts?.result, descriptor, family: afterFamily, beforeById });
+      transition = textAnnotationTransition({ before: beforePrepared, after: afterImages, beforeFamily, afterFamily });
       const createdId = (data.facts?.result                                            )?.createdAnnotationId;
       if (typeof createdId !== 'string' || createdId.length === 0) {
         throw new ValidationError('annotated text paste history has no created annotation');
@@ -1160,7 +1158,7 @@ export function registerAnnotatedTextCrudHandlers({
       if (payload.version === 1) throw new ValidationError('annotated text compensation is history-authored only');
       let beforeFamily                                                        = null;
       let beforeImages                                 = null;
-      if (command && (command.edit.kind === 'text.insert' || command.edit.kind === 'annotation.paste')) {
+      if (command && command.edit.kind === 'annotation.paste') {
         try {
           const beforeState = db.prepare(`SELECT family_checkpoint FROM ${prefix}_state WHERE document_id = ?`).get(command.id)                                             ;
           if (beforeState) {
@@ -1176,7 +1174,7 @@ export function registerAnnotatedTextCrudHandlers({
         if (payload.version !== 9) return events;
         const originFact = command.edit.kind === 'text.insert' || command.edit.kind === 'annotation.paste'
           ? (() => {
-            if (beforeFamily && beforeImages) {
+            if (command.edit.kind === 'text.insert' || (beforeFamily && beforeImages)) {
               try {
                 const canonical = captureNativeTextHistory({ command, events, beforeFamily, beforeImages, descriptor })                       ;
                 const planFacts = events[0]?.data?.facts;

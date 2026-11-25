@@ -80,6 +80,29 @@ test('readableFieldNames returns exactly the readable field subset', async () =>
   assert.equal(bobReadable.has('owner'), true);
 });
 
+test('readableFieldNames evaluates the row read grant once across fields without explicit .can', async () => {
+  let grantCalls = 0;
+  const Multi = entity('Multi', {
+    a: text(),
+    b: text(),
+    c: text(),
+    d: text(),
+    grant: () => [scope(() => everyone()).can(() => {
+      grantCalls += 1;
+      return grant(read);
+    })],
+  });
+  const db = new DatabaseSync(':memory:');
+  const app = workbench({ db, entities: [Multi] });
+  const compiled = app.entity(Multi);
+  const row = compiled.deserializeRow({ id: 'm1', a: '1', b: '2', c: '3', d: '4' });
+
+  const readable = await readableFieldNames(compiled, row, bob);
+  assert.deepEqual([...readable].sort(), ['a', 'b', 'c', 'd']);
+  assert.equal(grantCalls, 1, 'row read grant should be evaluated once per readableFieldNames call');
+  db.close();
+});
+
 test('mayReadField denies the unreadable field without any field-name echo', async () => {
   const { Doc } = bootDoc();
   const row = Doc.deserializeRow({ id: 'd1', title: 'Report', owner: 'alice', secret: 'top-secret-value' });

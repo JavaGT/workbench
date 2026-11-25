@@ -597,10 +597,10 @@ export function logRetentionReport(db: DbHandle, retentionDays: number, nowMs: n
 // Nonce identity is derived from the retained row itself, so the only honest
 // way to recognize obsolete claims is to re-derive the retained nonce set.
 function pruneObsoleteV16Claims(db: DbHandle): number {
-  const exists = db.prepare(
-    "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = '_V16CapabilityClaim'",
-  ).get();
+  const exists = db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = '_V16CapabilityClaim'").get();
   if (exists == null) return 0;
+  const claims = db.prepare('SELECT nonce FROM _V16CapabilityClaim').all() as Array<{ nonce: string }>;
+  if (claims.length === 0) return 0;
   const rows = db.prepare('SELECT scope, seq, eventType, eventData, actionId FROM _Log').all() as Array<{
     scope: string; seq: number; eventType: string; eventData: string; actionId: string;
   }>;
@@ -646,7 +646,6 @@ function pruneObsoleteV16Claims(db: DbHandle): number {
   // Fail closed: an unreadable retained row must never cause a live capability
   // to be deleted (that would admit a replay of a consumed event).
   if (uncertain) return 0;
-  const claims = db.prepare('SELECT nonce FROM _V16CapabilityClaim').all() as Array<{ nonce: string }>;
   const remove = prepareCached(db, 'DELETE FROM _V16CapabilityClaim WHERE nonce = ?');
   let pruned = 0;
   for (const claim of claims) {

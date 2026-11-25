@@ -94,9 +94,15 @@ export async function readableFieldNames(
   principal         ,
   authorization                              ,
 )                       {
-  const fields = (entity?.fields ?? {})                           ;
+  const fields = (entity?.fields ?? {})                                                    ;
   const readable = new Set        ();
+  let rowReadAllowed                     ;
   for (const fieldName of Object.keys(fields)) {
+    if (!authorization && typeof fields[fieldName]?.access !== 'function') {
+      rowReadAllowed ??= await mayRow(entity, 'read', row, principal);
+      if (rowReadAllowed) readable.add(fieldName);
+      continue;
+    }
     if (await mayReadField(entity, fieldName, row, principal, authorization)) readable.add(fieldName);
   }
   return readable;

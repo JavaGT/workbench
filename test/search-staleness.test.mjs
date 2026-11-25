@@ -550,6 +550,29 @@ describe('staleness bridge — revocation and erasure priority', () => {
     assert.ok(pluginB.calls.some((call) => call.op === 'rebuild'), 'the ordinary update\'s affected plugin is rebuilt too');
     db.close();
   });
+
+  test('pendingPage returns a bounded priority-ordered slice and pendingCount reports total rows', () => {
+    const db = freshNoteDb();
+    const registry = createSearchPluginRegistry();
+    const pluginA = makeIndexedPlugin({ id: 'plugin-a' });
+    registry.register(pluginA.plugin);
+    registry.bindSource(db);
+    let tick = 0;
+    const bridge = createSearchStalenessBridge({ registry, now: () => `2026-01-01T00:00:0${tick++}.000Z` });
+    bridge.engage(db);
+
+    bridge.notifySourceChange({ entity: 'Note', rowId: 'n1', kind: 'updated', committedAt: 't1' });
+    bridge.notifySourceChange({ entity: 'Note', rowId: 'n2', kind: 'updated', committedAt: 't2' });
+    bridge.notifySourceChange({ entity: 'Note', rowId: 'n3', kind: 'updated', committedAt: 't3' });
+    bridge.onRevocation(principal({ type: 'user', id: 'u1' }), { category: 'entity', key: 'Note:n3' });
+
+    assert.equal(bridge.pendingCount(), 3);
+    const page = bridge.pendingPage(2);
+    assert.equal(page.length, 2);
+    assert.equal(page[0].sourceKey, 'n3', 'high-priority revocation comes first');
+    assert.equal(page[1].sourceKey, 'n1', 'oldest ordinary change comes next');
+    db.close();
+  });
 });
 
 // ---- app wiring --------------------------------------------------------------

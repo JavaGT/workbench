@@ -451,18 +451,10 @@ export function createSearchReconcileEngine(options                        )    
     callOptions                                  = {},
   )                                       {
     const limit = Math.max(1, Math.floor(callOptions.batchSize ?? batchSize));
-    const pending = staleness.pending();
-    if (pending.length === 0) {
-      return Object.freeze({
-        processed: 0,
-        reconciled: 0,
-        rebuilt: 0,
-        retained: 0,
-        remaining: 0,
-        failures: Object.freeze([]),
-      });
+    const slice = typeof staleness.pendingPage === 'function' ? staleness.pendingPage(limit) : staleness.pending().slice(0, limit);
+    if (slice.length === 0) {
+      return Object.freeze({ processed: 0, reconciled: 0, rebuilt: 0, retained: 0, remaining: 0, failures: Object.freeze([]) });
     }
-    const slice = pending.slice(0, limit);
     let reconciled = 0;
     let rebuilt = 0;
     let retained = 0;
@@ -485,12 +477,13 @@ export function createSearchReconcileEngine(options                        )    
         }
       }
     }
+    const remaining = typeof staleness.pendingCount === 'function' ? staleness.pendingCount() : staleness.pending().length;
     return Object.freeze({
       processed: reconciled + rebuilt,
       reconciled,
       rebuilt,
       retained,
-      remaining: staleness.pending().length,
+      remaining,
       failures: Object.freeze(failures),
     });
   }

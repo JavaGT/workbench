@@ -632,31 +632,26 @@ function annotationPostimage({ annotations, ranges }: {
   annotations: Array<Annotation & { orphan?: { savedQuote: string; lastRange: number[] | null } | null }>;
   ranges: AnnotationRange[];
 }): Record<string, unknown>[] {
-  const ordinalByAnnotation = new Map<string, number>();
+  const rangesByAnnotation = new Map<string, AnnotationRange[]>();
+  for (const range of ranges) {
+    const bucket = rangesByAnnotation.get(range.annotationId);
+    if (bucket) bucket.push(range); else rangesByAnnotation.set(range.annotationId, [range]);
+  }
   // The companion id list is canonicalized by id. Keep the image list in the
   // same order so projection can prove the two witnesses byte-for-byte,
   // including when paste appends a freshly minted id after an older image.
   return [...annotations]
     .sort((left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0))
-    .map((annotation) => {
-      const memberships = ranges
-        .filter((range) => range.annotationId === annotation.id)
-        .map((range) => {
-          const ordinal = ordinalByAnnotation.get(annotation.id) ?? 0;
-          ordinalByAnnotation.set(annotation.id, ordinal + 1);
-          return { ordinal, start: range.start, end: range.end };
-        });
-      return {
-        id: annotation.id,
-        family: annotation.family,
-        fields: { ...(annotation.fields ?? {}) },
-        protectedTargetIds: [...(annotation.protectedTargetIds ?? [])].sort(),
-        memberships,
-        empty: annotation.empty,
-        cardinality: annotation.cardinality ?? 'many',
-        orphan: annotation.orphan ?? null,
-      };
-    });
+    .map((annotation) => ({
+      id: annotation.id,
+      family: annotation.family,
+      fields: { ...(annotation.fields ?? {}) },
+      protectedTargetIds: [...(annotation.protectedTargetIds ?? [])].sort(),
+      memberships: (rangesByAnnotation.get(annotation.id) ?? []).map((range, ordinal) => ({ ordinal, start: range.start, end: range.end })),
+      empty: annotation.empty,
+      cardinality: annotation.cardinality ?? 'many',
+      orphan: annotation.orphan ?? null,
+    }));
 }
 
 /**

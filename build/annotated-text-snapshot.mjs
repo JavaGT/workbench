@@ -94,14 +94,13 @@ const SHARED_SNAPSHOT_CACHE_LIMIT = 32;
 
 
 
-
 const dbSnapshotCaches = new WeakMap                              ();
 
 function cacheStateForDb(db         )                              {
   if (!db || typeof db !== 'object') return null;
   let state = dbSnapshotCaches.get(db);
   if (!state) {
-    state = { mutationVersions: new Map(), snapshots: new Map() };
+    state = { mutationEpoch: 0, snapshots: new Map() };
     dbSnapshotCaches.set(db, state);
   }
   return state;
@@ -112,15 +111,14 @@ function docCacheKey(prefix        , documentId        )         {
 }
 
 /**
- * Bump the annotation mutation version and evict any cached visible snapshot
+ * Bump the DB mutation epoch and evict any cached visible snapshot
  * for `(db, prefix, documentId)`. Called on every projection/CRUD write.
  */
 export function invalidateAnnotatedTextSnapshotCache(db         , prefix        , documentId        )       {
   const state = cacheStateForDb(db);
   if (!state) return;
-  const key = docCacheKey(prefix, documentId);
-  state.mutationVersions.set(key, (state.mutationVersions.get(key) ?? 0) + 1);
-  state.snapshots.delete(key);
+  state.mutationEpoch += 1;
+  state.snapshots.delete(docCacheKey(prefix, documentId));
 }
 
 function readDataVersion(db     )         {
@@ -146,11 +144,9 @@ function getCachedSnapshot(
   const key = docCacheKey(prefix, documentId);
   const cached = state.snapshots.get(key);
   if (!cached) return null;
-  const mutationVersion = state.mutationVersions.get(key) ?? 0;
   if (
     cached.structureVersion !== structureVersion
     || cached.familyCheckpoint !== familyCheckpoint
-    || cached.annotationMutationVersion !== mutationVersion
     || cached.dataVersion !== dataVersion
     || cached.descriptor !== descriptor
   ) {
@@ -168,9 +164,10 @@ function putCachedSnapshot(
   prefix        ,
   documentId        ,
   entry                        ,
+  expectedEpoch        ,
 )       {
   const state = cacheStateForDb(db);
-  if (!state) return;
+  if (!state || state.mutationEpoch !== expectedEpoch) return;
   const key = docCacheKey(prefix, documentId);
   state.snapshots.delete(key);
   state.snapshots.set(key, entry);
@@ -813,6 +810,8 @@ async function projectAnnotatedText({ db, entity, row, principal, fieldName, des
 
   let cached = getCachedSnapshot(db, prefix, row.id, structureVersion, familyCheckpoint, dataVersion, descriptor);
   if (!cached) {
+    const cacheState = cacheStateForDb(db);
+    const epochBefore = cacheState?.mutationEpoch ?? 0;
     started = performance.now();
     const family = restoreTextFamilySerialized(familyCheckpoint);
     profile?.('checkpoint JSON parse and family restore', performance.now() - started);
@@ -823,12 +822,9 @@ async function projectAnnotatedText({ db, entity, row, principal, fieldName, des
     const { sourceFor, activeProtectors } = loadRecipientProjectionSource({
       db, prefix, descriptor, documentId: row.id, family, text, fieldName, meta, profile,
     });
-    const cacheState = cacheStateForDb(db);
-    const annotationMutationVersion = cacheState?.mutationVersions.get(docCacheKey(prefix, row.id)) ?? 0;
     cached = {
       structureVersion,
       familyCheckpoint,
-      annotationMutationVersion,
       dataVersion,
       descriptor,
       family,
@@ -837,7 +833,7 @@ async function projectAnnotatedText({ db, entity, row, principal, fieldName, des
       activeProtectors,
       fullyVisibleRecipients: new Map(),
     };
-    putCachedSnapshot(db, prefix, row.id, cached);
+    putCachedSnapshot(db, prefix, row.id, cached, epochBefore);
   } else {
     profile?.('shared snapshot cache hit', 0);
   }

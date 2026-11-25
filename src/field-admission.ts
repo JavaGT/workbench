@@ -94,9 +94,15 @@ export async function readableFieldNames(
   principal: unknown,
   authorization?: AuthorizationAdapter | null,
 ): Promise<Set<string>> {
-  const fields = (entity?.fields ?? {}) as Record<string, unknown>;
+  const fields = (entity?.fields ?? {}) as Record<string, { access?: unknown } | undefined>;
   const readable = new Set<string>();
+  let rowReadAllowed: boolean | undefined;
   for (const fieldName of Object.keys(fields)) {
+    if (!authorization && typeof fields[fieldName]?.access !== 'function') {
+      rowReadAllowed ??= await mayRow(entity, 'read', row, principal);
+      if (rowReadAllowed) readable.add(fieldName);
+      continue;
+    }
     if (await mayReadField(entity, fieldName, row, principal, authorization)) readable.add(fieldName);
   }
   return readable;

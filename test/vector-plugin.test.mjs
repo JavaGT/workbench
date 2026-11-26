@@ -668,7 +668,7 @@ test('a stale embedding is never disclosed under an advanced segment revision', 
   assert.equal(current.result.hits[0].score, 0, 'the r2 embedding replaced the r1 vector');
 });
 
-test('a derived index is not searchable across a model-space switch', async (t) => {
+test('a derived index serves the declared space only after it materializes, retaining the old space', async (t) => {
   const kit = await derivedSetup(t);
   kit.note('n1', 'p1');
   kit.segment('s1', 'n1', 'p1', [1, 0]);
@@ -676,16 +676,43 @@ test('a derived index is not searchable across a model-space switch', async (t) 
 
   kit.plugin.setModelSpace({ model: 'embed-v2', dimensions: 2 });
   assert.equal(kit.registry.stateOf('multimodal-vectors').state, 'building');
+  // The retained generation is still a valid v1 index: a v1 query is answered
+  // from it rather than from a half-built v2 space.
   const oldSpace = await kit.search([1, 0]);
-  assert.equal(oldSpace.ok, false);
-  assert.match(oldSpace.lastError?.message ?? '', /requires 'embed-v2'/);
-
+  assert.equal(oldSpace.ok, true, oldSpace.lastError?.message);
+  assert.deepEqual(oldSpace.result.hits.map((hit) => hit.id), ['s1']);
+  assert.equal(oldSpace.state, 'building');
+  // The declared v2 space has no materialization yet: no hits, never v1 bytes
+  // reinterpreted as v2.
   const newSpace = await kit.registry.search('multimodal-vectors', {
     principal: PRINCIPAL,
     query: { model: 'embed-v2', vector: [1, 0] },
     limit: 10,
   });
-  assert.deepEqual(newSpace.result.hits, [], 'a stale generation is not searchable in the new model space');
+  assert.deepEqual(newSpace.result.hits, []);
+
+  // A v2 rebuild while the source rows are still v1 must FAIL and leave the
+  // retained v1 index searchable — the staged transition's failure behavior.
+  const failed = await kit.registry.rebuild('multimodal-vectors');
+  assert.equal(failed.ok, false);
+  assert.match(failed.lastError?.message ?? '', /requires 'embed-v2'/);
+  assert.deepEqual((await kit.search([1, 0])).result.hits.map((hit) => hit.id), ['s1']);
+  assert.deepEqual(kit.registry.healthOf('multimodal-vectors').plugin.activeSpace, { model: 'embed-v1', dimensions: 2 });
+
+  // Only a complete v2 generation activates v2, atomically.
+  kit.db.prepare('UPDATE NoteSegment SET embedding_model = ?, embedding = ? WHERE id = ?')
+    .run('embed-v2', JSON.stringify([0, 1]), 's1');
+  await kit.rebuild();
+  const activated = await kit.registry.search('multimodal-vectors', {
+    principal: PRINCIPAL,
+    query: { model: 'embed-v2', vector: [0, 1] },
+    limit: 10,
+  });
+  assert.deepEqual(activated.result.hits.map((hit) => hit.id), ['s1']);
+  // The retained v1 bytes are no longer reachable once v2 is active.
+  const retired = await kit.search([1, 0]);
+  assert.equal(retired.ok, false);
+  assert.match(retired.lastError?.message ?? '', /requires 'embed-v2'/);
 });
 
 test('derived segments shadow-rebuild with parity over the fenced projection', async (t) => {
@@ -767,4 +794,267 @@ test('derived segments follow the CURRENT parent project fence', async (t) => {
     (await kit.search([1, 0], { scope: { projectId: 'p2' } })).result.hits.map((hit) => hit.id),
     ['s2'],
   );
+});
+
+// ---- persistent schema upgrade, purge and failure behavior ------------------
+
+const BASE = 'vec_note_vectors';
+const legacyGeneration = (name) => [
+  `CREATE TABLE ${name} (source_key TEXT PRIMARY KEY, scope_id TEXT NOT NULL DEFAULT '', norm REAL NOT NULL, embedding BLOB NOT NULL);`,
+  `CREATE INDEX ${name}_scope_idx ON ${name} (scope_id);`,
+];
+const legacyState = `CREATE TABLE ${BASE}_state (slot TEXT PRIMARY KEY CHECK (slot = 'active'), active INTEGER NOT NULL CHECK (active IN (0, 1)), previous INTEGER NOT NULL CHECK (previous IN (0, 1)), model TEXT NOT NULL, dimensions INTEGER NOT NULL);
+  INSERT INTO ${BASE}_state VALUES ('active', 0, 0, 'embed-v1', 2);`;
+const float32 = (values) => new Uint8Array(new Float32Array(values).buffer.slice(0));
+
+async function bindOwnedIndex(t, db, registry, plugin) {
+  const queue = createWriteQueue();
+  const census = new Map();
+  for (const object of plugin.ownedObjects) {
+    census.set(`${object.kind}:${object.name}`.toLowerCase(), {
+      kind: 'plugin', owner: plugin.id, objectKind: object.kind, name: object.name,
+    });
+  }
+  registry.bindIndex(createSearchOwnedIndexCapability({
+    db, census, writeCoordinator: queue, fenceOf: (id) => registry.stateOf(id).fence,
+  }));
+  t.after(async () => { await queue.close(); });
+}
+
+function persistentNotePlugin() {
+  return createVectorPlugin({
+    id: 'note-vectors',
+    version: '1.0.0',
+    source: { entity: 'Note', vector: 'embedding', model: 'embedding_model', owns: () => true },
+    modelSpace: { model: 'embed-v1', dimensions: 2 },
+    admission: {
+      entity: { name: 'Note' },
+      adapter: { registerResource() {}, async admit() { return { admitted: true, reasonCode: null }; } },
+    },
+  });
+}
+
+// An index written before the derived-segment change already holds vectors and
+// its four-column tables. Boot must NOT need an ALTER: those rows stay readable
+// and writable, with no rebuild and no data loss.
+test('a persistent vector index created before the fence columns upgrades without losing vectors', async (t) => {
+  const db = new DatabaseSync(':memory:');
+  db.exec('CREATE TABLE Note (id TEXT PRIMARY KEY, embedding TEXT, embedding_model TEXT, owner TEXT);');
+  for (const sql of [
+    legacyState,
+    ...legacyGeneration(`${BASE}_g0`),
+    ...legacyGeneration(`${BASE}_g1`),
+  ]) db.exec(sql);
+  db.prepare(`INSERT INTO ${BASE}_g0 (source_key, scope_id, norm, embedding) VALUES (?, '', 1, ?)`)
+    .run('legacy', float32([1, 0]));
+  db.prepare('INSERT INTO Note (id, embedding, embedding_model, owner) VALUES (?, ?, ?, ?)')
+    .run('legacy', JSON.stringify([1, 0]), 'embed-v1', 'alice');
+  db.prepare('INSERT INTO Note (id, embedding, embedding_model, owner) VALUES (?, ?, ?, ?)')
+    .run('fresh', JSON.stringify([0, 1]), 'embed-v1', 'alice');
+
+  const registry = createSearchPluginRegistry();
+  const plugin = persistentNotePlugin();
+  registry.register(plugin);
+  registry.bindSource(db);
+  await bindOwnedIndex(t, db, registry, plugin);
+  const prepared = await registry.prepare('note-vectors');
+  assert.equal(prepared.ok, true, prepared.lastError?.message);
+
+  // The ordinary declaration keeps the legacy column shape, so no upgrade DDL
+  // is implied for existing tables.
+  const generationDdl = plugin.ownedObjects
+    .filter((object) => object.kind === 'table' && /_g[01]$/.test(object.name))
+    .map((object) => object.ddl.join(' '))
+    .join(' ');
+  assert.doesNotMatch(generationDdl, /parent_key/);
+
+  // The existing vector is served immediately, before any rebuild.
+  const served = await registry.search('note-vectors', {
+    principal: PRINCIPAL,
+    query: { model: 'embed-v1', vector: [1, 0] },
+    limit: 10,
+  });
+  assert.equal(served.ok, true, served.lastError?.message);
+  assert.deepEqual(served.result.hits.map((hit) => hit.id), ['legacy']);
+  assert.equal(served.result.hits[0].score, 1);
+
+  // New writes and a full rebuild work against the same tables.
+  const reconciled = await registry.reconcile('note-vectors', [{ entity: 'Note', rowId: 'fresh', kind: 'created' }]);
+  assert.equal(reconciled.ok, true, reconciled.lastError?.message);
+  const rebuilt = await registry.rebuild('note-vectors');
+  assert.equal(rebuilt.ok, true, rebuilt.lastError?.message);
+  const after = await registry.search('note-vectors', {
+    principal: PRINCIPAL,
+    query: { model: 'embed-v1', vector: [1, 0] },
+    limit: 10,
+  });
+  assert.deepEqual(after.result.hits.map((hit) => hit.id), ['legacy', 'fresh']);
+  db.close();
+});
+
+// An ordinary table written by the intermediate build carries the fence columns
+// UNUSED. Explicit column lists must still read and write it.
+test('an ordinary index tolerates a generation table that carries unused fence columns', async (t) => {
+  const db = new DatabaseSync(':memory:');
+  db.exec('CREATE TABLE Note (id TEXT PRIMARY KEY, embedding TEXT, embedding_model TEXT, owner TEXT);');
+  db.exec(legacyState);
+  for (const name of [`${BASE}_g0`, `${BASE}_g1`]) {
+    db.exec(`CREATE TABLE ${name} (source_key TEXT PRIMARY KEY, scope_id TEXT NOT NULL DEFAULT '', norm REAL NOT NULL, embedding BLOB NOT NULL, parent_key TEXT NOT NULL DEFAULT '', revision TEXT NOT NULL DEFAULT '', project_key TEXT NOT NULL DEFAULT '');`);
+    db.exec(`CREATE INDEX ${name}_scope_idx ON ${name} (scope_id);`);
+  }
+  db.prepare(`INSERT INTO ${BASE}_g0 (source_key, scope_id, norm, embedding) VALUES (?, '', 1, ?)`)
+    .run('legacy', float32([1, 0]));
+  db.prepare('INSERT INTO Note (id, embedding, embedding_model, owner) VALUES (?, ?, ?, ?)')
+    .run('legacy', JSON.stringify([1, 0]), 'embed-v1', 'alice');
+
+  const registry = createSearchPluginRegistry();
+  const plugin = persistentNotePlugin();
+  registry.register(plugin);
+  registry.bindSource(db);
+  await bindOwnedIndex(t, db, registry, plugin);
+  assert.equal((await registry.prepare('note-vectors')).ok, true);
+  const served = await registry.search('note-vectors', {
+    principal: PRINCIPAL,
+    query: { model: 'embed-v1', vector: [1, 0] },
+    limit: 10,
+  });
+  assert.deepEqual(served.result.hits.map((hit) => hit.id), ['legacy']);
+  assert.equal((await registry.rebuild('note-vectors')).ok, true);
+  db.close();
+});
+
+// A DERIVED source cannot reuse a pre-fence table, and the owned-index
+// capability cannot ALTER one. Refuse at boot with an actionable message
+// instead of failing halfway through the first write.
+test('a derived source refuses a pre-fence generation table with a rebuild diagnostic', async (t) => {
+  const db = new DatabaseSync(':memory:');
+  db.exec(derivedSchema);
+  db.exec(legacyState);
+  for (const name of [`${BASE}_g0`, `${BASE}_g1`]) db.exec(legacyGeneration(name)[0]);
+  const registry = createSearchPluginRegistry();
+  const plugin = createVectorPlugin({
+    id: 'note-vectors',
+    version: '1.0.0',
+    source: {
+      entity: 'NoteSegment', vector: 'embedding', model: 'embedding_model', owns: () => true,
+      parent: {
+        entity: 'Note', field: 'noteId', revisionField: 'revision', projectField: 'projectId',
+        parentRevisionField: 'revision', parentProjectField: 'projectId',
+      },
+    },
+    modelSpace: { model: 'embed-v1', dimensions: 2 },
+    admission: { entity: { name: 'Note' }, adapter: { registerResource() {}, async admit() { return { admitted: true, reasonCode: null }; } } },
+  });
+  registry.register(plugin);
+  registry.bindSource(db);
+  await bindOwnedIndex(t, db, registry, plugin);
+  const prepared = await registry.prepare('note-vectors');
+  assert.equal(prepared.ok, false);
+  assert.match(prepared.lastError?.message ?? '', /predates the segment fence schema/);
+  db.close();
+});
+
+test('removing a parent purges its vectors from BOTH generations, not just the active one', async (t) => {
+  const kit = await derivedSetup(t);
+  kit.note('n1', 'p1');
+  kit.segment('s1', 'n1', 'p1', [1, 0]);
+  await kit.rebuild();
+  const generations = generationTables(kit.plugin);
+  assert.equal(generations.reduce((total, table) => total + storedCount(kit.db, table, 'parent_key', 'n1'), 0), 1);
+
+  kit.db.prepare('DELETE FROM Note WHERE id = ?').run('n1');
+  const removed = await kit.registry.reconcile('multimodal-vectors', [
+    { entity: 'Note', rowId: 'n1', kind: 'removed' },
+  ]);
+  assert.equal(removed.ok, true, removed.lastError?.message);
+  assert.deepEqual(generations.map((table) => storedCount(kit.db, table, 'parent_key', 'n1')), [0, 0]);
+  assert.equal(kit.registry.healthOf('multimodal-vectors').plugin.vectors, 0);
+  assert.deepEqual((await kit.search([1, 0], { limit: 10 })).result.hits, []);
+});
+
+test('a stale segment is fenced BEFORE its bytes are parsed, so it cannot abort a rebuild', async (t) => {
+  const kit = await derivedSetup(t);
+  kit.note('n1', 'p1', 'r2');
+  // A stale r1 row whose stored embedding is not valid JSON.
+  kit.db.prepare(
+    'INSERT INTO NoteSegment (id, segmentId, noteId, projectId, revision, embedding, embedding_model) VALUES (?, ?, ?, ?, ?, ?, ?)',
+  ).run('stale', 'stale', 'n1', 'p1', 'r1', 'not-json', 'embed-v1');
+  kit.segment('current', 'n1', 'p1', [1, 0], { revision: 'r2' });
+
+  await kit.rebuild();
+  const found = await kit.search([1, 0], { limit: 10 });
+  assert.deepEqual(found.result.hits.map((hit) => hit.id), ['current']);
+
+  // A CURRENT row with the same corruption is still a real error.
+  kit.segment('broken', 'n1', 'p1', [1, 0], { revision: 'r2' });
+  kit.db.prepare('UPDATE NoteSegment SET embedding = ? WHERE id = ?').run('not-json', 'broken');
+  const failed = await kit.registry.rebuild('multimodal-vectors');
+  assert.equal(failed.ok, false);
+  assert.match(failed.lastError?.message ?? '', /invalid JSON/);
+});
+
+test('ordinary vector admission refills the page instead of underfilling it', async (t) => {
+  const db = new DatabaseSync(':memory:');
+  t.after(() => db.close());
+  db.exec('CREATE TABLE Note (id TEXT PRIMARY KEY, embedding TEXT, embedding_model TEXT, owner TEXT);');
+  const registry = createSearchPluginRegistry();
+  registry.register(createVectorPlugin({
+    id: 'note-vectors',
+    version: '1.0.0',
+    source: { entity: 'Note', vector: 'embedding', model: 'embedding_model', owns: () => true },
+    modelSpace: { model: 'embed-v1', dimensions: 2 },
+    admission: {
+      entity: { name: 'Note' },
+      adapter: {
+        registerResource() {},
+        async admit({ row }) {
+          const admitted = row?.owner === 'alice';
+          return { admitted, reasonCode: admitted ? null : 'no-capability' };
+        },
+      },
+    },
+  }));
+  registry.bindSource(db);
+  const insert = db.prepare('INSERT INTO Note (id, embedding, embedding_model, owner) VALUES (?, ?, ?, ?)');
+  insert.run('blocked', JSON.stringify([1, 0]), 'embed-v1', 'mallory');
+  insert.run('a', JSON.stringify([0.9, 0.1]), 'embed-v1', 'alice');
+  insert.run('b', JSON.stringify([0.8, 0.2]), 'embed-v1', 'alice');
+  assert.equal((await registry.rebuild('note-vectors')).ok, true);
+
+  const page = await registry.search('note-vectors', {
+    principal: PRINCIPAL,
+    query: { model: 'embed-v1', vector: [1, 0] },
+    limit: 2,
+  });
+  assert.equal(page.ok, true, page.lastError?.message);
+  assert.deepEqual(page.result.hits.map((hit) => hit.id), ['a', 'b'], 'a denied top hit cannot shorten an ordinary vector page');
+
+  const offsetPage = await registry.search('note-vectors', {
+    principal: PRINCIPAL,
+    query: { model: 'embed-v1', vector: [1, 0] },
+    offset: 1,
+    limit: 1,
+  });
+  assert.deepEqual(offsetPage.result.hits.map((hit) => hit.id), ['b']);
+});
+
+test('a derived admission entity must name the parent row it discloses', () => {
+  const base = {
+    id: 'mismatched-admission',
+    version: '1.0.0',
+    modelSpace: { model: 'embed-v1', dimensions: 2 },
+    source: {
+      entity: 'NoteSegment', vector: 'embedding', model: 'embedding_model', owns: () => true,
+      parent: {
+        entity: 'Note', field: 'noteId', revisionField: 'revision', projectField: 'projectId',
+        parentRevisionField: 'revision', parentProjectField: 'projectId',
+      },
+    },
+  };
+  const adapter = { registerResource() {}, async admit() { return { admitted: true, reasonCode: null }; } };
+  assert.throws(
+    () => createVectorPlugin({ ...base, admission: { entity: { name: 'NoteSegment' }, adapter } }),
+    /admission entity must be 'Note'/,
+  );
+  assert.doesNotThrow(() => createVectorPlugin({ ...base, admission: { entity: { name: 'Note' }, adapter } }));
 });

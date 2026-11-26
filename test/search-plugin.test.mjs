@@ -16,6 +16,7 @@ import { join } from 'node:path';
 import {
   createSearchPluginRegistry,
   createSearchSourceReader,
+  hybridSearch,
   SUPPORTED_SEARCH_PLUGIN_CONTRACT_VERSION,
 } from '../build/search-plugin.mjs';
 import {
@@ -988,5 +989,57 @@ describe('app.registerSearchPlugin surface', () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe('search plugin registry — hybrid fusion pagination contract', () => {
+  // A registry whose branches answer the requested depth, like the real one:
+  // whatever `limit` the composer asks for bounds that branch's candidate list.
+  function depthBoundRegistry(branches) {
+    return {
+      search(pluginId, request) {
+        const hits = (branches[pluginId] ?? []).slice(0, request.limit ?? 0).map((id) => ({ id }));
+        return {
+          ok: true, generation: 1, fence: 0, state: 'ready', counts: {}, lastError: null,
+          result: { hits, generation: 1, fence: 0, state: 'ready' },
+          cancelled: false, timedOut: false,
+        };
+      },
+    };
+  }
+
+  test('per-page windows read ONE stable fused ranking, so pages never repeat a hit', async () => {
+    // `c` and `d` rank low lexically but gain a vector contribution only when
+    // the vector branch is read deeply. A branch depth derived from each page's
+    // own offset would let the shallow page rank a,b first and the deeper page
+    // rank c,d first — repeating `a` across pages 0 and 2.
+    const registry = depthBoundRegistry({ fts: ['a', 'b', 'c', 'd'], vec: ['c', 'd'] });
+    const pages = [];
+    for (let offset = 0; offset < 4; offset += 1) {
+      const page = await hybridSearch({
+        registry,
+        principal: { type: 'user', id: 'alice' },
+        fts: { pluginId: 'fts', query: 'q' },
+        vector: { pluginId: 'vec', query: {} },
+        offset,
+        limit: 1,
+      });
+      assert.equal(page.ok, true);
+      pages.push(...page.hits.map((hit) => hit.key));
+    }
+    assert.deepEqual(pages, ['c', 'd', 'a', 'b']);
+    assert.equal(new Set(pages).size, pages.length, 'paginated hits are unique');
+
+    // The full pool is disclosed, so a caller can tell exhaustion from a
+    // window that was cut short.
+    const full = await hybridSearch({
+      registry,
+      principal: { type: 'user', id: 'alice' },
+      fts: { pluginId: 'fts', query: 'q' },
+      vector: { pluginId: 'vec', query: {} },
+      limit: 10,
+    });
+    assert.equal(full.totalCandidates, 4);
+    assert.deepEqual(full.hits.map((hit) => hit.key), ['c', 'd', 'a', 'b']);
   });
 });

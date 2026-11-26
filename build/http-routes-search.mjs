@@ -1,5 +1,9 @@
 // Framework-owned FTS / vector / hybrid search routes. Hit admission runs
 // through the SAME entity adapter REST uses; unresolvable hits fail closed.
+// The route admits a raw batch before slicing the caller's window and refills
+// across batches, so a denied hit never shortens a page. Hybrid fusion is read
+// at a fixed depth, which keeps concatenated batches over ONE ranking; a failed
+// batch is disclosed as a failure, never as exhausted results.
 
 
 import { collapseForAdmission, anonymous } from './principal.mjs';
@@ -169,30 +173,46 @@ async function admitSearchHitsByEntity(
   return admitted;
 }
 
+// The closed metadata every batch outcome exposes. A batch that did not
+// complete is a FAILURE, never a short page: returning it would let a timeout
+// or a cancelled scan masquerade as exhausted results.
+
+
+
+
+
+
+
 // Admit before slicing. Fetch raw-ranked batches from the SAME search
 // lifecycle, keep only rows the entity adapter admits, and only then apply the
 // caller's offset/limit. A denied top hit therefore cannot shorten the page:
 // scanning continues until the authorized page is full or the ranked results
 // are exhausted. Each batch is a bounded registry request, so the plugin still
 // owns retrieval and the route owns neither a second index nor a second auth
-// engine.
-async function admittedSearchPage      (
+// engine. `truncated` discloses a window cut short by the raw scan bound; a
+// failed batch returns its own outcome with no partial hits.
+async function admittedSearchPage                              (
   app              ,
   authorization                      ,
   principal           ,
   indices                   ,
   fetchPage                                                                                                        ,
   window                                                     ,
-)                                                                    {
+)                                                                                                 {
   const target = window.offset + window.limit;
   let batchSize = Math.min(SEARCH_MAX_RESULTS_CAP, Math.max(window.limit, window.limit * 4));
   const admitted            = [];
   let meta              = null;
   let rawOffset = 0;
-  while (admitted.length < target && rawOffset < SEARCH_MAX_WINDOW) {
+  while (admitted.length < target) {
+    if (rawOffset >= SEARCH_MAX_WINDOW) {
+      return { hits: admitted.slice(window.offset, window.offset + window.limit), meta, truncated: true };
+    }
     const batch = Math.min(batchSize, SEARCH_MAX_WINDOW - rawOffset);
-    if (batch <= 0) break;
     const page = await fetchPage(rawOffset, batch);
+    if (!page.meta.ok) {
+      return { hits: [], meta: page.meta, truncated: false };
+    }
     if (meta === null) meta = page.meta;
     if (page.hits.length === 0) break;
     const admittedBatch = await admitSearchHitsByEntity(app, authorization, page.hits, principal, indices);
@@ -206,6 +226,7 @@ async function admittedSearchPage      (
   return {
     hits: admitted.slice(window.offset, window.offset + window.limit),
     meta,
+    truncated: false,
   };
 }
 
@@ -320,6 +341,11 @@ export async function handleSearchRoute(
         reject(res, 400, 'hybrid search did not return a result');
         return true;
       }
+      // A failed batch (timeout, cancellation, branch error) is disclosed as a
+      // failed result, never as an exhausted page.
+      const failure = result.ok === true
+        ? null
+        : result.outcomes?.fts?.lastError ?? result.outcomes?.vector?.lastError ?? null;
       sendJson(res, 200, {
         ok: result.ok,
         mode: 'hybrid',
@@ -329,6 +355,8 @@ export async function handleSearchRoute(
         k: result.k,
         cancelled: result.cancelled === true,
         timedOut: result.timedOut === true,
+        truncated: page.truncated,
+        ...(failure ? { error: failure.message ?? 'hybrid search failed' } : {}),
       });
     } catch (err) {
       reject(res, 400, err instanceof Error ? err.message : 'invalid hybrid search request');
@@ -379,6 +407,7 @@ export async function handleSearchRoute(
       hits: page.hits,
       cancelled: outcome.cancelled === true,
       timedOut: outcome.timedOut === true,
+      truncated: page.truncated,
       ...(outcome.lastError ? { error: outcome.lastError.message } : {}),
     });
   } catch (err) {

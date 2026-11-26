@@ -46,6 +46,7 @@ import {
   composeHybridSearch,
   HYBRID_SEARCH_DEFAULT_RRF_K,
   SEARCH_DEFAULT_TIMEOUT_MS,
+  SEARCH_MAX_RESULTS_CAP,
   searchPageWindow,
   SearchWindowValidationError,
   searchStalenessOf,
@@ -1157,15 +1158,15 @@ export async function hybridSearch(request: HybridPluginSearchRequest): Promise<
     page: request.page,
     pageSize: request.pageSize,
   });
-  const defaultBranchLimit = Math.max(window.offset + window.limit, (window.offset + window.limit) * 2);
-  const ftsLimit = fts.limit ?? defaultBranchLimit;
-  const vectorLimit = vector.limit ?? defaultBranchLimit;
-
-  const sharedScope = {
-    ...(scope !== undefined ? { scope } : {}),
-    ...(scopeId !== undefined ? { scopeId } : {}),
-  };
-
+  // STABLE FUSION: the branch depth is FIXED, never derived from this page's
+  // offset. RRF scores depend on branch rank, so a depth that grew with the
+  // offset would re-rank already-returned hits between page requests and make
+  // concatenated pages duplicate or skip entries. The fused pool is the union
+  // of the two bounded branch lists; a window past it is honestly empty.
+  const branchLimit = SEARCH_MAX_RESULTS_CAP;
+  const ftsLimit = fts.limit ?? branchLimit;
+  const vectorLimit = vector.limit ?? branchLimit;
+  const sharedScope = { ...(scope !== undefined ? { scope } : {}), ...(scopeId !== undefined ? { scopeId } : {}) };
   const [ftsOutcome, vectorOutcome] = await Promise.all([
     registry.search(fts.pluginId, {
       query: fts.query,
@@ -1189,11 +1190,8 @@ export async function hybridSearch(request: HybridPluginSearchRequest): Promise<
   const vectorStaleness: SearchStaleness = searchStalenessOf(vectorOutcome.state);
 
   if (cancelled || timedOut || !ftsOutcome.ok || !vectorOutcome.ok || !ftsOutcome.result || !vectorOutcome.result) {
-    const worst: SearchStaleness = ftsStaleness === 'stale' || vectorStaleness === 'stale'
-      ? 'stale'
-      : ftsStaleness === 'rebuilding' || vectorStaleness === 'rebuilding'
-        ? 'rebuilding'
-        : 'fresh';
+    const worst: SearchStaleness = ftsStaleness === 'stale' || vectorStaleness === 'stale' ? 'stale'
+      : ftsStaleness === 'rebuilding' || vectorStaleness === 'rebuilding' ? 'rebuilding' : 'fresh';
     return Object.freeze({
       ok: false,
       cancelled,
@@ -1223,11 +1221,7 @@ export async function hybridSearch(request: HybridPluginSearchRequest): Promise<
         staleness: vectorStaleness,
       },
     ],
-    {
-      k,
-      limit: window.limit,
-      offset: window.offset,
-    },
+    { k, limit: window.limit, offset: window.offset },
   );
 
   return Object.freeze({

@@ -15,6 +15,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import workbench from '../build/app.mjs';
 import {
@@ -32,6 +35,7 @@ import {
 } from '../build/index.mjs';
 import { createFts5Plugin } from '../build/fts5-plugin.mjs';
 import { createVectorPlugin } from '../build/vector-plugin.mjs';
+import { SUPPORTED_SEARCH_PLUGIN_CONTRACT_VERSION } from '../build/search-plugin.mjs';
 import { createAuthorizationAdapter } from '../build/authorization-adapter.mjs';
 import { createQueryClient, WorkbenchFailureError } from '../public/workbench-client.mjs';
 
@@ -933,4 +937,154 @@ test('createQueryClient: search round-trip', { skip: SQLITE_AUTHORIZER }, async 
   const hits = await searchClient.search({ mode: 'fts', index: 'note-fts', query: 'coastal', scopeId: 'proj-a', limit: 10 });
   assert.equal(hits.ok, true);
   assert.deepEqual(hits.hits.map((hit) => hit.id).sort(), ['doc-both', 'doc-fts']);
+});
+
+// ---------------------------------------------------------------------------
+// /search pagination stability and batch-failure disclosure
+// ---------------------------------------------------------------------------
+
+// Deny specific ENTITY rows at the ROUTE only. Plugin-level admission still
+// passes them, so the route must refill its authorized page across raw batches.
+function routeRowDenyingAdapter(db, deniedIds) {
+  const inner = createAuthorizationAdapter({ db });
+  return {
+    admit: async (input) => {
+      if (input.category === 'entity' && deniedIds.has(String(input.resourceId))) {
+        return {
+          admitted: false,
+          operation: 'read',
+          resourceCategory: 'entity',
+          resourceId: input.resourceId ?? null,
+          reasonCode: 'no-capability',
+          capabilities: [],
+          trace: null,
+        };
+      }
+      return inner.admit(input);
+    },
+    registerResource: (input) => inner.registerResource(input),
+  };
+}
+
+const hybridBody = (window) => ({
+  mode: 'hybrid',
+  sources: { fts: 'note-fts', vector: 'note-vec' },
+  query: 'clinic',
+  vector: [1, 0, 0],
+  model: 'embed-v1',
+  scopeId: 'proj-a',
+  ...window,
+});
+
+test('POST /search: hybrid deep pages refill route-denied hits across batches, full and deduplicated', { skip: SQLITE_AUTHORIZER }, async (t) => {
+  const db = new DatabaseSync(':memory:');
+  const denied = new Set();
+  for (let i = 1; i < 200; i += 2) denied.add(`paged-${i}`);
+  const authorization = routeRowDenyingAdapter(db, denied);
+  const kit = await bootSearchServer(t, authorization, db);
+  const insert = kit.app.db.prepare(
+    'INSERT INTO Note (id, title, body, projectId, owner, embedding, embedding_model) VALUES (?, ?, ?, ?, ?, ?, ?)',
+  );
+  for (let i = 0; i < 200; i += 1) {
+    const angle = i / 17;
+    insert.run(`paged-${i}`, 'clinic coastal notes', `clinic coastal ${i}`, 'proj-a', 'alice',
+      JSON.stringify([Math.cos(angle), Math.sin(angle), 0.05]), 'embed-v1');
+  }
+  assert.equal((await kit.app.searchPlugins.rebuild('note-fts')).ok, true);
+  assert.equal((await kit.app.searchPlugins.rebuild('note-vec')).ok, true);
+
+  const full = await postJson(kit.origin, '/search', hybridBody({ limit: 120 }), 'alice');
+  assert.equal(full.status, 200);
+  assert.equal(full.body.ok, true);
+  assert.ok(full.body.hits.length > 80, 'the reference page reaches well past the tested window');
+
+  // Each deep page needs several raw batches because half the rows are denied.
+  // Every batch must see the same fused order, so the concatenation is exactly
+  // the authorized prefix — no duplicates, no omissions.
+  const paged = [];
+  for (const offset of [40, 50, 60, 70]) {
+    const page = await postJson(kit.origin, '/search', hybridBody({ offset, limit: 10 }), 'alice');
+    assert.equal(page.status, 200);
+    assert.equal(page.body.ok, true);
+    assert.equal(page.body.truncated, false);
+    assert.equal(page.body.hits.length, 10, `offset ${offset} page stays full`);
+    paged.push(...page.body.hits.map((hit) => hit.key));
+  }
+  assert.equal(new Set(paged).size, paged.length, 'concatenated pages never repeat a hit');
+  assert.deepEqual(paged, full.body.hits.slice(40, 80).map((hit) => hit.key));
+});
+
+test('POST /search: a later batch failure is reported as a failure, not as exhaustion', { skip: SQLITE_AUTHORIZER }, async (t) => {
+  const db = new DatabaseSync(':memory:');
+  const Note = searchNoteEntity();
+  const authorization = denyingAuthorizationAdapter({ denyEntity: true, db });
+  let calls = 0;
+  // The fake index answers the first batch and fails on the next one, which is
+  // only reached because every row is denied to this principal.
+  const plugin = {
+    contractVersion: SUPPORTED_SEARCH_PLUGIN_CONTRACT_VERSION,
+    id: 'flaky-fts',
+    version: '1.0.0',
+    ownedObjects: [],
+    sourceInterests: [{ entity: 'Note' }],
+    stalenessKey: () => null,
+    prepare() {},
+    validate() {},
+    reconcile: () => ({ counts: {} }),
+    rebuild: () => ({ counts: {} }),
+    search(_ctx, request) {
+      calls += 1;
+      if (calls > 1) throw new Error('index scanner unavailable');
+      const limit = Number(request.limit ?? 0);
+      return { hits: Array.from({ length: limit }, (_, index) => ({ id: `n${index}` })) };
+    },
+  };
+  const { app, origin } = await bootApp(t, {
+    db,
+    entities: [Note],
+    authorization,
+    setup: (application) => application.registerSearchPlugin(plugin),
+  });
+  const insert = app.db.prepare(
+    'INSERT INTO Note (id, title, body, projectId, owner, embedding, embedding_model) VALUES (?, ?, ?, ?, ?, ?, ?)',
+  );
+  for (let i = 0; i < 100; i += 1) {
+    insert.run(`n${i}`, 'denied notes', 'denied notes', 'proj-a', 'mallory', '[]', 'embed-v1');
+  }
+
+  const res = await postJson(origin, '/search', { mode: 'fts', index: 'flaky-fts', query: 'denied', limit: 5 }, 'alice');
+  assert.equal(calls, 2, 'the route advanced past the first batch');
+  assert.equal(res.status, 400);
+  assert.equal(res.body.ok, false);
+  assert.equal(res.body.failure?.category, 'invalid-input');
+  assert.equal(res.body.hits, undefined, 'a failed batch never discloses a partial page');
+});
+
+test('POST /search: a pre-existing vector index upgrades through a real boot without a schema change', { skip: SQLITE_AUTHORIZER }, async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'wb-vector-upgrade-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const db = new DatabaseSync(join(root, 'workbench.sqlite'));
+  const base = 'vec_note_vec';
+  // The durable shape written before the derived-segment change: four columns,
+  // no fence metadata, and an active generation that already holds a vector.
+  db.exec(`CREATE TABLE ${base}_state (slot TEXT PRIMARY KEY CHECK (slot = 'active'), active INTEGER NOT NULL CHECK (active IN (0, 1)), previous INTEGER NOT NULL CHECK (previous IN (0, 1)), model TEXT NOT NULL, dimensions INTEGER NOT NULL);
+    INSERT INTO ${base}_state VALUES ('active', 0, 0, 'embed-v1', 3);`);
+  for (const name of [`${base}_g0`, `${base}_g1`]) {
+    db.exec(`CREATE TABLE ${name} (source_key TEXT PRIMARY KEY, scope_id TEXT NOT NULL DEFAULT '', norm REAL NOT NULL, embedding BLOB NOT NULL);`);
+    db.exec(`CREATE INDEX ${name}_scope_idx ON ${name} (scope_id);`);
+  }
+  db.prepare(`INSERT INTO ${base}_g0 (source_key, scope_id, norm, embedding) VALUES (?, 'proj-a', 1, ?)`)
+    .run('doc-vec', new Uint8Array(new Float32Array([1, 0, 0]).buffer.slice(0)));
+
+  // Boot runs the census, skips the existing DDL and rebuilds through the
+  // legacy-shaped tables. A schema that still required parent_key would throw
+  // here instead of serving search.
+  const kit = await bootSearchServer(t, undefined, db);
+  const res = await postJson(kit.origin, '/search', {
+    mode: 'vector', index: 'note-vec', query: { model: 'embed-v1', vector: [1, 0, 0] }, scopeId: 'proj-a', limit: 10,
+  }, 'alice');
+  assert.equal(res.status, 200);
+  assert.equal(res.body.ok, true);
+  assert.ok(res.body.hits.some((hit) => hit.id === 'doc-vec'));
+  assert.equal(res.body.truncated, false);
 });

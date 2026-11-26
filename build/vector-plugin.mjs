@@ -4,6 +4,10 @@
 // before disclosure. Bound indexes page BLOBs in bounded windows; unbound
 // harnesses keep the in-memory slab. Derived search refills its window after
 // denials/fences so pagination is over authorized results.
+// An ordinary source keeps the four-column generation schema it has always
+// written, so an existing index upgrades with no ALTER and no rebuild; a derived
+// source persists the fence in its own tables. While a declared model space is
+// not yet materialized, the retained active generation keeps serving ITS space.
 import { createHash } from 'node:crypto';
 import { Float32VectorSlab, cosineSimilarityFloat32, vectorNorm } from './vector.mjs';
 import {
@@ -164,10 +168,6 @@ function cellValue(value         )                {
   return null;
 }
 
-
-
-
-
 function segmentFence(row                                   , parent                    )                            {
   const parentId = cellValue(row[parent.field]);
   const revision = cellValue(row[parent.revisionField]);
@@ -175,17 +175,8 @@ function segmentFence(row                                   , parent            
   return parentId !== null && revision !== null && projectId !== null ? { parentId, revision, projectId } : null;
 }
 
-
-
-
-
 // Current-parent fence: current row, optional ownership, current project/revision.
-function parentFenceOf(
-  ctx                     ,
-  parent                    ,
-  fence                    ,
-  silent = false,
-)                           {
+function parentFenceOf(ctx                     , parent                    , fence                    , silent = false)                           {
   const row = ctx.reader.row(parent.entity, fence.parentId);
   if (row === undefined) return null;
   if (parent.owns !== undefined) {
@@ -202,12 +193,7 @@ function parentFenceOf(
   if (projectId === null || revision === null || projectId !== fence.projectId || revision !== fence.revision) return null;
   return { row, projectId, revision };
 }
-function derivedHit(
-  match             ,
-  segmentRow                                   ,
-  parentFence                   ,
-  parent                    ,
-)                                    {
+function derivedHit(match             , segmentRow                                   , parentFence                   , parent                    )                                    {
   return Object.freeze({
     id: match.id,
     score: match.score,
@@ -234,15 +220,6 @@ function compareIds(a        , b        )         {
   if (a > b) return 1;
   return 0;
 }
-
-
-
-
-
-
-
-
-
 
 
 function compareScoredMatches(a             , b             )         {
@@ -349,12 +326,32 @@ export function createVectorPlugin(options                     )               {
   )) {
     throw new TypeError('vector plugin requires a search admission configuration');
   }
+  // Plugin-level admission receives the row that will be disclosed: the CURRENT
+  // PARENT for a derived source, the source row otherwise. Refuse a declaration
+  // naming any other entity — its registered scope would compile over the wrong
+  // columns and silently deny every hit.
+  const admittedEntity = parent === undefined ? options.source.entity : parent.entity;
+  if (typeof options.admission?.entity?.name === 'string' && options.admission.entity.name !== admittedEntity) {
+    throw new TypeError(`vector plugin admission entity must be '${admittedEntity}' — the row disclosed for this source`);
+  }
   let modelSpace = Object.freeze({ ...options.modelSpace });
   assertModelSpace(modelSpace);
   let sequence = 0;
   const base = `vec_${options.id.replaceAll(/[^A-Za-z0-9_]/g, '_')}`;
   const stateTable = `${base}_state`;
   const tables = [`${base}_g0`, `${base}_g1`]         ;
+  // Existing persistent indexes predate the derived-segment fence columns, and
+  // the owned-index capability cannot ALTER a table. An ORDINARY source
+  // therefore keeps writing the four columns it always wrote (an extra column
+  // from an intermediate build is ignored by explicit column lists, so both
+  // shapes read and write); only a derived source persists the fence.
+  const vectorColumns = parent === undefined
+    ? 'source_key, scope_id, norm, embedding'
+    : 'source_key, scope_id, norm, embedding, parent_key, revision, project_key';
+  const upsertSql = (table        ) => `INSERT OR REPLACE INTO ${table} (${vectorColumns}) VALUES (?, ?, ?, ?${parent === undefined ? '' : ', ?, ?, ?'})`;
+  const upsertParams = (entry                                                                                                                                                    )                     => parent === undefined
+    ? [entry.id, entry.scopeId, entry.norm, float32ToBlob(entry.vector)]
+    : [entry.id, entry.scopeId, entry.norm, float32ToBlob(entry.vector), entry.fence?.parentId ?? '', entry.fence?.revision ?? '', entry.fence?.projectId ?? ''];
   let activeGen        = 0;
   let buildingGen               = null;
   let promotedGen               = null;
@@ -374,15 +371,9 @@ export function createVectorPlugin(options                     )               {
   }
   function readPersistedState(ctx                     )                                                              {
     if (!hasBoundIndex(ctx)) return null;
-    const row = ctx.index.query({
-      sql: `SELECT active, model, dimensions FROM ${stateTable} WHERE slot = 'active'`,
-    })[0];
+    const row = ctx.index.query({ sql: `SELECT active, model, dimensions FROM ${stateTable} WHERE slot = 'active'` })[0];
     if (!row) return null;
-    return {
-      active: row.active === 1 ? 1 : 0,
-      model: String(row.model ?? ''),
-      dimensions: Number(row.dimensions ?? 0),
-    };
+    return { active: row.active === 1 ? 1 : 0, model: String(row.model ?? ''), dimensions: Number(row.dimensions ?? 0) };
   }
   function currentActiveGeneration(ctx                                 )        {
     if (ctx && hasBoundIndex(ctx)) {
@@ -397,10 +388,9 @@ export function createVectorPlugin(options                     )               {
   function targetTable(ctx                     )         {
     return tables[buildingGen ?? currentActiveGeneration(ctx)];
   }
-  function persistentModelCurrent(ctx                     )          {
+  function materializedInDeclaredSpace(ctx                     )          {
     const persisted = readPersistedState(ctx);
-    return persisted === null
-      || (persisted.model === modelSpace.model && persisted.dimensions === modelSpace.dimensions);
+    return persisted === null || (persisted.model === modelSpace.model && persisted.dimensions === modelSpace.dimensions);
   }
   function countTable(ctx                     , table        )         {
     const row = ctx.index.query({ sql: `SELECT COUNT(*) AS count FROM ${table}` })[0];
@@ -408,23 +398,30 @@ export function createVectorPlugin(options                     )               {
   }
   function tableBoundaryIds(ctx                     , table        , count        )                    {
     if (count === 0) return [];
-    if (count <= CENSUS_BOUNDARY_SAMPLE * 2) {
-      return ctx.index.query({
-        sql: `SELECT source_key FROM ${table} ORDER BY source_key ASC LIMIT ${CENSUS_BOUNDARY_SAMPLE * 2}`,
-      }).map((row) => String(row.source_key));
-    }
-    const head = ctx.index.query({
-      sql: `SELECT source_key FROM ${table} ORDER BY source_key ASC LIMIT ${CENSUS_BOUNDARY_SAMPLE}`,
+    const keys = (order                , limit        ) => ctx.index.query({
+      sql: `SELECT source_key FROM ${table} ORDER BY source_key ${order} LIMIT ${limit}`,
     }).map((row) => String(row.source_key));
-    const tail = ctx.index.query({
-      sql: `SELECT source_key FROM ${table} ORDER BY source_key DESC LIMIT ${CENSUS_BOUNDARY_SAMPLE}`,
-    }).map((row) => String(row.source_key));
-    return [...head, ...tail];
+    if (count <= CENSUS_BOUNDARY_SAMPLE * 2) return keys('ASC', CENSUS_BOUNDARY_SAMPLE * 2);
+    return [...keys('ASC', CENSUS_BOUNDARY_SAMPLE), ...keys('DESC', CENSUS_BOUNDARY_SAMPLE)];
   }
-  function scorePersistedRow(queryVec              , queryNorm        , row                                   )                     {
+  // One page of the plugin's OWN generation table, walking `source_key` in key
+  // order. Explicit column lists keep an ordinary index readable whether its
+  // table predates the fence columns or carries them unused.
+  function persistedPage(ctx                     , table        , columns        , afterKey                    , scopeId         ) {
+    const clauses           = [];
+    const params            = [];
+    if (scopeId !== undefined) { clauses.push('scope_id = ?'); params.push(scopeId); }
+    if (afterKey !== undefined) { clauses.push('source_key > ?'); params.push(afterKey); }
+    const where = clauses.length === 0 ? '' : ` WHERE ${clauses.join(' AND ')}`;
+    return ctx.index.query({
+      sql: `SELECT ${columns} FROM ${table}${where} ORDER BY source_key ASC LIMIT ${PERSISTED_SCAN_PAGE_SIZE}`,
+      params,
+    });
+  }
+  function scorePersistedRow(queryVec              , queryNorm        , row                                   , dimensions        )                     {
     let vector              ;
     try {
-      vector = blobToFloat32(row.embedding, modelSpace.dimensions);
+      vector = blobToFloat32(row.embedding, dimensions);
     } catch {
       return null;
     }
@@ -436,91 +433,61 @@ export function createVectorPlugin(options                     )               {
     const fence = parentKey === null ? undefined : { parentId: parentKey, revision: String(row.revision ?? ''), projectId: String(row.project_key ?? '') };
     return { id: String(row.source_key), score, fence };
   }
-  async function scanPersistedPredicate(
-    ctx                     ,
-    table        ,
-    predicate                                   ,
-    queryVec              ,
-    queryNorm        ,
-    topK                                         ,
-    signal                         ,
-  )                   {
+  // The one walk over the plugin's declared source entity. Every full-corpus
+  // reader (rebuild, predicate scan, collected keys) pages through here, so the
+  // id cursor and its no-progress guard exist exactly once.
+  async function* sourcePages(ctx                     )                                                     {
     let afterId                    ;
-    let pages = 0;
     while (true) {
+      const page = ctx.reader.rows(options.source.entity, { afterId, limit: SOURCE_PAGE_SIZE, order: 'asc' });
+      if (page.length === 0) return;
+      yield page;
+      if (page.length < SOURCE_PAGE_SIZE) return;
+      const lastId = String(page[page.length - 1]?.id ?? '');
+      if (lastId.length === 0 || (afterId !== undefined && lastId <= afterId)) return;
+      afterId = lastId;
+    }
+  }
+  async function scanPersistedPredicate(ctx                     , table        , predicate                                   , queryVec              , queryNorm        , topK                                         , signal                         , dimensions        )                   {
+    let pages = 0;
+    for await (const page of sourcePages(ctx)) {
       if (signal?.aborted) return false;
-      const page = ctx.reader.rows(options.source.entity, {
-        afterId,
-        limit: SOURCE_PAGE_SIZE,
-        order: 'asc',
-      });
-      if (page.length === 0) break;
       const ids           = [];
       for (const row of page) {
-        if (typeof row.id === 'string' && row.id.length > 0 && matchesScope(row, predicate)) {
-          ids.push(row.id);
-        }
+        if (typeof row.id === 'string' && row.id.length > 0 && matchesScope(row, predicate)) ids.push(row.id);
       }
       for (let offset = 0; offset < ids.length; offset += PERSISTED_LOOKUP_CHUNK) {
         if (signal?.aborted) return false;
         const chunk = ids.slice(offset, offset + PERSISTED_LOOKUP_CHUNK);
         const placeholders = chunk.map(() => '?').join(', ');
         const rows = ctx.index.query({
-          sql: `SELECT source_key, norm, embedding, parent_key, revision, project_key FROM ${table} WHERE source_key IN (${placeholders}) LIMIT ${PERSISTED_LOOKUP_CHUNK}`,
+          sql: `SELECT ${vectorColumns} FROM ${table} WHERE source_key IN (${placeholders}) LIMIT ${PERSISTED_LOOKUP_CHUNK}`,
           params: chunk,
         });
         for (const row of rows) {
-          const scored = scorePersistedRow(queryVec, queryNorm, row);
+          const scored = scorePersistedRow(queryVec, queryNorm, row, dimensions);
           if (scored !== null) topK.offer(scored);
         }
       }
-      if (page.length < SOURCE_PAGE_SIZE) break;
-      const lastId = String(page[page.length - 1]?.id ?? '');
-      if (lastId.length === 0 || (afterId !== undefined && lastId <= afterId)) break;
-      afterId = lastId;
       pages += 1;
       if (pages % PERSISTED_YIELD_PAGES === 0) await yieldToEventLoop();
     }
     return true;
   }
-  async function scanPersistedMatches(
-    ctx                     ,
-    table        ,
-    queryVec              ,
-    queryNorm        ,
-    limit        ,
-    filter                     ,
-    signal                         ,
-  )                                  {
+  async function scanPersistedMatches(ctx                     , table        , queryVec              , queryNorm        , limit        , filter                     , signal                         , dimensions        )                                  {
     const topK = createBoundedTopK(limit);
     if (filter.predicate !== undefined) {
-      const completed = await scanPersistedPredicate(ctx, table, filter.predicate, queryVec, queryNorm, topK, signal);
+      const completed = await scanPersistedPredicate(ctx, table, filter.predicate, queryVec, queryNorm, topK, signal, dimensions);
       return completed ? topK.results() : [];
     }
-    const scopeId = filter.scopeId;
     let afterKey                    ;
     let pages = 0;
     while (true) {
       if (signal?.aborted) return [];
-      const rows = scopeId === undefined
-        ? (afterKey === undefined
-          ? ctx.index.query({ sql: `SELECT source_key, norm, embedding, parent_key, revision, project_key FROM ${table} ORDER BY source_key ASC LIMIT ${PERSISTED_SCAN_PAGE_SIZE}` })
-          : ctx.index.query({
-            sql: `SELECT source_key, norm, embedding, parent_key, revision, project_key FROM ${table} WHERE source_key > ? ORDER BY source_key ASC LIMIT ${PERSISTED_SCAN_PAGE_SIZE}`,
-            params: [afterKey],
-          }))
-        : (afterKey === undefined
-          ? ctx.index.query({
-            sql: `SELECT source_key, norm, embedding, parent_key, revision, project_key FROM ${table} WHERE scope_id = ? ORDER BY source_key ASC LIMIT ${PERSISTED_SCAN_PAGE_SIZE}`,
-            params: [scopeId],
-          })
-          : ctx.index.query({
-            sql: `SELECT source_key, norm, embedding, parent_key, revision, project_key FROM ${table} WHERE scope_id = ? AND source_key > ? ORDER BY source_key ASC LIMIT ${PERSISTED_SCAN_PAGE_SIZE}`,
-            params: [scopeId, afterKey],
-          }));
+      const rows = persistedPage(ctx, table, vectorColumns, afterKey, filter.scopeId);
       if (rows.length === 0) break;
       for (const row of rows) {
-        const scored = scorePersistedRow(queryVec, queryNorm, row);
+        const scored = scorePersistedRow(queryVec, queryNorm, row, dimensions);
         if (scored !== null) topK.offer(scored);
       }
       if (rows.length < PERSISTED_SCAN_PAGE_SIZE) break;
@@ -533,18 +500,13 @@ export function createVectorPlugin(options                     )               {
     }
     return topK.results();
   }
-  function validatePersistedTable(ctx                     , table        )       {
+  function validatePersistedTable(ctx                     , table        , dimensions        )       {
     let afterKey                    ;
     while (true) {
-      const rows = afterKey === undefined
-        ? ctx.index.query({ sql: `SELECT source_key, embedding FROM ${table} ORDER BY source_key ASC LIMIT ${PERSISTED_SCAN_PAGE_SIZE}` })
-        : ctx.index.query({
-          sql: `SELECT source_key, embedding FROM ${table} WHERE source_key > ? ORDER BY source_key ASC LIMIT ${PERSISTED_SCAN_PAGE_SIZE}`,
-          params: [afterKey],
-        });
+      const rows = persistedPage(ctx, table, 'source_key, embedding', afterKey);
       if (rows.length === 0) break;
       for (const row of rows) {
-        const vector = blobToFloat32(row.embedding, modelSpace.dimensions);
+        const vector = blobToFloat32(row.embedding, dimensions);
         for (let i = 0; i < vector.length; i += 1) {
           if (!Number.isFinite(vector[i])) {
             throw new Error(`vector '${String(row.source_key)}' contains a non-finite value`);
@@ -569,13 +531,7 @@ export function createVectorPlugin(options                     )               {
       if (result.changes === 0) break;
     }
   }
-  function parseAndValidateRow(row                                   )
-
-
-
-
-
-    {
+  function parseAndValidateRow(row                                   )                                                                                                                                                     {
     const id = row.id;
     if (typeof id !== 'string' || id.length === 0) {
       throw new VectorPluginValidationError('unauthorized-source-ownership', 'vector source row requires a non-empty id');
@@ -602,18 +558,14 @@ export function createVectorPlugin(options                     )               {
     if (parent !== undefined && fence === null) throw new VectorPluginValidationError('invalid-derived-segment', `vector source '${id}' is missing its parent revision fence`);
     return { id, scopeId: scopeValueOf(row, scopeField), vector, norm, fence };
   }
-  async function flushUpserts(
-    ctx                     ,
-    table        ,
-    entries                                                                                                                                                               ,
-  )                {
+  async function flushUpserts(ctx                     , table        , entries                                                                                                                                                               )                {
     if (!hasBoundIndex(ctx) || entries.length === 0) return;
-    const sql = `INSERT OR REPLACE INTO ${table} (source_key, scope_id, norm, embedding, parent_key, revision, project_key) VALUES (?, ?, ?, ?, ?, ?, ?)`;
+    const sql = upsertSql(table);
     for (let offset = 0; offset < entries.length; offset += MAX_WRITE_STATEMENTS) {
       if (isSuperseded(ctx)) return;
       const statements = entries.slice(offset, offset + MAX_WRITE_STATEMENTS).map((entry) => ({
         sql,
-        params: [entry.id, entry.scopeId, entry.norm, float32ToBlob(entry.vector), entry.fence?.parentId ?? '', entry.fence?.revision ?? '', entry.fence?.projectId ?? ''],
+        params: upsertParams(entry),
       }));
       await ctx.index.write({ expectedFence: ctx.fence, statements });
     }
@@ -637,29 +589,22 @@ export function createVectorPlugin(options                     )               {
     }
     await clearTable(ctx, table, true);
     try {
-      let afterId                    ;
-      while (!isSuperseded(ctx)) {
-        const page = ctx.reader.rows(options.source.entity, {
-          afterId,
-          limit: SOURCE_PAGE_SIZE,
-          order: 'asc',
-        });
-        if (page.length === 0) break;
+      for await (const page of sourcePages(ctx)) {
+        if (isSuperseded(ctx)) break;
         const parsedPage                                                                                                                                                       = [];
         for (const row of page) {
-          const parsed = parseAndValidateRow(row);
+          // Fence FIRST: a row whose parent revision/project advanced (or whose
+          // parent is gone) is not part of this projection, so its bytes are
+          // never parsed — a corrupt stale row cannot abort a healthy rebuild.
           if (parent !== undefined) {
             const fence = segmentFence(row, parent);
             if (fence === null || parentFenceOf(ctx, parent, fence) === null) continue;
           }
+          const parsed = parseAndValidateRow(row);
           next?.set(parsed.id, parsed.vector, parsed.norm, parsed.scopeId);
           parsedPage.push(parsed);
         }
         await flushUpserts(ctx, table, parsedPage);
-        if (page.length < SOURCE_PAGE_SIZE) break;
-        const lastId = String(page[page.length - 1]?.id ?? '');
-        if (lastId.length === 0 || (afterId !== undefined && lastId <= afterId)) break;
-        afterId = lastId;
       }
     } catch (err) {
       if (!isSuperseded(ctx)) {
@@ -696,8 +641,14 @@ export function createVectorPlugin(options                     )               {
     const persistent = hasBoundIndex(ctx);
     const next = persistent ? null : targetSlab();
     if (!claimGeneration(ctx)) return { counts: { vectors: materializedCount(ctx) } };
-    // A parent change can move the project/revision fence; rebuild its projection.
+    // A parent change can move the project/revision fence, or remove the parent
+    // entirely. Purge that parent's vectors from BOTH generations BEFORE the
+    // rebuild, so a normal removal cannot leave readable bytes in the retained
+    // generation that only a current-parent check happens to hide.
     if (parent !== undefined && changes.some((change) => change.entity === parent.entity)) {
+      for (const change of changes) {
+        if (change.entity === parent.entity) await purgeRows(ctx, 'parent_key = ?', [change.rowId]);
+      }
       return rebuild(ctx);
     }
     const table = targetTable(ctx);
@@ -730,7 +681,6 @@ export function createVectorPlugin(options                     )               {
         removeFromEveryGeneration(change.rowId);
       } else {
         try {
-          const parsed = parseAndValidateRow(row);
           if (parent !== undefined) {
             const fence = segmentFence(row, parent);
             if (fence === null || parentFenceOf(ctx, parent, fence) === null) {
@@ -739,11 +689,9 @@ export function createVectorPlugin(options                     )               {
               continue;
             }
           }
+          const parsed = parseAndValidateRow(row);
           next?.set(parsed.id, parsed.vector, parsed.norm, parsed.scopeId);
-          statements.push({
-            sql: `INSERT OR REPLACE INTO ${table} (source_key, scope_id, norm, embedding, parent_key, revision, project_key) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            params: [parsed.id, parsed.scopeId, parsed.norm, float32ToBlob(parsed.vector), parsed.fence?.parentId ?? '', parsed.fence?.revision ?? '', parsed.fence?.projectId ?? ''],
-          });
+          statements.push({ sql: upsertSql(table), params: upsertParams(parsed) });
         } catch (err) {
           if (err instanceof VectorPluginValidationError && err.code === 'unauthorized-source-ownership') {
             next?.delete(change.rowId);
@@ -785,23 +733,12 @@ export function createVectorPlugin(options                     )               {
     }
     return { counts: { vectors: next === null ? countTable(ctx, table) : next.size } };
   }
-  function collectAllowedKeys(ctx                     , predicate                                   )                      {
+  async function collectAllowedKeys(ctx                     , predicate                                   )                               {
     const allowed = new Set        ();
-    let afterId                    ;
-    while (true) {
-      const page = ctx.reader.rows(options.source.entity, {
-        afterId,
-        limit: SOURCE_PAGE_SIZE,
-        order: 'asc',
-      });
-      if (page.length === 0) break;
+    for await (const page of sourcePages(ctx)) {
       for (const row of page) {
         if (typeof row.id === 'string' && matchesScope(row, predicate)) allowed.add(row.id);
       }
-      if (page.length < SOURCE_PAGE_SIZE) break;
-      const lastId = String(page[page.length - 1]?.id ?? '');
-      if (lastId.length === 0 || (afterId !== undefined && lastId <= afterId)) break;
-      afterId = lastId;
     }
     return allowed;
   }
@@ -830,22 +767,41 @@ export function createVectorPlugin(options                     )               {
     if (request.signal?.aborted) return { hits: [] };
     if (request.principal === undefined) throw new VectorPluginValidationError('unauthorized-source-ownership', 'vector search requires a principal for result admission');
     const query = request.query                     ;
-    const { vector: queryVec, norm: queryNorm } = validateVectorToFloat32(query?.vector, query?.model, modelSpace, 'query');
+    const bound = hasBoundIndex(ctx);
+    const persisted = bound ? readPersistedState(ctx) : null;
+    // Two spaces may be served: the DECLARED space once materialized, and the
+    // retained ACTIVE generation's own space while a declared change is still
+    // being built (the rollback window). A query never mixes them — it is
+    // answered from exactly one generation, or refused.
+    const space = query?.model === modelSpace.model
+      ? modelSpace
+      : persisted !== null && query?.model === persisted.model
+        ? { model: persisted.model, dimensions: persisted.dimensions }
+        : null;
+    if (space === null) {
+      throw new VectorPluginValidationError(
+        'model-space-mismatch',
+        `vector query has model '${String(query?.model)}'; generation requires '${modelSpace.model}'`,
+      );
+    }
+    const { vector: queryVec, norm: queryNorm } = validateVectorToFloat32(query?.vector, query?.model, space, 'query');
+    const declared = space.model === modelSpace.model && space.dimensions === modelSpace.dimensions;
+    if (declared && persisted !== null && (persisted.model !== space.model || persisted.dimensions !== space.dimensions)) {
+      return { hits: [] };
+    }
+    const generation = declared ? currentActiveGeneration(ctx) : persisted .active;
     const filter = resolveScopeFilter(scopeField, request, query);
     const requested = typeof request.limit === 'number' && Number.isFinite(request.limit) ? Math.floor(request.limit) : SEARCH_MAX_RESULTS_CAP;
     const limit = Math.max(1, requested);
-    const total = parent === undefined
-      ? limit
-      : hasBoundIndex(ctx) ? countTable(ctx, tables[currentActiveGeneration(ctx)]) : activeSlab.size;
+    const total = bound ? countTable(ctx, tables[generation]) : activeSlab.size;
     const staleness = ctx.state !== undefined ? searchStalenessOf(ctx.state) : 'stale';
     let candidateLimit = limit;
     for (;;) {
       let matches                        ;
-      if (hasBoundIndex(ctx)) {
-        if (!persistentModelCurrent(ctx)) return { hits: [] };
-        matches = await scanPersistedMatches(ctx, tables[currentActiveGeneration(ctx)], queryVec, queryNorm, candidateLimit, filter, request.signal);
+      if (bound) {
+        matches = await scanPersistedMatches(ctx, tables[generation], queryVec, queryNorm, candidateLimit, filter, request.signal, space.dimensions);
       } else {
-        const allowedKeys = filter.predicate !== undefined ? collectAllowedKeys(ctx, filter.predicate) : undefined;
+        const allowedKeys = filter.predicate !== undefined ? await collectAllowedKeys(ctx, filter.predicate) : undefined;
         const poolSize = filter.scopeId !== undefined
           ? activeSlab.slotsForScope(filter.scopeId).length
           : allowedKeys !== undefined ? allowedKeys.size : activeSlab.size;
@@ -880,7 +836,10 @@ export function createVectorPlugin(options                     )               {
           'vector search requires a search admission adapter to re-authorize result rows',
         );
       }
-      if (parent === undefined || hits.length >= limit || matches.length < candidateLimit || candidateLimit >= total) {
+      // Admission is part of the index's output contract for EVERY source, not
+      // just derived ones: a denied ordinary candidate must not shorten the
+      // page while lower-ranked authorized candidates remain.
+      if (hits.length >= limit || matches.length < candidateLimit || candidateLimit >= total) {
         return { hits };
       }
       candidateLimit = Math.min(total, candidateLimit * 2);
@@ -901,7 +860,7 @@ export function createVectorPlugin(options                     )               {
         kind: 'table'         ,
         name,
         disposition: { kind: 'retained'         , reason: 'Vector index is derived and rebuilt from the source census' },
-        ddl: [`CREATE TABLE IF NOT EXISTS ${name} (source_key TEXT PRIMARY KEY, scope_id TEXT NOT NULL DEFAULT '', norm REAL NOT NULL, embedding BLOB NOT NULL, parent_key TEXT NOT NULL DEFAULT '', revision TEXT NOT NULL DEFAULT '', project_key TEXT NOT NULL DEFAULT '');`],
+        ddl: [`CREATE TABLE IF NOT EXISTS ${name} (source_key TEXT PRIMARY KEY, scope_id TEXT NOT NULL DEFAULT '', norm REAL NOT NULL, embedding BLOB NOT NULL${parent === undefined ? '' : ", parent_key TEXT NOT NULL DEFAULT '', revision TEXT NOT NULL DEFAULT '', project_key TEXT NOT NULL DEFAULT ''"});`],
       })),
       ...tables.map((name) => ({
         kind: 'index'         ,
@@ -939,6 +898,19 @@ export function createVectorPlugin(options                     )               {
     },
     async prepare(ctx) {
       if (!hasBoundIndex(ctx)) return;
+      // A DERIVED source needs the fence columns. An owned-index statement
+      // cannot ALTER a table, so an index created before the derived schema has
+      // to be rebuilt rather than silently failing on its first write. Refuse
+      // at boot with the exact table and a next step.
+      if (parent !== undefined) {
+        for (const table of tables) {
+          try {
+            ctx.index.query({ sql: `SELECT parent_key FROM ${table} LIMIT 1` });
+          } catch {
+            throw new Error(`vector plugin '${options.id}' needs a derived-segment index rebuild: ${table} predates the segment fence schema (drop it, or register a new plugin id, then rebuild)`);
+          }
+        }
+      }
       await ctx.index.write({
         expectedFence: ctx.fence,
         statements: [{
@@ -948,11 +920,18 @@ export function createVectorPlugin(options                     )               {
       });
     },
     validate(ctx) {
-      if (hasBoundIndex(ctx)) {
-        validatePersistedTable(ctx, targetTable(ctx));
+      if (!hasBoundIndex(ctx)) {
+        targetSlab().validateFinite();
         return;
       }
-      targetSlab().validateFinite();
+      // Validate the generation that is actually served, in ITS OWN space: a
+      // retained generation predates the declared model space.
+      const persisted = readPersistedState(ctx);
+      validatePersistedTable(
+        ctx,
+        persisted === null ? targetTable(ctx) : tables[persisted.active],
+        persisted === null ? modelSpace.dimensions : persisted.dimensions,
+      );
     },
     reconcile,
     revoke,
@@ -1067,12 +1046,19 @@ export function createVectorPlugin(options                     )               {
       if (discarded !== null) await clearTable(ctx, tables[discarded], true);
     },
     health(ctx) {
-      const vectors = hasBoundIndex(ctx) && persistentModelCurrent(ctx)
-        ? countTable(ctx, tables[currentActiveGeneration(ctx)])
-        : (hasBoundIndex(ctx) ? 0 : activeSlab.size);
+      const persisted = hasBoundIndex(ctx) ? readPersistedState(ctx) : null;
+      const bound = hasBoundIndex(ctx);
+      const vectors = bound
+        ? (persisted === null ? 0 : countTable(ctx, tables[persisted.active]))
+        : activeSlab.size;
       return Object.freeze({
         generationIdentity: generationIdentity(modelSpace, sequence),
         modelSpace,
+        // The space the retained generation actually holds; differs from
+        // `modelSpace` only while a declared change is not yet materialized.
+        activeSpace: persisted === null || materializedInDeclaredSpace(ctx)
+          ? modelSpace
+          : { model: persisted.model, dimensions: persisted.dimensions },
         vectors,
       });
     },

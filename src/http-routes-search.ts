@@ -77,15 +77,32 @@ function searchWindow(body: Record<string, unknown>): { readonly offset: number;
 // admitted against; otherwise the hit came from its source entity directly.
 // A fused (hybrid) hit wraps the plugin hit under `hit`, so provenance is read
 // from either level.
+function fenceCell(value: unknown): string | null {
+  if (typeof value === 'string') return value.length > 0 ? value : null;
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  return null;
+}
+
+interface DerivedHitFence {
+  readonly entity: CrudEntity;
+  readonly id: string;
+  readonly projectId: string | null;
+  readonly revision: string | null;
+  readonly parentProjectField: string;
+  readonly parentRevisionField: string;
+  readonly parentOwns?: (row: Readonly<Record<string, unknown>>) => boolean;
+}
+
 function searchHitAuthorization(
   app: FrameworkApp,
   hit: unknown,
   indices: readonly string[],
-): { readonly entity: CrudEntity; readonly id: string } | undefined {
+): { readonly entity: CrudEntity; readonly id: string; readonly derivedFence?: Omit<DerivedHitFence, 'entity' | 'id'> } | undefined {
   if (!app.entities) return undefined;
   const outer = hit !== null && typeof hit === 'object' ? hit as Record<string, unknown> : null;
   if (!outer) return undefined;
   const nested = outer.hit !== null && typeof outer.hit === 'object' ? outer.hit as Record<string, unknown> : null;
+  const plugins = (app as { searchPlugins?: SearchPluginRegistry }).searchPlugins;
 
   // Explicit provenance wins and is fail-closed: if it names an entity this
   // app does not know, the hit is not re-labeled with a guessed source.
@@ -95,7 +112,32 @@ function searchHitAuthorization(
     const rowId = searchRowId(record.authorizationRowId);
     if (typeof entityName === 'string' && entityName.length > 0 && rowId !== null) {
       const entity = app.entities.get(entityName);
-      return entity ? { entity, id: rowId } : undefined;
+      if (!entity) return undefined;
+      let parentProjectField = 'projectId';
+      let parentRevisionField = 'revision';
+      let parentOwns: ((row: Readonly<Record<string, unknown>>) => boolean) | undefined;
+      for (const index of indices) {
+        const plugin = typeof plugins?.get === 'function' ? plugins.get(index) as {
+          parentSource?: { entity?: string; parentProjectField?: string; parentRevisionField?: string; owns?: (row: Readonly<Record<string, unknown>>) => boolean };
+        } | undefined : undefined;
+        if (plugin?.parentSource?.entity === entityName) {
+          if (typeof plugin.parentSource.parentProjectField === 'string') parentProjectField = plugin.parentSource.parentProjectField;
+          if (typeof plugin.parentSource.parentRevisionField === 'string') parentRevisionField = plugin.parentSource.parentRevisionField;
+          if (typeof plugin.parentSource.owns === 'function') parentOwns = plugin.parentSource.owns;
+          break;
+        }
+      }
+      return {
+        entity,
+        id: rowId,
+        derivedFence: {
+          projectId: fenceCell(record.projectId),
+          revision: fenceCell(record.sourceRevision),
+          parentProjectField,
+          parentRevisionField,
+          parentOwns,
+        },
+      };
     }
   }
 
@@ -104,7 +146,6 @@ function searchHitAuthorization(
   const candidates: string[] = [];
   const explicit = outer.entity;
   if (typeof explicit === 'string') candidates.push(explicit);
-  const plugins = (app as { searchPlugins?: SearchPluginRegistry }).searchPlugins;
   for (const index of indices) {
     const plugin = typeof plugins?.get === 'function' ? plugins.get(index) : undefined;
     const interest = plugin?.sourceInterests?.[0];
@@ -156,10 +197,28 @@ async function admitSearchHitsByEntity(
     // index snapshot means this hit cannot be re-authorized. Drop it rather
     // than disclose a stale or plugin-forged row body.
     if (source === undefined || !stored) continue;
-    const { entity, id } = source;
+    const { entity, id, derivedFence } = source;
     const row = typeof entity.deserializeRow === 'function'
       ? entity.deserializeRow({ ...stored })
       : stored;
+    // Re-verify the derived hit's projectId and sourceRevision fence against
+    // the CURRENT parent row before disclosing, even when the principal can
+    // read the updated parent.
+    if (derivedFence !== undefined) {
+      if (derivedFence.projectId === null || derivedFence.revision === null) continue;
+      const currentProject = fenceCell((row as Record<string, unknown>)[derivedFence.parentProjectField]);
+      const currentRevision = fenceCell((row as Record<string, unknown>)[derivedFence.parentRevisionField]);
+      if (currentProject !== derivedFence.projectId || currentRevision !== derivedFence.revision) continue;
+      if (derivedFence.parentOwns !== undefined) {
+        let owned = false;
+        try {
+          owned = derivedFence.parentOwns(row as Record<string, unknown>) === true;
+        } catch {
+          owned = false;
+        }
+        if (!owned) continue;
+      }
+    }
     const decision = await authorization.admit({
       category: 'entity',
       verb: 'read',
@@ -196,7 +255,7 @@ async function admittedSearchPage<Meta extends SearchBatchMeta>(
   authorization: AuthorizationAdapter,
   principal: Principal,
   indices: readonly string[],
-  fetchPage: (offset: number, limit: number) => Promise<{ readonly hits: readonly unknown[]; readonly meta: Meta }>,
+  fetchPage: (offset: number, limit: number) => Promise<{ readonly hits: readonly unknown[]; readonly meta: Meta; readonly truncated?: boolean }>,
   window: { readonly offset: number; readonly limit: number },
 ): Promise<{ readonly hits: unknown[]; readonly meta: Meta | null; readonly truncated: boolean }> {
   const target = window.offset + window.limit;
@@ -204,6 +263,7 @@ async function admittedSearchPage<Meta extends SearchBatchMeta>(
   const admitted: unknown[] = [];
   let meta: Meta | null = null;
   let rawOffset = 0;
+  let poolTruncated = false;
   while (admitted.length < target) {
     if (rawOffset >= SEARCH_MAX_WINDOW) {
       return { hits: admitted.slice(window.offset, window.offset + window.limit), meta, truncated: true };
@@ -214,6 +274,7 @@ async function admittedSearchPage<Meta extends SearchBatchMeta>(
       return { hits: [], meta: page.meta, truncated: false };
     }
     if (meta === null) meta = page.meta;
+    if (page.truncated) poolTruncated = true;
     if (page.hits.length === 0) break;
     const admittedBatch = await admitSearchHitsByEntity(app, authorization, page.hits, principal, indices);
     admitted.push(...admittedBatch);
@@ -226,7 +287,7 @@ async function admittedSearchPage<Meta extends SearchBatchMeta>(
   return {
     hits: admitted.slice(window.offset, window.offset + window.limit),
     meta,
-    truncated: false,
+    truncated: poolTruncated && admitted.length < target,
   };
 }
 
@@ -332,7 +393,7 @@ export async function handleSearchRoute(
           const next = typeof (registry as SearchRegistry).hybridSearch === 'function'
             ? await (registry as SearchRegistry).hybridSearch!(request)
             : await hybridSearch({ registry: registry as SearchPluginRegistry, ...request } as never);
-          return { hits: next.hits ?? [], meta: next };
+          return { hits: next.hits ?? [], meta: next, truncated: next.truncated === true };
         },
         window,
       );
@@ -385,7 +446,7 @@ export async function handleSearchRoute(
       [index],
       async (offset, limit) => {
         const outcome = await (registry as SearchRegistry).search(index, { ...request, offset, limit });
-        return { hits: outcome.result?.hits ?? [], meta: outcome };
+        return { hits: outcome.result?.hits ?? [], meta: outcome, truncated: outcome.result?.truncated === true };
       },
       window,
     );

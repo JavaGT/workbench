@@ -12,7 +12,7 @@ import {
 } from './search-plugin.ts';
 import { censusOfRows, type SearchCensus, type SearchEntityCensus, type SearchShadowCapabilities } from './search-reconcile.ts';
 import { admitSearchHits } from './search-auth.ts';
-import { SEARCH_MAX_RESULTS_CAP, searchStalenessOf } from './search-response.ts';
+import { SEARCH_MAX_WINDOW, searchStalenessOf } from './search-response.ts';
 import type { AuthorizationAdapter } from './authorization-adapter.ts';
 import type { EntityRecord } from './row-grant.ts';
 
@@ -507,72 +507,59 @@ export function createFts5Plugin(options: Fts5PluginOptions): Fts5Plugin {
       if (request.principal === undefined) throw new Fts5QueryValidationError('FTS5 search requires a principal for result admission');
       const table = tables[activeGeneration(ctx)];
       try {
-        // Single-query FTS5 projection: uses SQLite's parser directly, filters
-        // by `scope_id = ?` BEFORE `LIMIT`, and determines per-column match
-        // attribution via `highlight(...) IS NOT <field>` without N*F extra
-        // MATCH queries.
+        // Single-query FTS5 projection: pre-filters `scope_id` before LIMIT,
+        // attributes per-column matches via highlight(), and refills on denial.
         const matchExprs = options.source.fields
-          .map((field, index) => `(highlight(${table}, ${index}, '[', ']') IS NOT ${field}) AS matched_${index}`)
-          .join(', ');
+          .map((field, index) => `(highlight(${table}, ${index}, '[', ']') IS NOT ${field}) AS matched_${index}`).join(', ');
         const snippetExprs = options.source.fields
-          .map((_, index) => `snippet(${table}, ${index}, '[', ']', '...', ?) AS excerpt_${index}`)
-          .join(', ');
-        const whereClause = scopeId === undefined
-          ? `${table} MATCH ?`
-          : `${table} MATCH ? AND ${SCOPE_COLUMN} = ?`;
-        const whereParams: unknown[] = scopeId === undefined
-          ? [queryText]
-          : [queryText, scopeId];
-        const limit = Math.min(SEARCH_MAX_RESULTS_CAP, Math.max(0, Math.floor(request.limit ?? 100)));
+          .map((_, index) => `snippet(${table}, ${index}, '[', ']', '...', ?) AS excerpt_${index}`).join(', ');
+        const whereClause = scopeId === undefined ? `${table} MATCH ?` : `${table} MATCH ? AND ${SCOPE_COLUMN} = ?`;
+        const whereParams: unknown[] = scopeId === undefined ? [queryText] : [queryText, scopeId];
+        const limit = Math.min(SEARCH_MAX_WINDOW, Math.max(0, Math.floor(request.limit ?? 100)));
+        if (limit === 0 || request.signal?.aborted) return { hits: [] };
         const snippetTokens = Math.min(64, snippetLength);
-        const rows = ctx.index.query({
-          sql: `SELECT ${idColumn} AS id, bm25(${table}) AS score, ${matchExprs}, ${snippetExprs} FROM ${table} WHERE ${whereClause} ORDER BY score ASC, ${idColumn} ASC LIMIT ?`,
-          params: [...options.source.fields.map(() => snippetTokens), ...whereParams, limit],
-        });
-        const greatest = Math.max(0, ...rows.map((row) => -asNumber(row.score)));
-        const candidates = rows.map((row) => {
-          const id = String(row.id);
-          // Cross-field matches are ambiguous, so only attribute an excerpt
-          // when exactly one indexed column matched the FTS5 query.
-          const matchingFieldIndexes: number[] = [];
-          for (let index = 0; index < options.source.fields.length; index += 1) {
-            if (Number(row[`matched_${index}`]) === 1) matchingFieldIndexes.push(index);
-          }
-          const fieldIndex = matchingFieldIndexes.length === 1 ? matchingFieldIndexes[0] : undefined;
-          const excerpt = fieldIndex === undefined ? undefined : row[`excerpt_${fieldIndex}`];
-          const hit = Object.freeze({
-            id,
-            rank: greatest === 0 ? 1 : Math.max(0, -asNumber(row.score) / greatest),
-            ...(fieldIndex === undefined ? {} : { excerptField: options.source.fields[fieldIndex] }),
-          });
-          return {
-            hit,
-            key: id,
-            rank: hit.rank,
-            row: ctx.reader.row(options.source.entity, id) ?? null,
-            ...(typeof excerpt === 'string' && hit.excerptField !== undefined ? {
-              excerpt: {
-                entity: options.admission.entity,
-                fieldName: hit.excerptField,
-                text: boundedExcerpt(excerpt, snippetLength),
-              },
-            } : {}),
-          };
-        });
         const staleness = ctx.state !== undefined ? searchStalenessOf(ctx.state) : 'stale';
-        const admitted = await admitSearchHits(options.admission.adapter, {
-          pluginId: options.id,
-          generation: ctx.generation,
-          staleness,
-          principal: request.principal,
-          candidates,
-        });
-        return {
-          hits: Object.freeze(admitted.hits.map(({ hit, excerpt }) => Object.freeze({
-            ...hit,
-            ...(excerpt !== undefined ? { excerpt } : {}),
-          }))),
-        };
+        let candidateLimit = limit;
+        for (;;) {
+          if (request.signal?.aborted) return { hits: [] };
+          const rows = ctx.index.query({
+            sql: `SELECT ${idColumn} AS id, bm25(${table}) AS score, ${matchExprs}, ${snippetExprs} FROM ${table} WHERE ${whereClause} ORDER BY score ASC, ${idColumn} ASC LIMIT ?`,
+            params: [...options.source.fields.map(() => snippetTokens), ...whereParams, candidateLimit],
+          });
+          if (request.signal?.aborted) return { hits: [] };
+          const greatest = Math.max(0, ...rows.map((row) => -asNumber(row.score)));
+          const candidates = rows.map((row) => {
+            const id = String(row.id);
+            const matchingFieldIndexes: number[] = [];
+            for (let index = 0; index < options.source.fields.length; index += 1) {
+              if (Number(row[`matched_${index}`]) === 1) matchingFieldIndexes.push(index);
+            }
+            const fieldIndex = matchingFieldIndexes.length === 1 ? matchingFieldIndexes[0] : undefined;
+            const excerpt = fieldIndex === undefined ? undefined : row[`excerpt_${fieldIndex}`];
+            const hit = Object.freeze({
+              id, rank: greatest === 0 ? 1 : Math.max(0, -asNumber(row.score) / greatest),
+              ...(fieldIndex === undefined ? {} : { excerptField: options.source.fields[fieldIndex] }),
+            });
+            return {
+              hit, key: id, rank: hit.rank, row: ctx.reader.row(options.source.entity, id) ?? null,
+              ...(typeof excerpt === 'string' && hit.excerptField !== undefined ? {
+                excerpt: { entity: options.admission.entity, fieldName: hit.excerptField, text: boundedExcerpt(excerpt, snippetLength) },
+              } : {}),
+            };
+          });
+          const admitted = await admitSearchHits(options.admission.adapter, {
+            pluginId: options.id, generation: ctx.generation, staleness, principal: request.principal, candidates,
+          });
+          if (request.signal?.aborted) return { hits: [] };
+          const hits = Object.freeze(admitted.hits.slice(0, limit).map(({ hit, excerpt }) => Object.freeze({
+            ...hit, ...(excerpt !== undefined ? { excerpt } : {}),
+          })));
+          const truncated = rows.length >= candidateLimit && candidateLimit >= SEARCH_MAX_WINDOW && hits.length < limit;
+          if (hits.length >= limit || rows.length < candidateLimit || candidateLimit >= SEARCH_MAX_WINDOW) {
+            return truncated ? { hits, truncated: true } : { hits };
+          }
+          candidateLimit = Math.min(SEARCH_MAX_WINDOW, candidateLimit * 2);
+        }
       } catch (error) {
         if (error instanceof Fts5QueryValidationError) throw error;
         throw new Fts5QueryValidationError(`FTS5 query is malformed: ${error instanceof Error ? error.message : String(error)}`);

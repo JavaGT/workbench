@@ -1040,6 +1040,24 @@ describe('search plugin registry — hybrid fusion pagination contract', () => {
       limit: 10,
     });
     assert.equal(full.totalCandidates, 4);
+    assert.equal(full.truncated, false);
     assert.deepEqual(full.hits.map((hit) => hit.key), ['c', 'd', 'a', 'b']);
+  });
+
+  test('hybridSearch discloses truncated: true when a 1000-depth branch is exhausted before offset + limit', async () => {
+    const ids = Array.from({ length: 1200 }, (_, i) => `h-${String(i).padStart(4, '0')}`);
+    const registry = depthBoundRegistry({ fts: ids, vec: ids });
+    const partial = await hybridSearch({
+      registry,
+      principal: { type: 'user', id: 'alice' },
+      fts: { pluginId: 'fts', query: 'q' },
+      vector: { pluginId: 'vec', query: {} },
+      offset: 995,
+      limit: 10,
+    });
+    assert.equal(partial.ok, true);
+    assert.equal(partial.totalCandidates, 1000);
+    assert.equal(partial.hits.length, 5);
+    assert.equal(partial.truncated, true);
   });
 });

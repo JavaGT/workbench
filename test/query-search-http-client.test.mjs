@@ -1088,3 +1088,79 @@ test('POST /search: a pre-existing vector index upgrades through a real boot wit
   assert.ok(res.body.hits.some((hit) => hit.id === 'doc-vec'));
   assert.equal(res.body.truncated, false);
 });
+
+test('POST /search: HTTP re-admission fences derived hits on current parent revision and projectId', { skip: SQLITE_AUTHORIZER }, async (t) => {
+  const kit = await bootDerivedSearchServer(t);
+  kit.note('n1', { projectId: 'p1', revision: 'r1', owner: 'alice', title: 'coastal', body: 'coastal' });
+  kit.segment('seg-1', 'n1', { projectId: 'p1', revision: 'r1', embedding: [1, 0] });
+  await kit.rebuild();
+
+  // Parent advances revision while alice STILL has read authorization on n1.
+  kit.app.db.prepare('UPDATE Note SET revision = ? WHERE id = ?').run('r2', 'n1');
+  const staleRevVec = await postJson(kit.origin, '/search', { ...derivedVectorQuery, limit: 10 }, 'alice');
+  assert.equal(staleRevVec.status, 200);
+  assert.deepEqual(staleRevVec.body.hits, [], 'HTTP re-admission rejects stale revision even when principal can read current parent');
+
+  const staleRevHybrid = await postJson(kit.origin, '/search', {
+    mode: 'hybrid',
+    sources: { fts: 'note-fts', vector: 'note-vec' },
+    query: 'coastal',
+    vector: [1, 0],
+    model: 'embed-v1',
+    scopeId: 'p1',
+    limit: 10,
+  }, 'alice');
+  assert.equal(staleRevHybrid.status, 200);
+  assert.ok(!staleRevHybrid.body.hits.some((hit) => hit.key === 'seg-1'));
+
+  // Parent restores revision r1 but moves projectId to p2.
+  kit.app.db.prepare('UPDATE Note SET revision = ?, projectId = ? WHERE id = ?').run('r1', 'p2', 'n1');
+  const staleProjVec = await postJson(kit.origin, '/search', { ...derivedVectorQuery, limit: 10 }, 'alice');
+  assert.equal(staleProjVec.status, 200);
+  assert.deepEqual(staleProjVec.body.hits, [], 'HTTP re-admission rejects mismatched projectId');
+});
+
+test('POST /search: FTS single-index refills route-denied hits to return a full page', { skip: SQLITE_AUTHORIZER }, async (t) => {
+  const db = new DatabaseSync(':memory:');
+  const denied = new Set(['d0', 'd1', 'd2']);
+  const kit = await bootSearchServer(t, routeRowDenyingAdapter(db, denied), db);
+  const insert = kit.app.db.prepare(
+    'INSERT INTO Note (id, title, body, projectId, owner, embedding, embedding_model) VALUES (?, ?, ?, ?, ?, ?, ?)',
+  );
+  for (const id of ['d0', 'd1', 'd2']) insert.run(id, 'harbor harbor harbor', 'harbor', 'proj-a', 'alice', '[1,0,0]', 'embed-v1');
+  for (const id of ['a0', 'a1', 'a2']) insert.run(id, 'harbor', 'notes', 'proj-a', 'alice', '[0,1,0]', 'embed-v1');
+  assert.equal((await kit.app.searchPlugins.rebuild('note-fts')).ok, true);
+
+  const res = await postJson(kit.origin, '/search', {
+    mode: 'fts', index: 'note-fts', query: 'harbor', scopeId: 'proj-a', limit: 3,
+  }, 'alice');
+  assert.equal(res.status, 200);
+  assert.equal(res.body.ok, true);
+  assert.deepEqual(res.body.hits.map((hit) => hit.id).sort(), ['a0', 'a1', 'a2']);
+  assert.equal(res.body.truncated, false);
+});
+
+test('POST /search: hybrid discloses truncated: true when bounded candidate pool is exhausted before offset + limit', { skip: SQLITE_AUTHORIZER }, async (t) => {
+  const db = new DatabaseSync(':memory:');
+  const kit = await bootSearchServer(t, undefined, db);
+  const insert = kit.app.db.prepare(
+    'INSERT INTO Note (id, title, body, projectId, owner, embedding, embedding_model) VALUES (?, ?, ?, ?, ?, ?, ?)',
+  );
+  for (let i = 0; i < 1005; i += 1) {
+    const angle = i / 500;
+    insert.run(`pool-${String(i).padStart(4, '0')}`, 'clinic', 'clinic', 'proj-a', 'alice',
+      JSON.stringify([Math.cos(angle), Math.sin(angle), 0.1]), 'embed-v1');
+  }
+  assert.equal((await kit.app.searchPlugins.rebuild('note-fts')).ok, true);
+  assert.equal((await kit.app.searchPlugins.rebuild('note-vec')).ok, true);
+
+  const boundary = await postJson(kit.origin, '/search', hybridBody({ offset: 995, limit: 10 }), 'alice');
+  assert.equal(boundary.status, 200);
+  assert.equal(boundary.body.ok, true);
+  assert.equal(boundary.body.truncated, true, 'exhausted 1000-depth hybrid pool discloses truncation');
+
+  const pastPool = await postJson(kit.origin, '/search', hybridBody({ offset: 1000, limit: 10 }), 'alice');
+  assert.equal(pastPool.status, 200);
+  assert.equal(pastPool.body.ok, true);
+  assert.equal(pastPool.body.truncated, true, 'offset past bounded hybrid pool discloses truncation');
+});

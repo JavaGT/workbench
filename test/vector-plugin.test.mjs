@@ -1058,3 +1058,174 @@ test('a derived admission entity must name the parent row it discloses', () => {
   );
   assert.doesNotThrow(() => createVectorPlugin({ ...base, admission: { entity: { name: 'Note' }, adapter } }));
 });
+
+test('Float32 ingress rejects finite numbers overflowing Float32 and zero-norm vectors', async (t) => {
+  const kit = await derivedSetup(t);
+  kit.note('n1', 'p1');
+  assert.throws(
+    () => kit.plugin.validateSourceRow({
+      id: 'overflow', segmentId: 'overflow', noteId: 'n1', projectId: 'p1', revision: 'r1',
+      embedding: [1, 1e100], embedding_model: 'embed-v1',
+    }),
+    (err) => err instanceof VectorPluginValidationError && err.code === 'non-finite-value',
+  );
+  assert.throws(
+    () => kit.plugin.validateSourceRow({
+      id: 'zero', segmentId: 'zero', noteId: 'n1', projectId: 'p1', revision: 'r1',
+      embedding: [0, 0], embedding_model: 'embed-v1',
+    }),
+    (err) => err instanceof VectorPluginValidationError && err.code === 'invalid-vector',
+  );
+
+  const overflowQuery = await kit.search([1, 1e100]);
+  assert.equal(overflowQuery.ok, false);
+  assert.match(overflowQuery.lastError?.message ?? '', /non-finite/);
+
+  const zeroQuery = await kit.search([0, 0]);
+  assert.equal(zeroQuery.ok, false);
+  assert.match(zeroQuery.lastError?.message ?? '', /non-zero/);
+});
+
+test('staged generation manifest gates activation and resumes from checkpoint without wiping staged rows', async (t) => {
+  const kit = await derivedSetup(t);
+  kit.note('n1', 'p1');
+  for (let i = 0; i < 600; i += 1) {
+    kit.segment(`s-${String(i).padStart(4, '0')}`, 'n1', 'p1', [1, 0]);
+  }
+  await kit.rebuild();
+
+  // Switch model space and stage only the first page (512 of 600 rows).
+  kit.plugin.setModelSpace({ model: 'embed-v2', dimensions: 2, spaceId: 'embed-v2:2' });
+  kit.db.prepare('UPDATE NoteSegment SET embedding_model = ?').run('embed-v2');
+  const ctx = () => ({
+    id: kit.plugin.id,
+    version: kit.plugin.version,
+    reader: kit.registry.sourceReader('multimodal-vectors'),
+    index: kit.registry.ownedIndex('multimodal-vectors'),
+    generation: kit.registry.stateOf('multimodal-vectors').generation + 1,
+    fence: kit.registry.stateOf('multimodal-vectors').fence,
+  });
+
+  const partial = await kit.plugin.stageGeneration(ctx(), { maxBatches: 1 });
+  assert.equal(partial.status, 'staging');
+  assert.equal(partial.model, 'embed-v2');
+  assert.equal(partial.spaceId, 'embed-v2:2');
+  assert.equal(partial.expectedCount, 600);
+  assert.equal(partial.indexedCount, 512);
+  assert.ok(partial.cursor && partial.cursor.length > 0);
+  assert.equal(kit.registry.healthOf('multimodal-vectors').plugin.staging?.indexedCount, 512);
+
+  // Incomplete staged generation cannot be activated; old active generation stays intact.
+  await assert.rejects(() => kit.plugin.activateGeneration(ctx(), partial.generation), /incomplete/);
+  assert.deepEqual(kit.registry.healthOf('multimodal-vectors').plugin.activeSpace, { model: 'embed-v1', dimensions: 2 });
+
+  // Spy on index.clear / DELETE to verify resume does NOT wipe the 512 staged rows.
+  const index = kit.registry.ownedIndex('multimodal-vectors');
+  let cleared = false;
+  const resumeCtx = {
+    ...ctx(),
+    index: {
+      ...index,
+      clear: async (req) => { cleared = true; return index.clear(req); },
+    },
+  };
+  const completed = await kit.plugin.stageGeneration(resumeCtx);
+  assert.equal(cleared, false, 'resuming from checkpoint must not wipe already-staged rows');
+  assert.equal(completed.status, 'ready');
+  assert.equal(completed.indexedCount, 600);
+  assert.equal(completed.cursor, null);
+
+  const activated = await kit.plugin.activateGeneration(ctx(), completed.generation);
+  assert.equal(activated.status, 'active');
+  assert.deepEqual(kit.registry.healthOf('multimodal-vectors').plugin.activeSpace, { model: 'embed-v2', dimensions: 2, spaceId: 'embed-v2:2' });
+
+  // Expected-count gate refuses activation when corpus has fewer than expected rows.
+  const partialExpected = await kit.plugin.stageGeneration(ctx(), { expectedCount: 700 });
+  assert.equal(partialExpected.status, 'staging');
+  assert.equal(partialExpected.indexedCount, 600);
+  await assert.rejects(() => kit.plugin.activateGeneration(ctx(), partialExpected.generation), /incomplete/);
+});
+
+test('rollbackShadow atomically restores previous space metadata alongside active pointer', async (t) => {
+  const kit = await derivedSetup(t);
+  kit.note('n1', 'p1');
+  kit.segment('s1', 'n1', 'p1', [1, 0]);
+  await kit.rebuild();
+
+  kit.plugin.setModelSpace({ model: 'embed-v2', dimensions: 3 });
+  kit.db.prepare('UPDATE NoteSegment SET embedding_model = ?, embedding = ? WHERE id = ?')
+    .run('embed-v2', JSON.stringify([0, 1, 0]), 's1');
+  const shadowCtx = () => ({
+    id: kit.plugin.id,
+    version: kit.plugin.version,
+    reader: kit.registry.sourceReader('multimodal-vectors'),
+    index: kit.registry.ownedIndex('multimodal-vectors'),
+    generation: kit.registry.stateOf('multimodal-vectors').generation + 1,
+    fence: kit.registry.stateOf('multimodal-vectors').fence,
+  });
+  await kit.plugin.beginShadow(shadowCtx());
+  await kit.plugin.rebuild(shadowCtx());
+  await kit.plugin.commitShadow(shadowCtx());
+  const promotedState = kit.db.prepare(`SELECT active, model, dimensions FROM ${stateTableOf(kit.plugin)} WHERE slot = 'active'`).get();
+  assert.equal(promotedState.model, 'embed-v2');
+  assert.equal(promotedState.dimensions, 3);
+
+  await kit.plugin.rollbackShadow(shadowCtx());
+  const rolledBackState = kit.db.prepare(`SELECT active, model, dimensions FROM ${stateTableOf(kit.plugin)} WHERE slot = 'active'`).get();
+  assert.equal(rolledBackState.active, 0);
+  assert.equal(rolledBackState.model, 'embed-v1');
+  assert.equal(rolledBackState.dimensions, 2);
+  assert.deepEqual(kit.registry.healthOf('multimodal-vectors').plugin.activeSpace, { model: 'embed-v1', dimensions: 2 });
+
+  const oldSpaceQuery = await kit.search([1, 0]);
+  assert.equal(oldSpaceQuery.ok, true, oldSpaceQuery.lastError?.message);
+  assert.deepEqual(oldSpaceQuery.result.hits.map((hit) => hit.id), ['s1']);
+});
+
+test('parent revocation purges derived vectors across generations without recreating them', async (t) => {
+  const kit = await derivedSetup(t);
+  kit.note('n1', 'p1');
+  kit.note('n2', 'p2');
+  kit.segment('s1', 'n1', 'p1', [1, 0]);
+  kit.segment('s2', 'n2', 'p2', [0, 1]);
+  await kit.rebuild();
+
+  // Parent and segment rows STILL exist in SQLite; revoke must keep them purged.
+  const revoked = await kit.registry.revoke('multimodal-vectors', {
+    kind: 'revocation',
+    entity: 'Note',
+    rowId: 'n1',
+  });
+  assert.equal(revoked.ok, true, revoked.lastError?.message);
+  const generations = generationTables(kit.plugin);
+  assert.deepEqual(generations.map((table) => storedCount(kit.db, table, 'parent_key', 'n1')), [0, 0]);
+  assert.deepEqual((await kit.search([1, 0], { limit: 10 })).result.hits.map((hit) => hit.id), ['s2']);
+
+  const scopeRevoked = await kit.registry.revoke('multimodal-vectors', {
+    kind: 'erasure',
+    entity: 'Note',
+    scopeId: 'p2',
+  });
+  assert.equal(scopeRevoked.ok, true, scopeRevoked.lastError?.message);
+  assert.deepEqual(generations.map((table) => storedCount(kit.db, table, 'project_key', 'p2')), [0, 0]);
+  assert.deepEqual((await kit.search([0, 1], { limit: 10 })).result.hits, []);
+});
+
+test('benign parent-change reconcile builds into shadow first so failure keeps active generation searchable', async (t) => {
+  const kit = await derivedSetup(t);
+  kit.note('n1', 'p1');
+  kit.segment('s1', 'n1', 'p1', [1, 0]);
+  await kit.rebuild();
+
+  // Introduce a corrupt current segment; a parent update reconcile must fail in shadow without destroying s1 in active.
+  kit.segment('bad', 'n1', 'p1', [1, 0], { model: 'other-model' });
+  const failed = await kit.registry.reconcile('multimodal-vectors', [
+    { entity: 'Note', rowId: 'n1', kind: 'updated' },
+  ]);
+  assert.equal(failed.ok, false);
+  assert.match(failed.lastError?.message ?? '', /requires 'embed-v1'/);
+
+  const found = await kit.search([1, 0], { limit: 10 });
+  assert.equal(found.ok, true, found.lastError?.message);
+  assert.deepEqual(found.result.hits.map((hit) => hit.id), ['s1']);
+});

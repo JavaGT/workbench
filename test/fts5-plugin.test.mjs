@@ -198,3 +198,23 @@ test('FTS5 health detects indexed-text corruption even when payload is unchanged
   kit.db.prepare('UPDATE SearchFts_note_fts_g0 SET body = ? WHERE Note_id = ?').run('corrupt body', 'a');
   assert.equal(kit.registry.healthOf('note-fts').plugin.integrity.ok, false);
 });
+
+test('FTS5 plugin refills across denied rows so authorized pages stay full', async (t) => {
+  const kit = await setup();
+  t.after(() => close(kit));
+  kit.insert('denied-1', 'coastal coastal coastal', 'coastal', 'secret', 'mallory');
+  kit.insert('denied-2', 'coastal coastal', 'coastal', 'secret', 'mallory');
+  kit.insert('denied-3', 'coastal coastal', 'body', 'secret', 'mallory');
+  kit.insert('allowed-1', 'coastal', 'body', 'secret', 'alice');
+  kit.insert('allowed-2', 'coastal', 'notes', 'secret', 'alice');
+  kit.insert('allowed-3', 'title', 'coastal', 'secret', 'alice');
+  await rebuild(kit);
+
+  const outcome = await kit.registry.search('note-fts', { query: 'coastal', limit: 3, principal: alice });
+  assert.equal(outcome.ok, true, outcome.lastError?.message);
+  assert.deepEqual(
+    outcome.result.hits.map((hit) => hit.id).sort(),
+    ['allowed-1', 'allowed-2', 'allowed-3'],
+    'denied top FTS matches must refill rather than returning a short page',
+  );
+});

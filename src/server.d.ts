@@ -42,16 +42,24 @@ export interface SearchChange {
   readonly kind: SearchChangeKind;
   readonly data?: Readonly<Record<string, unknown>>;
 }
+export interface SearchRevocationTarget {
+  readonly kind: 'revocation' | 'erasure';
+  readonly entity: string;
+  readonly rowId?: string;
+  readonly scopeId?: string;
+}
 export interface SearchRequest {
   readonly query: unknown;
   readonly entity?: string;
   readonly principal?: Principal;
+  readonly scope?: string | Readonly<Record<string, unknown>>;
+  readonly scopeId?: string;
   readonly limit?: number;
   readonly offset?: number;
   readonly signal?: AbortSignal;
 }
 export interface SearchMaterializeResult { readonly counts?: SearchPluginCounts; }
-export interface SearchPluginSearchResult { readonly hits: readonly unknown[]; }
+export interface SearchPluginSearchResult { readonly hits: readonly unknown[]; readonly truncated?: boolean; }
 export interface SearchSourceHandle {
   prepare(sql: string): {
     all(...params: unknown[]): Record<string, unknown>[];
@@ -92,6 +100,7 @@ export interface SearchPluginContext {
   readonly index: SearchOwnedIndex;
   readonly generation: number;
   readonly fence: number;
+  readonly state?: SearchPluginState;
 }
 export interface SearchLifecycleOutcome {
   readonly ok: boolean;
@@ -108,7 +117,7 @@ export interface SearchSearchOutcome {
   readonly fence: number;
   readonly state: SearchPluginState;
   readonly counts: SearchPluginCounts;
-  readonly result: { readonly hits: readonly unknown[]; readonly generation: number; readonly fence: number; readonly state: SearchPluginState } | null;
+  readonly result: { readonly hits: readonly unknown[]; readonly generation: number; readonly fence: number; readonly state: SearchPluginState; readonly truncated?: boolean } | null;
   readonly lastError: SearchRetryInfo | null;
   readonly cancelled: boolean;
   readonly timedOut: boolean;
@@ -194,13 +203,30 @@ export type VectorPluginValidationCode =
   | 'non-finite-value'
   | 'model-space-mismatch'
   | 'unauthorized-source-ownership'
-  | 'invalid-vector';
-export interface VectorModelSpace { readonly model: string; readonly dimensions: number; }
+  | 'invalid-vector'
+  | 'invalid-derived-segment';
+export interface VectorModelSpace {
+  readonly model: string;
+  readonly dimensions: number;
+  readonly spaceId?: string;
+}
+export interface VectorParentSource {
+  readonly entity: string;
+  readonly field: string;
+  readonly revisionField: string;
+  readonly projectField: string;
+  readonly parentRevisionField: string;
+  readonly parentProjectField: string;
+  readonly owns?: (row: Readonly<Record<string, unknown>>) => boolean;
+  readonly segmentIdField?: string;
+}
 export interface VectorPluginSource {
   readonly entity: string;
   readonly vector: string;
   readonly model: string;
+  readonly scopeField?: string;
   readonly owns: (row: Readonly<Record<string, unknown>>) => boolean;
+  readonly parent?: VectorParentSource;
 }
 export interface VectorPluginOptions {
   readonly admission?: { readonly entity: { name: string }; readonly adapter: import('../index.d.ts').AuthorizationAdapter };
@@ -213,6 +239,30 @@ export interface VectorPluginOptions {
   // admission adapter. The default fails closed — an index whose hits cannot be
   // re-authorized returns no disclosure.
   readonly unsafeAllowUnauthorizedSearch?: boolean;
+}
+export type VectorGenerationStatus = 'staging' | 'ready' | 'active';
+export interface VectorGenerationManifest {
+  readonly generation: 0 | 1;
+  readonly generationId: string;
+  readonly model: string;
+  readonly dimensions: number;
+  readonly spaceId: string;
+  readonly status: VectorGenerationStatus;
+  readonly expectedCount: number;
+  readonly indexedCount: number;
+  readonly cursor: string | null;
+}
+export interface VectorStageGenerationOptions {
+  readonly expectedCount?: number;
+  readonly maxBatches?: number;
+  readonly signal?: AbortSignal;
+}
+export interface VectorPluginHealth {
+  readonly generationIdentity: string;
+  readonly modelSpace: VectorModelSpace;
+  readonly activeSpace: VectorModelSpace;
+  readonly vectors: number;
+  readonly staging?: VectorGenerationManifest | null;
 }
 export interface SearchEntityCensus {
   readonly count: number;
@@ -230,8 +280,13 @@ export interface SearchShadowCapabilities {
 export interface VectorPlugin extends SearchPlugin, SearchShadowCapabilities {
   readonly generationIdentity: string;
   readonly modelSpace: VectorModelSpace;
+  readonly parentSource?: VectorParentSource;
   validateSourceRow(row: Readonly<Record<string, unknown>>): void;
   setModelSpace(modelSpace: VectorModelSpace): void;
+  stageGeneration(ctx: SearchPluginContext, options?: VectorStageGenerationOptions): Promise<VectorGenerationManifest>;
+  activateGeneration(ctx: SearchPluginContext, generation?: 0 | 1): Promise<VectorGenerationManifest>;
+  generationManifest(ctx: SearchPluginContext, generation?: 0 | 1): VectorGenerationManifest | null;
+  health(ctx: SearchPluginContext): VectorPluginHealth;
 }
 export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin;
 export type { PostCommitEffectRunner } from '../index.d.ts';

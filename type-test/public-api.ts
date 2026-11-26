@@ -40,7 +40,9 @@ import {
    type BlobCleanupState,
    createSearchPluginRegistry, createSearchSourceReader, createSearchOwnedIndexCapability, createVectorPlugin,
    type SearchPlugin, type SearchPluginContext, type SearchOwnedIndex, type SearchSourceReader,
-   type SearchOwnedIndexCapabilityOptions, type VectorPlugin,
+   type SearchOwnedIndexCapabilityOptions, type VectorPlugin, type VectorParentSource,
+   type VectorPluginValidationCode, type VectorGenerationManifest, type VectorGenerationStatus,
+   type VectorPluginHealth,
  } from 'workbench/server';
 import {
   LiveChannel, LiveList, WorkbenchFailureError, createAuthClient, createLiveStore,
@@ -1060,7 +1062,7 @@ const typedFamilyPage: Promise<ClientQueryPage<NoteQueryRow>> = queryClient.quer
 });
 const typedEntityTitles: Promise<string[]> = typedEntityPage.then((page) => page.rows.map((row) => row.title));
 const typedFamilyTitles: Promise<string[]> = typedFamilyPage.then((page) => page.rows.map((row) => row.title));
-const ftsSearchRequest: QuerySearchRequest = { mode: 'fts', index: 'note-fts', query: 'hello', limit: 5, scopeId: 'project-1' };
+const ftsSearchRequest: QuerySearchRequest = { mode: 'fts', index: 'note-fts', query: 'hello', limit: 5, offset: 0, scopeId: 'project-1' };
 const hybridSearchRequest: QuerySearchRequest = {
   mode: 'hybrid',
   sources: { fts: 'note-fts', vector: 'note-vec' },
@@ -1070,9 +1072,50 @@ const hybridSearchRequest: QuerySearchRequest = {
   weights: { fts: 1, vector: 1 },
   k: 60,
   limit: 3,
+  offset: 3,
 };
 const querySearchResponse: Promise<QuerySearchResponse> = queryClient.search(ftsSearchRequest);
 const queryHybridResponse: Promise<QuerySearchResponse> = queryClient.search(hybridSearchRequest, { signal: new AbortController().signal });
+const querySearchTruncated: Promise<boolean | undefined> = queryHybridResponse.then((res) => res.truncated);
 // @ts-expect-error search modes are a closed union
 queryClient.search({ mode: 'semantic' });
-void [queryClient, entityQueryPage, familyQueryPage, typedEntityPage, typedFamilyPage, typedEntityTitles, typedFamilyTitles, querySearchResponse, queryHybridResponse];
+
+// ── derived vector plugin & staged generation public contract ───────────────
+const derivedParentSource: VectorParentSource = {
+  entity: 'Note',
+  field: 'noteId',
+  revisionField: 'revision',
+  projectField: 'projectId',
+  parentRevisionField: 'revision',
+  parentProjectField: 'projectId',
+  owns: () => true,
+  segmentIdField: 'segmentId',
+};
+const derivedVectorPlugin: VectorPlugin = createVectorPlugin({
+  id: 'derived-vectors',
+  version: '1.0.0',
+  source: {
+    entity: 'NoteSegment',
+    vector: 'embedding',
+    model: 'embeddingModel',
+    scopeField: 'projectId',
+    owns: () => true,
+    parent: derivedParentSource,
+  },
+  modelSpace: { model: 'embed-v1', dimensions: 3, spaceId: 'embed-v1:3' },
+  admission: undefined,
+});
+const derivedValidationCode: VectorPluginValidationCode = 'invalid-derived-segment';
+const derivedHealth: VectorPluginHealth = derivedVectorPlugin.health(searchPluginContext);
+const derivedActiveSpaceModel: string = derivedHealth.activeSpace.model;
+const stagedGeneration: Promise<VectorGenerationManifest> = derivedVectorPlugin.stageGeneration(searchPluginContext, { expectedCount: 10, maxBatches: 1 });
+const activatedGeneration: Promise<VectorGenerationManifest> = derivedVectorPlugin.activateGeneration(searchPluginContext, 0);
+const currentManifest: VectorGenerationManifest | null = derivedVectorPlugin.generationManifest(searchPluginContext, 0);
+const generationStatus: VectorGenerationStatus | undefined = currentManifest?.status;
+// @ts-expect-error generation status is a closed union
+const invalidGenerationStatus: VectorGenerationStatus = 'partial';
+void [
+  queryClient, entityQueryPage, familyQueryPage, typedEntityPage, typedFamilyPage, typedEntityTitles, typedFamilyTitles,
+  querySearchResponse, queryHybridResponse, querySearchTruncated,
+  derivedValidationCode, derivedActiveSpaceModel, stagedGeneration, activatedGeneration, generationStatus, invalidGenerationStatus,
+];

@@ -165,6 +165,7 @@ export const SUPPORTED_SEARCH_PLUGIN_CONTRACT_VERSION = 2;
 
 
 
+
 // The minimal read handle the scoped source reader needs. Intentionally NOT the
 // raw DbHandle type: the reader is built over a structurally read-only subset,
 // so a plugin can never reach exec/run/transaction through it.
@@ -1034,6 +1035,7 @@ export function createSearchPluginRegistry(options                              
         };
       }
       const hits = run.value.hits.slice(offset, offset + limit);
+      const truncated = run.value.truncated === true && hits.length < limit;
       return {
         ok: true,
         generation,
@@ -1045,6 +1047,7 @@ export function createSearchPluginRegistry(options                              
           generation,
           fence,
           state,
+          ...(truncated ? { truncated: true } : {}),
         },
         lastError: null,
         cancelled: false,
@@ -1092,28 +1095,14 @@ export function createSearchPluginRegistry(options                              
     has: (id        ) => plugins.has(id),
     get: (id        ) => plugins.get(id),
     ids: () => Object.freeze([...plugins.keys()]),
-    get size() {
-      return plugins.size;
-    },
-    census,
-    stateOf,
-    healthOf,
-    bindSource,
-    bindIndex,
-    ownedIndex,
-    sourceReader,
-    notifyChange,
-    prepare,
-    validate,
-    reconcile,
-    rebuild,
-    revoke,
-    search,
-    purgePlans,
+    get size() { return plugins.size; },
+    census, stateOf, healthOf, bindSource, bindIndex, ownedIndex, sourceReader,
+    notifyChange, prepare, validate, reconcile, rebuild, revoke, search, purgePlans,
   });
 }
 
 // ---- built-in hybrid retrieval composer (FTS5 + vector RRF) -----------------
+
 
 
 
@@ -1196,6 +1185,7 @@ export async function hybridSearch(request                           )          
       ok: false,
       cancelled,
       timedOut,
+      truncated: false,
       hits: Object.freeze([]),
       totalCandidates: 0,
       staleness: worst,
@@ -1224,10 +1214,19 @@ export async function hybridSearch(request                           )          
     { k, limit: window.limit, offset: window.offset },
   );
 
+  // Disclose truncation when either bounded branch hit its depth cap and the
+  // bounded fused pool was exhausted before satisfying the caller's window.
+  const poolBounded = ftsOutcome.result.hits.length >= ftsLimit
+    || vectorOutcome.result.hits.length >= vectorLimit
+    || ftsOutcome.result.truncated === true
+    || vectorOutcome.result.truncated === true;
+  const truncated = poolBounded && (window.offset + window.limit > fused.totalCandidates);
+
   return Object.freeze({
     ...fused,
     cancelled: false,
     timedOut: false,
+    truncated,
     outcomes: Object.freeze({ fts: ftsOutcome, vector: vectorOutcome }),
   });
 }

@@ -163,6 +163,7 @@ export interface SearchMaterializeResult {
 // a plugin cannot spoof its own health.
 export interface SearchPluginSearchResult {
   readonly hits: readonly unknown[];
+  readonly truncated?: boolean;
 }
 
 // The minimal read handle the scoped source reader needs. Intentionally NOT the
@@ -253,7 +254,7 @@ export interface SearchSearchOutcome {
   readonly fence: number;
   readonly state: SearchPluginState;
   readonly counts: SearchPluginCounts;
-  readonly result: { readonly hits: readonly unknown[]; readonly generation: number; readonly fence: number; readonly state: SearchPluginState } | null;
+  readonly result: { readonly hits: readonly unknown[]; readonly generation: number; readonly fence: number; readonly state: SearchPluginState; readonly truncated?: boolean } | null;
   readonly lastError: SearchRetryInfo | null;
   // Closed disclosure of a search that did not complete: true when the search
   // was cancelled by the caller's signal or stopped by the deadline (S4/A6).
@@ -1034,6 +1035,7 @@ export function createSearchPluginRegistry(options: SearchPluginRegistryOptions 
         };
       }
       const hits = run.value.hits.slice(offset, offset + limit);
+      const truncated = run.value.truncated === true && hits.length < limit;
       return {
         ok: true,
         generation,
@@ -1045,6 +1047,7 @@ export function createSearchPluginRegistry(options: SearchPluginRegistryOptions 
           generation,
           fence,
           state,
+          ...(truncated ? { truncated: true } : {}),
         },
         lastError: null,
         cancelled: false,
@@ -1092,24 +1095,9 @@ export function createSearchPluginRegistry(options: SearchPluginRegistryOptions 
     has: (id: string) => plugins.has(id),
     get: (id: string) => plugins.get(id),
     ids: () => Object.freeze([...plugins.keys()]),
-    get size() {
-      return plugins.size;
-    },
-    census,
-    stateOf,
-    healthOf,
-    bindSource,
-    bindIndex,
-    ownedIndex,
-    sourceReader,
-    notifyChange,
-    prepare,
-    validate,
-    reconcile,
-    rebuild,
-    revoke,
-    search,
-    purgePlans,
+    get size() { return plugins.size; },
+    census, stateOf, healthOf, bindSource, bindIndex, ownedIndex, sourceReader,
+    notifyChange, prepare, validate, reconcile, rebuild, revoke, search, purgePlans,
   });
 }
 
@@ -1140,6 +1128,7 @@ export interface HybridPluginSearchRequest {
 export interface HybridPluginSearchOutcome extends HybridSearchResult<Readonly<Record<string, unknown>>> {
   readonly cancelled: boolean;
   readonly timedOut: boolean;
+  readonly truncated: boolean;
   readonly outcomes: {
     readonly fts: SearchSearchOutcome;
     readonly vector: SearchSearchOutcome;
@@ -1196,6 +1185,7 @@ export async function hybridSearch(request: HybridPluginSearchRequest): Promise<
       ok: false,
       cancelled,
       timedOut,
+      truncated: false,
       hits: Object.freeze([]),
       totalCandidates: 0,
       staleness: worst,
@@ -1224,10 +1214,19 @@ export async function hybridSearch(request: HybridPluginSearchRequest): Promise<
     { k, limit: window.limit, offset: window.offset },
   );
 
+  // Disclose truncation when either bounded branch hit its depth cap and the
+  // bounded fused pool was exhausted before satisfying the caller's window.
+  const poolBounded = ftsOutcome.result.hits.length >= ftsLimit
+    || vectorOutcome.result.hits.length >= vectorLimit
+    || ftsOutcome.result.truncated === true
+    || vectorOutcome.result.truncated === true;
+  const truncated = poolBounded && (window.offset + window.limit > fused.totalCandidates);
+
   return Object.freeze({
     ...fused,
     cancelled: false,
     timedOut: false,
+    truncated,
     outcomes: Object.freeze({ fts: ftsOutcome, vector: vectorOutcome }),
   });
 }

@@ -1135,6 +1135,7 @@ export interface QuerySearchRequest {
   readonly vector?: readonly number[] | Float32Array;
   readonly model?: string;
   readonly limit?: number;
+  readonly offset?: number;
   readonly scopeId?: string;
   readonly scope?: string | Readonly<Record<string, unknown>>;
   readonly sources?: {
@@ -1165,6 +1166,7 @@ export interface QuerySearchResponse {
   readonly k?: number;
   readonly cancelled?: boolean;
   readonly timedOut?: boolean;
+  readonly truncated?: boolean;
   readonly error?: string;
 }
 

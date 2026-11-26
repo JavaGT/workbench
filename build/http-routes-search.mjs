@@ -77,15 +77,32 @@ function searchWindow(body                         )                            
 // admitted against; otherwise the hit came from its source entity directly.
 // A fused (hybrid) hit wraps the plugin hit under `hit`, so provenance is read
 // from either level.
+function fenceCell(value         )                {
+  if (typeof value === 'string') return value.length > 0 ? value : null;
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  return null;
+}
+
+
+
+
+
+
+
+
+
+
+
 function searchHitAuthorization(
   app              ,
   hit         ,
   indices                   ,
-)                                                                   {
+)                                                                                                                                   {
   if (!app.entities) return undefined;
   const outer = hit !== null && typeof hit === 'object' ? hit                            : null;
   if (!outer) return undefined;
   const nested = outer.hit !== null && typeof outer.hit === 'object' ? outer.hit                            : null;
+  const plugins = (app                                            ).searchPlugins;
 
   // Explicit provenance wins and is fail-closed: if it names an entity this
   // app does not know, the hit is not re-labeled with a guessed source.
@@ -95,7 +112,32 @@ function searchHitAuthorization(
     const rowId = searchRowId(record.authorizationRowId);
     if (typeof entityName === 'string' && entityName.length > 0 && rowId !== null) {
       const entity = app.entities.get(entityName);
-      return entity ? { entity, id: rowId } : undefined;
+      if (!entity) return undefined;
+      let parentProjectField = 'projectId';
+      let parentRevisionField = 'revision';
+      let parentOwns                                                                   ;
+      for (const index of indices) {
+        const plugin = typeof plugins?.get === 'function' ? plugins.get(index)
+
+                      : undefined;
+        if (plugin?.parentSource?.entity === entityName) {
+          if (typeof plugin.parentSource.parentProjectField === 'string') parentProjectField = plugin.parentSource.parentProjectField;
+          if (typeof plugin.parentSource.parentRevisionField === 'string') parentRevisionField = plugin.parentSource.parentRevisionField;
+          if (typeof plugin.parentSource.owns === 'function') parentOwns = plugin.parentSource.owns;
+          break;
+        }
+      }
+      return {
+        entity,
+        id: rowId,
+        derivedFence: {
+          projectId: fenceCell(record.projectId),
+          revision: fenceCell(record.sourceRevision),
+          parentProjectField,
+          parentRevisionField,
+          parentOwns,
+        },
+      };
     }
   }
 
@@ -104,7 +146,6 @@ function searchHitAuthorization(
   const candidates           = [];
   const explicit = outer.entity;
   if (typeof explicit === 'string') candidates.push(explicit);
-  const plugins = (app                                            ).searchPlugins;
   for (const index of indices) {
     const plugin = typeof plugins?.get === 'function' ? plugins.get(index) : undefined;
     const interest = plugin?.sourceInterests?.[0];
@@ -156,10 +197,28 @@ async function admitSearchHitsByEntity(
     // index snapshot means this hit cannot be re-authorized. Drop it rather
     // than disclose a stale or plugin-forged row body.
     if (source === undefined || !stored) continue;
-    const { entity, id } = source;
+    const { entity, id, derivedFence } = source;
     const row = typeof entity.deserializeRow === 'function'
       ? entity.deserializeRow({ ...stored })
       : stored;
+    // Re-verify the derived hit's projectId and sourceRevision fence against
+    // the CURRENT parent row before disclosing, even when the principal can
+    // read the updated parent.
+    if (derivedFence !== undefined) {
+      if (derivedFence.projectId === null || derivedFence.revision === null) continue;
+      const currentProject = fenceCell((row                           )[derivedFence.parentProjectField]);
+      const currentRevision = fenceCell((row                           )[derivedFence.parentRevisionField]);
+      if (currentProject !== derivedFence.projectId || currentRevision !== derivedFence.revision) continue;
+      if (derivedFence.parentOwns !== undefined) {
+        let owned = false;
+        try {
+          owned = derivedFence.parentOwns(row                           ) === true;
+        } catch {
+          owned = false;
+        }
+        if (!owned) continue;
+      }
+    }
     const decision = await authorization.admit({
       category: 'entity',
       verb: 'read',
@@ -196,7 +255,7 @@ async function admittedSearchPage                              (
   authorization                      ,
   principal           ,
   indices                   ,
-  fetchPage                                                                                                        ,
+  fetchPage                                                                                                                                      ,
   window                                                     ,
 )                                                                                                 {
   const target = window.offset + window.limit;
@@ -204,6 +263,7 @@ async function admittedSearchPage                              (
   const admitted            = [];
   let meta              = null;
   let rawOffset = 0;
+  let poolTruncated = false;
   while (admitted.length < target) {
     if (rawOffset >= SEARCH_MAX_WINDOW) {
       return { hits: admitted.slice(window.offset, window.offset + window.limit), meta, truncated: true };
@@ -214,6 +274,7 @@ async function admittedSearchPage                              (
       return { hits: [], meta: page.meta, truncated: false };
     }
     if (meta === null) meta = page.meta;
+    if (page.truncated) poolTruncated = true;
     if (page.hits.length === 0) break;
     const admittedBatch = await admitSearchHitsByEntity(app, authorization, page.hits, principal, indices);
     admitted.push(...admittedBatch);
@@ -226,7 +287,7 @@ async function admittedSearchPage                              (
   return {
     hits: admitted.slice(window.offset, window.offset + window.limit),
     meta,
-    truncated: false,
+    truncated: poolTruncated && admitted.length < target,
   };
 }
 
@@ -332,7 +393,7 @@ export async function handleSearchRoute(
           const next = typeof (registry                  ).hybridSearch === 'function'
             ? await (registry                  ).hybridSearch (request)
             : await hybridSearch({ registry: registry                        , ...request }         );
-          return { hits: next.hits ?? [], meta: next };
+          return { hits: next.hits ?? [], meta: next, truncated: next.truncated === true };
         },
         window,
       );
@@ -385,7 +446,7 @@ export async function handleSearchRoute(
       [index],
       async (offset, limit) => {
         const outcome = await (registry                  ).search(index, { ...request, offset, limit });
-        return { hits: outcome.result?.hits ?? [], meta: outcome };
+        return { hits: outcome.result?.hits ?? [], meta: outcome, truncated: outcome.result?.truncated === true };
       },
       window,
     );

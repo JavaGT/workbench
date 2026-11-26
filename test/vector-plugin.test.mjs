@@ -460,8 +460,9 @@ async function derivedSetup(t, { dimensions = 2 } = {}) {
     note: (id, projectId, revision = 'r1', owner = 'alice') => insertNote.run(id, projectId, revision, owner),
     segment: (id, noteId, projectId, embedding, {
       revision = 'r1', segmentId = id, modality = 'video', start = 0, end = 1, hash = `h-${id}`,
+      model = 'embed-v1',
     } = {}) => insertSegment.run(
-      id, segmentId, noteId, projectId, revision, JSON.stringify(embedding), 'embed-v1', modality, start, end, hash,
+      id, segmentId, noteId, projectId, revision, JSON.stringify(embedding), model, modality, start, end, hash,
     ),
     rebuild: async () => {
       const outcome = await registry.rebuild('multimodal-vectors');
@@ -612,4 +613,56 @@ test('derived segments shadow-rebuild with parity over the fenced projection', a
   const found = await kit.search([1, 0], { limit: 10 });
   assert.deepEqual(found.result.hits.map((hit) => hit.id), ['s1', 's3', 's2']);
   assert.ok(!found.result.hits.some((hit) => hit.id === 'old'), 'a stale segment is not part of the projection');
+});
+
+test('a failed derived rebuild leaves the last good generation searchable', async (t) => {
+  const kit = await derivedSetup(t);
+  kit.note('n1', 'p1');
+  kit.segment('s1', 'n1', 'p1', [1, 0]);
+  await kit.rebuild();
+
+  kit.segment('bad', 'n1', 'p1', [1, 0], { model: 'other-model' });
+  const failed = await kit.registry.rebuild('multimodal-vectors');
+  assert.equal(failed.ok, false);
+  assert.match(failed.lastError?.message ?? '', /requires 'embed-v1'/);
+  const found = await kit.search([1, 0], { limit: 10 });
+  assert.deepEqual(found.result.hits.map((hit) => hit.id), ['s1'], 'the active generation survives a failed scan');
+});
+
+test('derived segments follow the CURRENT parent project fence', async (t) => {
+  const kit = await derivedSetup(t);
+  kit.note('n1', 'p1');
+  kit.segment('s1', 'n1', 'p1', [1, 0]);
+  await kit.rebuild();
+  assert.deepEqual(
+    (await kit.search([1, 0], { scope: { projectId: 'p1' } })).result.hits.map((hit) => hit.id),
+    ['s1'],
+  );
+
+  kit.db.prepare('UPDATE Note SET projectId = ? WHERE id = ?').run('p2', 'n1');
+  assert.deepEqual(
+    (await kit.search([1, 0], { scope: { projectId: 'p1' } })).result.hits,
+    [],
+    'the old project window no longer discloses the segment',
+  );
+  assert.deepEqual(
+    (await kit.search([1, 0], { scope: { projectId: 'p2' } })).result.hits,
+    [],
+    'a segment whose stored project differs from the current parent project is fenced',
+  );
+
+  const parentChanged = await kit.registry.reconcile('multimodal-vectors', [
+    { entity: 'Note', rowId: 'n1', kind: 'updated' },
+  ]);
+  assert.equal(parentChanged.ok, true, parentChanged.lastError?.message);
+
+  kit.segment('s2', 'n1', 'p2', [1, 0]);
+  const rederived = await kit.registry.reconcile('multimodal-vectors', [
+    { entity: 'NoteSegment', rowId: 's2', kind: 'created' },
+  ]);
+  assert.equal(rederived.ok, true, rederived.lastError?.message);
+  assert.deepEqual(
+    (await kit.search([1, 0], { scope: { projectId: 'p2' } })).result.hits.map((hit) => hit.id),
+    ['s2'],
+  );
 });

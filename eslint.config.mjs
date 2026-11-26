@@ -51,6 +51,6 @@ export default [
 		},
 	},
 	{
-		ignores: ['node_modules/**', 'coverage/**'],
+		ignores: ['node_modules/**', 'coverage/**', 'public/workbench-client-vendor-*.mjs'],
 	},
 ];

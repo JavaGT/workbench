@@ -2,6 +2,7 @@
 // directly; it never receives raw log rows or application projection callbacks.
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { Packr } from 'msgpackr';
 
 import type { Principal } from './principal.ts';
 import type { FrameworkLog } from './log.ts';
@@ -70,21 +71,50 @@ function ruleFrom(url: URL): unknown {
   }
 }
 
+// Stateless standard MessagePack encoder that omits undefined properties so
+// decoded objects match JSON.stringify/JSON.parse shapes strictly. `skipValues`
+// is supported at runtime in msgpackr 2.1.4 though omitted from its index.d.ts.
+const bootstrapPackr = new Packr({
+  useRecords: false,
+  skipValues: [undefined],
+  structuredClone: false,
+} as ConstructorParameters<typeof Packr>[0]);
+
+function acceptsMsgpack(acceptHeader: string | string[] | undefined): boolean {
+  const raw = Array.isArray(acceptHeader) ? acceptHeader.join(',') : acceptHeader;
+  if (!raw) return false;
+  for (const part of raw.toLowerCase().split(',')) {
+    const [mediaType, ...params] = part.trim().split(';');
+    if (mediaType !== 'application/x-msgpack' && mediaType !== 'application/msgpack') continue;
+    let q = 1;
+    for (const param of params) {
+      const [key, val] = param.trim().split('=');
+      if (key === 'q') {
+        const parsed = Number(val);
+        if (Number.isFinite(parsed)) q = parsed;
+      }
+    }
+    if (q > 0) return true;
+  }
+  return false;
+}
+
 // Bootstraps and catch-ups are one-time page-load responses: a document's
 // recipient view plus (for unredacted recipients) its family checkpoint seed.
 // Those legitimately reach tens of MB on large transcripts. Per-keystroke SSE
 // frames stay at JSON_LIMIT so folds cannot silently demote to resync.
-async function writeJson(
+async function writeBootstrapPayload(
   req: IncomingMessage,
   res: ServerResponse,
   value: unknown,
   maxBytes = JSON_LIMIT,
 ): Promise<void> {
-  const body = JSON.stringify(value);
+  const wantMsgpack = acceptsMsgpack(req.headers.accept);
+  const body = wantMsgpack ? bootstrapPackr.pack(value) : JSON.stringify(value);
   const compressed = await compressPayloadAsync(body, req.headers['accept-encoding']);
   if (compressed.body.length > maxBytes) throw new Error('live delivery response exceeds limit');
   const headers: Record<string, string | number> = {
-    'content-type': 'application/json; charset=utf-8',
+    'content-type': wantMsgpack ? 'application/x-msgpack' : 'application/json; charset=utf-8',
     'cache-control': 'no-store',
     'content-length': compressed.body.length,
   };
@@ -223,13 +253,13 @@ export function createLiveDeliveryHttpHandler({
         if (mode === 'snapshot') {
           // The delivery seam creates the snapshot from its recipient-hydrated row.
           const result = await delivery.bootstrap({ principal, scope: effectiveScope, document, capabilities });
-          await writeJson(req, res, result, bootstrapLimit);
+          await writeBootstrapPayload(req, res, result, bootstrapLimit);
         } else if (mode === 'catchup') {
           const result = await delivery.catchup({ principal, scope: effectiveScope, after, document, capabilities, projectionToken });
           // A small event count can still contain a large recipient envelope.
           // Replace oversized replay with the same paired opaque recovery.
           const encoded = JSON.stringify(result);
-          await writeJson(req, res, Buffer.byteLength(encoded) > JSON_LIMIT
+          await writeBootstrapPayload(req, res, Buffer.byteLength(encoded) > JSON_LIMIT
             ? await delivery.bootstrap({ principal, scope: effectiveScope, document, capabilities })
             : result, bootstrapLimit);
         } else {

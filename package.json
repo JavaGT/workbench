@@ -84,11 +84,14 @@
 		"@playwright/test": "^1.62.1",
 		"@types/node": "^26.1.1",
 		"@types/ws": "^8.18.2",
+		"esbuild": "^0.28.2",
 		"eslint": "^9.39.5",
 		"fake-indexeddb": "^6.2.5",
 		"globals": "^17.7.0",
+		"idb": "^8.0.4",
 		"jsdom": "^29.1.1",
-		"typescript": "^7.0.2"
+		"typescript": "^7.0.2",
+		"xstate": "6.0.0-beta.5"
 	},
 	"engines": {
 		"node": ">=24.10.0"
@@ -97,6 +100,7 @@
 		"@mjackson/multipart-parser": "^0.10.1",
 		"cookie": "^2.0.2",
 		"lru-cache": "^11.5.3",
+		"msgpackr": "^2.1.4",
 		"rou3": "^1.0.0",
 		"ws": "^8.23.0"
 	}

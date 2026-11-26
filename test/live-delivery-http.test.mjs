@@ -522,3 +522,61 @@ test('a connection generation replacement aborts the bootstrap it superseded (#7
   assert.notEqual(signals[1], first);
   session.close();
 });
+
+test('HTTP delivery negotiates application/x-msgpack when requested and preserves JSON default', async () => {
+  const complexSnapshot = {
+    id: 'p1',
+    nested: { ranges: [[0, 5], [6, 11]], tags: ['a', 'b'], meta: { ok: true, count: 42 } },
+  };
+  const delivery = {
+    async bootstrap() {
+      return { kind: 'snapshot', snapshot: complexSnapshot, cursor: { anchor: 1, aggregate: 2 } };
+    },
+    async catchup({ after }) {
+      return {
+        kind: 'catchup',
+        envelopes: [{ type: 'event', seq: 3, event: { type: 'Project.updated', data: { title: 'binary' } } }],
+        cursor: { anchor: after.anchor, aggregate: 3 },
+      };
+    },
+    async subscribe() {
+      return { activate: async () => ({ anchor: 1, aggregate: 2 }) };
+    },
+  };
+  const handler = createLiveDeliveryHttpHandler({ delivery, principalOf: () => ({ type: 'user', id: 'u1' }) });
+  const { server, baseUrl } = await serve(handler);
+  try {
+    // Plain fetch without msgpack Accept keeps application/json; charset=utf-8
+    const jsonRes = await fetch(`${baseUrl}/bootstrap?scope=Project%3Ap1&mode=snapshot`);
+    assert.equal(jsonRes.status, 200);
+    assert.equal(jsonRes.headers.get('content-type'), 'application/json; charset=utf-8');
+    assert.deepEqual(await jsonRes.json(), {
+      kind: 'snapshot',
+      snapshot: complexSnapshot,
+      cursor: { anchor: 1, aggregate: 2 },
+    });
+
+    // createLiveDeliveryHttpSession advertises Accept: application/x-msgpack, application/json
+    let negotiatedContentType = null;
+    const session = createLiveDeliveryHttpSession({
+      baseUrl,
+      scope: 'Project:p1',
+      fetchImpl: async (url, options) => {
+        const res = await fetch(url, options);
+        if (String(url).includes('/bootstrap')) negotiatedContentType = res.headers.get('content-type');
+        return res;
+      },
+      eventSourceFactory: () => ({ close() {} }),
+      validateSnapshot: (value) => value,
+      fold: (snapshot, envelope) => ({ ...snapshot, latest: envelope.event.data.title }),
+      sendAction: async () => ({ ok: true }),
+      historySession: 'tab-msgpack',
+    });
+    await session.ready;
+    assert.equal(negotiatedContentType, 'application/x-msgpack');
+    assert.deepEqual(session.snapshot, complexSnapshot);
+    session.close();
+  } finally {
+    server.close();
+  }
+});

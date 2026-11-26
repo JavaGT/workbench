@@ -3,6 +3,9 @@
 import { SNAPSHOT_PATCH_CAPABILITY } from './workbench-client-core.mjs';
 import { createLiveDeliverySession } from './workbench-client-delivery.mjs';
 import { normalizeFailure } from './workbench-client-errors.mjs';
+import { Unpackr } from './workbench-client-vendor-msgpackr.mjs';
+
+const bootstrapUnpackr = new Unpackr({ useRecords: false, structuredClone: false });
 
 /**
  * Connect the package-owned recovery session to its HTTP/SSE delivery skin.
@@ -59,14 +62,22 @@ export function createLiveDeliveryHttpSession({
       // The signal is this connection generation's cancellation handle. An
       // aborted request is a retryable transport outcome, exactly like a
       // network failure: it must never masquerade as a terminal verdict.
-      response = await fetchImpl(url.toString(), signal ? { credentials: 'include', signal } : { credentials: 'include' });
+      const fetchOptions = {
+        credentials: 'include',
+        headers: { accept: 'application/x-msgpack, application/json' },
+      };
+      if (signal) fetchOptions.signal = signal;
+      response = await fetchImpl(url.toString(), fetchOptions);
     } catch {
       return { kind: 'retry' };
     }
     if (response.status === 401 || response.status === 403) return { kind: 'revoked' };
     if (response.status >= 500) return { kind: 'retry' };
     if (!response.ok) throw new Error(`live delivery bootstrap failed with HTTP ${response.status}: ${await response.text()}`);
-    const result = await response.json();
+    const contentType = response.headers?.get?.('content-type') ?? '';
+    const result = contentType.includes('msgpack') && typeof response.arrayBuffer === 'function'
+      ? bootstrapUnpackr.unpack(new Uint8Array(await response.arrayBuffer()))
+      : await response.json();
     if (!result || typeof result !== 'object' || !['snapshot', 'catchup', 'retry', 'revoked'].includes(result.kind)) {
       throw new Error('live delivery bootstrap returned an invalid response');
     }

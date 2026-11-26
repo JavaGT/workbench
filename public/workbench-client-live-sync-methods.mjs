@@ -31,12 +31,12 @@ _openSocket() {
     }
     if (this._connecting) return this._connecting;
 
-    this._state = 'connecting';
+    this._lifecycle.send({ type: 'CONNECT' });
     // The state machine owns the transition; observers must see it too, or a
     // bindConnection handle misses the first hop of a lazy connection and
     // reports 'disconnected' until the socket finally opens.
     this._emitConnectionStatus('connecting');
-    const generation = ++this._generation;
+    const generation = this._generation;
     const connecting = new Promise((resolve, reject) => {
       let ws;
       try {
@@ -44,8 +44,8 @@ _openSocket() {
       } catch (err) {
         if (generation === this._generation) {
           this._socket = null;
-          this._state = 'idle';
         }
+        this._lifecycle.send({ type: 'CONNECT_FAILED', generation });
         reject(err);
         return;
       }
@@ -67,9 +67,8 @@ _openSocket() {
           reject(new ClientClosedError());
           return;
         }
-        this._reconnectAttempt = 0;
         this._socket = ws;
-        this._state = 'online';
+        this._lifecycle.send({ type: 'OPENED', generation });
         this._emitConnectionStatus('connected');
         this._reconcileDesired();
         resolve();
@@ -81,8 +80,8 @@ _openSocket() {
         stopTimers();
         if (generation === this._generation) {
           this._socket = null;
-          this._state = 'idle';
         }
+        this._lifecycle.send({ type: 'CONNECT_FAILED', generation });
         reject(new Error('WebSocket connection failed'));
       };
 
@@ -119,8 +118,8 @@ _openSocket() {
           stopTimers();
           if (generation === this._generation) {
             this._socket = null;
-            this._state = 'idle';
           }
+          this._lifecycle.send({ type: 'CONNECT_FAILED', generation });
           try { ws.close(); } catch { /* ignore */ }
           reject(new Error('WebSocket connection timeout'));
         }
@@ -136,13 +135,12 @@ _openSocket() {
 _retireSocket(ws, generation) {
     if (this._closed || generation !== this._generation) return;
     if (this._socket === ws) this._socket = null;
-    this._generation++;
+    this._lifecycle.send({ type: 'SOCKET_RETIRED', generation });
     this._subRequests.clear();
     for (const sub of this._subs.values()) {
       sub.sentGeneration = 0;
       sub.requestId = undefined;
     }
-    this._state = 'backoff';
     this._emitConnectionStatus('disconnected');
     try {
       if (ws.readyState < 2) ws.close();
@@ -326,7 +324,7 @@ _scheduleReconnect() {
     if (this._closed || this._reconnectTimer) return;
     this._emitConnectionStatus('reconnecting');
     const delay = backoffDelay(this._reconnectAttempt, this._backoffBase, this._maxBackoff);
-    this._reconnectAttempt++;
+    this._lifecycle.send({ type: 'SCHEDULE_RECONNECT' });
     this._reconnectTimer = setTimeout(async () => {
       this._reconnectTimer = null;
       if (this._closed) return;
@@ -344,7 +342,7 @@ _clearReconnect() {
       clearTimeout(this._reconnectTimer);
       this._reconnectTimer = null;
     }
-    this._reconnectAttempt = 0;
+    this._lifecycle.send({ type: 'CLEAR_RECONNECT' });
   },
 get status() {
     if (this._state === 'online') return 'connected';

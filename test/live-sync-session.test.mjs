@@ -369,3 +369,28 @@ test('the same subscription cannot be recreated until unsubscribe is acknowledge
   assert.deepEqual(await replacement, { currentSeq: 2 });
   channel.close();
 });
+
+test('closed lifecycle stays permanently disconnected and ignores stale socket open/close/error events', async () => {
+  const statuses = [];
+  const { channel, sockets } = harness();
+  channel.onConnectionChange((status) => statuses.push(status));
+
+  const pending = channel.subscribe('Doc', 'a', () => {});
+  const rejected = assert.rejects(pending, /closed/i);
+  await tick();
+  assert.equal(sockets.length, 1);
+
+  channel.close();
+  await rejected;
+  assert.equal(channel.status, 'disconnected');
+
+  // Stale socket events arriving after terminal close must be ignored cleanly
+  sockets[0].emit('open');
+  sockets[0].emit('error');
+  sockets[0].emit('close');
+  await new Promise((resolve) => setTimeout(resolve, 15));
+
+  assert.equal(channel.status, 'disconnected');
+  assert.equal(sockets.length, 1);
+  assert.deepEqual(statuses, ['connecting', 'disconnected']);
+});

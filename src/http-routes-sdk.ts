@@ -58,6 +58,9 @@ const CLIENT_SDK_SPLIT_FILES = Object.freeze([
   'workbench-client-live-sync.mjs',
   'workbench-client-replica.mjs',
   'workbench-client-scope-store.mjs',
+  'workbench-client-vendor-idb.mjs',
+  'workbench-client-vendor-msgpackr.mjs',
+  'workbench-client-vendor-xstate.mjs',
 ]);
 const CLIENT_SDK_SPLIT_PATHS = new Map(
   CLIENT_SDK_SPLIT_FILES.map((file) => [`/${file}`, join(root, 'public', file)]),

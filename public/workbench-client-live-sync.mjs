@@ -1,6 +1,125 @@
 // workbench-client-live-sync.mjs — browser SDK slice. The public surface is re-exported by
 // ./workbench-client.mjs; this module is loaded by the browser over HTTP.
 import { ClientClosedError, normalizeSubscribeArgs, subscribeEnvelope } from './workbench-client-core.mjs';
+import { createActor, createMachine } from './workbench-client-vendor-xstate.mjs';
+
+const compatStateEvents = {
+  FORCE_STATE: ({ event }) => (
+    ['idle', 'connecting', 'online', 'backoff'].includes(event.state)
+      ? { target: event.state }
+      : undefined
+  ),
+  SET_GENERATION: ({ context, event }) => ({
+    context: { ...context, generation: event.generation },
+  }),
+  SET_RECONNECT_ATTEMPT: ({ context, event }) => ({
+    context: { ...context, reconnectAttempt: event.reconnectAttempt },
+  }),
+};
+
+const liveSyncLifecycleMachine = createMachine({
+  id: 'liveSyncLifecycle',
+  initial: 'idle',
+  context: {
+    generation: 0,
+    reconnectAttempt: 0,
+  },
+  states: {
+    idle: {
+      on: {
+        ...compatStateEvents,
+        CONNECT: ({ context }) => ({
+          target: 'connecting',
+          context: { ...context, generation: context.generation + 1 },
+        }),
+        SCHEDULE_RECONNECT: ({ context }) => ({
+          context: { ...context, reconnectAttempt: context.reconnectAttempt + 1 },
+        }),
+        CLEAR_RECONNECT: ({ context }) => ({
+          context: { ...context, reconnectAttempt: 0 },
+        }),
+        BEGIN_CLOSE: ({ context }) => ({
+          target: 'closing',
+          context: { ...context, generation: context.generation + 1, reconnectAttempt: 0 },
+        }),
+      },
+    },
+    connecting: {
+      on: {
+        ...compatStateEvents,
+        OPENED: ({ context, event }) => (
+          event.generation === context.generation
+            ? { target: 'online', context: { ...context, reconnectAttempt: 0 } }
+            : undefined
+        ),
+        CONNECT_FAILED: ({ context, event }) => (
+          event.generation === context.generation
+            ? { target: 'idle' }
+            : undefined
+        ),
+        SOCKET_RETIRED: ({ context, event }) => (
+          event.generation === context.generation
+            ? { target: 'backoff', context: { ...context, generation: context.generation + 1 } }
+            : undefined
+        ),
+        CLEAR_RECONNECT: ({ context }) => ({
+          context: { ...context, reconnectAttempt: 0 },
+        }),
+        BEGIN_CLOSE: ({ context }) => ({
+          target: 'closing',
+          context: { ...context, generation: context.generation + 1, reconnectAttempt: 0 },
+        }),
+      },
+    },
+    online: {
+      on: {
+        ...compatStateEvents,
+        SOCKET_RETIRED: ({ context, event }) => (
+          event.generation === context.generation
+            ? { target: 'backoff', context: { ...context, generation: context.generation + 1 } }
+            : undefined
+        ),
+        CLEAR_RECONNECT: ({ context }) => ({
+          context: { ...context, reconnectAttempt: 0 },
+        }),
+        BEGIN_CLOSE: ({ context }) => ({
+          target: 'closing',
+          context: { ...context, generation: context.generation + 1, reconnectAttempt: 0 },
+        }),
+      },
+    },
+    backoff: {
+      on: {
+        ...compatStateEvents,
+        CONNECT: ({ context }) => ({
+          target: 'connecting',
+          context: { ...context, generation: context.generation + 1 },
+        }),
+        SCHEDULE_RECONNECT: ({ context }) => ({
+          context: { ...context, reconnectAttempt: context.reconnectAttempt + 1 },
+        }),
+        CLEAR_RECONNECT: ({ context }) => ({
+          context: { ...context, reconnectAttempt: 0 },
+        }),
+        BEGIN_CLOSE: ({ context }) => ({
+          target: 'closing',
+          context: { ...context, generation: context.generation + 1, reconnectAttempt: 0 },
+        }),
+      },
+    },
+    closing: {
+      on: {
+        CLEAR_RECONNECT: ({ context }) => ({
+          context: { ...context, reconnectAttempt: 0 },
+        }),
+        FINISH_CLOSE: () => ({
+          target: 'closed',
+        }),
+      },
+    },
+    closed: {},
+  },
+});
 
 export class LiveSyncSession {constructor(baseUrl, options = {}) {
     let wsUrl;
@@ -30,12 +149,9 @@ export class LiveSyncSession {constructor(baseUrl, options = {}) {
     this._pendingUnsubs = new Map();
 
     this._socket = null;
-    this._state = 'idle';
-    this._generation = 0;
+    this._lifecycle = createActor(liveSyncLifecycleMachine).start();
     this._connecting = null;
-    this._closed = false;
     this._reconnectTimer = null;
-    this._reconnectAttempt = 0;
     this._maxBackoff = options.maxBackoff ?? 5000;
     this._backoffBase = options.backoffBase ?? 200;
     this._connCallbacks = new Set();
@@ -43,6 +159,35 @@ export class LiveSyncSession {constructor(baseUrl, options = {}) {
     // Replays after a reconnect so a caret move during a reconnect window is
     // not silently dropped; a clear supersedes it.
     this._pendingCaret = null;
+  }
+
+  get _state() {
+    return this._lifecycle.getSnapshot().value;
+  }
+
+  set _state(value) {
+    this._lifecycle.send({ type: 'FORCE_STATE', state: value });
+  }
+
+  get _closed() {
+    const state = this._lifecycle.getSnapshot().value;
+    return state === 'closing' || state === 'closed';
+  }
+
+  get _generation() {
+    return this._lifecycle.getSnapshot().context.generation;
+  }
+
+  set _generation(value) {
+    this._lifecycle.send({ type: 'SET_GENERATION', generation: value });
+  }
+
+  get _reconnectAttempt() {
+    return this._lifecycle.getSnapshot().context.reconnectAttempt;
+  }
+
+  set _reconnectAttempt(value) {
+    this._lifecycle.send({ type: 'SET_RECONNECT_ATTEMPT', reconnectAttempt: value });
   }
 
   // Subscribe to an (entity, id). Opens the WebSocket lazily on first call.
@@ -184,9 +329,7 @@ export class LiveSyncSession {constructor(baseUrl, options = {}) {
   // After close(), no further reconnects or deliveries happen.
   close() {
     if (this._closed) return;
-    this._closed = true;
-    this._state = 'closing';
-    this._generation++;
+    this._lifecycle.send({ type: 'BEGIN_CLOSE' });
     this._clearReconnect();
     if (this._socket) {
       try { this._socket.close(); } catch { /* ignore */ }
@@ -205,7 +348,8 @@ export class LiveSyncSession {constructor(baseUrl, options = {}) {
     }
     this._pendingUnsubs.clear();
     this._connecting = null;
-    this._state = 'closed';
+    this._lifecycle.send({ type: 'FINISH_CLOSE' });
+    this._lifecycle.stop();
     this._emitConnectionStatus('disconnected');
     this._connCallbacks.clear();
   }

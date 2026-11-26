@@ -133,3 +133,19 @@ test('db-less app: GET /workbench.mjs falls through (no live kernel → not serv
   assert.equal((await fetch(`${origin}/workbench-annotated-text.mjs`)).status, 404);
   assert.equal((await fetch(`${origin}/workbench-annotated-text-snapshot.mjs`)).status, 404);
 });
+
+test('db-backed app serves pre-bundled browser vendor modules with zero bare npm specifiers', async (t) => {
+  const origin = await bootDb(t);
+  for (const name of [
+    'workbench-client-vendor-idb.mjs',
+    'workbench-client-vendor-msgpackr.mjs',
+    'workbench-client-vendor-xstate.mjs',
+  ]) {
+    const res = await fetch(`${origin}/${name}`);
+    assert.equal(res.status, 200, name);
+    assert.equal(res.headers.get('content-type'), 'text/javascript; charset=utf-8', name);
+    const body = await res.text();
+    assert.doesNotMatch(body, /\bfrom\s*['"](?:idb|xstate|msgpackr)/, `${name} must not contain bare npm imports`);
+    assert.doesNotMatch(body, /['"]node:/, `${name} must not reference Node built-ins`);
+  }
+});

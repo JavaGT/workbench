@@ -35,7 +35,7 @@ export { EventKind, created, updated, removed, fieldSet, native, parseEventType,
 export { scopeOf, parseScopeKey, tryParseScopeKey, isScopeHandle } from './scope-handle.mjs';
 export { decideReplay, normalizeSeqSpan } from './replay-decision.mjs';
 export { createWebSocketLiveDelivery, createLiveServer } from './live-delivery.mjs';
-export { upgradeWebSocket, FrameSender, FrameParser } from './websocket.mjs';
+export { createWebSocketServer } from './websocket.mjs';
 export { resolveTemplate, matchExtension, isSafePath, escapeHtml } from './views.mjs';
 export { mayVerb, mayFieldOp, mayRow } from './row-grant.mjs';
 export { createAuthorizationAdapter,                                                                                                                                                } from './authorization-adapter.mjs';

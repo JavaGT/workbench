@@ -171,6 +171,28 @@ test('multipart file upload', async () => {
   assert.deepEqual(result.file.content, fileContent);
 });
 
+test('multipart preserves binary high bytes and CRLF alongside UTF-8 text fields', async () => {
+  const boundary = 'boundary-bin-utf8';
+  const binary = Buffer.from([0x00, 0x0d, 0x0a, 0x80, 0xc3, 0xff, 0x7f]);
+  const body = Buffer.concat([
+    Buffer.from(`--${boundary}\r\n`, 'utf8'),
+    Buffer.from('Content-Disposition: form-data; name="label"\r\n\r\n', 'utf8'),
+    Buffer.from('café ☕', 'utf8'),
+    Buffer.from(`\r\n--${boundary}\r\n`, 'utf8'),
+    Buffer.from('Content-Disposition: form-data; name="blob"; filename="raw.bin"\r\n', 'utf8'),
+    Buffer.from('Content-Type: application/octet-stream\r\n\r\n', 'utf8'),
+    binary,
+    Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8'),
+  ]);
+  const req = mockReq({ body, contentType: `multipart/form-data; boundary=${boundary}` });
+  const result = await readRequestBody(req);
+  assert.equal(result.label, 'café ☕');
+  assert.equal(result.blob.filename, 'raw.bin');
+  assert.equal(result.blob.size, binary.length);
+  assert.ok(Buffer.isBuffer(result.blob.content));
+  assert.deepEqual(result.blob.content, binary);
+});
+
 test('multipart rejects when jsonOnly', async () => {
   const boundary = 'boundary123';
   const body = `--${boundary}\r\nContent-Disposition: form-data; name="x"\r\n\r\nval\r\n--${boundary}--`;

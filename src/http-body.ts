@@ -1,3 +1,5 @@
+import { parseMultipart } from '@mjackson/multipart-parser';
+
 // Read and parse a request body. Caps the body to guard against unbounded uploads.
 // An empty body parses to {}. Entity CRUD still requires JSON; imperative routes
 // can also accept browser forms.
@@ -131,29 +133,6 @@ function parseUrlencodedBody(buffer: Buffer): Record<string, unknown> {
   return body;
 }
 
-function parseMultipartHeaders(rawHeaders: string): Record<string, string> {
-  const headers: Record<string, string> = {};
-  for (const line of rawHeaders.split('\r\n')) {
-    const colon = line.indexOf(':');
-    if (colon === -1) continue;
-    headers[line.slice(0, colon).trim().toLowerCase()] = line.slice(colon + 1).trim();
-  }
-  return headers;
-}
-
-function parseContentDisposition(value: string): Record<string, string> {
-  const params: Record<string, string> = {};
-  for (const part of value.split(';').slice(1)) {
-    const [key, ...valueParts] = part.split('=');
-    const name = key?.trim().toLowerCase();
-    if (!name) continue;
-    let paramValue = valueParts.join('=').trim();
-    if (paramValue.startsWith('"') && paramValue.endsWith('"')) paramValue = paramValue.slice(1, -1);
-    params[name] = paramValue;
-  }
-  return params;
-}
-
 interface MultipartFile {
   name: string;
   filename: string;
@@ -165,29 +144,27 @@ interface MultipartFile {
 function parseMultipartBody(buffer: Buffer, boundary: string | null): Record<string, unknown> {
   if (!boundary) throw new BodyError('multipart body is missing a boundary', 400);
   const body: Record<string, unknown> = {};
-  const delimiter = `--${boundary}`;
-  const raw = buffer.toString('latin1');
-  for (const section of raw.split(delimiter).slice(1)) {
-    if (section.startsWith('--')) break;
-    const trimmed = section.startsWith('\r\n') ? section.slice(2) : section;
-    const splitAt = trimmed.indexOf('\r\n\r\n');
-    if (splitAt === -1) continue;
-    const headers = parseMultipartHeaders(trimmed.slice(0, splitAt));
-    let content = Buffer.from(trimmed.slice(splitAt + 4), 'latin1');
-    if (content.subarray(-2).toString('latin1') === '\r\n') content = content.subarray(0, -2);
-    const disposition = parseContentDisposition(headers['content-disposition'] ?? '');
-    if (!disposition.name) continue;
-    if (Object.prototype.hasOwnProperty.call(disposition, 'filename')) {
-      assignFormValue(body, disposition.name, {
-        name: disposition.name,
-        filename: disposition.filename,
-        type: headers['content-type'] ?? 'application/octet-stream',
-        size: content.length,
-        content,
-      } satisfies MultipartFile);
-    } else {
-      assignFormValue(body, disposition.name, content.toString('utf8'));
+  try {
+    for (const part of parseMultipart(buffer, { boundary, maxFileSize: BODY_LIMIT })) {
+      const name = part.name;
+      if (!name) continue;
+      if (part.filename !== undefined) {
+        const bytes = part.bytes;
+        const content = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        assignFormValue(body, name, {
+          name,
+          filename: part.filename,
+          type: part.mediaType || 'application/octet-stream',
+          size: content.length,
+          content,
+        } satisfies MultipartFile);
+      } else {
+        assignFormValue(body, name, part.text);
+      }
     }
+  } catch (error) {
+    if (error instanceof BodyError) throw error;
+    throw new BodyError('invalid multipart body', 400);
   }
   return body;
 }

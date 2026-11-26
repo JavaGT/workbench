@@ -217,6 +217,16 @@ Map of modules to loops: `docs/architecture-map.md`.
 - **Two default-on layers**: a route gate (auth required) and a row gate (grant).
   Both on by default; opt out explicitly, never implicitly.
 
+## Dependencies
+
+Workbench does not enforce a rigid zero-dependency budget, but every dependency must earn its place under strict scope and craft standards:
+
+- **Do few things well.** Prefer focused, single-purpose libraries over kitchen-sink frameworks or grab-bag utility belts. A dependency should solve one well-bounded, hard problem (protocol framing, WebAuthn/crypto, streaming parsing, SIMD/vector math, statechart lifecycles) with high craft — never pull in an ecosystem.
+- **Pay for hard problems, not convenience.** Add a dependency when hand-rolling it would be subtle, spec-heavy, security-sensitive, or a long-term bug magnet (RFC/spec compliance, concurrency/reconnect lifecycles, binary wire codecs, crypto/auth verification, streaming parsers). Do not add a package to save 40 lines of straightforward code.
+- **Contained behind one seam — never a second machine.** A dependency must sit cleanly behind an existing Workbench seam (a loop, a coat plugin, or a client protocol). It must not dictate Workbench's architecture, introduce a parallel write/auth/reconciliation path, or leak its own types or concepts across Workbench's public API.
+- **Shallow tree, clean boundaries.** Prefer packages with zero or minimal transitive dependencies, native ESM, strong TypeScript types, and stable releases (avoid beta/churning packages in Workbench's runtime). Keep browser-exported entrypoints (`workbench/client`) especially lean; if a browser seam adopts a dependency, bundle or bound its byte footprint rather than forcing heavy runtimes onto consumers.
+- **Pass the deletion test.** Adopting a dependency must delete or replace substantial hand-rolled complexity (or measurably move a hot-path bottleneck) — never sit beside a legacy hand-rolled path as a second pathway.
+
 ## Product stage
 
 - **This is a beta product.** Build for the long-term best version of the tool; the

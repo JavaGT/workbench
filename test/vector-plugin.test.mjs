@@ -494,6 +494,8 @@ test('derived segments index N per parent and re-authorize the CURRENT parent', 
     segmentId: 's1',
     projectId: 'p1',
     sourceRevision: 'r1',
+    authorizationEntity: 'Note',
+    authorizationRowId: 'n1',
   });
 
   // Authorization is evaluated against the parent as it exists now, not at

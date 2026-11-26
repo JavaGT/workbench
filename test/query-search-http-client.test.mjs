@@ -561,6 +561,260 @@ test('POST /search: unknown index 404 and malformed payload 400', { skip: SQLITE
 });
 
 // ---------------------------------------------------------------------------
+// Derived (1:N) vector hits over the public HTTP route
+// ---------------------------------------------------------------------------
+
+function derivedNoteEntity() {
+  return entity('Note', {
+    title: text(),
+    body: text(),
+    projectId: text(),
+    revision: text(),
+    owner: ref('User', { role: 'owner', readonly: true }),
+    embedding: text(),
+    embedding_model: text(),
+    grant: ownerGrant,
+  });
+}
+
+function noteSegmentEntity() {
+  return entity('NoteSegment', {
+    noteId: ref('Note'),
+    segmentId: text(),
+    projectId: text(),
+    revision: text(),
+    embedding: text(),
+    embedding_model: text(),
+    owner: ref('User', { role: 'owner', readonly: true }),
+    grant: ownerGrant,
+  });
+}
+
+// The plugin's own search admission is deliberately permissive here: these
+// tests isolate the HTTP route's FINAL entity admission. The route must
+// re-authorize the hit's CURRENT parent through the app's real adapter.
+function allowEverySearchHit() {
+  return {
+    registerResource() {},
+    async admit() { return { admitted: true, reasonCode: null }; },
+  };
+}
+
+function recordingAuthorizationAdapter(db) {
+  const inner = createAuthorizationAdapter({ db });
+  const calls = [];
+  const deniedParents = new Set();
+  const denied = (input) => ({
+    admitted: false,
+    operation: 'read',
+    resourceCategory: input.category,
+    resourceId: input.resourceId ?? null,
+    reasonCode: 'no-capability',
+    capabilities: [],
+    trace: null,
+  });
+  return {
+    calls,
+    deniedParents,
+    admit: async (input) => {
+      calls.push(input);
+      // The route must never re-admit a derived hit by its segment identity;
+      // denying every segment admission makes a provenance regression fail.
+      if (input.category === 'entity' && input.entity?.name === 'NoteSegment') return denied(input);
+      if (input.category === 'entity' && input.entity?.name === 'Note'
+        && deniedParents.has(String(input.resourceId))) return denied(input);
+      return inner.admit(input);
+    },
+    registerResource: (input) => inner.registerResource(input),
+  };
+}
+
+async function bootDerivedSearchServer(t, db = new DatabaseSync(':memory:')) {
+  const Note = derivedNoteEntity();
+  const NoteSegment = noteSegmentEntity();
+  const authorization = recordingAuthorizationAdapter(db);
+  const admission = allowEverySearchHit();
+  const fts = createFts5Plugin({
+    id: 'note-fts',
+    version: '1.0.0',
+    tokenizer: 'porter',
+    snippetLength: 32,
+    source: { entity: 'Note', fields: ['title', 'body'], scopeField: 'projectId' },
+    admission: { entity: Note, adapter: admission },
+  });
+  const vector = createVectorPlugin({
+    id: 'note-vec',
+    version: '1.0.0',
+    source: {
+      entity: 'NoteSegment',
+      vector: 'embedding',
+      model: 'embedding_model',
+      scopeField: 'projectId',
+      owns: () => true,
+      parent: {
+        entity: 'Note',
+        field: 'noteId',
+        revisionField: 'revision',
+        projectField: 'projectId',
+        parentRevisionField: 'revision',
+        parentProjectField: 'projectId',
+        segmentIdField: 'segmentId',
+      },
+    },
+    modelSpace: { model: 'embed-v1', dimensions: 2 },
+    admission: { entity: Note, adapter: admission },
+  });
+  const { app, origin } = await bootApp(t, {
+    db,
+    entities: [Note, NoteSegment],
+    authorization,
+    setup: (application) => {
+      application.registerSearchPlugin(fts);
+      application.registerSearchPlugin(vector);
+    },
+  });
+  const insertNote = app.db.prepare(
+    'INSERT INTO Note (id, title, body, projectId, revision, owner, embedding, embedding_model) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+  );
+  const insertSegment = app.db.prepare(
+    'INSERT INTO NoteSegment (id, noteId, segmentId, projectId, revision, embedding, embedding_model, owner) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+  );
+  return {
+    app,
+    origin,
+    calls: authorization.calls,
+    deniedParents: authorization.deniedParents,
+    note: (id, {
+      projectId = 'p1', revision = 'r1', owner = 'alice', title = '', body = '', embedding = [0, 0],
+    } = {}) => insertNote.run(id, title, body, projectId, revision, owner, JSON.stringify(embedding), 'embed-v1'),
+    segment: (id, noteId, {
+      segmentId = id, projectId = 'p1', revision = 'r1', owner = 'mallory', embedding = [0, 0],
+    } = {}) => insertSegment.run(
+      id, noteId, segmentId, projectId, revision, JSON.stringify(embedding), 'embed-v1', owner,
+    ),
+    rebuild: async () => {
+      assert.equal((await app.searchPlugins.rebuild('note-fts')).ok, true);
+      assert.equal((await app.searchPlugins.rebuild('note-vec')).ok, true);
+    },
+  };
+}
+
+const derivedVectorQuery = {
+  mode: 'vector',
+  index: 'note-vec',
+  query: { model: 'embed-v1', vector: [1, 0] },
+  scopeId: 'p1',
+};
+
+test('POST /search: a denied derived top hit does not shorten the page and re-admits the parent', { skip: SQLITE_AUTHORIZER }, async (t) => {
+  const kit = await bootDerivedSearchServer(t);
+  kit.note('n-denied', { owner: 'mallory', title: 'coastal clinic', body: 'coastal' });
+  kit.note('n-allowed', { owner: 'alice', title: 'harbor scheduling', body: 'shift roster' });
+  kit.segment('seg-denied', 'n-denied', { embedding: [1, 0] });
+  kit.segment('seg-allowed', 'n-allowed', { embedding: [0.9, 0.1] });
+  kit.deniedParents.add('n-denied');
+  await kit.rebuild();
+
+  const res = await postJson(kit.origin, '/search', { ...derivedVectorQuery, limit: 1 }, 'alice');
+  assert.equal(res.status, 200);
+  assert.equal(res.body.ok, true);
+  assert.equal(res.body.hits.length, 1, 'the authorized lower-ranked hit fills the page');
+  assert.equal(res.body.hits[0].id, 'seg-allowed');
+  assert.equal(res.body.hits[0].sourceId, 'n-allowed');
+  assert.equal(res.body.hits[0].authorizationEntity, 'Note');
+  assert.equal(res.body.hits[0].authorizationRowId, 'n-allowed');
+
+  const entityCalls = kit.calls.filter((call) => call.category === 'entity');
+  assert.ok(
+    entityCalls.some((call) => call.entity.name === 'Note' && call.resourceId === 'n-denied'),
+    'the denied hit was re-checked as its parent',
+  );
+  assert.ok(
+    entityCalls.some((call) => call.entity.name === 'Note' && call.resourceId === 'n-allowed'),
+    'the disclosed hit was re-checked as its parent',
+  );
+  assert.ok(
+    entityCalls.every((call) => call.entity.name === 'Note'),
+    'derived hits are never re-admitted by segment identity',
+  );
+});
+
+test('POST /search: offset applies to the authorized derived page, not the raw ranking', { skip: SQLITE_AUTHORIZER }, async (t) => {
+  const kit = await bootDerivedSearchServer(t);
+  kit.note('n-denied', { owner: 'mallory' });
+  kit.note('n-allowed', { owner: 'alice' });
+  kit.segment('seg-denied', 'n-denied', { embedding: [1, 0] });
+  kit.segment('seg-a', 'n-allowed', { embedding: [0.9, 0.1] });
+  kit.segment('seg-b', 'n-allowed', { embedding: [0.8, 0.2] });
+  kit.deniedParents.add('n-denied');
+  await kit.rebuild();
+
+  const first = await postJson(kit.origin, '/search', { ...derivedVectorQuery, limit: 1, offset: 0 }, 'alice');
+  const second = await postJson(kit.origin, '/search', { ...derivedVectorQuery, limit: 1, offset: 1 }, 'alice');
+  assert.equal(first.status, 200);
+  assert.equal(second.status, 200);
+  assert.deepEqual(first.body.hits.map((hit) => hit.id), ['seg-a']);
+  assert.deepEqual(second.body.hits.map((hit) => hit.id), ['seg-b'], 'offset advances through authorized hits');
+  assert.equal(second.body.hits.length, 1, 'the offset page stays full');
+});
+
+test('POST /search: revoking the parent after indexing removes its derived hit', { skip: SQLITE_AUTHORIZER }, async (t) => {
+  const kit = await bootDerivedSearchServer(t);
+  kit.note('n-revoked', { owner: 'alice' });
+  kit.segment('seg-revoked', 'n-revoked', { embedding: [1, 0] });
+  await kit.rebuild();
+
+  const before = await postJson(kit.origin, '/search', { ...derivedVectorQuery, limit: 10 }, 'alice');
+  assert.deepEqual(before.body.hits.map((hit) => hit.id), ['seg-revoked']);
+
+  // Revoke the parent's authorization after the index snapshot. The route must
+  // consult the CURRENT parent row, not the indexed provenance alone.
+  kit.deniedParents.add('n-revoked');
+  const after = await postJson(kit.origin, '/search', { ...derivedVectorQuery, limit: 10 }, 'alice');
+  assert.equal(after.status, 200);
+  assert.deepEqual(after.body.hits, [], 'the revoked parent contributes no derived hit or metadata');
+});
+
+test('POST /search: hybrid admits derived parents before filling the fused page', { skip: SQLITE_AUTHORIZER }, async (t) => {
+  const kit = await bootDerivedSearchServer(t);
+  kit.note('n-denied', {
+    owner: 'mallory', title: 'coastal clinic', body: 'coastal', embedding: [1, 0],
+  });
+  kit.note('n-vec', {
+    owner: 'alice', title: 'harbor scheduling', body: 'shift roster', embedding: [0.9, 0.1],
+  });
+  kit.segment('seg-denied', 'n-denied', { embedding: [1, 0] });
+  kit.segment('seg-vec', 'n-vec', { embedding: [0.9, 0.1] });
+  kit.deniedParents.add('n-denied');
+  await kit.rebuild();
+
+  const res = await postJson(kit.origin, '/search', {
+    mode: 'hybrid',
+    sources: { fts: 'note-fts', vector: 'note-vec' },
+    query: 'coastal',
+    vector: [1, 0],
+    model: 'embed-v1',
+    weights: { fts: 1, vector: 1 },
+    k: 60,
+    scopeId: 'p1',
+    limit: 1,
+  }, 'alice');
+  assert.equal(res.status, 200);
+  assert.equal(res.body.ok, true);
+  assert.equal(res.body.hits.length, 1);
+  assert.equal(res.body.hits[0].key, 'seg-vec', 'the admitted vector-only hit fills the fused page');
+  assert.ok(
+    kit.calls.some((call) => call.category === 'entity'
+      && call.entity.name === 'Note' && call.resourceId === 'n-vec'),
+    'the fused vector hit was re-admitted as its parent',
+  );
+  assert.ok(
+    kit.calls.filter((call) => call.category === 'entity').every((call) => call.entity.name === 'Note'),
+    'hybrid admission never re-checks the segment identity',
+  );
+});
+
+// ---------------------------------------------------------------------------
 // Injected authorization adapter (finding 1) — every framework-owned read
 // route must honor the SAME adapter REST does: a principal denial is a 401,
 // and an entity denial omits rows/hits just like REST list's post-filter.

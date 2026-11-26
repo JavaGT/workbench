@@ -9,7 +9,12 @@ import type { CrudEntity } from './http-crud-dispatch.ts';
 import type { EntityRecord } from './row-grant.ts';
 import type { AuthorizationAdapter } from './authorization-adapter.ts';
 import { hybridSearch, type SearchPluginRegistry } from './search-plugin.ts';
-import { searchStalenessOf } from './search-response.ts';
+import {
+  searchStalenessOf,
+  searchPageWindow,
+  SEARCH_MAX_RESULTS_CAP,
+  SEARCH_MAX_WINDOW,
+} from './search-response.ts';
 import type { SearchRegistry } from './app.ts';
 import { sendJson, type HttpResponseLike } from './http-response.ts';
 import {
@@ -47,20 +52,53 @@ function vectorQueryOf(body: Record<string, unknown>): Record<string, unknown> {
 
 function searchScope(body: Record<string, unknown>): Record<string, unknown> {
   const scope: Record<string, unknown> = {};
-  if (body.limit !== undefined) scope.limit = body.limit;
   if (body.scopeId !== undefined) scope.scopeId = body.scopeId;
   if (body.scope !== undefined) scope.scope = body.scope;
   return scope;
 }
 
-// Resolve the source entity a search hit came from. Framework plugins disclose
-// it through their registered source interests; a hit may also carry an explicit
-// `entity`. A custom registry disclosing neither has no entity row to re-check —
-// its plugin-owned search admission already ran, so nothing is added here.
-function searchHitSourceEntity(app: FrameworkApp, hit: unknown, indices: readonly string[]): CrudEntity | undefined {
+// The caller's requested page window. The route — not the registry call that
+// happens to fetch a batch — owns the final window, because hits are admitted
+// here before any slice is disclosed. The registry still owns its own window
+// for each batch fetch.
+function searchWindow(body: Record<string, unknown>): { readonly offset: number; readonly limit: number } {
+  return searchPageWindow({
+    ...(typeof body.limit === 'number' ? { limit: body.limit } : {}),
+    ...(typeof body.offset === 'number' ? { offset: body.offset } : {}),
+  });
+}
+
+// Resolve the source row a search hit must be re-authorized against. A derived
+// plugin hit carries explicit provenance for the CURRENT parent row it was
+// admitted against; otherwise the hit came from its source entity directly.
+// A fused (hybrid) hit wraps the plugin hit under `hit`, so provenance is read
+// from either level.
+function searchHitAuthorization(
+  app: FrameworkApp,
+  hit: unknown,
+  indices: readonly string[],
+): { readonly entity: CrudEntity; readonly id: string } | undefined {
   if (!app.entities) return undefined;
-  const explicit = (hit as { entity?: unknown } | null)?.entity;
+  const outer = hit !== null && typeof hit === 'object' ? hit as Record<string, unknown> : null;
+  if (!outer) return undefined;
+  const nested = outer.hit !== null && typeof outer.hit === 'object' ? outer.hit as Record<string, unknown> : null;
+
+  // Explicit provenance wins and is fail-closed: if it names an entity this
+  // app does not know, the hit is not re-labeled with a guessed source.
+  for (const record of [outer, nested]) {
+    if (!record) continue;
+    const entityName = record.authorizationEntity;
+    const rowId = searchRowId(record.authorizationRowId);
+    if (typeof entityName === 'string' && entityName.length > 0 && rowId !== null) {
+      const entity = app.entities.get(entityName);
+      return entity ? { entity, id: rowId } : undefined;
+    }
+  }
+
+  const id = searchHitId(hit);
+  if (id === null) return undefined;
   const candidates: string[] = [];
+  const explicit = outer.entity;
   if (typeof explicit === 'string') candidates.push(explicit);
   const plugins = (app as { searchPlugins?: SearchPluginRegistry }).searchPlugins;
   for (const index of indices) {
@@ -70,20 +108,26 @@ function searchHitSourceEntity(app: FrameworkApp, hit: unknown, indices: readonl
   }
   for (const name of candidates) {
     const entity = app.entities.get(name);
-    if (entity) return entity;
+    if (entity) return { entity, id };
   }
   return undefined;
 }
 
 // A hit's source row id. Plugin hits carry `id`; fused (hybrid) hits carry `key`
-// and wrap the plugin hit under `hit`. Either identifies the current source row.
+// and wrap the plugin hit under `hit`.
+function searchRowId(value: unknown): string | null {
+  if (typeof value === 'string' && value.length > 0) return value;
+  if (typeof value === 'number' && Number.isSafeInteger(value)) return String(value);
+  return null;
+}
+
 function searchHitId(hit: unknown): string | null {
   if (!hit || typeof hit !== 'object') return null;
   const record = hit as Record<string, unknown>;
   const nested = record.hit && typeof record.hit === 'object' ? record.hit as Record<string, unknown> : null;
   for (const candidate of [record.id, record.key, nested?.id, nested?.key]) {
-    if (typeof candidate === 'string' && candidate.length > 0) return candidate;
-    if (typeof candidate === 'number' && Number.isSafeInteger(candidate)) return String(candidate);
+    const id = searchRowId(candidate);
+    if (id !== null) return id;
   }
   return null;
 }
@@ -102,13 +146,13 @@ async function admitSearchHitsByEntity(
 ): Promise<unknown[]> {
   const admitted: unknown[] = [];
   for (const hit of hits) {
-    const entity = searchHitSourceEntity(app, hit, indices);
-    const id = searchHitId(hit);
-    const stored = entity && id !== null ? rawRow(app.db, entity.name, id) : undefined;
-    // Fail closed: no source entity, no id, or a row that vanished since the
+    const source = searchHitAuthorization(app, hit, indices);
+    const stored = source !== undefined ? rawRow(app.db, source.entity.name, source.id) : undefined;
+    // Fail closed: no source row, no id, or a row that vanished since the
     // index snapshot means this hit cannot be re-authorized. Drop it rather
     // than disclose a stale or plugin-forged row body.
-    if (!entity || id === null || !stored) continue;
+    if (source === undefined || !stored) continue;
+    const { entity, id } = source;
     const row = typeof entity.deserializeRow === 'function'
       ? entity.deserializeRow({ ...stored })
       : stored;
@@ -123,6 +167,46 @@ async function admitSearchHitsByEntity(
     if (decision.admitted) admitted.push(hit);
   }
   return admitted;
+}
+
+// Admit before slicing. Fetch raw-ranked batches from the SAME search
+// lifecycle, keep only rows the entity adapter admits, and only then apply the
+// caller's offset/limit. A denied top hit therefore cannot shorten the page:
+// scanning continues until the authorized page is full or the ranked results
+// are exhausted. Each batch is a bounded registry request, so the plugin still
+// owns retrieval and the route owns neither a second index nor a second auth
+// engine.
+async function admittedSearchPage<Meta>(
+  app: FrameworkApp,
+  authorization: AuthorizationAdapter,
+  principal: Principal,
+  indices: readonly string[],
+  fetchPage: (offset: number, limit: number) => Promise<{ readonly hits: readonly unknown[]; readonly meta: Meta }>,
+  window: { readonly offset: number; readonly limit: number },
+): Promise<{ readonly hits: unknown[]; readonly meta: Meta | null }> {
+  const target = window.offset + window.limit;
+  let batchSize = Math.min(SEARCH_MAX_RESULTS_CAP, Math.max(window.limit, window.limit * 4));
+  const admitted: unknown[] = [];
+  let meta: Meta | null = null;
+  let rawOffset = 0;
+  while (admitted.length < target && rawOffset < SEARCH_MAX_WINDOW) {
+    const batch = Math.min(batchSize, SEARCH_MAX_WINDOW - rawOffset);
+    if (batch <= 0) break;
+    const page = await fetchPage(rawOffset, batch);
+    if (meta === null) meta = page.meta;
+    if (page.hits.length === 0) break;
+    const admittedBatch = await admitSearchHitsByEntity(app, authorization, page.hits, principal, indices);
+    admitted.push(...admittedBatch);
+    rawOffset += page.hits.length;
+    if (page.hits.length < batch) break;
+    // Denials consumed a full batch without filling the page: widen the next
+    // batch so a heavily filtered index does not degrade into many tiny scans.
+    if (admitted.length < target) batchSize = Math.min(SEARCH_MAX_RESULTS_CAP, batchSize * 2);
+  }
+  return {
+    hits: admitted.slice(window.offset, window.offset + window.limit),
+    meta,
+  };
 }
 
 // POST /search — FTS5, Float32 vector, or hybrid RRF retrieval over the app's
@@ -164,6 +248,14 @@ export async function handleSearchRoute(
     const has = (registry as SearchRegistry).has;
     return typeof has === 'function' ? has.call(registry, index) : true;
   };
+
+  let window: { readonly offset: number; readonly limit: number };
+  try {
+    window = searchWindow(body);
+  } catch (err) {
+    reject(res, 400, err instanceof Error ? err.message : 'invalid search window');
+    return true;
+  }
 
   if (mode === 'hybrid') {
     const sources = (body.sources ?? {}) as Record<string, unknown>;
@@ -209,15 +301,30 @@ export async function handleSearchRoute(
       ...searchScope(body),
     };
     try {
-      const result = typeof (registry as SearchRegistry).hybridSearch === 'function'
-        ? await (registry as SearchRegistry).hybridSearch!(shared)
-        : await hybridSearch({ registry: registry as SearchPluginRegistry, ...shared } as never);
-      const hits = await admitSearchHitsByEntity(app, authorization, result.hits ?? [], admitted, [ftsIndex, vectorIndex]);
+      const page = await admittedSearchPage(
+        app,
+        authorization,
+        admitted,
+        [ftsIndex, vectorIndex],
+        async (offset, limit) => {
+          const request = { ...shared, offset, limit };
+          const next = typeof (registry as SearchRegistry).hybridSearch === 'function'
+            ? await (registry as SearchRegistry).hybridSearch!(request)
+            : await hybridSearch({ registry: registry as SearchPluginRegistry, ...request } as never);
+          return { hits: next.hits ?? [], meta: next };
+        },
+        window,
+      );
+      const result = page.meta;
+      if (result === null) {
+        reject(res, 400, 'hybrid search did not return a result');
+        return true;
+      }
       sendJson(res, 200, {
         ok: result.ok,
         mode: 'hybrid',
         staleness: result.staleness,
-        hits,
+        hits: page.hits,
         totalCandidates: result.totalCandidates,
         k: result.k,
         cancelled: result.cancelled === true,
@@ -243,19 +350,33 @@ export async function handleSearchRoute(
     ...searchScope(body),
   };
   try {
-    const outcome = await (registry as SearchRegistry).search(index, request);
+    const page = await admittedSearchPage(
+      app,
+      authorization,
+      admitted,
+      [index],
+      async (offset, limit) => {
+        const outcome = await (registry as SearchRegistry).search(index, { ...request, offset, limit });
+        return { hits: outcome.result?.hits ?? [], meta: outcome };
+      },
+      window,
+    );
+    const outcome = page.meta;
+    if (outcome === null) {
+      reject(res, 400, 'search did not return a result');
+      return true;
+    }
     if (!outcome.ok && !outcome.cancelled && !outcome.timedOut && outcome.lastError) {
       reject(res, 400, outcome.lastError.message ?? 'invalid search request');
       return true;
     }
-    const hits = await admitSearchHitsByEntity(app, authorization, outcome.result?.hits ?? [], admitted, [index]);
     sendJson(res, 200, {
       ok: outcome.ok,
       mode,
       index,
       generation: outcome.generation,
       staleness: searchStalenessOf(outcome.state),
-      hits,
+      hits: page.hits,
       cancelled: outcome.cancelled === true,
       timedOut: outcome.timedOut === true,
       ...(outcome.lastError ? { error: outcome.lastError.message } : {}),

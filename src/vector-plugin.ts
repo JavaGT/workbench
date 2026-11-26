@@ -215,6 +215,9 @@ function derivedHit(
     segmentId: parent.segmentIdField === undefined ? match.id : segmentRow[parent.segmentIdField],
     projectId: parentFence.projectId,
     sourceRevision: parentFence.revision,
+    // Re-admit the CURRENT parent, not the segment key.
+    authorizationEntity: parent.entity,
+    authorizationRowId: String(segmentRow[parent.field]),
   });
 }
 function boundaryKeyCensus(count: number, boundaryIds: readonly string[]): SearchEntityCensus {

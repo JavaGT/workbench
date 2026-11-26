@@ -94,6 +94,10 @@
 		"node": ">=24.10.0"
 	},
 	"dependencies": {
+		"@mjackson/multipart-parser": "^0.10.1",
+		"cookie": "^2.0.2",
+		"lru-cache": "^11.5.3",
+		"rou3": "^1.0.0",
 		"ws": "^8.23.0"
 	}
 }

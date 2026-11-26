@@ -14,6 +14,7 @@
 import { principal, anonymous, isPrincipalStatus,                                                          } from '../principal.mjs';
 import { config } from '../config.mjs';
 import { createHash } from 'node:crypto';
+import { parseCookie, stringifySetCookie } from 'cookie';
 
 // The minimal request shape session hydration reads: the raw `Cookie` header
 // (node:http exposes the string) and the `Authorization` header for Bearer keys.
@@ -112,23 +113,25 @@ export function hashSessionToken(token        )         {
 // identity, only a key into the Session table.
 export const SESSION_COOKIE = 'sid';
 
+function safeDecodeCookieValue(value        )                     {
+  if (!value.includes('%')) return value;
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return undefined;
+  }
+}
+
 // Parse a raw `Cookie` request header (`name=value; name2=value2`) into a
 // name→value map. Values are url-decoded. A missing/empty header is an empty map.
-// Zero-dependency: node:http exposes the raw header string, nothing parses it.
 // Malformed percent-escapes are skipped (fail closed) — never throw 500 (cso M1).
 export function parseCookies(header                           )                         {
   const cookies                         = {};
   if (!header) return cookies;
-  for (const pair of header.split(';')) {
-    const eq = pair.indexOf('=');
-    if (eq === -1) continue;
-    const name = pair.slice(0, eq).trim();
-    if (!name) continue;
-    const value = pair.slice(eq + 1).trim();
-    try {
-      cookies[name] = decodeURIComponent(value);
-    } catch {
-      // Malformed percent-encoding — skip this cookie (fail closed, anonymous)
+  const parsed = parseCookie(header, { decode: safeDecodeCookieValue });
+  for (const [name, value] of Object.entries(parsed)) {
+    if (name && value !== undefined) {
+      cookies[name] = value;
     }
   }
   return cookies;
@@ -155,14 +158,24 @@ export function sessionCookie(
   if (env === 'production' && !secure) {
     throw new Error('sessionCookie secure:false is not permitted in production');
   }
-  const attributes = [`${SESSION_COOKIE}=${token}`, 'HttpOnly', 'SameSite=Lax', 'Path=/'];
+  let resolvedMaxAge                    ;
   if (typeof maxAge === 'number' && Number.isFinite(maxAge) && maxAge >= 0) {
-    attributes.push(`Max-Age=${Math.floor(maxAge)}`);
+    resolvedMaxAge = Math.floor(maxAge);
   } else if (typeof ttlMs === 'number' && Number.isFinite(ttlMs) && ttlMs >= 0) {
-    attributes.push(`Max-Age=${Math.floor(ttlMs / 1000)}`);
+    resolvedMaxAge = Math.floor(ttlMs / 1000);
   }
-  if (secure) attributes.push('Secure');
-  return attributes.join('; ');
+  return stringifySetCookie(
+    {
+      name: SESSION_COOKIE,
+      value: token,
+      httpOnly: true,
+      sameSite: 'lax',
+      path: '/',
+      secure,
+      ...(resolvedMaxAge !== undefined ? { maxAge: resolvedMaxAge } : {}),
+    },
+    { encode: (value) => value },
+  );
 }
 
 // Read the opaque session token from the request's `sid` cookie, or undefined

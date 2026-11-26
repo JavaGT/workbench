@@ -1,5 +1,9 @@
 // rate-limit.mjs — per-key fixed-window rate limiters.
-// Buckets keyed by floor(now / windowMs); stale buckets dropped on access.
+// Buckets keyed by floor(now / windowMs) and bounded in O(1) via LRUCache.
+
+import { LRUCache } from 'lru-cache';
+
+const DEFAULT_MAX_BUCKETS = 10_000;
 
 
 
@@ -42,17 +46,8 @@
 
 
 
-function pruneBuckets(buckets                         , currentWindow        ) {
-  for (const [key, bucket] of buckets) {
-    if (bucket.window < currentWindow) {
-      buckets.delete(key);
-    }
-  }
-}
-
-function checkBucket(buckets                         , key        , windowMs        , max        , now              )              {
+function checkBucket(buckets                              , key        , windowMs        , max        , now              )              {
   const currentWindow = Math.floor(now() / windowMs);
-  pruneBuckets(buckets, currentWindow);
 
   let bucket = buckets.get(key);
   if (!bucket || bucket.window !== currentWindow) {
@@ -70,8 +65,8 @@ function checkBucket(buckets                         , key        , windowMs    
 export function createRateLimiter(
   { ip: { windowMs: ipWindowMs, max: ipMax }, session = null, local = null, now = Date.now }                   = {}                    ,
 )                                                                        {
-  const ipBuckets = new Map                    ();
-  const sessionBuckets = new Map                    ();
+  const ipBuckets = new LRUCache                    ({ max: DEFAULT_MAX_BUCKETS });
+  const sessionBuckets = new LRUCache                    ({ max: DEFAULT_MAX_BUCKETS });
   const sessionWindowMs = session?.windowMs;
   const sessionMax = session?.max;
   const localWindowMs = local?.windowMs;
@@ -156,7 +151,7 @@ export function isTrustedLocalPeer(ip        )          {
 export function createKeyedRateLimiter(
   { windowMs, max, now = Date.now }                        = {}                         ,
 )                   {
-  const buckets = new Map                    ();
+  const buckets = new LRUCache                    ({ max: DEFAULT_MAX_BUCKETS });
 
   function check(key        )                       {
     return checkBucket(buckets, key, windowMs, max, now);

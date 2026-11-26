@@ -35,7 +35,7 @@ export { EventKind, created, updated, removed, fieldSet, native, parseEventType,
 export { scopeOf, parseScopeKey, tryParseScopeKey, isScopeHandle } from './scope-handle.ts';
 export { decideReplay, normalizeSeqSpan } from './replay-decision.ts';
 export { createWebSocketLiveDelivery, createLiveServer } from './live-delivery.ts';
-export { upgradeWebSocket, FrameSender, FrameParser } from './websocket.ts';
+export { createWebSocketServer } from './websocket.ts';
 export { resolveTemplate, matchExtension, isSafePath, escapeHtml } from './views.ts';
 export { mayVerb, mayFieldOp, mayRow } from './row-grant.ts';
 export { createAuthorizationAdapter, type AuthorizationAdapter, type AdmitInput, type AdmissionDecision, type AdmissionReasonCode, type ResourceCategory, type ResourceRegistration } from './authorization-adapter.ts';

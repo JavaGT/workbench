@@ -44,3 +44,17 @@ test('matchRoute does not match longer or shorter paths', () => {
   assert.equal(matchRoute(routes, 'GET', '/docs/feed/extra').pathMatched, false);
   assert.equal(matchRoute(routes, 'GET', '/docs').route, null);
 });
+
+test('matchRoute rejects malformed percent-encoding cleanly', () => {
+  const match = matchRoute(routes, 'GET', '/docs/%ZZ');
+  assert.equal(match.route, null);
+  assert.equal(match.params, null);
+  assert.equal(match.pathMatched, false);
+});
+
+test('matchRoute returns consistent fresh params across repeated cached lookups', () => {
+  const first = matchRoute(routes, 'GET', '/users/alice/docs/d1');
+  const second = matchRoute(routes, 'GET', '/users/bob/docs/d2');
+  assert.deepEqual(first.params, { userId: 'alice', docId: 'd1' });
+  assert.deepEqual(second.params, { userId: 'bob', docId: 'd2' });
+});

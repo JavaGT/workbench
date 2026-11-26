@@ -1,3 +1,5 @@
+import { addRoute, createRouter, findRoute, type RouterContext } from 'rou3';
+
 export type RouteParams = Record<string, string>;
 
 export interface RouteDefinition {
@@ -10,34 +12,47 @@ export type RouteMatch =
   | { route: RouteDefinition; params: RouteParams }
   | { route: null; params: null; pathMatched: boolean };
 
-function matchPath(template: string, actual: string): RouteParams | null {
-  const t = template.split('/').filter(Boolean);
-  const a = actual.split('/').filter(Boolean);
-  if (t.length !== a.length) return null;
+interface CompiledRoutes {
+  readonly length: number;
+  readonly byMethod: RouterContext<RouteDefinition>;
+  readonly anyMethod: RouterContext<true>;
+}
+
+const compiledRouteCache = new WeakMap<readonly RouteDefinition[], CompiledRoutes>();
+
+function normalizePath(path: string): string {
+  const segments = path.split('/').filter(Boolean);
+  return `/${segments.join('/')}`;
+}
+
+function compileRoutes(routes: readonly RouteDefinition[]): CompiledRoutes {
+  const cached = compiledRouteCache.get(routes);
+  if (cached && cached.length === routes.length) return cached;
+
+  const byMethod = createRouter<RouteDefinition>();
+  const anyMethod = createRouter<true>();
+  for (const route of routes) {
+    const normalized = normalizePath(route.path);
+    addRoute(byMethod, route.method, normalized, route);
+    addRoute(anyMethod, 'ANY', normalized, true);
+  }
+  const compiled: CompiledRoutes = { length: routes.length, byMethod, anyMethod };
+  compiledRouteCache.set(routes, compiled);
+  return compiled;
+}
+
+function decodeParams(rawParams: Record<string, string> | undefined): RouteParams | null {
   const params: RouteParams = {};
-  for (let i = 0; i < t.length; i += 1) {
-    if (t[i].startsWith(':')) {
-      try {
-        params[t[i].slice(1)] = decodeURIComponent(a[i]);
-      } catch (error) {
-        if (error instanceof URIError) return null;
-        throw error;
-      }
-    } else if (t[i] !== a[i]) {
-      return null;
+  if (!rawParams) return params;
+  for (const [key, value] of Object.entries(rawParams)) {
+    try {
+      params[key] = decodeURIComponent(value);
+    } catch (error) {
+      if (error instanceof URIError) return null;
+      throw error;
     }
   }
   return params;
-}
-
-function specificity(template: string): number {
-  return template.split('/').filter((s) => s && !s.startsWith(':')).length;
-}
-
-interface ScoredMatch {
-  route: RouteDefinition;
-  params: RouteParams;
-  score: number;
 }
 
 export function matchRoute(
@@ -45,15 +60,21 @@ export function matchRoute(
   method: string,
   pathname: string,
 ): RouteMatch {
-  let pathMatched = false;
-  let best: ScoredMatch | null = null;
-  for (const route of routes) {
-    const params = matchPath(route.path, pathname);
-    if (params === null) continue;
-    pathMatched = true;
-    if (route.method !== method) continue;
-    const score = specificity(route.path);
-    if (!best || score > best.score) best = { route, params, score };
+  const compiled = compileRoutes(routes);
+  const normalizedPathname = normalizePath(pathname);
+
+  const hit = findRoute(compiled.byMethod, method, normalizedPathname);
+  if (hit) {
+    const params = decodeParams(hit.params);
+    if (params !== null) {
+      return { route: hit.data, params };
+    }
+    return { route: null, params: null, pathMatched: false };
   }
-  return best ? { route: best.route, params: best.params } : { route: null, params: null, pathMatched };
+
+  const anyHit = findRoute(compiled.anyMethod, 'ANY', normalizedPathname);
+  if (anyHit && decodeParams(anyHit.params) !== null) {
+    return { route: null, params: null, pathMatched: true };
+  }
+  return { route: null, params: null, pathMatched: false };
 }

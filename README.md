@@ -13,8 +13,10 @@ Structurally it is a **small machine** (compile → commit → deliver) wearing 
 
 ## Status
 
-**Implemented.** Zero runtime dependencies — Node 24.10+ (26 recommended):
-`node:http`, `node:crypto`, `node:sqlite`, `node:fs`. Suite: `npm test`.
+**Implemented.** Minimal, focused runtime dependencies (see
+[`AGENTS.md`](AGENTS.md#dependencies)) built on Node 24.10+ (26 recommended)
+built-ins (`node:http`, `node:crypto`, `node:sqlite`, `node:fs`) and Bun.
+Suite: `npm test`.
 
 ## Quick start
 

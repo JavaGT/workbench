@@ -1,3 +1,4 @@
+import { LRUCache } from 'lru-cache';
 import { deserializeField } from './field-strategy.mjs';
 import {
   compactTextFamilyCheckpoint,
@@ -100,7 +101,10 @@ function cacheStateForDb(db         )                              {
   if (!db || typeof db !== 'object') return null;
   let state = dbSnapshotCaches.get(db);
   if (!state) {
-    state = { mutationEpoch: 0, snapshots: new Map() };
+    state = {
+      mutationEpoch: 0,
+      snapshots: new LRUCache                                ({ max: SHARED_SNAPSHOT_CACHE_LIMIT }),
+    };
     dbSnapshotCaches.set(db, state);
   }
   return state;
@@ -153,9 +157,6 @@ function getCachedSnapshot(
     state.snapshots.delete(key);
     return null;
   }
-  // Touch LRU position.
-  state.snapshots.delete(key);
-  state.snapshots.set(key, cached);
   return cached;
 }
 
@@ -168,13 +169,7 @@ function putCachedSnapshot(
 )       {
   const state = cacheStateForDb(db);
   if (!state || state.mutationEpoch !== expectedEpoch) return;
-  const key = docCacheKey(prefix, documentId);
-  state.snapshots.delete(key);
-  state.snapshots.set(key, entry);
-  if (state.snapshots.size > SHARED_SNAPSHOT_CACHE_LIMIT) {
-    const oldestKey = state.snapshots.keys().next().value;
-    if (oldestKey !== undefined) state.snapshots.delete(oldestKey);
-  }
+  state.snapshots.set(docCacheKey(prefix, documentId), entry);
 }
 
 function requireRecipientReadInput(input     ) {

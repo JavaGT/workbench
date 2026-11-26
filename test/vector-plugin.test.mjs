@@ -570,6 +570,20 @@ test('derived search filters before pagination and refills denied windows', asyn
   assert.equal(otherProject.result.hits[0].segmentId, 'shared', 'same segment id in another project keeps its own row identity');
 });
 
+function generationTables(plugin) {
+  return plugin.ownedObjects
+    .filter((object) => object.kind === 'table' && /_g[01]$/.test(object.name))
+    .map((object) => object.name);
+}
+
+function stateTableOf(plugin) {
+  return plugin.ownedObjects.find((object) => object.kind === 'table' && object.name.endsWith('_state')).name;
+}
+
+function storedCount(db, table, column, value) {
+  return Number(db.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE ${column} = ?`).get(value).count);
+}
+
 test('erasing a parent purges its derived segments through rebuild', async (t) => {
   const kit = await derivedSetup(t);
   kit.note('n1', 'p1');
@@ -584,6 +598,72 @@ test('erasing a parent purges its derived segments through rebuild', async (t) =
   });
   assert.equal(outcome.ok, true, outcome.lastError?.message);
   assert.equal(kit.registry.healthOf('multimodal-vectors').plugin.vectors, 0);
+});
+
+test('an erased parent is purged from every generation and cannot return on rollback', async (t) => {
+  const kit = await derivedSetup(t);
+  kit.note('n1', 'p1');
+  kit.segment('s1', 'n1', 'p1', [1, 0]);
+  await kit.rebuild();
+  const generations = generationTables(kit.plugin);
+  assert.equal(generations.length, 2);
+  assert.equal(generations.reduce((total, table) => total + storedCount(kit.db, table, 'parent_key', 'n1'), 0), 1);
+
+  kit.db.prepare('DELETE FROM Note WHERE id = ?').run('n1');
+  const outcome = await kit.registry.revoke('multimodal-vectors', {
+    kind: 'erasure',
+    entity: 'Note',
+    rowId: 'n1',
+  });
+  assert.equal(outcome.ok, true, outcome.lastError?.message);
+  assert.deepEqual(generations.map((table) => storedCount(kit.db, table, 'parent_key', 'n1')), [0, 0]);
+  assert.deepEqual((await kit.search([1, 0], { limit: 10 })).result.hits, []);
+
+  kit.db.prepare(`UPDATE ${stateTableOf(kit.plugin)} SET active = previous WHERE slot = 'active'`).run();
+  assert.deepEqual((await kit.search([1, 0], { limit: 10 })).result.hits, [], 'the retained generation cannot resurrect erased derived vectors');
+});
+
+test('removing a segment purges its stored vector from every generation', async (t) => {
+  const kit = await derivedSetup(t);
+  kit.note('n1', 'p1');
+  kit.segment('s1', 'n1', 'p1', [1, 0]);
+  kit.segment('s2', 'n1', 'p1', [0, 1]);
+  await kit.rebuild();
+  const generations = generationTables(kit.plugin);
+  assert.equal(generations.reduce((total, table) => total + storedCount(kit.db, table, 'source_key', 's2'), 0), 1);
+
+  kit.db.prepare('DELETE FROM NoteSegment WHERE id = ?').run('s2');
+  const removed = await kit.registry.reconcile('multimodal-vectors', [
+    { entity: 'NoteSegment', rowId: 's2', kind: 'removed' },
+  ]);
+  assert.equal(removed.ok, true, removed.lastError?.message);
+  assert.deepEqual(generations.map((table) => storedCount(kit.db, table, 'source_key', 's2')), [0, 0]);
+  assert.deepEqual((await kit.search([1, 0], { limit: 10 })).result.hits.map((hit) => hit.id), ['s1']);
+});
+
+test('a stale embedding is never disclosed under an advanced segment revision', async (t) => {
+  const kit = await derivedSetup(t);
+  kit.note('n1', 'p1', 'r1');
+  kit.segment('s1', 'n1', 'p1', [1, 0], { revision: 'r1' });
+  await kit.rebuild();
+
+  kit.db.prepare('UPDATE Note SET revision = ? WHERE id = ?').run('r2', 'n1');
+  kit.db.prepare('UPDATE NoteSegment SET revision = ?, embedding = ? WHERE id = ?')
+    .run('r2', JSON.stringify([0, 1]), 's1');
+  assert.deepEqual(
+    (await kit.search([1, 0], { limit: 10 })).result.hits,
+    [],
+    'the r1 embedding is not served as the r2 revision',
+  );
+
+  const reconciled = await kit.registry.reconcile('multimodal-vectors', [
+    { entity: 'NoteSegment', rowId: 's1', kind: 'updated' },
+  ]);
+  assert.equal(reconciled.ok, true, reconciled.lastError?.message);
+  const current = await kit.search([1, 0], { limit: 10 });
+  assert.deepEqual(current.result.hits.map((hit) => hit.id), ['s1']);
+  assert.equal(current.result.hits[0].sourceRevision, 'r2');
+  assert.equal(current.result.hits[0].score, 0, 'the r2 embedding replaced the r1 vector');
 });
 
 test('derived segments shadow-rebuild with parity over the fenced projection', async (t) => {

@@ -241,6 +241,7 @@ function compareIds(a        , b        )         {
 
 
 
+
 function compareScoredMatches(a             , b             )         {
   if (a.score > b.score) return -1;
   if (a.score < b.score) return 1;
@@ -428,7 +429,9 @@ export function createVectorPlugin(options                     )               {
     const norm = typeof storedNorm === 'number' && Number.isFinite(storedNorm) ? storedNorm : vectorNorm(vector);
     const score = cosineSimilarityFloat32(queryVec, queryNorm, vector, norm);
     if (!Number.isFinite(score)) return null;
-    return { id: String(row.source_key), score };
+    const parentKey = typeof row.parent_key === 'string' && row.parent_key.length > 0 ? row.parent_key : null;
+    const fence = parentKey === null ? undefined : { parentId: parentKey, revision: String(row.revision ?? ''), projectId: String(row.project_key ?? '') };
+    return { id: String(row.source_key), score, fence };
   }
   async function scanPersistedPredicate(
     ctx                     ,
@@ -460,7 +463,7 @@ export function createVectorPlugin(options                     )               {
         const chunk = ids.slice(offset, offset + PERSISTED_LOOKUP_CHUNK);
         const placeholders = chunk.map(() => '?').join(', ');
         const rows = ctx.index.query({
-          sql: `SELECT source_key, norm, embedding FROM ${table} WHERE source_key IN (${placeholders}) LIMIT ${PERSISTED_LOOKUP_CHUNK}`,
+          sql: `SELECT source_key, norm, embedding, parent_key, revision, project_key FROM ${table} WHERE source_key IN (${placeholders}) LIMIT ${PERSISTED_LOOKUP_CHUNK}`,
           params: chunk,
         });
         for (const row of rows) {
@@ -498,18 +501,18 @@ export function createVectorPlugin(options                     )               {
       if (signal?.aborted) return [];
       const rows = scopeId === undefined
         ? (afterKey === undefined
-          ? ctx.index.query({ sql: `SELECT source_key, norm, embedding FROM ${table} ORDER BY source_key ASC LIMIT ${PERSISTED_SCAN_PAGE_SIZE}` })
+          ? ctx.index.query({ sql: `SELECT source_key, norm, embedding, parent_key, revision, project_key FROM ${table} ORDER BY source_key ASC LIMIT ${PERSISTED_SCAN_PAGE_SIZE}` })
           : ctx.index.query({
-            sql: `SELECT source_key, norm, embedding FROM ${table} WHERE source_key > ? ORDER BY source_key ASC LIMIT ${PERSISTED_SCAN_PAGE_SIZE}`,
+            sql: `SELECT source_key, norm, embedding, parent_key, revision, project_key FROM ${table} WHERE source_key > ? ORDER BY source_key ASC LIMIT ${PERSISTED_SCAN_PAGE_SIZE}`,
             params: [afterKey],
           }))
         : (afterKey === undefined
           ? ctx.index.query({
-            sql: `SELECT source_key, norm, embedding FROM ${table} WHERE scope_id = ? ORDER BY source_key ASC LIMIT ${PERSISTED_SCAN_PAGE_SIZE}`,
+            sql: `SELECT source_key, norm, embedding, parent_key, revision, project_key FROM ${table} WHERE scope_id = ? ORDER BY source_key ASC LIMIT ${PERSISTED_SCAN_PAGE_SIZE}`,
             params: [scopeId],
           })
           : ctx.index.query({
-            sql: `SELECT source_key, norm, embedding FROM ${table} WHERE scope_id = ? AND source_key > ? ORDER BY source_key ASC LIMIT ${PERSISTED_SCAN_PAGE_SIZE}`,
+            sql: `SELECT source_key, norm, embedding, parent_key, revision, project_key FROM ${table} WHERE scope_id = ? AND source_key > ? ORDER BY source_key ASC LIMIT ${PERSISTED_SCAN_PAGE_SIZE}`,
             params: [scopeId, afterKey],
           }));
       if (rows.length === 0) break;
@@ -568,6 +571,7 @@ export function createVectorPlugin(options                     )               {
 
 
 
+
     {
     const id = row.id;
     if (typeof id !== 'string' || id.length === 0) {
@@ -591,23 +595,22 @@ export function createVectorPlugin(options                     )               {
       }
     }
     const { vector, norm } = validateVectorToFloat32(sourceVector, row[options.source.model], modelSpace, id);
-    if (parent !== undefined && segmentFence(row, parent) === null) {
-      throw new VectorPluginValidationError('invalid-derived-segment', `vector source '${id}' is missing its parent revision fence`);
-    }
-    return { id, scopeId: scopeValueOf(row, scopeField), vector, norm };
+    const fence = parent === undefined ? null : segmentFence(row, parent);
+    if (parent !== undefined && fence === null) throw new VectorPluginValidationError('invalid-derived-segment', `vector source '${id}' is missing its parent revision fence`);
+    return { id, scopeId: scopeValueOf(row, scopeField), vector, norm, fence };
   }
   async function flushUpserts(
     ctx                     ,
     table        ,
-    entries                                                                                                                    ,
+    entries                                                                                                                                                               ,
   )                {
     if (!hasBoundIndex(ctx) || entries.length === 0) return;
-    const sql = `INSERT OR REPLACE INTO ${table} (source_key, scope_id, norm, embedding) VALUES (?, ?, ?, ?)`;
+    const sql = `INSERT OR REPLACE INTO ${table} (source_key, scope_id, norm, embedding, parent_key, revision, project_key) VALUES (?, ?, ?, ?, ?, ?, ?)`;
     for (let offset = 0; offset < entries.length; offset += MAX_WRITE_STATEMENTS) {
       if (isSuperseded(ctx)) return;
       const statements = entries.slice(offset, offset + MAX_WRITE_STATEMENTS).map((entry) => ({
         sql,
-        params: [entry.id, entry.scopeId, entry.norm, float32ToBlob(entry.vector)],
+        params: [entry.id, entry.scopeId, entry.norm, float32ToBlob(entry.vector), entry.fence?.parentId ?? '', entry.fence?.revision ?? '', entry.fence?.projectId ?? ''],
       }));
       await ctx.index.write({ expectedFence: ctx.fence, statements });
     }
@@ -639,7 +642,7 @@ export function createVectorPlugin(options                     )               {
           order: 'asc',
         });
         if (page.length === 0) break;
-        const parsedPage                                                                                                            = [];
+        const parsedPage                                                                                                                                                       = [];
         for (const row of page) {
           const parsed = parseAndValidateRow(row);
           if (parent !== undefined) {
@@ -710,17 +713,18 @@ export function createVectorPlugin(options                     )               {
       }
       statements.length = 0;
     };
+    const removeFromEveryGeneration = (rowId        )       => { for (const generationTable of tables) statements.push({ sql: `DELETE FROM ${generationTable} WHERE source_key = ?`, params: [rowId] }); };
     for (const change of changes) {
       if (change.entity !== options.source.entity) continue;
       if (change.kind === 'removed') {
         next?.delete(change.rowId);
-        statements.push({ sql: `DELETE FROM ${table} WHERE source_key = ?`, params: [change.rowId] });
+        removeFromEveryGeneration(change.rowId);
         continue;
       }
       const row = ctx.reader.row(options.source.entity, change.rowId);
       if (row === undefined) {
         next?.delete(change.rowId);
-        statements.push({ sql: `DELETE FROM ${table} WHERE source_key = ?`, params: [change.rowId] });
+        removeFromEveryGeneration(change.rowId);
       } else {
         try {
           const parsed = parseAndValidateRow(row);
@@ -728,19 +732,19 @@ export function createVectorPlugin(options                     )               {
             const fence = segmentFence(row, parent);
             if (fence === null || parentFenceOf(ctx, parent, fence) === null) {
               next?.delete(change.rowId);
-              statements.push({ sql: `DELETE FROM ${table} WHERE source_key = ?`, params: [change.rowId] });
+              removeFromEveryGeneration(change.rowId);
               continue;
             }
           }
           next?.set(parsed.id, parsed.vector, parsed.norm, parsed.scopeId);
           statements.push({
-            sql: `INSERT OR REPLACE INTO ${table} (source_key, scope_id, norm, embedding) VALUES (?, ?, ?, ?)`,
-            params: [parsed.id, parsed.scopeId, parsed.norm, float32ToBlob(parsed.vector)],
+            sql: `INSERT OR REPLACE INTO ${table} (source_key, scope_id, norm, embedding, parent_key, revision, project_key) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            params: [parsed.id, parsed.scopeId, parsed.norm, float32ToBlob(parsed.vector), parsed.fence?.parentId ?? '', parsed.fence?.revision ?? '', parsed.fence?.projectId ?? ''],
           });
         } catch (err) {
           if (err instanceof VectorPluginValidationError && err.code === 'unauthorized-source-ownership') {
             next?.delete(change.rowId);
-            statements.push({ sql: `DELETE FROM ${table} WHERE source_key = ?`, params: [change.rowId] });
+            removeFromEveryGeneration(change.rowId);
             await flushStatements();
           }
           throw err;
@@ -750,39 +754,31 @@ export function createVectorPlugin(options                     )               {
     await flushStatements();
     return { counts: { vectors: next === null ? countTable(ctx, table) : next.size } };
   }
+  async function purgeRows(ctx                     , where        , params                    )                {
+    if (!hasBoundIndex(ctx) || isSuperseded(ctx)) return;
+    await ctx.index.write({ expectedFence: ctx.fence, statements: tables.map((generationTable) => ({ sql: `DELETE FROM ${generationTable} WHERE ${where}`, params })) });
+  }
   async function revoke(ctx                     , target                        )                                   {
     const persistent = hasBoundIndex(ctx);
     const next = persistent ? null : targetSlab();
     if (!claimGeneration(ctx)) {
       return { counts: { vectors: materializedCount(ctx) } };
     }
-    if (parent !== undefined && target.entity === parent.entity) return rebuild(ctx);
+    if (parent !== undefined && target.entity === parent.entity) {
+      if (target.rowId !== undefined) await purgeRows(ctx, 'parent_key = ?', [target.rowId]);
+      if (target.scopeId !== undefined) await purgeRows(ctx, 'project_key = ?', [target.scopeId]);
+      return rebuild(ctx);
+    }
     if (target.entity !== options.source.entity) {
       return { counts: { vectors: materializedCount(ctx) } };
     }
     const table = targetTable(ctx);
     if (target.scopeId !== undefined) {
       next?.deleteScope(target.scopeId);
-      if (hasBoundIndex(ctx)) {
-        while (!isSuperseded(ctx)) {
-          const result = await ctx.index.write({
-            expectedFence: ctx.fence,
-            statements: [{
-              sql: `DELETE FROM ${table} WHERE rowid IN (SELECT rowid FROM ${table} WHERE scope_id = ? LIMIT ${DELETE_CHUNK_SIZE})`,
-              params: [target.scopeId],
-            }],
-          });
-          if (result.changes === 0) break;
-        }
-      }
+      await purgeRows(ctx, 'scope_id = ?', [target.scopeId]);
     } else if (target.rowId !== undefined) {
       next?.delete(target.rowId);
-      if (hasBoundIndex(ctx)) {
-        await ctx.index.write({
-          expectedFence: ctx.fence,
-          statements: [{ sql: `DELETE FROM ${table} WHERE source_key = ?`, params: [target.rowId] }],
-        });
-      }
+      await purgeRows(ctx, 'source_key = ?', [target.rowId]);
     }
     return { counts: { vectors: next === null ? countTable(ctx, table) : next.size } };
   }
@@ -820,7 +816,8 @@ export function createVectorPlugin(options                     )               {
       owned = false;
     }
     const fence = owned ? segmentFence(row, parent) : null;
-    const parentFence = fence === null ? null : parentFenceOf(ctx, parent, fence, true);
+    const stale = hasBoundIndex(ctx) && (match.fence === undefined || fence === null || match.fence.parentId !== fence.parentId || match.fence.revision !== fence.revision || match.fence.projectId !== fence.projectId);
+    const parentFence = fence === null || stale ? null : parentFenceOf(ctx, parent, fence, true);
     return parentFence === null
       ? null
       : { hit: derivedHit(match, row, parentFence, parent), key: match.id, rank: match.score, row: parentFence.row };
@@ -901,7 +898,7 @@ export function createVectorPlugin(options                     )               {
         kind: 'table'         ,
         name,
         disposition: { kind: 'retained'         , reason: 'Vector index is derived and rebuilt from the source census' },
-        ddl: [`CREATE TABLE IF NOT EXISTS ${name} (source_key TEXT PRIMARY KEY, scope_id TEXT NOT NULL DEFAULT '', norm REAL NOT NULL, embedding BLOB NOT NULL);`],
+        ddl: [`CREATE TABLE IF NOT EXISTS ${name} (source_key TEXT PRIMARY KEY, scope_id TEXT NOT NULL DEFAULT '', norm REAL NOT NULL, embedding BLOB NOT NULL, parent_key TEXT NOT NULL DEFAULT '', revision TEXT NOT NULL DEFAULT '', project_key TEXT NOT NULL DEFAULT '');`],
       })),
       ...tables.map((name) => ({
         kind: 'index'         ,

@@ -666,6 +666,26 @@ test('a stale embedding is never disclosed under an advanced segment revision', 
   assert.equal(current.result.hits[0].score, 0, 'the r2 embedding replaced the r1 vector');
 });
 
+test('a derived index is not searchable across a model-space switch', async (t) => {
+  const kit = await derivedSetup(t);
+  kit.note('n1', 'p1');
+  kit.segment('s1', 'n1', 'p1', [1, 0]);
+  await kit.rebuild();
+
+  kit.plugin.setModelSpace({ model: 'embed-v2', dimensions: 2 });
+  assert.equal(kit.registry.stateOf('multimodal-vectors').state, 'building');
+  const oldSpace = await kit.search([1, 0]);
+  assert.equal(oldSpace.ok, false);
+  assert.match(oldSpace.lastError?.message ?? '', /requires 'embed-v2'/);
+
+  const newSpace = await kit.registry.search('multimodal-vectors', {
+    principal: PRINCIPAL,
+    query: { model: 'embed-v2', vector: [1, 0] },
+    limit: 10,
+  });
+  assert.deepEqual(newSpace.result.hits, [], 'a stale generation is not searchable in the new model space');
+});
+
 test('derived segments shadow-rebuild with parity over the fenced projection', async (t) => {
   const kit = await derivedSetup(t);
   kit.note('n1', 'p1');

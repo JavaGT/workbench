@@ -1,19 +1,9 @@
-// vector-plugin.ts — model-space-aware, persistent Float32Array vector search plugin.
-//
-// Embeddings are supplied by the application's worker in source rows. This
-// plugin stores compact Float32 BLOBs + precomputed L2 norms + optional
-// scope_id in census-owned SQLite tables (`vec_...`).
-//
-// A BOUND index is served from disk: every search applies its scope filter in
-// SQL (scope_id equality, or a source-key IN/merge when the caller filters on
-// arbitrary source columns) and pages the surviving candidates in bounded
-// windows, retaining only one page plus the requested top-K in JS heap. The
-// full table is never materialized as a resident slab — including during a
-// shadow rebuild, which builds directly into the disposable generation table.
-//
-// An UNBOUND owned-index capability (registries/harnesses with no durable
-// tables) keeps the in-memory Float32VectorSlab path unchanged.
-
+// vector-plugin.ts — model-space-aware, persistent Float32Array vector search.
+// A source row may supply one vector, or (with source.parent) one derived segment
+// whose CURRENT parent row is re-authorized, revision-fenced and project-fenced
+// before disclosure. Bound indexes page BLOBs in bounded windows; unbound
+// harnesses keep the in-memory slab. Derived search refills its window after
+// denials/fences so pagination is over authorized results.
 import { createHash } from 'node:crypto';
 import { Float32VectorSlab, cosineSimilarityFloat32, vectorNorm } from './vector.ts';
 import {
@@ -31,112 +21,52 @@ import { admitSearchHits } from './search-auth.ts';
 import { SEARCH_MAX_RESULTS_CAP, searchStalenessOf } from './search-response.ts';
 import type { AuthorizationAdapter } from './authorization-adapter.ts';
 import type { EntityRecord } from './row-grant.ts';
-
-export type VectorPluginValidationCode =
-  | 'dimension-mismatch'
-  | 'non-finite-value'
-  | 'model-space-mismatch'
-  | 'unauthorized-source-ownership'
-  | 'invalid-vector'
-  | 'invalid-derived-segment';
-
+// Closed validation vocabulary; every rejection carries one of these codes.
+export type VectorPluginValidationCode = 'dimension-mismatch' | 'non-finite-value' | 'model-space-mismatch'
+  | 'unauthorized-source-ownership' | 'invalid-vector' | 'invalid-derived-segment';
 export class VectorPluginValidationError extends Error {
   readonly code: VectorPluginValidationCode;
-
   constructor(code: VectorPluginValidationCode, message: string) {
     super(message);
     this.name = 'VectorPluginValidationError';
     this.code = code;
   }
 }
-
 export interface VectorModelSpace {
   readonly model: string;
   readonly dimensions: number;
 }
-
-// A derived source is a row per segment. Authorization is deliberately not
-// segment-role based: the current source ROW (the parent) is re-read and
-// admitted for every hit, so project membership, ownership transfer, revocation
-// and deletion are evaluated against the parent as it exists NOW. Register the
-// admission resource against `parent.entity`; the segment table is private
-// derived storage and must not be an event-logged entity (no vector blobs in
-// sync/event payloads).
+// Derived segment source: current-parent authorization + revision/project fence.
 export interface VectorParentSource {
-  readonly entity: string;
-  // Segment columns naming the parent row id, its derivation revision and the
-  // project the segment was derived under.
-  readonly field: string;
-  readonly revisionField: string;
-  readonly projectField: string;
-  // Parent columns holding the CURRENT revision and project. A segment is only
-  // served while both still match the segment's own fence.
-  readonly parentRevisionField: string;
-  readonly parentProjectField: string;
-  readonly owns?: (row: Readonly<Record<string, unknown>>) => boolean;
-  // Optional stable identity for feedback references; defaults to the row id.
-  readonly segmentIdField?: string;
+  readonly entity: string; readonly field: string; readonly revisionField: string; readonly projectField: string;
+  readonly parentRevisionField: string; readonly parentProjectField: string;
+  readonly owns?: (row: Readonly<Record<string, unknown>>) => boolean; readonly segmentIdField?: string;
 }
-
 export interface VectorPluginSource {
-  readonly entity: string;
-  readonly vector: string;
-  readonly model: string;
-  // Optional source column stored as `scope_id` for O(1) SQL pre-filtering
-  // before any vector is fetched or scored (e.g. 'projectId').
-  readonly scopeField?: string;
-  // The source reader only constrains declared table scopes. Every vector source
-  // must additionally prove that each row belongs to this plugin's index.
-  readonly owns: (row: Readonly<Record<string, unknown>>) => boolean;
-  // Enables the 1:N derived-segment model: `entity` is the segment table and
-  // `parent` is the current source-of-authority table for those segments.
-  readonly parent?: VectorParentSource;
+  readonly entity: string; readonly vector: string; readonly model: string; readonly scopeField?: string;
+  readonly owns: (row: Readonly<Record<string, unknown>>) => boolean; readonly parent?: VectorParentSource;
 }
-
 export interface VectorPluginOptions {
-  readonly id: string;
-  readonly version: string;
-  readonly source: VectorPluginSource;
-  readonly modelSpace: VectorModelSpace;
+  readonly id: string; readonly version: string; readonly source: VectorPluginSource; readonly modelSpace: VectorModelSpace;
   readonly admission?: { readonly entity: EntityRecord; readonly adapter: AuthorizationAdapter };
-  // Escape hatch for LOW-LEVEL UNIT FIXTURES ONLY (never a production app):
-  // return raw candidate hits without re-authorizing each row through an
-  // admission adapter. The default fails closed — an index whose hits cannot be
-  // re-authorized returns no disclosure. A fixture that only exercises query /
-  // ranking mechanics opts in explicitly so the insecure path is visible.
   readonly unsafeAllowUnauthorizedSearch?: boolean;
 }
-
 export interface VectorSearchQuery {
-  readonly model: string;
-  readonly vector: readonly number[] | Float32Array;
-  // A source-row equality predicate or scope string applied to the index BEFORE
-  // nearest-neighbour selection, so a caller's window (limit/offset) is served
-  // from the matching partition instead of the whole index.
-  readonly scope?: string | Readonly<Record<string, unknown>>;
-  readonly scopeId?: string;
+  readonly model: string; readonly vector: readonly number[] | Float32Array;
+  readonly scope?: string | Readonly<Record<string, unknown>>; readonly scopeId?: string;
 }
-
 export interface VectorPlugin extends SearchPlugin, SearchShadowCapabilities {
-  readonly generationIdentity: string;
-  readonly modelSpace: VectorModelSpace;
-  validateSourceRow(row: Readonly<Record<string, unknown>>): void;
-  setModelSpace(modelSpace: VectorModelSpace): void;
+  readonly generationIdentity: string; readonly modelSpace: VectorModelSpace;
+  validateSourceRow(row: Readonly<Record<string, unknown>>): void; setModelSpace(modelSpace: VectorModelSpace): void;
 }
-
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const MAX_WRITE_STATEMENTS = 128;
 const SOURCE_PAGE_SIZE = 512;
 const DELETE_CHUNK_SIZE = 500;
 const CENSUS_BOUNDARY_SAMPLE = 32;
-// Bounded page for disk-backed vector scans: 512 rows of a 1536-dimension
-// Float32 vector is ~3 MiB, independent of index size.
 const PERSISTED_SCAN_PAGE_SIZE = 512;
-// Bounded lookup chunk for the arbitrary-predicate fallback.
 const PERSISTED_LOOKUP_CHUNK = 256;
-// Cooperative yield cadence between persisted pages so abort/deadline can act.
 const PERSISTED_YIELD_PAGES = 8;
-
 function assertModelSpace(modelSpace: VectorModelSpace): void {
   if (typeof modelSpace.model !== 'string' || modelSpace.model.length === 0) {
     throw new TypeError('vector model-space requires a non-empty model identity');
@@ -145,11 +75,9 @@ function assertModelSpace(modelSpace: VectorModelSpace): void {
     throw new TypeError('vector model-space dimensions must be a positive safe integer');
   }
 }
-
 function generationIdentity(modelSpace: VectorModelSpace, sequence: number): string {
   return `${modelSpace.model}:${modelSpace.dimensions}:${sequence}`;
 }
-
 function validateScope(scope: unknown): string | Readonly<Record<string, unknown>> | undefined {
   if (scope === undefined) return undefined;
   if (typeof scope === 'string') return scope;
@@ -158,14 +86,12 @@ function validateScope(scope: unknown): string | Readonly<Record<string, unknown
   }
   return scope as Readonly<Record<string, unknown>>;
 }
-
 function matchesScope(row: Readonly<Record<string, unknown>>, scope: Readonly<Record<string, unknown>>): boolean {
   for (const key of Object.keys(scope)) {
     if (row[key] !== scope[key]) return false;
   }
   return true;
 }
-
 function validateVectorToFloat32(
   value: unknown,
   model: unknown,
@@ -201,11 +127,9 @@ function validateVectorToFloat32(
   }
   return { vector: f32, norm: Math.sqrt(sumSq) };
 }
-
 function float32ToBlob(vector: Float32Array): Uint8Array {
   return new Uint8Array(vector.buffer.slice(vector.byteOffset, vector.byteOffset + vector.byteLength));
 }
-
 function blobToFloat32(blob: unknown, dimensions: number): Float32Array {
   if (!(blob instanceof Uint8Array)) {
     throw new VectorPluginValidationError('invalid-vector', 'persisted vector BLOB must be a Uint8Array');
@@ -224,44 +148,38 @@ function blobToFloat32(blob: unknown, dimensions: number): Float32Array {
   }
   return vector;
 }
-
 function scopeValueOf(row: Readonly<Record<string, unknown>>, scopeField: string | undefined): string {
   if (scopeField === undefined) return '';
   const value = row[scopeField];
   return value === null || value === undefined ? '' : String(value);
 }
-
 function assertFieldName(value: unknown, label: string): asserts value is string {
   if (typeof value !== 'string' || !IDENTIFIER.test(value)) {
     throw new TypeError(`vector plugin ${label} must be a SQLite identifier`);
   }
 }
-
 function cellValue(value: unknown): string | null {
   if (typeof value === 'string') return value.length > 0 ? value : null;
   if (typeof value === 'number' && Number.isFinite(value)) return String(value);
   return null;
 }
-
 interface VectorSegmentFence {
   readonly parentId: string;
   readonly revision: string;
   readonly projectId: string;
 }
-
 function segmentFence(row: Readonly<Record<string, unknown>>, parent: VectorParentSource): VectorSegmentFence | null {
   const parentId = cellValue(row[parent.field]);
   const revision = cellValue(row[parent.revisionField]);
   const projectId = cellValue(row[parent.projectField]);
   return parentId !== null && revision !== null && projectId !== null ? { parentId, revision, projectId } : null;
 }
-
 interface VectorParentFence {
   readonly row: Record<string, unknown>;
   readonly projectId: string;
   readonly revision: string;
 }
-
+// Current-parent fence: current row, optional ownership, current project/revision.
 function parentFenceOf(
   ctx: SearchPluginContext,
   parent: VectorParentSource,
@@ -284,7 +202,6 @@ function parentFenceOf(
   if (projectId === null || revision === null || projectId !== fence.projectId || revision !== fence.revision) return null;
   return { row, projectId, revision };
 }
-
 function derivedHit(
   match: ScoredMatch,
   segmentRow: Readonly<Record<string, unknown>>,
@@ -300,46 +217,35 @@ function derivedHit(
     sourceRevision: parentFence.revision,
   });
 }
-
 function boundaryKeyCensus(count: number, boundaryIds: readonly string[]): SearchEntityCensus {
   if (count === 0) return { count: 0, digest: createHash('sha256').update('0:').digest('hex') };
   const deduped = [...new Set(boundaryIds)].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   const digest = createHash('sha256').update(`${count}:${deduped.join('\n')}`).digest('hex');
   return { count, digest };
 }
-
 function hasBoundIndex(ctx: SearchPluginContext | undefined): boolean {
   return Boolean(ctx && ctx.index && ctx.index.bound !== false);
 }
-
 function compareIds(a: string, b: string): number {
   if (a < b) return -1;
   if (a > b) return 1;
   return 0;
 }
-
-// A scored source key. Higher cosine similarity ranks first; equal scores use
-// the stable source key ascending, exactly like the in-memory slab scan.
 interface ScoredMatch {
   readonly id: string;
   readonly score: number;
 }
-
 interface VectorSearchCandidate {
   readonly hit: Readonly<Record<string, unknown>>;
   readonly key: string;
   readonly rank: number;
   readonly row: Record<string, unknown>;
 }
-
 function compareScoredMatches(a: ScoredMatch, b: ScoredMatch): number {
   if (a.score > b.score) return -1;
   if (a.score < b.score) return 1;
   return compareIds(a.id, b.id);
 }
-
-// Bounded top-K accumulator: retains at most `limit` candidates regardless of
-// how many are offered. The array root is the current worst kept candidate.
 function createBoundedTopK(limit: number): { offer(candidate: ScoredMatch): void; results(): readonly ScoredMatch[] } {
   const heap: ScoredMatch[] = [];
   const push = (candidate: ScoredMatch): void => {
@@ -380,19 +286,13 @@ function createBoundedTopK(limit: number): { offer(candidate: ScoredMatch): void
     },
   };
 }
-
 function yieldToEventLoop(): Promise<void> {
   return new Promise<void>((resolve) => setTimeout(resolve, 0));
 }
-
 interface ResolvedScopeFilter {
   readonly scopeId?: string;
-  // Arbitrary source-row equality predicate (when no persistent scope column
-  // applies). The persistent path evaluates this against source pages; the
-  // in-memory path reduces it to a key set.
   readonly predicate?: Readonly<Record<string, unknown>>;
 }
-
 function resolveScopeFilter(
   scopeField: string | undefined,
   request: SearchRequest,
@@ -410,8 +310,6 @@ function resolveScopeFilter(
   if (typeof scope === 'string') return { scopeId: scope };
   const entries = Object.entries(scope);
   if (entries.length === 0) return {};
-  // A declared scope column (or an explicit scope_id) filters in SQL BEFORE any
-  // vector is fetched or scored.
   if (scopeField !== undefined && entries.length === 1) {
     const [key, value] = entries[0];
     if (key === scopeField || key === 'scope_id') {
@@ -420,11 +318,6 @@ function resolveScopeFilter(
   }
   return { predicate: scope };
 }
-
-// Creates a persistent SQLite + (unbound-only) compact Float32Array slab vector
-// search plugin. A bound index pages BLOB storage in bounded windows and never
-// materializes the full vector table in JS heap; an unbound index keeps the
-// in-memory slab for harnesses and ephemeral use.
 export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
   if (typeof options.source.owns !== 'function') {
     throw new TypeError('vector plugin source requires an ownership predicate');
@@ -452,38 +345,29 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
   )) {
     throw new TypeError('vector plugin requires a search admission configuration');
   }
-
   let modelSpace = Object.freeze({ ...options.modelSpace });
   assertModelSpace(modelSpace);
   let sequence = 0;
-
   const base = `vec_${options.id.replaceAll(/[^A-Za-z0-9_]/g, '_')}`;
   const stateTable = `${base}_state`;
   const tables = [`${base}_g0`, `${base}_g1`] as const;
-
   let activeGen: 0 | 1 = 0;
   let buildingGen: 0 | 1 | null = null;
   let promotedGen: 0 | 1 | null = null;
-  // The slab is only ever populated when the owned-index capability is unbound.
-  // In persistent mode it stays empty (never a resident copy of the table).
   let activeSlab = new Float32VectorSlab(modelSpace.dimensions);
   let shadowSlab: Float32VectorSlab | null = null;
   let activeWriteGeneration = 0;
-
   function targetSlab(): Float32VectorSlab {
     return shadowSlab ?? activeSlab;
   }
-
   function isSuperseded(ctx: SearchPluginContext): boolean {
     return ctx.generation < activeWriteGeneration;
   }
-
   function claimGeneration(ctx: SearchPluginContext): boolean {
     if (ctx.generation < activeWriteGeneration) return false;
     activeWriteGeneration = ctx.generation;
     return true;
   }
-
   function readPersistedState(ctx: SearchPluginContext): { active: 0 | 1; model: string; dimensions: number } | null {
     if (!hasBoundIndex(ctx)) return null;
     const row = ctx.index.query({
@@ -496,7 +380,6 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
       dimensions: Number(row.dimensions ?? 0),
     };
   }
-
   function currentActiveGeneration(ctx: SearchPluginContext | undefined): 0 | 1 {
     if (ctx && hasBoundIndex(ctx)) {
       const persisted = readPersistedState(ctx);
@@ -507,27 +390,18 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
     }
     return activeGen;
   }
-
   function targetTable(ctx: SearchPluginContext): string {
     return tables[buildingGen ?? currentActiveGeneration(ctx)];
   }
-
-  // Is the persisted active generation materialized for the current model
-  // space? After a setModelSpace() switch the old table stops being searchable
-  // until a rebuild rewrites the state row (mirrors clearing an in-memory slab).
   function persistentModelCurrent(ctx: SearchPluginContext): boolean {
     const persisted = readPersistedState(ctx);
     return persisted === null
       || (persisted.model === modelSpace.model && persisted.dimensions === modelSpace.dimensions);
   }
-
   function countTable(ctx: SearchPluginContext, table: string): number {
     const row = ctx.index.query({ sql: `SELECT COUNT(*) AS count FROM ${table}` })[0];
     return Number(row?.count ?? 0);
   }
-
-  // Boundary ids for the SQL-backed census: the same head/tail sample shape the
-  // source census uses, without reading vector payloads.
   function tableBoundaryIds(ctx: SearchPluginContext, table: string, count: number): readonly string[] {
     if (count === 0) return [];
     if (count <= CENSUS_BOUNDARY_SAMPLE * 2) {
@@ -543,14 +417,11 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
     }).map((row) => String(row.source_key));
     return [...head, ...tail];
   }
-
   function scorePersistedRow(queryVec: Float32Array, queryNorm: number, row: Readonly<Record<string, unknown>>): ScoredMatch | null {
     let vector: Float32Array;
     try {
       vector = blobToFloat32(row.embedding, modelSpace.dimensions);
     } catch {
-      // A corrupt BLOB is not a candidate. Never surface it as a NaN score:
-      // NaN comparisons make every corrupt row look like an equal top hit.
       return null;
     }
     const storedNorm = row.norm;
@@ -559,10 +430,6 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
     if (!Number.isFinite(score)) return null;
     return { id: String(row.source_key), score };
   }
-
-  // Arbitrary-predicate fallback: drive from bounded source pages and fetch the
-  // vectors for each matching id chunk. Memory stays bounded by the page/chunk,
-  // never by the number of matching source rows.
   async function scanPersistedPredicate(
     ctx: SearchPluginContext,
     table: string,
@@ -610,9 +477,6 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
     }
     return true;
   }
-
-  // Exact top-K cosine scan over bounded disk pages. The scope predicate is
-  // applied in SQL before any of a page's vectors are fetched.
   async function scanPersistedMatches(
     ctx: SearchPluginContext,
     table: string,
@@ -663,9 +527,6 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
     }
     return topK.results();
   }
-
-  // Page-validate persisted BLOBs (used on restart and before shadow activation)
-  // without hydrating a resident slab.
   function validatePersistedTable(ctx: SearchPluginContext, table: string): void {
     let afterKey: string | undefined;
     while (true) {
@@ -688,7 +549,6 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
       afterKey = String(rows[rows.length - 1].source_key);
     }
   }
-
   async function clearTable(ctx: SearchPluginContext, table: string, allowSuperseded = false): Promise<void> {
     if (!hasBoundIndex(ctx) || (!allowSuperseded && isSuperseded(ctx))) return;
     if (typeof ctx.index.clear === 'function') {
@@ -703,7 +563,6 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
       if (result.changes === 0) break;
     }
   }
-
   function parseAndValidateRow(row: Readonly<Record<string, unknown>>): {
     readonly id: string;
     readonly scopeId: string;
@@ -737,7 +596,6 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
     }
     return { id, scopeId: scopeValueOf(row, scopeField), vector, norm };
   }
-
   async function flushUpserts(
     ctx: SearchPluginContext,
     table: string,
@@ -754,33 +612,21 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
       await ctx.index.write({ expectedFence: ctx.fence, statements });
     }
   }
-
   function materializedCount(ctx: SearchPluginContext): number {
     if (hasBoundIndex(ctx)) return countTable(ctx, targetTable(ctx));
     return targetSlab().size;
   }
-
   async function rebuild(ctx: SearchPluginContext): Promise<SearchMaterializeResult> {
     const persistent = hasBoundIndex(ctx);
     if (!claimGeneration(ctx)) return { counts: { vectors: materializedCount(ctx) } };
-    // Always build into the INACTIVE generation. A3 shadow rebuilds already
-    // selected it in beginShadow(); a direct rebuild chooses it here. The
-    // active generation is never cleared first, so a failed scan leaves the
-    // last known-good index searchable.
     const shadowActive = buildingGen !== null;
     const active = currentActiveGeneration(ctx);
-    // Before the first materialization the "active" pointer names an empty
-    // table, so that table IS the shadow. Once rows are searchable, a direct
-    // rebuild always targets the opposite generation.
     const activeIsEmpty = persistent && countTable(ctx, tables[active]) === 0;
     const destination: 0 | 1 = buildingGen ?? (activeIsEmpty ? active : (active === 0 ? 1 : 0));
     const table = tables[destination];
     const next = persistent ? null : (shadowSlab ?? new Float32VectorSlab(modelSpace.dimensions));
     if (next !== null) {
       next.clear();
-      // Direct searches/reconciles during the build target the shadow, never
-      // the last good generation. On failure the emptied shadow is discarded
-      // by the next rebuild; the active generation stays intact either way.
       shadowSlab = next;
     }
     await clearTable(ctx, table, true);
@@ -810,18 +656,12 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
         afterId = lastId;
       }
     } catch (err) {
-      // Clean up the shadow only. The active generation (pointer, table and
-      // model-space stamp) is untouched, so the failure is atomic from a
-      // reader's point of view.
       if (!isSuperseded(ctx)) {
         next?.clear();
         await clearTable(ctx, table, true);
       }
       throw err;
     }
-    // A3 shadows are activated by commitShadow after parity validation; only a
-    // direct rebuild flips the pointer itself, in one statement, after the
-    // full scan succeeded.
     if (!shadowActive && !isSuperseded(ctx)) {
       if (persistent) {
         const previous = currentActiveGeneration(ctx);
@@ -846,14 +686,11 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
       },
     };
   }
-
   async function reconcile(ctx: SearchPluginContext, changes: readonly SearchChange[]): Promise<SearchMaterializeResult> {
     const persistent = hasBoundIndex(ctx);
     const next = persistent ? null : targetSlab();
     if (!claimGeneration(ctx)) return { counts: { vectors: materializedCount(ctx) } };
-    // A parent change can move the project or advance the revision fence, which
-    // invalidates every derived segment under that parent. Without a separate
-    // parent→segment index, a full re-scan is the correct incremental answer.
+    // A parent change can move the project/revision fence; rebuild its projection.
     if (parent !== undefined && changes.some((change) => change.entity === parent.entity)) {
       return rebuild(ctx);
     }
@@ -873,7 +710,6 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
       }
       statements.length = 0;
     };
-
     for (const change of changes) {
       if (change.entity !== options.source.entity) continue;
       if (change.kind === 'removed') {
@@ -881,8 +717,6 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
         statements.push({ sql: `DELETE FROM ${table} WHERE source_key = ?`, params: [change.rowId] });
         continue;
       }
-      // A missing row is outside the scoped reader (or was concurrently removed),
-      // so its prior indexed value must not remain searchable.
       const row = ctx.reader.row(options.source.entity, change.rowId);
       if (row === undefined) {
         next?.delete(change.rowId);
@@ -916,15 +750,12 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
     await flushStatements();
     return { counts: { vectors: next === null ? countTable(ctx, table) : next.size } };
   }
-
   async function revoke(ctx: SearchPluginContext, target: SearchRevocationTarget): Promise<SearchMaterializeResult> {
     const persistent = hasBoundIndex(ctx);
     const next = persistent ? null : targetSlab();
     if (!claimGeneration(ctx)) {
       return { counts: { vectors: materializedCount(ctx) } };
     }
-    // Revoking the parent (or its project scope) must make every child segment
-    // inaccessible. A full re-scan fences the parent's current revision.
     if (parent !== undefined && target.entity === parent.entity) return rebuild(ctx);
     if (target.entity !== options.source.entity) {
       return { counts: { vectors: materializedCount(ctx) } };
@@ -955,9 +786,6 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
     }
     return { counts: { vectors: next === null ? countTable(ctx, table) : next.size } };
   }
-
-  // In-memory predicate bypass: resolve matching source ids into a key set the
-  // slab scan can pre-filter with. Only used by the unbound adapter.
   function collectAllowedKeys(ctx: SearchPluginContext, predicate: Readonly<Record<string, unknown>>): ReadonlySet<string> {
     const allowed = new Set<string>();
     let afterId: string | undefined;
@@ -978,7 +806,7 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
     }
     return allowed;
   }
-
+  // Re-read the current segment and parent; index-time authorization is never trusted.
   function searchCandidate(ctx: SearchPluginContext, match: ScoredMatch): VectorSearchCandidate | null {
     const row = ctx.reader.row(options.source.entity, match.id);
     if (row === undefined) return null;
@@ -997,7 +825,7 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
       ? null
       : { hit: derivedHit(match, row, parentFence, parent), key: match.id, rank: match.score, row: parentFence.row };
   }
-
+  // Derived hits consume the window only after current-parent admission; refill on denial.
   async function search(ctx: SearchPluginContext, request: SearchRequest): Promise<SearchPluginSearchResult> {
     if (request.signal?.aborted) return { hits: [] };
     if (request.principal === undefined) throw new VectorPluginValidationError('unauthorized-source-ownership', 'vector search requires a principal for result admission');
@@ -1010,10 +838,6 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
       ? limit
       : hasBoundIndex(ctx) ? countTable(ctx, tables[currentActiveGeneration(ctx)]) : activeSlab.size;
     const staleness = ctx.state !== undefined ? searchStalenessOf(ctx.state) : 'stale';
-
-    // A derived hit is authorized against its CURRENT parent, so denied or fenced
-    // candidates must not consume the caller's window. Re-scan a wider candidate
-    // set until the window is full or the index is exhausted.
     let candidateLimit = limit;
     for (;;) {
       let matches: readonly ScoredMatch[];
@@ -1049,15 +873,8 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
         });
         for (const result of admitted.hits) hits.push(result.hit);
       } else if (options.unsafeAllowUnauthorizedSearch === true) {
-        // Explicit low-level unit-fixture opt-in ONLY. No adapter means no
-        // re-authorization of the current row: this path is unsafe by design and
-        // must never be used by an application serving protected content.
         for (const candidate of candidates) hits.push(candidate.hit);
       } else {
-        // Fail closed: without an admission adapter there is no proof that any
-        // candidate row is visible to this principal. Never fall back to the raw
-        // (grant-filtered-but-not-admitted) reader — index-time authorization is
-        // never current, so the disclosed hits would be unverified.
         throw new VectorPluginValidationError(
           'unauthorized-source-ownership',
           'vector search requires a search admission adapter to re-authorize result rows',
@@ -1069,7 +886,6 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
       candidateLimit = Math.min(total, candidateLimit * 2);
     }
   }
-
   const plugin: VectorPlugin = {
     contractVersion: SUPPORTED_SEARCH_PLUGIN_CONTRACT_VERSION,
     id: options.id,
@@ -1112,8 +928,6 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
       if (nextModelSpace.model === modelSpace.model && nextModelSpace.dimensions === modelSpace.dimensions) return;
       modelSpace = Object.freeze({ ...nextModelSpace });
       sequence += 1;
-      // The in-memory slab cannot describe the new space; persistent mode is
-      // gated on the persisted state row until a rebuild rewrites it.
       activeSlab = new Float32VectorSlab(modelSpace.dimensions);
       shadowSlab = null;
       buildingGen = null;
@@ -1149,7 +963,6 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
       const nextGen: 0 | 1 = currentActiveGeneration(ctx) === 0 ? 1 : 0;
       buildingGen = nextGen;
       if (hasBoundIndex(ctx)) {
-        // Build directly into the disposable generation table — no slab copy.
         await clearTable(ctx, tables[nextGen]);
       } else {
         shadowSlab = new Float32VectorSlab(modelSpace.dimensions);
@@ -1169,9 +982,8 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
       });
     },
     sourceCensus(ctx): SearchCensus {
+      // Parity counts only the currently fenced projection, not raw segment rows.
       if (parent !== undefined) {
-        // Only currently fenced segments are materialized, so parity must count
-        // the same projection rather than every raw segment row.
         let count = 0;
         const head: string[] = [];
         const tail: string[] = [];
@@ -1239,8 +1051,6 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
     async rollbackShadow(ctx) {
       if (promotedGen === null) return;
       if (hasBoundIndex(ctx)) {
-        // Restore the durable active pointer; the previous generation table is
-        // still intact, so no rehydration is required.
         await ctx.index.write({
           expectedFence: ctx.fence,
           statements: [{ sql: `UPDATE ${stateTable} SET active = previous WHERE slot = 'active'` }],

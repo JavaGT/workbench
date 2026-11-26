@@ -7,6 +7,7 @@ import { createVectorPlugin, VectorPluginValidationError } from '../build/vector
 import { createSearchStalenessBridge } from '../build/search-staleness.mjs';
 import { createSearchReconcileEngine } from '../build/search-reconcile.mjs';
 import { createWriteQueue } from '../build/write-queue.mjs';
+import { createSearchOwnedIndexCapability } from '../build/index-capability.mjs';
 
 const PRINCIPAL = Object.freeze({ type: 'user', id: 'alice' });
 
@@ -362,4 +363,253 @@ test('validation errors retain a typed code', () => {
     (error) => error instanceof VectorPluginValidationError && error.code === 'dimension-mismatch',
   );
   kit.db.close();
+});
+
+// ---- 1:N derived segments ---------------------------------------------------
+
+const derivedSchema = `
+  CREATE TABLE Note (
+    id TEXT PRIMARY KEY,
+    projectId TEXT NOT NULL,
+    revision TEXT NOT NULL,
+    owner TEXT NOT NULL
+  );
+  CREATE TABLE NoteSegment (
+    id TEXT PRIMARY KEY,
+    segmentId TEXT NOT NULL,
+    noteId TEXT NOT NULL,
+    projectId TEXT NOT NULL,
+    revision TEXT NOT NULL,
+    embedding TEXT,
+    embedding_model TEXT,
+    modality TEXT,
+    startMs INTEGER,
+    endMs INTEGER,
+    contentHash TEXT
+  );
+`;
+
+async function derivedSetup(t, { dimensions = 2 } = {}) {
+  const db = new DatabaseSync(':memory:');
+  db.exec(derivedSchema);
+  const registry = createSearchPluginRegistry();
+  const plugin = createVectorPlugin({
+    id: 'multimodal-vectors',
+    version: '1.0.0',
+    source: {
+      entity: 'NoteSegment',
+      vector: 'embedding',
+      model: 'embedding_model',
+      scopeField: 'projectId',
+      owns: () => true,
+      parent: {
+        entity: 'Note',
+        field: 'noteId',
+        revisionField: 'revision',
+        projectField: 'projectId',
+        parentRevisionField: 'revision',
+        parentProjectField: 'projectId',
+        segmentIdField: 'segmentId',
+      },
+    },
+    modelSpace: { model: 'embed-v1', dimensions },
+    admission: {
+      entity: {},
+      adapter: {
+        registerResource() {},
+        async admit({ row }) {
+          const admitted = row?.owner === 'alice';
+          return { admitted, reasonCode: admitted ? null : 'no-capability' };
+        },
+      },
+    },
+  });
+  registry.register(plugin);
+  registry.bindSource(db);
+  for (const entry of registry.census().entries) db.exec(entry.sql);
+  const queue = createWriteQueue();
+  const census = new Map();
+  for (const object of plugin.ownedObjects) {
+    census.set(`${object.kind}:${object.name}`.toLowerCase(), {
+      kind: 'plugin', owner: plugin.id, objectKind: object.kind, name: object.name,
+    });
+  }
+  registry.bindIndex(createSearchOwnedIndexCapability({
+    db,
+    census,
+    writeCoordinator: queue,
+    fenceOf: (id) => registry.stateOf(id).fence,
+  }));
+  const prepared = await registry.prepare('multimodal-vectors');
+  assert.equal(prepared.ok, true, prepared.lastError?.message);
+  t.after(async () => {
+    await queue.close();
+    db.close();
+  });
+  const insertNote = db.prepare('INSERT INTO Note (id, projectId, revision, owner) VALUES (?, ?, ?, ?)');
+  const insertSegment = db.prepare(
+    `INSERT INTO NoteSegment
+       (id, segmentId, noteId, projectId, revision, embedding, embedding_model, modality, startMs, endMs, contentHash)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  return {
+    db,
+    registry,
+    plugin,
+    queue,
+    note: (id, projectId, revision = 'r1', owner = 'alice') => insertNote.run(id, projectId, revision, owner),
+    segment: (id, noteId, projectId, embedding, {
+      revision = 'r1', segmentId = id, modality = 'video', start = 0, end = 1, hash = `h-${id}`,
+    } = {}) => insertSegment.run(
+      id, segmentId, noteId, projectId, revision, JSON.stringify(embedding), 'embed-v1', modality, start, end, hash,
+    ),
+    rebuild: async () => {
+      const outcome = await registry.rebuild('multimodal-vectors');
+      assert.equal(outcome.ok, true, outcome.lastError?.message);
+      return outcome;
+    },
+    search: (vector, options = {}) => registry.search('multimodal-vectors', {
+      principal: PRINCIPAL,
+      query: { model: 'embed-v1', vector },
+      ...options,
+    }),
+  };
+}
+
+test('derived segments index N per parent and re-authorize the CURRENT parent', async (t) => {
+  const kit = await derivedSetup(t);
+  kit.note('n1', 'p1');
+  kit.segment('s1', 'n1', 'p1', [1, 0], { modality: 'video', start: 0, end: 4, hash: 'h1' });
+  kit.segment('s2', 'n1', 'p1', [0, 1], { modality: 'text', start: 4, end: 8, hash: 'h2' });
+  await kit.rebuild();
+
+  const found = await kit.search([1, 0], { limit: 10 });
+  assert.equal(found.ok, true, found.lastError?.message);
+  assert.deepEqual(found.result.hits.map((hit) => hit.id), ['s1', 's2']);
+  assert.deepEqual(found.result.hits[0], {
+    id: 's1',
+    score: 1,
+    sourceId: 'n1',
+    segmentId: 's1',
+    projectId: 'p1',
+    sourceRevision: 'r1',
+  });
+
+  // Authorization is evaluated against the parent as it exists now, not at
+  // index time.
+  kit.db.prepare('UPDATE Note SET owner = ? WHERE id = ?').run('mallory', 'n1');
+  const denied = await kit.search([1, 0], { limit: 10 });
+  assert.deepEqual(denied.result.hits, []);
+});
+
+test('derived segments are fenced to the parent current revision', async (t) => {
+  const kit = await derivedSetup(t);
+  kit.note('n1', 'p1', 'r1');
+  kit.segment('s1', 'n1', 'p1', [1, 0]);
+  await kit.rebuild();
+  assert.equal((await kit.search([1, 0])).result.hits.length, 1);
+
+  kit.db.prepare('UPDATE Note SET revision = ? WHERE id = ?').run('r2', 'n1');
+  assert.deepEqual((await kit.search([1, 0])).result.hits, [], 'an old-revision segment is fenced immediately');
+
+  kit.segment('s2', 'n1', 'p1', [1, 0], { revision: 'r2' });
+  const reconciled = await kit.registry.reconcile('multimodal-vectors', [
+    { entity: 'NoteSegment', rowId: 's2', kind: 'created' },
+  ]);
+  assert.equal(reconciled.ok, true, reconciled.lastError?.message);
+  assert.deepEqual((await kit.search([1, 0])).result.hits.map((hit) => hit.id), ['s2']);
+});
+
+test('derived segment and parent deletion use the existing search lifecycle', async (t) => {
+  const kit = await derivedSetup(t);
+  kit.note('n1', 'p1');
+  kit.segment('s1', 'n1', 'p1', [1, 0]);
+  kit.segment('s2', 'n1', 'p1', [0.5, 0.5]);
+  await kit.rebuild();
+
+  kit.db.prepare('DELETE FROM NoteSegment WHERE id = ?').run('s2');
+  const segmentRemoved = await kit.registry.reconcile('multimodal-vectors', [
+    { entity: 'NoteSegment', rowId: 's2', kind: 'removed' },
+  ]);
+  assert.equal(segmentRemoved.ok, true, segmentRemoved.lastError?.message);
+  assert.deepEqual((await kit.search([1, 0])).result.hits.map((hit) => hit.id), ['s1']);
+
+  kit.db.prepare('DELETE FROM Note WHERE id = ?').run('n1');
+  assert.deepEqual((await kit.search([1, 0])).result.hits, [], 'a missing parent is omitted before reconciliation');
+  const parentRemoved = await kit.registry.reconcile('multimodal-vectors', [
+    { entity: 'Note', rowId: 'n1', kind: 'removed' },
+  ]);
+  assert.equal(parentRemoved.ok, true, parentRemoved.lastError?.message);
+  assert.equal(kit.registry.healthOf('multimodal-vectors').plugin.vectors, 0);
+});
+
+test('derived search filters before pagination and refills denied windows', async (t) => {
+  const kit = await derivedSetup(t);
+  kit.note('n1', 'p1', 'r1', 'alice');
+  kit.note('n2', 'p2', 'r1', 'alice');
+  kit.note('n3', 'p1', 'r1', 'mallory');
+  kit.segment('row-blocked', 'n3', 'p1', [1, 0]);
+  kit.segment('row-foreign', 'n2', 'p2', [1, 0], { segmentId: 'shared' });
+  kit.segment('row-a', 'n1', 'p1', [0.8, 0.6], { segmentId: 'shared' });
+  kit.segment('row-b', 'n1', 'p1', [0.6, 0.8]);
+  kit.segment('row-c', 'n1', 'p1', [0, 1]);
+  await kit.rebuild();
+
+  const firstPage = await kit.search([1, 0], { scope: { projectId: 'p1' }, limit: 2 });
+  assert.equal(firstPage.ok, true, firstPage.lastError?.message);
+  assert.deepEqual(firstPage.result.hits.map((hit) => hit.id), ['row-a', 'row-b']);
+  assert.ok(firstPage.result.hits.every((hit) => hit.projectId === 'p1'));
+  assert.equal(firstPage.result.hits[0].segmentId, 'shared');
+
+  const secondPage = await kit.search([1, 0], { scope: { projectId: 'p1' }, offset: 1, limit: 1 });
+  assert.deepEqual(secondPage.result.hits.map((hit) => hit.id), ['row-b'], 'offset slices the authorized window');
+
+  const otherProject = await kit.search([1, 0], { scope: { projectId: 'p2' }, limit: 1 });
+  assert.deepEqual(otherProject.result.hits.map((hit) => hit.id), ['row-foreign']);
+  assert.equal(otherProject.result.hits[0].segmentId, 'shared', 'same segment id in another project keeps its own row identity');
+});
+
+test('erasing a parent purges its derived segments through rebuild', async (t) => {
+  const kit = await derivedSetup(t);
+  kit.note('n1', 'p1');
+  kit.segment('s1', 'n1', 'p1', [1, 0]);
+  await kit.rebuild();
+
+  kit.db.prepare('DELETE FROM Note WHERE id = ?').run('n1');
+  const outcome = await kit.registry.revoke('multimodal-vectors', {
+    kind: 'erasure',
+    entity: 'Note',
+    rowId: 'n1',
+  });
+  assert.equal(outcome.ok, true, outcome.lastError?.message);
+  assert.equal(kit.registry.healthOf('multimodal-vectors').plugin.vectors, 0);
+});
+
+test('derived segments shadow-rebuild with parity over the fenced projection', async (t) => {
+  const kit = await derivedSetup(t);
+  kit.note('n1', 'p1');
+  kit.note('n2', 'p2');
+  kit.segment('s1', 'n1', 'p1', [1, 0]);
+  kit.segment('s2', 'n1', 'p1', [0, 1]);
+  kit.segment('s3', 'n2', 'p2', [1, 0]);
+  // A stale segment is not part of the materialized projection.
+  kit.note('stale', 'p1', 'r1');
+  kit.segment('old', 'stale', 'p1', [1, 0], { revision: 'r0' });
+  await kit.rebuild();
+
+  const bridge = createSearchStalenessBridge({ registry: kit.registry });
+  bridge.engage(kit.db);
+  const engine = createSearchReconcileEngine({
+    registry: kit.registry,
+    staleness: bridge,
+    db: kit.db,
+    writeQueue: kit.queue,
+  });
+  const shadow = await engine.rebuildShadow('multimodal-vectors');
+  assert.equal(shadow.ok, true, shadow.lastError ?? 'shadow rebuild failed');
+  assert.equal(shadow.activated, true);
+  assert.equal(engine.parity('multimodal-vectors').matches, true);
+  const found = await kit.search([1, 0], { limit: 10 });
+  assert.deepEqual(found.result.hits.map((hit) => hit.id), ['s1', 's3', 's2']);
+  assert.ok(!found.result.hits.some((hit) => hit.id === 'old'), 'a stale segment is not part of the projection');
 });

@@ -37,7 +37,8 @@ export type VectorPluginValidationCode =
   | 'non-finite-value'
   | 'model-space-mismatch'
   | 'unauthorized-source-ownership'
-  | 'invalid-vector';
+  | 'invalid-vector'
+  | 'invalid-derived-segment';
 
 export class VectorPluginValidationError extends Error {
   readonly code: VectorPluginValidationCode;
@@ -54,6 +55,29 @@ export interface VectorModelSpace {
   readonly dimensions: number;
 }
 
+// A derived source is a row per segment. Authorization is deliberately not
+// segment-role based: the current source ROW (the parent) is re-read and
+// admitted for every hit, so project membership, ownership transfer, revocation
+// and deletion are evaluated against the parent as it exists NOW. Register the
+// admission resource against `parent.entity`; the segment table is private
+// derived storage and must not be an event-logged entity (no vector blobs in
+// sync/event payloads).
+export interface VectorParentSource {
+  readonly entity: string;
+  // Segment columns naming the parent row id, its derivation revision and the
+  // project the segment was derived under.
+  readonly field: string;
+  readonly revisionField: string;
+  readonly projectField: string;
+  // Parent columns holding the CURRENT revision and project. A segment is only
+  // served while both still match the segment's own fence.
+  readonly parentRevisionField: string;
+  readonly parentProjectField: string;
+  readonly owns?: (row: Readonly<Record<string, unknown>>) => boolean;
+  // Optional stable identity for feedback references; defaults to the row id.
+  readonly segmentIdField?: string;
+}
+
 export interface VectorPluginSource {
   readonly entity: string;
   readonly vector: string;
@@ -64,6 +88,9 @@ export interface VectorPluginSource {
   // The source reader only constrains declared table scopes. Every vector source
   // must additionally prove that each row belongs to this plugin's index.
   readonly owns: (row: Readonly<Record<string, unknown>>) => boolean;
+  // Enables the 1:N derived-segment model: `entity` is the segment table and
+  // `parent` is the current source-of-authority table for those segments.
+  readonly parent?: VectorParentSource;
 }
 
 export interface VectorPluginOptions {
@@ -204,6 +231,76 @@ function scopeValueOf(row: Readonly<Record<string, unknown>>, scopeField: string
   return value === null || value === undefined ? '' : String(value);
 }
 
+function assertFieldName(value: unknown, label: string): asserts value is string {
+  if (typeof value !== 'string' || !IDENTIFIER.test(value)) {
+    throw new TypeError(`vector plugin ${label} must be a SQLite identifier`);
+  }
+}
+
+function cellValue(value: unknown): string | null {
+  if (typeof value === 'string') return value.length > 0 ? value : null;
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  return null;
+}
+
+interface VectorSegmentFence {
+  readonly parentId: string;
+  readonly revision: string;
+  readonly projectId: string;
+}
+
+function segmentFence(row: Readonly<Record<string, unknown>>, parent: VectorParentSource): VectorSegmentFence | null {
+  const parentId = cellValue(row[parent.field]);
+  const revision = cellValue(row[parent.revisionField]);
+  const projectId = cellValue(row[parent.projectField]);
+  return parentId !== null && revision !== null && projectId !== null ? { parentId, revision, projectId } : null;
+}
+
+interface VectorParentFence {
+  readonly row: Record<string, unknown>;
+  readonly projectId: string;
+  readonly revision: string;
+}
+
+function parentFenceOf(
+  ctx: SearchPluginContext,
+  parent: VectorParentSource,
+  fence: VectorSegmentFence,
+  silent = false,
+): VectorParentFence | null {
+  const row = ctx.reader.row(parent.entity, fence.parentId);
+  if (row === undefined) return null;
+  if (parent.owns !== undefined) {
+    let owned = false;
+    try {
+      owned = parent.owns(row) === true;
+    } catch {
+      if (!silent) throw new Error(`vector parent '${fence.parentId}' ownership could not be verified`);
+    }
+    if (!owned) return null;
+  }
+  const projectId = cellValue(row[parent.parentProjectField]);
+  const revision = cellValue(row[parent.parentRevisionField]);
+  if (projectId === null || revision === null || projectId !== fence.projectId || revision !== fence.revision) return null;
+  return { row, projectId, revision };
+}
+
+function derivedHit(
+  match: ScoredMatch,
+  segmentRow: Readonly<Record<string, unknown>>,
+  parentFence: VectorParentFence,
+  parent: VectorParentSource,
+): Readonly<Record<string, unknown>> {
+  return Object.freeze({
+    id: match.id,
+    score: match.score,
+    sourceId: String(segmentRow[parent.field]),
+    segmentId: parent.segmentIdField === undefined ? match.id : segmentRow[parent.segmentIdField],
+    projectId: parentFence.projectId,
+    sourceRevision: parentFence.revision,
+  });
+}
+
 function boundaryKeyCensus(count: number, boundaryIds: readonly string[]): SearchEntityCensus {
   if (count === 0) return { count: 0, digest: createHash('sha256').update('0:').digest('hex') };
   const deduped = [...new Set(boundaryIds)].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
@@ -226,6 +323,13 @@ function compareIds(a: string, b: string): number {
 interface ScoredMatch {
   readonly id: string;
   readonly score: number;
+}
+
+interface VectorSearchCandidate {
+  readonly hit: Readonly<Record<string, unknown>>;
+  readonly key: string;
+  readonly rank: number;
+  readonly row: Record<string, unknown>;
 }
 
 function compareScoredMatches(a: ScoredMatch, b: ScoredMatch): number {
@@ -328,6 +432,19 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
   const scopeField = options.source.scopeField;
   if (scopeField !== undefined && !IDENTIFIER.test(scopeField)) {
     throw new TypeError('vector plugin scopeField must be a SQLite identifier');
+  }
+  const parent = options.source.parent;
+  if (parent !== undefined) {
+    if (parent === null || typeof parent !== 'object') throw new TypeError('vector plugin parent must be a declaration object');
+    const fields = {
+      entity: parent.entity, field: parent.field, revisionField: parent.revisionField,
+      projectField: parent.projectField, parentRevisionField: parent.parentRevisionField,
+      parentProjectField: parent.parentProjectField,
+    };
+    for (const [label, value] of Object.entries(fields)) assertFieldName(value, `parent ${label}`);
+    if (parent.entity === options.source.entity) throw new TypeError('vector plugin parent entity must differ from the segment source entity');
+    if (parent.owns !== undefined && typeof parent.owns !== 'function') throw new TypeError('vector plugin parent ownership predicate must be a function');
+    if (parent.segmentIdField !== undefined) assertFieldName(parent.segmentIdField, 'parent segmentIdField');
   }
   if (options.admission !== undefined && (
     options.admission === null || typeof options.admission !== 'object' ||
@@ -615,6 +732,9 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
       }
     }
     const { vector, norm } = validateVectorToFloat32(sourceVector, row[options.source.model], modelSpace, id);
+    if (parent !== undefined && segmentFence(row, parent) === null) {
+      throw new VectorPluginValidationError('invalid-derived-segment', `vector source '${id}' is missing its parent revision fence`);
+    }
     return { id, scopeId: scopeValueOf(row, scopeField), vector, norm };
   }
 
@@ -676,6 +796,10 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
         const parsedPage: { readonly id: string; readonly scopeId: string; readonly vector: Float32Array; readonly norm: number }[] = [];
         for (const row of page) {
           const parsed = parseAndValidateRow(row);
+          if (parent !== undefined) {
+            const fence = segmentFence(row, parent);
+            if (fence === null || parentFenceOf(ctx, parent, fence) === null) continue;
+          }
           next?.set(parsed.id, parsed.vector, parsed.norm, parsed.scopeId);
           parsedPage.push(parsed);
         }
@@ -727,6 +851,12 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
     const persistent = hasBoundIndex(ctx);
     const next = persistent ? null : targetSlab();
     if (!claimGeneration(ctx)) return { counts: { vectors: materializedCount(ctx) } };
+    // A parent change can move the project or advance the revision fence, which
+    // invalidates every derived segment under that parent. Without a separate
+    // parent→segment index, a full re-scan is the correct incremental answer.
+    if (parent !== undefined && changes.some((change) => change.entity === parent.entity)) {
+      return rebuild(ctx);
+    }
     const table = targetTable(ctx);
     const statements: { readonly sql: string; readonly params?: readonly unknown[] }[] = [];
     const flushStatements = async (): Promise<void> => {
@@ -760,6 +890,14 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
       } else {
         try {
           const parsed = parseAndValidateRow(row);
+          if (parent !== undefined) {
+            const fence = segmentFence(row, parent);
+            if (fence === null || parentFenceOf(ctx, parent, fence) === null) {
+              next?.delete(change.rowId);
+              statements.push({ sql: `DELETE FROM ${table} WHERE source_key = ?`, params: [change.rowId] });
+              continue;
+            }
+          }
           next?.set(parsed.id, parsed.vector, parsed.norm, parsed.scopeId);
           statements.push({
             sql: `INSERT OR REPLACE INTO ${table} (source_key, scope_id, norm, embedding) VALUES (?, ?, ?, ?)`,
@@ -782,7 +920,13 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
   async function revoke(ctx: SearchPluginContext, target: SearchRevocationTarget): Promise<SearchMaterializeResult> {
     const persistent = hasBoundIndex(ctx);
     const next = persistent ? null : targetSlab();
-    if (target.entity !== options.source.entity || !claimGeneration(ctx)) {
+    if (!claimGeneration(ctx)) {
+      return { counts: { vectors: materializedCount(ctx) } };
+    }
+    // Revoking the parent (or its project scope) must make every child segment
+    // inaccessible. A full re-scan fences the parent's current revision.
+    if (parent !== undefined && target.entity === parent.entity) return rebuild(ctx);
+    if (target.entity !== options.source.entity) {
       return { counts: { vectors: materializedCount(ctx) } };
     }
     const table = targetTable(ctx);
@@ -835,80 +979,95 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
     return allowed;
   }
 
+  function searchCandidate(ctx: SearchPluginContext, match: ScoredMatch): VectorSearchCandidate | null {
+    const row = ctx.reader.row(options.source.entity, match.id);
+    if (row === undefined) return null;
+    if (parent === undefined) {
+      return { hit: Object.freeze({ id: match.id, score: match.score }), key: match.id, rank: match.score, row };
+    }
+    let owned = false;
+    try {
+      owned = options.source.owns(row) === true;
+    } catch {
+      owned = false;
+    }
+    const fence = owned ? segmentFence(row, parent) : null;
+    const parentFence = fence === null ? null : parentFenceOf(ctx, parent, fence, true);
+    return parentFence === null
+      ? null
+      : { hit: derivedHit(match, row, parentFence, parent), key: match.id, rank: match.score, row: parentFence.row };
+  }
+
   async function search(ctx: SearchPluginContext, request: SearchRequest): Promise<SearchPluginSearchResult> {
     if (request.signal?.aborted) return { hits: [] };
     if (request.principal === undefined) throw new VectorPluginValidationError('unauthorized-source-ownership', 'vector search requires a principal for result admission');
     const query = request.query as VectorSearchQuery;
     const { vector: queryVec, norm: queryNorm } = validateVectorToFloat32(query?.vector, query?.model, modelSpace, 'query');
     const filter = resolveScopeFilter(scopeField, request, query);
-
-    let matches: readonly ScoredMatch[];
-    if (hasBoundIndex(ctx)) {
-      if (!persistentModelCurrent(ctx)) return { hits: [] };
-      const table = tables[currentActiveGeneration(ctx)];
-      // The registry always supplies a bounded limit; a capped default keeps
-      // top-K memory bounded even when a direct caller omits one. An empty
-      // table simply yields no matches — no COUNT probe is needed first.
-      const requested = typeof request.limit === 'number' && Number.isFinite(request.limit)
-        ? Math.floor(request.limit)
-        : SEARCH_MAX_RESULTS_CAP;
-      const limit = Math.max(1, requested);
-      matches = await scanPersistedMatches(ctx, table, queryVec, queryNorm, limit, filter, request.signal);
-    } else {
-      const allowedKeys = filter.predicate !== undefined ? collectAllowedKeys(ctx, filter.predicate) : undefined;
-      const poolSize = filter.scopeId !== undefined
-        ? activeSlab.slotsForScope(filter.scopeId).length
-        : allowedKeys !== undefined
-          ? allowedKeys.size
-          : activeSlab.size;
-      if (poolSize === 0) return { hits: [] };
-      const requested = typeof request.limit === 'number' && Number.isFinite(request.limit) ? Math.floor(request.limit) : poolSize;
-      const limit = Math.max(1, requested);
-      matches = await activeSlab.topKInterruptibly(queryVec, queryNorm, limit, {
-        scopeId: filter.scopeId,
-        allowedKeys,
-        signal: request.signal,
-      });
-    }
-    if (request.signal?.aborted) return { hits: [] };
-    const hits: Readonly<Record<string, unknown>>[] = [];
-    const candidates = matches.map((match) => {
-      const row = ctx.reader.row(options.source.entity, match.id) ?? null;
-      return {
-        // Search returns identity + similarity score only; callers hydrate
-        // source rows through their current read path.
-        hit: Object.freeze({ id: match.id, score: match.score }),
-        key: match.id,
-        rank: match.score,
-        row,
-      };
-    });
+    const requested = typeof request.limit === 'number' && Number.isFinite(request.limit) ? Math.floor(request.limit) : SEARCH_MAX_RESULTS_CAP;
+    const limit = Math.max(1, requested);
+    const total = parent === undefined
+      ? limit
+      : hasBoundIndex(ctx) ? countTable(ctx, tables[currentActiveGeneration(ctx)]) : activeSlab.size;
     const staleness = ctx.state !== undefined ? searchStalenessOf(ctx.state) : 'stale';
-    if (options.admission) {
-      const admitted = await admitSearchHits(options.admission.adapter, {
-        pluginId: options.id,
-        generation: ctx.generation,
-        staleness,
-        principal: request.principal,
-        candidates,
-      });
-      for (const result of admitted.hits) hits.push(result.hit);
-    } else if (options.unsafeAllowUnauthorizedSearch === true) {
-      // Explicit low-level unit-fixture opt-in ONLY. No adapter means no
-      // re-authorization of the current row: this path is unsafe by design and
-      // must never be used by an application serving protected content.
-      for (const candidate of candidates) if (candidate.row !== null) hits.push(candidate.hit);
-    } else {
-      // Fail closed: without an admission adapter there is no proof that any
-      // candidate row is visible to this principal. Never fall back to the raw
-      // (grant-filtered-but-not-admitted) reader — index-time authorization is
-      // never current, so the disclosed hits would be unverified.
-      throw new VectorPluginValidationError(
-        'unauthorized-source-ownership',
-        'vector search requires a search admission adapter to re-authorize result rows',
-      );
+
+    // A derived hit is authorized against its CURRENT parent, so denied or fenced
+    // candidates must not consume the caller's window. Re-scan a wider candidate
+    // set until the window is full or the index is exhausted.
+    let candidateLimit = limit;
+    for (;;) {
+      let matches: readonly ScoredMatch[];
+      if (hasBoundIndex(ctx)) {
+        if (!persistentModelCurrent(ctx)) return { hits: [] };
+        matches = await scanPersistedMatches(ctx, tables[currentActiveGeneration(ctx)], queryVec, queryNorm, candidateLimit, filter, request.signal);
+      } else {
+        const allowedKeys = filter.predicate !== undefined ? collectAllowedKeys(ctx, filter.predicate) : undefined;
+        const poolSize = filter.scopeId !== undefined
+          ? activeSlab.slotsForScope(filter.scopeId).length
+          : allowedKeys !== undefined ? allowedKeys.size : activeSlab.size;
+        if (poolSize === 0) return { hits: [] };
+        matches = await activeSlab.topKInterruptibly(queryVec, queryNorm, Math.min(candidateLimit, poolSize), {
+          scopeId: filter.scopeId,
+          allowedKeys,
+          signal: request.signal,
+        });
+      }
+      if (request.signal?.aborted) return { hits: [] };
+      const candidates: VectorSearchCandidate[] = [];
+      for (const match of matches) {
+        const candidate = searchCandidate(ctx, match);
+        if (candidate !== null) candidates.push(candidate);
+      }
+      const hits: Readonly<Record<string, unknown>>[] = [];
+      if (options.admission) {
+        const admitted = await admitSearchHits(options.admission.adapter, {
+          pluginId: options.id,
+          generation: ctx.generation,
+          staleness,
+          principal: request.principal,
+          candidates,
+        });
+        for (const result of admitted.hits) hits.push(result.hit);
+      } else if (options.unsafeAllowUnauthorizedSearch === true) {
+        // Explicit low-level unit-fixture opt-in ONLY. No adapter means no
+        // re-authorization of the current row: this path is unsafe by design and
+        // must never be used by an application serving protected content.
+        for (const candidate of candidates) hits.push(candidate.hit);
+      } else {
+        // Fail closed: without an admission adapter there is no proof that any
+        // candidate row is visible to this principal. Never fall back to the raw
+        // (grant-filtered-but-not-admitted) reader — index-time authorization is
+        // never current, so the disclosed hits would be unverified.
+        throw new VectorPluginValidationError(
+          'unauthorized-source-ownership',
+          'vector search requires a search admission adapter to re-authorize result rows',
+        );
+      }
+      if (parent === undefined || hits.length >= limit || matches.length < candidateLimit || candidateLimit >= total) {
+        return { hits };
+      }
+      candidateLimit = Math.min(total, candidateLimit * 2);
     }
-    return { hits };
   }
 
   const plugin: VectorPlugin = {
@@ -935,7 +1094,10 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
         ddl: [`CREATE INDEX IF NOT EXISTS ${name}_scope_idx ON ${name} (scope_id);`],
       })),
     ]),
-    sourceInterests: Object.freeze([{ entity: options.source.entity }]),
+    sourceInterests: Object.freeze([
+      { entity: options.source.entity },
+      ...(parent !== undefined ? [{ entity: parent.entity }] : []),
+    ]),
     get generationIdentity() {
       return generationIdentity(modelSpace, sequence);
     },
@@ -957,7 +1119,9 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
       buildingGen = null;
     },
     stalenessKey(change) {
-      return change.entity === options.source.entity ? `${change.entity}:${change.rowId}` : null;
+      if (change.entity === options.source.entity) return `${change.entity}:${change.rowId}`;
+      if (parent !== undefined && change.entity === parent.entity) return `${change.entity}:${change.rowId}`;
+      return null;
     },
     async prepare(ctx) {
       if (!hasBoundIndex(ctx)) return;
@@ -1005,6 +1169,32 @@ export function createVectorPlugin(options: VectorPluginOptions): VectorPlugin {
       });
     },
     sourceCensus(ctx): SearchCensus {
+      if (parent !== undefined) {
+        // Only currently fenced segments are materialized, so parity must count
+        // the same projection rather than every raw segment row.
+        let count = 0;
+        const head: string[] = [];
+        const tail: string[] = [];
+        let afterId: string | undefined;
+        while (true) {
+          const page = ctx.reader.rows(options.source.entity, { afterId, limit: SOURCE_PAGE_SIZE, order: 'asc' });
+          if (page.length === 0) break;
+          for (const row of page) {
+            const fence = segmentFence(row, parent);
+            if (fence === null || parentFenceOf(ctx, parent, fence) === null) continue;
+            count += 1;
+            if (head.length < CENSUS_BOUNDARY_SAMPLE) head.push(String(row.id));
+            tail.push(String(row.id));
+            if (tail.length > CENSUS_BOUNDARY_SAMPLE * 2) tail.shift();
+          }
+          if (page.length < SOURCE_PAGE_SIZE) break;
+          const lastId = String(page[page.length - 1]?.id ?? '');
+          if (lastId.length === 0 || (afterId !== undefined && lastId <= afterId)) break;
+          afterId = lastId;
+        }
+        const boundary = [...head, ...tail.slice(-CENSUS_BOUNDARY_SAMPLE)];
+        return Object.freeze({ [options.source.entity]: boundaryKeyCensus(count, boundary) });
+      }
       const count = typeof ctx.reader.count === 'function'
         ? ctx.reader.count(options.source.entity)
         : ctx.reader.rows(options.source.entity).length;
